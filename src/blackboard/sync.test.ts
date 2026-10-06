@@ -160,6 +160,46 @@ describe("sync observations and cache", () => {
     expect(read).toHaveBeenCalledTimes(2);
   });
 
+  it.each([0, 1, 2])(
+    "returns an earlier cached position at seq %s without alarms or cache changes",
+    async (seq) => {
+      const { sync, deps, log, read, alarms, vt } = unitFixture();
+      await sync.observeNow();
+      await vt.advance(123);
+      log.append({ type: "agent.registered", actor: MAC, payload: agentRegistered() });
+      log.append(
+        { type: "agent.registered", actor: MAC, payload: agentRegistered() },
+        {
+          mutate: (entry) => {
+            entry.signature = { status: "missing" };
+          },
+        },
+      );
+      log.append({
+        type: "task.created",
+        actor: "human",
+        payload: taskCreated({ owner: MAC, repo: "https://example.com/code.git" }),
+      });
+      await sync.replayTo(log.tip);
+      const current = sync.current();
+      const previousAlarms = [...alarms];
+      const updates = vi.fn();
+      sync.onState(updates);
+      read.mockClear();
+      const entry = log.entries[seq];
+      if (!entry) throw new Error("Missing historical entry");
+
+      expect(await sync.replayTo(entry.sha)).toEqual(replay(log.entries.slice(0, seq + 1)));
+      expect(read).toHaveBeenCalledExactlyOnceWith(deps.git, deps.clone.dir, deps.trustPath, {
+        ref: entry.sha,
+      });
+      expect(alarms).toEqual(previousAlarms);
+      expect(updates).not.toHaveBeenCalled();
+      expect(sync.current()).toEqual(current);
+      expect(sync.current().tip).toBe(log.tip);
+    },
+  );
+
   it("protects cached state from callers and independently notifies subscribers", async () => {
     const { sync, log } = unitFixture();
     const observed: State[] = [];
@@ -180,6 +220,43 @@ describe("sync observations and cache", () => {
     await sync.replayTo(log.tip);
     expect(observed).toHaveLength(2);
   });
+
+  it.each(["observeNow", "replayTo"] as const)(
+    "reports a throwing state listener without failing %s",
+    async (method) => {
+      const { sync, log, refs, alarms, vt } = unitFixture();
+      const problem = new Error("Subscriber unavailable");
+      const unsubscribe = sync.onState((state) => {
+        state.seq = 999;
+        throw problem;
+      });
+      const listener = vi.fn();
+      sync.onState(listener);
+      const observe = () => (method === "observeNow" ? sync.observeNow() : sync.replayTo(log.tip));
+
+      expect(await observe()).toEqual(replay(log.entries));
+      expect(listener).toHaveBeenCalledExactlyOnceWith(replay(log.entries));
+      expect(sync.current()).toMatchObject({ tip: log.tip, seq: 0 });
+      expect(alarms).toHaveLength(1);
+      expect(alarms[0]).toMatchObject({
+        kind: "sync_failed",
+        error: expect.any(SyncError),
+      });
+      if (alarms[0]?.kind !== "sync_failed") throw new Error("Missing listener alarm");
+      expect(alarms[0].error.cause).toBe(problem);
+      expect(alarms[0].error.message).toContain("state listener");
+      if (method === "observeNow") expect(sync.current().fetchedAtMonoMs).toBe(0);
+
+      unsubscribe();
+      log.append({ type: "agent.registered", actor: MAC, payload: agentRegistered() });
+      refs.remote["refs/heads/main"] = log.tip;
+      await vt.advance(123);
+      expect(await observe()).toEqual(replay(log.entries));
+      expect(listener).toHaveBeenCalledTimes(2);
+      expect(alarms).toHaveLength(1);
+      if (method === "observeNow") expect(sync.current().fetchedAtMonoMs).toBe(123);
+    },
+  );
 
   it("alarms and retries a full replay after LogReadError without corrupting the cache", async () => {
     const { sync, deps, log, read, alarms } = unitFixture();
@@ -247,8 +324,8 @@ describe("sync observations and cache", () => {
       sync.replayTo(first),
     ]);
     expect(states.map((state) => state.seq)).toEqual([0, 1, 0]);
-    expect(sync.current().tip).toBe(first);
-    expect(read.mock.calls.map((call) => call[3]?.ref)).toEqual([first, second, first, first]);
+    expect(sync.current().tip).toBe(second);
+    expect(read.mock.calls.map((call) => call[3]?.ref)).toEqual([first, second, first]);
   });
 
   it("observeNow always fetches both refs and refreshes metadata, without resetting HEAD", async () => {
@@ -682,6 +759,27 @@ describe("sync against a signed temporary blackboard", () => {
     expect(state).toEqual(
       await fullReplaySource(git, readerClone.dir, trustPath).replayTo(state.tip),
     );
+  });
+
+  it("returns an ancestor snapshot after a newer poll without raising a rewrite alarm", async () => {
+    const alarms: SyncAlarm[] = [];
+    sync.onAlarm((alarm) => alarms.push(alarm));
+    const initial = await sync.observeNow();
+    await register();
+    const older = await sync.observeNow();
+    expect(
+      await publisher.publish(
+        () => draft("task.created", T1, "human", taskCreated({ owner: MAC }), {}),
+        { signer: human },
+      ),
+    ).toMatchObject({ status: "accepted" });
+    const newer = await sync.observeNow();
+
+    await sync.replayTo(newer.tip);
+    expect(await sync.replayTo(older.tip)).toEqual(older);
+    expect(await sync.replayTo(initial.tip)).toEqual(initial);
+    expect(sync.current().state).toEqual(newer);
+    expect(alarms).toEqual([]);
   });
 
   it("alarms and fully rebuilds after remote history rewrites and rollback to genesis", async () => {

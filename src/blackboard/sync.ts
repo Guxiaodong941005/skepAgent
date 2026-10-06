@@ -138,7 +138,21 @@ export class Sync implements StateSource {
   }
 
   replayTo(tip: Sha): Promise<State> {
-    return this.enqueue(async () => structuredClone(await this.readState(ShaSchema.parse(tip))));
+    return this.enqueue(async () => {
+      const requestedTip = ShaSchema.parse(tip);
+      const cached = this.state;
+      // A publisher's fetched tip can precede a concurrent poll's cache update (§7.2).
+      // Historical snapshots must not report a rewrite or regress the current observation.
+      if (
+        cached &&
+        cached.tip !== requestedTip &&
+        (cached.genesis_sha === requestedTip ||
+          cached.outcomes.some((outcome) => outcome.sha === requestedTip))
+      ) {
+        return structuredClone(await this.fullReplay(requestedTip));
+      }
+      return structuredClone(await this.readState(requestedTip));
+    });
   }
 
   /** A delivery re-verification always fetches, even when the polling shortcut could apply. */
@@ -222,14 +236,22 @@ export class Sync implements StateSource {
         this.emitAlarm({ kind: "invalid_commit", outcome: structuredClone(outcome) });
       }
     }
-    for (const cb of this.stateListeners) cb(structuredClone(next));
+    for (const cb of this.stateListeners) {
+      try {
+        cb(structuredClone(next));
+      } catch (error) {
+        this.alarm("sync_failed", "Could not notify a sync state listener", error);
+      }
+    }
     return next;
   }
 
   private async fullReplay(tip: Sha): Promise<State> {
-    return replay(
+    const state = replay(
       await readLog(this.deps.git, this.deps.clone.dir, this.deps.trustPath, { ref: tip }),
     );
+    if (state.tip !== tip) throw new SyncError(`Replay did not reach requested tip ${tip}`);
+    return state;
   }
 
   private async observe(force: boolean): Promise<State> {
