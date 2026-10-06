@@ -20,7 +20,7 @@ import { register as registerReplan } from "./commands/replan.js";
 import { register as registerSim } from "./commands/sim.js";
 import { register as registerStatus } from "./commands/status.js";
 import { register as registerTask } from "./commands/task.js";
-import type { CliContext } from "./context.js";
+import { type CliContext, connectDaemon } from "./context.js";
 import { CliError, createOutput, EXIT, type Output } from "./output.js";
 
 export type { SkepPaths } from "../config/paths.js";
@@ -81,6 +81,9 @@ export function buildProgram(ctx: CliContext): Command {
 export async function runCli(argv: string[], ctx: CliContext): Promise<number> {
   // A reused context must not keep a previous action's failure (sim violations set this).
   ctx.exitCode = undefined;
+  // The daemon socket is the CLI's way to publish and query (ARCHITECTURE §12). An action or a
+  // test may supply its own factory; otherwise talk to the socket under the resolved home.
+  ctx.connectDaemon ??= () => connectDaemon(ctx);
   const program = buildProgram(ctx);
   // `output()` reads the flag off the program, which Commander has already stored by the time
   // an action or a usage error runs. Help/version never call it.
