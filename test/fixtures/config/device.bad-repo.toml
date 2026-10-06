@@ -1,0 +1,10 @@
+schema = "skep.device/v1"
+device = "mac"
+signing_key = "keys/daemon"
+
+[blackboard]
+url = "git@example.com:owner/blackboard.git"
+
+[[repos]]
+name = "App"
+url = "git@example.com:owner/app.git"

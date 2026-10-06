@@ -1,0 +1,14 @@
+schema = "skep.checks/v1"
+
+[checks.unit]
+argv = ["npm", "test"]
+
+[checks.lint]
+argv = ["npm", "run", "lint"]
+timeout_sec = 120
+cwd = "packages/app"
+parser = "none"
+
+[checks.env]
+env = { "NODE_ENV" = "test" }
+argv = ["npm", "test"]
