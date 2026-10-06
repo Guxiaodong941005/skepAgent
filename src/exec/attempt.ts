@@ -47,6 +47,7 @@ export const ATTEMPT_STEPS = [
   "claimed",
   "worktree_created",
   "preflight_ok",
+  "invocation_started",
   "invoked",
   "invocation_done",
   "committed",
@@ -62,6 +63,8 @@ export const ATTEMPT_STEPS = [
   "checkpointed",
   "stale",
 ] as const;
+
+const SECRET_FAILURE_DETAIL = "Secret scan blocked publication; see the local journal";
 
 const InputSchema = z.strictObject({
   lease: z.strictObject({
@@ -305,7 +308,7 @@ export class AttemptRunner {
       }
       let done = last(context, "invocation_done");
       if (!done) {
-        if (last(context, "invoked")) {
+        if (last(context, "invoked") || last(context, "invocation_started")) {
           if (interruption) return await this.checkpoint(context, "unknown");
           return await this.fail(
             context,
@@ -364,8 +367,6 @@ export class AttemptRunner {
       if (!(await this.scan(context, head, [title, body])))
         return await this.secretFailure(context);
       await this.push(context, head);
-      if (!(await this.scan(context, head, [title, body])))
-        return await this.secretFailure(context);
       let pr: PrInfo;
       const savedPr = last(context, "pr");
       if (savedPr) pr = PrSchema.parse(savedPr.pr);
@@ -591,16 +592,17 @@ export class AttemptRunner {
       invoke: async (inv) => {
         const id = `${kind}-${++counter}`;
         const raw = join(scratch, `${id}.raw`);
-        const captureStop = new AbortController();
-        captures.push(captureStop);
-        const capturing = this.capture(raw, join(logs, `${id}.log`), captureStop.signal);
+        // Keep pre-launch crash fencing without confusing intent with the factory's PID record.
         await this.record(c, {
-          step: "invoked",
+          step: typeof this.deps.adapter === "function" ? "invocation_started" : "invoked",
           kind: inv.kind,
           pid: null,
           pgid: null,
           start_token: null,
         });
+        const captureStop = new AbortController();
+        captures.push(captureStop);
+        const capturing = this.capture(raw, join(logs, `${id}.log`), captureStop.signal);
         let result: AdapterResult;
         try {
           result = await bound.invoke({
@@ -866,10 +868,14 @@ export class AttemptRunner {
   }
 
   private async secretFailure(c: RunningAttempt): Promise<AttemptResult> {
-    // D19: a hit suppresses every publication, including code, PRs and blackboard events.
-    const result = { status: "failed", class: "secret_detected" } as const;
-    await this.record(c, { step: "failed", class: "secret_detected", result });
-    return result;
+    // D19 blocks code and PR content; a fixed failure event still ends the lease (§5.5).
+    if (!last(c, "secret_detected")) await this.record(c, { step: "secret_detected" });
+    return this.preparePublication(c, "work.failed", {
+      item: c.key.item,
+      epoch: c.key.epoch,
+      class: "secret_detected",
+      detail: SECRET_FAILURE_DETAIL,
+    });
   }
 
   private async fail(c: RunningAttempt, failure: FailureClass, detail: string) {
@@ -941,7 +947,13 @@ export class AttemptRunner {
         : publication.type === "checkpoint.recorded"
           ? (publication.payload.snapshot.head_sha ?? c.input.baseSha)
           : ShaSchema.parse(last(c, "committed")?.sha ?? c.input.baseSha);
-    if (!(await this.scan(c, head, [JSON.stringify(publication)]))) return this.secretFailure(c);
+    const eventJson = JSON.stringify(publication);
+    if (publication.type === "work.failed" && publication.payload.class === "secret_detected") {
+      // B1: rescanning the rejected code would recurse and leave a barrier's lease held forever.
+      if (findSecrets(eventJson).length > 0) {
+        throw new AttemptError("Secret failure event contains unsafe metadata; repair the journal");
+      }
+    } else if (!(await this.scan(c, head, [eventJson]))) return this.secretFailure(c);
     let intent: Intent;
     const action = { task_id: c.key.task, actor: c.input.lease.holder };
     if (publication.type === "work.delivered") {

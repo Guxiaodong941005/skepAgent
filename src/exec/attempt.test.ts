@@ -45,6 +45,7 @@ const report = {
   replan_request: null,
 };
 const secret = `sk-${"A".repeat(24)}`;
+const secretFailureDetail = "Secret scan blocked publication; see the local journal";
 
 describe("journaled attempt pipeline", () => {
   const git = new NodeGitRunner();
@@ -293,6 +294,7 @@ describe("journaled attempt pipeline", () => {
       "gpgsig -----BEGIN SSH SIGNATURE-----",
     );
     expect(replay(log.entries).tasks[T1]?.status).toBe("delivered");
+    expect(scanner).toHaveBeenCalledTimes(2);
     expect(adapter.invocations[0]?.prompt).toContain("Do not run git");
     expect(adapter.invocations[0]?.env).toEqual({
       HOME: root,
@@ -378,7 +380,7 @@ describe("journaled attempt pipeline", () => {
   });
 
   it.each(["pattern", "gitleaks", "model"])(
-    "blocks a $0 secret with no publication",
+    "blocks a $0 secret and publishes only a secret-free failure event",
     async (source) => {
       if (source === "gitleaks") scanner.mockResolvedValue({ status: "secrets_detected" });
       else
@@ -394,8 +396,19 @@ describe("journaled attempt pipeline", () => {
             output: source === "model" ? { ...report, summary: secret } : report,
           },
         });
-      expect(await run()).toEqual({ status: "failed", class: "secret_detected" });
-      expect(publish).not.toHaveBeenCalled();
+      expect(await run()).toMatchObject({
+        status: "failed",
+        class: "secret_detected",
+        publication: { status: "accepted" },
+      });
+      expect(publish).toHaveBeenCalledOnce();
+      expect(log.events.at(-1)).toMatchObject({
+        type: "work.failed",
+        payload: { item: "W1", epoch: 1, class: "secret_detected", detail: secretFailureDetail },
+      });
+      expect(log.events.at(-1)?.payload).not.toHaveProperty("summary");
+      expect(replay(log.entries).tasks[T1]?.items.W1?.lease).toBeNull();
+      expect(scanner).toHaveBeenCalledTimes(source === "model" ? 0 : 1);
       expect(await host.remoteBranchSha("app", branch)).toBeNull();
       expect(await host.findPr("app", branch)).toBeNull();
       expect(await readFile(journal.path(key), "utf8")).not.toContain(secret);
@@ -426,6 +439,62 @@ describe("journaled attempt pipeline", () => {
     expect(await readdir(deps.scratchDir)).toEqual([]);
   });
 
+  it.each(["pending", "ambiguous acknowledgement"])(
+    "recovers a secret failure after %s with the saved event id and no code rescan",
+    async (failure) => {
+      scanner.mockResolvedValue({ status: "secrets_detected" });
+      const original = required(publish.getMockImplementation());
+      publish.mockImplementationOnce(async (intent, options) => {
+        const accepted =
+          failure === "ambiguous acknowledgement" ? await original(intent, options) : {};
+        return {
+          ...accepted,
+          status: "failed",
+          eventId: required(options?.eventId),
+          reason: "Lost acknowledgement",
+        };
+      });
+      expect(await run()).toMatchObject({ status: "pending" });
+      expect(await run()).toMatchObject({
+        status: "failed",
+        class: "secret_detected",
+        publication: { status: "accepted" },
+      });
+      expect(publish).toHaveBeenCalledTimes(2);
+      expect(publish.mock.calls[0]?.[1]?.eventId).toBe(publish.mock.calls[1]?.[1]?.eventId);
+      expect(log.events.filter((event) => event?.type === "work.failed")).toHaveLength(1);
+      expect(log.events.at(-1)?.payload).toMatchObject({
+        class: "secret_detected",
+        detail: secretFailureDetail,
+      });
+      expect(scanner).toHaveBeenCalledOnce();
+      expect(adapter.invocations).toHaveLength(1);
+      expect(await host.remoteBranchSha("app", branch)).toBeNull();
+      expect(await host.findPr("app", branch)).toBeNull();
+    },
+  );
+
+  it("checks the failure event itself for secrets even when the rejected code scan is bypassed", async () => {
+    scanner.mockResolvedValue({ status: "secrets_detected" });
+    publish.mockImplementationOnce(async (_intent, options) => ({
+      status: "failed",
+      eventId: required(options?.eventId),
+    }));
+    expect(await run()).toMatchObject({ status: "pending" });
+    const records = await journal.read(key);
+    const pending = required(records.findLast((record) => record.step === "publish_pending"));
+    const publication = pending.publication as { payload: { detail: string } };
+    publication.payload.detail = secret;
+    await writeFile(
+      journal.path(key),
+      `${records.map((record) => JSON.stringify(record)).join("\n")}\n`,
+    );
+    await expect(run()).rejects.toThrow("Secret failure event contains unsafe metadata");
+    expect(publish).toHaveBeenCalledOnce();
+    expect(scanner).toHaveBeenCalledOnce();
+    expect(await host.remoteBranchSha("app", branch)).toBeNull();
+  });
+
   it("blocks secrets encoded as JSON escapes in otherwise valid model output", async () => {
     deps.adapter = {
       cli: "codex",
@@ -442,8 +511,17 @@ describe("journaled attempt pipeline", () => {
         pid: null,
       }),
     };
-    expect(await run()).toEqual({ status: "failed", class: "secret_detected" });
-    expect(publish).not.toHaveBeenCalled();
+    expect(await run()).toMatchObject({
+      status: "failed",
+      class: "secret_detected",
+      publication: { status: "accepted" },
+    });
+    expect(publish).toHaveBeenCalledOnce();
+    expect(log.events.at(-1)).toMatchObject({
+      type: "work.failed",
+      payload: { class: "secret_detected", detail: secretFailureDetail },
+    });
+    expect(scanner).not.toHaveBeenCalled();
     expect(await readFile(journal.path(key), "utf8")).not.toContain(secret);
   });
 
@@ -565,6 +643,24 @@ describe("journaled attempt pipeline", () => {
     expect(adapter.invocations).toHaveLength(1);
   });
 
+  it("does not rerun a factory invocation whose pre-launch intent was journaled before a crash", async () => {
+    const append = journal.append.bind(journal);
+    deps.journal = {
+      path: journal.path.bind(journal),
+      read: journal.read.bind(journal),
+      append: async (attempt, record) => {
+        const saved = await append(attempt, record);
+        if (record.step === "invocation_started") throw new Error("simulated crash");
+        return saved;
+      },
+    };
+    deps.adapter = () => adapter;
+    await expect(run()).rejects.toThrow("simulated crash");
+    deps.journal = journal;
+    expect(await run()).toMatchObject({ status: "failed", class: "crash" });
+    expect(adapter.invocations).toHaveLength(0);
+  });
+
   it("checkpoints interrupted edits with a signed WIP commit pushed before the event", async () => {
     deps.adapter = {
       cli: "codex",
@@ -646,6 +742,14 @@ describe("journaled attempt pipeline", () => {
     expect(signalGroup).toHaveBeenCalledWith("SIGKILL");
     expect(await host.remoteBranchSha("app", branch)).toBeNull();
     expect(vt.nextTimerAt()).toBeNull();
+    const records = await journal.read(key);
+    expect(records.filter((record) => record.step === "invoked")).toHaveLength(1);
+    expect(records.find((record) => record.step === "invoked")).toMatchObject({
+      pid: 42,
+      pgid: 42,
+      start_token: "start",
+    });
+    expect(records.filter((record) => record.step === "invocation_started")).toHaveLength(1);
   });
 
   it("classifies a bounded invocation timeout as work.failed rather than a voluntary checkpoint", async () => {
@@ -742,6 +846,62 @@ describe("journaled attempt pipeline", () => {
     expect(log.events.at(-1)?.payload).toMatchObject({ barrier_id: barrier.id });
     expect(adapter.invocations).toHaveLength(0);
   });
+
+  it.each(["pattern", "gitleaks", "model"])(
+    "settles a barrier with work.failed when checkpointing hits a $0 secret",
+    async (source) => {
+      if (source === "gitleaks") scanner.mockResolvedValue({ status: "secrets_detected" });
+      deps.adapter = {
+        cli: "codex",
+        probe: adapter.probe.bind(adapter),
+        invoke: async (inv) => {
+          const state = replay(log.entries);
+          log.append({
+            type: "replan.requested",
+            task_id: T1,
+            actor: "human",
+            pre: { task_rev: required(state.tasks[T1]).rev },
+            payload: { summary: "Revise the example plan", evidence: [], item: "W1" },
+          });
+          const barrier = required(required(replay(log.entries).tasks[T1]).barrier);
+          expect(await runner.interrupt(key, barrier.id)).toBe(true);
+          await writeFile(
+            join(inv.cwd, "result.txt"),
+            source === "pattern" ? `partial\n${secret}\n` : "partial\n",
+          );
+          return {
+            outcome: "interrupted",
+            exitCode: 130,
+            finalMessage:
+              source === "model" ? JSON.stringify({ ...report, summary: secret }) : null,
+            usage: null,
+            durationMs: 1,
+            pid: null,
+          };
+        },
+      };
+      const runner = new AttemptRunner(deps);
+      expect(await runner.run(input)).toMatchObject({
+        status: "failed",
+        class: "secret_detected",
+        publication: { status: "accepted" },
+      });
+      expect(publish).toHaveBeenCalledOnce();
+      expect(log.events.at(-1)).toMatchObject({
+        type: "work.failed",
+        payload: { class: "secret_detected", detail: secretFailureDetail },
+      });
+      const task = required(replay(log.entries).tasks[T1]);
+      expect(task.items.W1?.lease).toBeNull();
+      expect(task.status).toBe("replanning");
+      expect(task.barrier?.closed_seq).not.toBeNull();
+      expect(log.events.some((event) => event?.type === "checkpoint.recorded")).toBe(false);
+      expect(scanner).toHaveBeenCalledTimes(source === "model" ? 0 : 1);
+      expect(await host.remoteBranchSha("app", branch)).toBeNull();
+      expect(await host.findPr("app", branch)).toBeNull();
+      expect(await readFile(journal.path(key), "utf8")).not.toContain(secret);
+    },
+  );
 
   it("never forwards agent or provider environment variables to daemon Git writes", async () => {
     deps.gitEnv = {
