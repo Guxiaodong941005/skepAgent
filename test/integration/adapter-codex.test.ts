@@ -9,7 +9,10 @@ import {
   type InterruptLadder,
   PINNED_CODEX_VERSION,
 } from "../../src/adapter/codex.js";
+import { normalizeOptionalNulls } from "../../src/adapter/output-schema.js";
 import type { AdapterInvocation } from "../../src/adapter/types.js";
+import { PlanSchema } from "../../src/core/schemas/plan.js";
+import { ReviewSchema } from "../../src/core/schemas/review.js";
 import { UsageSchema, WorkReportSchema } from "../../src/core/schemas/work-report.js";
 import type {
   ProcessExit,
@@ -134,6 +137,99 @@ function sanitizedEnvironment(): Record<string, string> {
   return env;
 }
 
+const sha = "a".repeat(40);
+const hash = "b".repeat(64);
+const cases = [
+  {
+    name: "WorkReport",
+    kind: "work",
+    schema: WorkReportSchema,
+    example: {
+      schema: "skep.work_report/v1",
+      summary: "Example complete",
+      files_intended: [],
+      concerns: [],
+      replan_request: {
+        summary: "Example mismatch",
+        evidence: [
+          {
+            id: "ev_check",
+            type: "check_run",
+            run_id: "example-run",
+            check: "unit",
+            sha,
+            exit: 0,
+            passed: null,
+            failed: null,
+            log_sha256: hash,
+          },
+        ],
+      },
+    },
+  },
+  {
+    name: "Plan",
+    kind: "plan",
+    schema: PlanSchema,
+    example: {
+      schema: "skep.plan/v1",
+      task_id: "T-20261006-abcd",
+      version: 1,
+      parent_version: null,
+      base: { repo: "git@example.com:owner/app.git", branch: "main", commit: sha },
+      mode: "solo",
+      summary: "Example plan",
+      items: [
+        {
+          id: "W1",
+          title: "Example item",
+          details: null,
+          role: "coding",
+          assignee: "vps.coding",
+          depends_on: [],
+          requires: null,
+          touches: ["src/example.ts"],
+          risk: "normal",
+          acceptance: [{ kind: "manual", text: "Example behaviour works" }],
+        },
+      ],
+      stack_order: ["W1"],
+      changes_from_parent: null,
+    },
+  },
+  {
+    name: "Review",
+    kind: "review",
+    schema: ReviewSchema,
+    example: {
+      schema: "skep.review/v1",
+      plan_version: 1,
+      plan_hash: `sha256:${hash}`,
+      verdict: "block",
+      blockers: [
+        {
+          id: "B1",
+          claim: "Example gap",
+          acceptance_gap: null,
+          evidence: [
+            {
+              id: "ev_file",
+              type: "file_span",
+              repo: "git@example.com:owner/app.git",
+              commit: sha,
+              path: "src/example.ts",
+              lines: [1, 2],
+              sha256: hash,
+              excerpt: null,
+            },
+          ],
+        },
+      ],
+      suggestions: [],
+    },
+  },
+] as const;
+
 describe.skipIf(process.env.SKEP_REAL_CODEX !== "1")("pinned real Codex CLI (opt-in)", () => {
   const scratchDirs: string[] = [];
   const runtimes: InlineRuntime[] = [];
@@ -145,25 +241,30 @@ describe.skipIf(process.env.SKEP_REAL_CODEX !== "1")("pinned real Codex CLI (opt
     );
   });
 
-  async function setup() {
+  async function setup(testCase: (typeof cases)[number] = cases[0]) {
     const dir = await mkdtemp(path.join(tmpdir(), "skep-codex-real-"));
     scratchDirs.push(dir);
     const runtime = new InlineRuntime();
     runtimes.push(runtime);
-    const adapter = new CodexAdapter({ runtime, interrupt, clock: systemClock });
+    const env = sanitizedEnvironment();
+    const adapter = new CodexAdapter({
+      runtime,
+      interrupt,
+      clock: systemClock,
+      probeEnv: { PATH: env.PATH ?? "" },
+    });
     const probe = await adapter.probe();
     expect(probe, probe.detail).toMatchObject({ ok: true, version: PINNED_CODEX_VERSION });
     const abort = new AbortController();
     const cwd = path.join(dir, "worktree");
     await mkdir(cwd);
     const inv: AdapterInvocation = {
-      kind: "work",
+      kind: testCase.kind,
       cwd,
-      prompt:
-        'Do not run tools or modify files. Return a work report with schema "skep.work_report/v1", summary "Example complete", empty files_intended and concerns, and null replan_request.',
-      outputSchema: z.toJSONSchema(WorkReportSchema),
+      prompt: `Do not run tools or modify files. Return only this exact example JSON. Null optional fields are removed before original Zod validation:\n${JSON.stringify(testCase.example)}`,
+      outputSchema: z.toJSONSchema(testCase.schema),
       timeoutMs: 120_000,
-      env: sanitizedEnvironment(),
+      env,
       logPath: path.join(dir, "capture.log"),
       scratchDir: path.join(dir, "scratch"),
       signal: abort.signal,
@@ -171,17 +272,24 @@ describe.skipIf(process.env.SKEP_REAL_CODEX !== "1")("pinned real Codex CLI (opt
     return { adapter, inv, runtime, abort };
   }
 
-  it("returns a schema-valid work report without passing provider credentials", async () => {
-    const { adapter, inv, runtime } = await setup();
-    const result = await adapter.invoke(inv);
-    expect(result).toMatchObject({ outcome: "completed", exitCode: 0 });
-    expect(result.finalMessage).not.toBeNull();
-    const report = WorkReportSchema.parse(JSON.parse(result.finalMessage ?? ""));
-    expect(report.schema).toBe("skep.work_report/v1");
-    if (result.usage !== null) expect(UsageSchema.safeParse(result.usage).success).toBe(true);
-    expect(await runtime.isAlive(result.pid ?? -1, `test-process-${result.pid}`)).toBe(false);
-    expect(Object.keys(inv.env)).not.toContain("OPENAI_API_KEY");
-  }, 150_000);
+  it.each(cases)(
+    "returns a Zod-valid $name using the transformed provider schema",
+    async (testCase) => {
+      const { adapter, inv, runtime } = await setup(testCase);
+      const result = await adapter.invoke(inv);
+      expect(result).toMatchObject({ outcome: "completed", exitCode: 0 });
+      expect(result.finalMessage).not.toBeNull();
+      // This is the SK-307 validation boundary: normalize only optional placeholders using the
+      // original schema, then let the original strict Zod schema enforce every protocol rule.
+      const value = normalizeOptionalNulls(JSON.parse(result.finalMessage ?? ""), inv.outputSchema);
+      const validated = testCase.schema.parse(value);
+      expect(validated).toEqual(normalizeOptionalNulls(testCase.example, inv.outputSchema));
+      if (result.usage !== null) expect(UsageSchema.safeParse(result.usage).success).toBe(true);
+      expect(await runtime.isAlive(result.pid ?? -1, `test-process-${result.pid}`)).toBe(false);
+      expect(Object.keys(inv.env)).not.toContain("OPENAI_API_KEY");
+    },
+    150_000,
+  );
 
   it("stops the detached CLI process group after SIGINT", async () => {
     const { adapter, inv, runtime, abort } = await setup();

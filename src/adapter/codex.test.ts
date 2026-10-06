@@ -9,6 +9,7 @@ import {
   CodexAdapterError,
   type InterruptLadder,
   PINNED_CODEX_VERSION,
+  toCodexOutputSchema,
 } from "./codex.js";
 import type { AdapterInvocation, AgentAdapter } from "./types.js";
 
@@ -148,9 +149,12 @@ describe("CodexAdapter", () => {
     expect(runtime.calls[0]?.argv.join(" ")).not.toContain(inv.prompt);
     expect(runtime.calls[0]?.argv.join(" ")).not.toMatch(/TOKEN|SECRET|API_KEY|auth/i);
     expect(runtime.calls[0]?.env).toBe(inv.env);
-    expect(JSON.parse(await readFile(path.join(inv.scratchDir, "schema.json"), "utf8"))).toEqual(
-      inv.outputSchema,
-    );
+    expect(JSON.parse(await readFile(path.join(inv.scratchDir, "schema.json"), "utf8"))).toEqual({
+      type: "object",
+      properties: { ok: { anyOf: [{ type: "boolean" }, { type: "null" }] } },
+      required: ["ok"],
+      additionalProperties: false,
+    });
     expect(await readFile(inv.logPath, "utf8")).toContain('"turn.completed"');
     expect(interrupt).not.toHaveBeenCalled();
   });
@@ -349,11 +353,103 @@ describe("CodexAdapter", () => {
     await expect(readFile(logPath ?? "", "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it("reports an unsupported CLI version without installing or accessing authentication", async () => {
+  it("reports any available version so the daemon can enforce the AGENT.md pin", async () => {
     const { adapter, runtime } = await setup();
     runtime.version = "codex-cli 0.1.0";
-    expect(await adapter.probe()).toMatchObject({ ok: false, version: "codex-cli 0.1.0" });
+    expect(await adapter.probe()).toMatchObject({ ok: true, version: "codex-cli 0.1.0" });
     expect(runtime.calls).toHaveLength(1);
+  });
+
+  it("passes only an explicit PATH to the version probe", async () => {
+    const { runtime, interrupt, clock } = await setup();
+    const adapter = new CodexAdapter({
+      runtime,
+      interrupt,
+      clock,
+      probeEnv: { PATH: "/example/bin" },
+    });
+    expect((await adapter.probe()).ok).toBe(true);
+    expect(runtime.calls[0]?.env).toEqual({ PATH: "/example/bin" });
+  });
+
+  it("rejects a successful probe without a recognizable version", async () => {
+    const { adapter, runtime } = await setup();
+    runtime.version = "example diagnostic";
+    expect(await adapter.probe()).toMatchObject({ ok: false, version: null });
+  });
+
+  it("writes the transformed real WorkReport schema without changing the invocation schema", async () => {
+    const { WorkReportSchema } = await import("../core/schemas/work-report.js");
+    const { z } = await import("zod");
+    const { adapter, inv } = await setup();
+    inv.outputSchema = z.toJSONSchema(WorkReportSchema);
+    const original = structuredClone(inv.outputSchema);
+    await adapter.invoke(inv);
+    expect(JSON.parse(await readFile(path.join(inv.scratchDir, "schema.json"), "utf8"))).toEqual(
+      toCodexOutputSchema(original),
+    );
+    expect(inv.outputSchema).toEqual(original);
+  });
+
+  it("uses strict output mode by default and never silently retries a rejected schema", async () => {
+    const { adapter, inv, runtime, interrupt } = await setup();
+    runtime.fixture = "invalid-schema";
+    runtime.code = 1;
+    runtime.finalMessage = null;
+    await expect(adapter.invoke(inv)).rejects.toMatchObject({
+      name: "CodexAdapterError",
+      message: expect.stringContaining("invalid_json_schema"),
+    });
+    expect(runtime.calls).toHaveLength(1);
+    expect(runtime.calls[0]?.argv).toContain("--output-schema");
+    expect(interrupt).not.toHaveBeenCalled();
+  });
+
+  it("stops a still-running CLI after a schema-configuration error", async () => {
+    const { adapter, inv, runtime, interrupt } = await setup();
+    runtime.fixture = "invalid-schema";
+    runtime.hang = true;
+    await expect(adapter.invoke(inv)).rejects.toThrow(/configuration error/);
+    expect(interrupt).toHaveBeenCalledOnce();
+  });
+
+  it("recognizes invalid_json_schema in plain stderr diagnostics", async () => {
+    const { adapter, inv, runtime } = await setup();
+    runtime.log = "ERROR: invalid_json_schema: example schema rejected\n";
+    await expect(adapter.invoke(inv)).rejects.toBeInstanceOf(CodexAdapterError);
+  });
+
+  it("recognizes a bare provider error response without a JSONL event type", async () => {
+    const { adapter, inv, runtime } = await setup();
+    runtime.log = JSON.stringify({
+      error: { code: "invalid_json_schema", message: "Example schema rejected" },
+    });
+    await expect(adapter.invoke(inv)).rejects.toThrow(/invalid_json_schema/);
+  });
+
+  it("does not treat assistant discussion of invalid_json_schema as a provider error", async () => {
+    const { adapter, inv, runtime } = await setup();
+    runtime.log = JSON.stringify({
+      type: "item.completed",
+      item: { type: "agent_message", text: "invalid_json_schema" },
+    });
+    expect((await adapter.invoke(inv)).outcome).toBe("completed");
+  });
+
+  it("offers an explicit off fallback with the original schema in stdin and no schema flag", async () => {
+    const { inv, runtime, interrupt, clock } = await setup();
+    const adapter = new CodexAdapter({ runtime, interrupt, clock, outputSchema: "off" });
+    expect((await adapter.invoke(inv)).finalMessage).toBe(runtime.finalMessage);
+    expect(runtime.calls).toHaveLength(1);
+    const spawned = runtime.calls[0];
+    expect(spawned?.argv).not.toContain("--output-schema");
+    expect(spawned?.argv).toContain("--output-last-message");
+    expect(spawned?.stdin).toContain(inv.prompt);
+    expect(spawned?.stdin).toContain(JSON.stringify(inv.outputSchema));
+    expect(spawned?.env).toBe(inv.env);
+    await expect(readFile(path.join(inv.scratchDir, "schema.json"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
   });
 
   it("reports a missing CLI as an actionable probe failure", async () => {

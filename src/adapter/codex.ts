@@ -28,6 +28,77 @@ export class CodexAdapterError extends Error {
   }
 }
 
+function schemaRecord(value: unknown): Record<string, unknown> {
+  const parsed = z.record(z.string(), z.unknown()).safeParse(value);
+  if (!parsed.success) {
+    throw new CodexAdapterError(
+      "Codex output schema must contain object schemas; use outputSchema: off for unsupported schemas",
+    );
+  }
+  return parsed.data;
+}
+
+/** B1: the provider schema is a lossy generation constraint; original Zod remains authoritative. */
+export function toCodexOutputSchema(jsonSchema: Record<string, unknown>): Record<string, unknown> {
+  const convert = (input: unknown): Record<string, unknown> => {
+    const source = schemaRecord(input);
+    const result: Record<string, unknown> = {};
+    // A conservative structural subset avoids model-dependent support for validation keywords.
+    for (const key of ["type", "description", "enum"]) {
+      if (source[key] !== undefined) result[key] = structuredClone(source[key]);
+    }
+    if (Object.hasOwn(source, "const")) result.enum = [structuredClone(source.const)];
+    if (typeof source.$ref === "string") {
+      result.$ref = source.$ref.replace(/^#\/definitions\//, "#/$defs/");
+    }
+    const definitions = source.$defs ?? source.definitions;
+    if (definitions !== undefined) {
+      result.$defs = Object.fromEntries(
+        Object.entries(schemaRecord(definitions)).map(([name, schema]) => [name, convert(schema)]),
+      );
+    }
+    const alternatives = source.anyOf ?? source.oneOf;
+    if (Array.isArray(alternatives)) result.anyOf = alternatives.map(convert);
+    const types = Array.isArray(source.type) ? source.type : [source.type];
+    if (types.includes("object") || source.properties !== undefined) {
+      const properties = schemaRecord(source.properties ?? {});
+      const required = new Set(Array.isArray(source.required) ? source.required : []);
+      result.type = source.type ?? "object";
+      result.properties = Object.fromEntries(
+        Object.entries(properties).map(([name, schema]) => {
+          const converted = convert(schema);
+          return [name, required.has(name) ? converted : { anyOf: [converted, { type: "null" }] }];
+        }),
+      );
+      result.required = Object.keys(properties);
+      result.additionalProperties = false;
+    }
+    const tuple = source.prefixItems ?? (Array.isArray(source.items) ? source.items : undefined);
+    if (Array.isArray(tuple)) {
+      const elements = tuple.map(convert);
+      const rest = Array.isArray(source.items) ? source.additionalItems : source.items;
+      if (rest !== undefined && typeof rest === "object" && !Array.isArray(rest)) {
+        elements.push(convert(rest));
+      }
+      const distinct = [
+        ...new Map(elements.map((element) => [JSON.stringify(element), element])).values(),
+      ];
+      result.items =
+        distinct.length === 1
+          ? distinct[0]
+          : distinct.length > 1
+            ? { anyOf: distinct }
+            : { type: "string" };
+    } else if (source.items !== undefined && typeof source.items === "object") {
+      result.items = convert(source.items);
+    } else if (types.includes("array")) {
+      result.items = { type: "string" };
+    }
+    return result;
+  };
+  return convert(jsonSchema);
+}
+
 const POLL_MS = 50;
 const MAX_LINE_BYTES = 1024 * 1024;
 
@@ -117,14 +188,32 @@ class CodexEvents {
     try {
       value = JSON.parse(line);
     } catch (error) {
-      if (error instanceof SyntaxError) return;
+      if (error instanceof SyntaxError) {
+        this.checkSchemaError(line);
+        return;
+      }
       throw error;
     }
     const parsed = EventSchema.safeParse(value);
-    if (!parsed.success) return;
+    if (!parsed.success) {
+      const response = z
+        .looseObject({
+          error: z.looseObject({ code: z.string().optional(), message: z.string().optional() }),
+        })
+        .safeParse(value);
+      if (response.success) this.checkSchemaError(JSON.stringify(response.data.error));
+      return;
+    }
     const event = parsed.data;
     const nested = EventSchema.safeParse(event.msg);
     const item = EventSchema.safeParse(event.item);
+    if (
+      [event, nested.success ? nested.data : null].some(
+        (candidate) =>
+          candidate !== null && ["error", "turn.failed", "thread.failed"].includes(candidate.type),
+      )
+    )
+      this.checkSchemaError(line);
     if (
       [event, nested.success ? nested.data : null, item.success ? item.data : null].some(
         (candidate) => candidate !== null && ApprovalTypes.has(candidate.type),
@@ -148,6 +237,17 @@ class CodexEvents {
       });
     }
   }
+
+  private checkSchemaError(text: string): void {
+    if (
+      /\binvalid_json_schema\b/.test(text) ||
+      /Invalid schema for response_format ["']codex_output_schema["']/.test(text)
+    ) {
+      throw new CodexAdapterError(
+        'Codex rejected --output-schema (invalid_json_schema); update the provider transform or explicitly select outputSchema: "off". This configuration error must not trigger a model repair.',
+      );
+    }
+  }
 }
 
 type StopReason = "abort" | "timeout" | "permission_prompt";
@@ -162,17 +262,23 @@ export class CodexAdapter implements AgentAdapter {
   private readonly interrupt: InterruptLadder;
   private readonly clock: Clock;
   private readonly codexPath: string;
+  private readonly outputSchemaMode: "strict" | "off";
+  private readonly probeEnv: Record<string, string>;
 
   constructor(opts: {
     runtime: RuntimeBackend;
     interrupt: InterruptLadder;
     clock: Clock;
     codexPath?: string;
+    outputSchema?: "strict" | "off";
+    probeEnv?: { PATH: string };
   }) {
     this.runtime = opts.runtime;
     this.interrupt = opts.interrupt;
     this.clock = opts.clock;
     this.codexPath = opts.codexPath ?? "codex";
+    this.outputSchemaMode = opts.outputSchema ?? "strict";
+    this.probeEnv = opts.probeEnv === undefined ? {} : { PATH: opts.probeEnv.PATH };
   }
 
   async probe(): Promise<AdapterProbe> {
@@ -183,7 +289,7 @@ export class CodexAdapter implements AgentAdapter {
       const handle = await this.runtime.spawn({
         argv: [this.codexPath, "--version"],
         cwd: dir,
-        env: {},
+        env: this.probeEnv,
         logPath,
         stdin: "",
       });
@@ -199,12 +305,12 @@ export class CodexAdapter implements AgentAdapter {
       const text = await readFile(logPath, "utf8");
       const version = text.split(/\r?\n/).find((line) => /^codex-cli \S+$/.test(line)) ?? null;
       return {
-        ok: version === PINNED_CODEX_VERSION,
+        ok: version !== null,
         version,
         detail:
-          version === PINNED_CODEX_VERSION
-            ? "Pinned Codex CLI is available; compare version with AGENT.md before invoking"
-            : `Install ${PINNED_CODEX_VERSION} and set AGENT.md cli_version to the exact version string`,
+          version !== null
+            ? "Codex CLI is available; compare the exact version with AGENT.md before invoking"
+            : "Codex --version did not report a recognizable version string",
       };
     } catch (error) {
       return {
@@ -239,7 +345,11 @@ export class CodexAdapter implements AgentAdapter {
     try {
       await mkdir(scratch, { recursive: true, mode: 0o700 });
       await mkdir(path.dirname(logPath), { recursive: true, mode: 0o700 });
-      await writeFile(schemaPath, `${JSON.stringify(inv.outputSchema)}\n`, { mode: 0o600 });
+      if (this.outputSchemaMode === "strict") {
+        await writeFile(schemaPath, `${JSON.stringify(toCodexOutputSchema(inv.outputSchema))}\n`, {
+          mode: 0o600,
+        });
+      }
       // A reused scratch directory must never turn a failed attempt into an old final message.
       await rm(lastPath, { force: true });
       await writeFile(logPath, "", { mode: 0o600 });
@@ -260,8 +370,7 @@ export class CodexAdapter implements AgentAdapter {
           'approval_policy="never"',
           "exec",
           "--json",
-          "--output-schema",
-          schemaPath,
+          ...(this.outputSchemaMode === "strict" ? ["--output-schema", schemaPath] : []),
           "--output-last-message",
           lastPath,
           "--sandbox",
@@ -276,7 +385,10 @@ export class CodexAdapter implements AgentAdapter {
         // or inspect agent-local provider configuration. RuntimeBackend closes stdin after this.
         env: inv.env,
         logPath,
-        stdin: inv.prompt,
+        stdin:
+          this.outputSchemaMode === "strict"
+            ? inv.prompt
+            : `${inv.prompt}\n\nReturn only JSON matching this original JSON Schema:\n${JSON.stringify(inv.outputSchema)}\n`,
       });
       const events = new CodexEvents(logPath);
       const { outcome, exit } = await this.supervise(
