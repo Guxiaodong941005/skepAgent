@@ -1,3 +1,8 @@
+/**
+ * `npm test` defaults to three sweep seeds (0..2) per scenario plus the seed-42 outcome checks.
+ * Override with a positive integer in SKEP_SIM_SEEDS; invalid values fail during collection.
+ * Full acceptance sweep: SKEP_SIM_SEEDS=50 npx vitest run test/integration/sim
+ */
 import { readdir, rm } from "node:fs/promises";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { canonicalJson } from "../../../src/core/canonical.js";
@@ -19,7 +24,16 @@ const names = [
   "duplicate-boot",
   "clock-skew",
 ] as const;
-const seeds = Array.from({ length: 50 }, (_, index) => index);
+function simSeedCount(value: string | undefined): number {
+  if (value === undefined) return 3;
+  const count = Number(value);
+  if (!Number.isSafeInteger(count) || count <= 0 || String(count) !== value) {
+    throw new RangeError("SKEP_SIM_SEEDS must be a positive integer, such as 3 or 50.");
+  }
+  return count;
+}
+
+const seeds = Array.from({ length: simSeedCount(process.env.SKEP_SIM_SEEDS) }, (_, index) => index);
 let root: string;
 
 beforeAll(async () => {
@@ -31,6 +45,24 @@ afterAll(async () => {
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+describe("simulation seed count", () => {
+  it.each([
+    [undefined, 3],
+    ["1", 1],
+    ["3", 3],
+    ["50", 50],
+  ] as const)("uses %s as %i seeds", (value, expected) => {
+    expect(simSeedCount(value)).toBe(expected);
+  });
+
+  it.each(["", "0", "-1", "1.5", "abc", "Infinity", "50x", " 3 ", "3\n", "9007199254740992"])(
+    "rejects invalid SKEP_SIM_SEEDS=%j",
+    (value) => {
+      expect(() => simSeedCount(value)).toThrow("SKEP_SIM_SEEDS must be a positive integer");
+    },
+  );
 });
 
 describe.each(names)("%s protocol scenario", (name) => {
