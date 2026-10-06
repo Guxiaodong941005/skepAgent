@@ -66,9 +66,7 @@ describe("authorization matrix (ARCHITECTURE §5.4)", () => {
     (type, human, owner, peer) => {
       const state = replay(reviewing().entries);
       expect(authorize({ kind: "human" }, envelope(type, "human"), state)).toBe(human);
-      expect(authorize({ kind: "daemon", device: "vps" }, envelope(type, VPS), state)).toBe(
-        owner,
-      );
+      expect(authorize({ kind: "daemon", device: "vps" }, envelope(type, VPS), state)).toBe(owner);
       expect(authorize({ kind: "daemon", device: "mac" }, envelope(type, MAC), state)).toBe(peer);
     },
   );
