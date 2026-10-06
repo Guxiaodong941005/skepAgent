@@ -1,4 +1,5 @@
 import { mkdir, open } from "node:fs/promises";
+import { constants } from "node:os";
 import path from "node:path";
 import { z } from "zod";
 import { canonicalJson, sha256Hex } from "../core/canonical.js";
@@ -49,6 +50,7 @@ export class ChecksError extends Error {
 }
 
 // Trusted config may add build variables, but cannot restore daemon credentials (§9.6, D19).
+// Filtering is deliberately conservative: harmless names such as CACHE_KEY are stripped too.
 const PRIVATE_ENV =
   /^(?:GIT_|SSH_|GH_|GITHUB_|OPENAI_|ANTHROPIC_|AZURE_|AWS_|GOOGLE_|GEMINI_|CODEX_|CLAUDE_|PI_CODING_)|(?:^|_)(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIALS?|AUTH|PROVIDER)(?:_|$)/;
 const IDENTITY_ENV = new Set(["HOME", "USER", "LOGNAME"]);
@@ -63,7 +65,7 @@ function checkEnv(opts: AgentEnvOptions, extra: CheckDef["env"]): Record<string,
   return env;
 }
 
-/** ARCHITECTURE §9.6: named checks are resolved anew at baseCommit, never at worktree HEAD. */
+/** ARCHITECTURE §9.6: callers fetch the mirror before resolving named checks at baseCommit. */
 export class ChecksRunner {
   private readonly runtime: RuntimeBackend;
   private readonly random: RandomSource;
@@ -80,10 +82,24 @@ export class ChecksRunner {
     const dir = await this.opts.mirror.mirrorPath(repo);
     const source = `${baseCommit}:${CHECKS_FILE_PATH}`;
     try {
-      const result = await this.opts.git.run(["show", source], { cwd: dir });
-      if (result.code !== 0) throw new ChecksError("git show did not exit successfully");
+      const commit = await this.opts.git.run(["cat-file", "-e", `${baseCommit}^{commit}`], {
+        cwd: dir,
+        allowFailure: true,
+      });
+      if (commit.code !== 0) {
+        throw new ChecksError(
+          `Base commit ${baseCommit} is unavailable in the mirror; fetch it first`,
+        );
+      }
+      const result = await this.opts.git.run(["show", source], { cwd: dir, allowFailure: true });
+      if (result.code !== 0) {
+        throw new ChecksError(
+          `Missing trusted checks at ${source}; merge a checks file at the plan base`,
+        );
+      }
       return parseChecksFile(result.stdout, source);
     } catch (error) {
+      if (error instanceof ChecksError) throw error;
       throw new ChecksError(`Cannot load trusted checks at ${source}; merge a valid checks file`, {
         cause: error,
       });
@@ -169,6 +185,8 @@ export class ChecksRunner {
         });
       });
     const { exit, timedOut } = await this.wait(handle, definition.timeout_sec * 1000);
+    // Keep raw logs private and unchanged for evidence digests. SK-504 must use SK-506 to redact
+    // every excerpt before publishing it or placing it in a fix-up prompt (D19, §16).
     const logFile = await open(logPath, "r");
     let log: Buffer;
     try {
@@ -177,12 +195,16 @@ export class ChecksRunner {
     } finally {
       await logFile.close();
     }
-    // CheckRun has an integer exit: a timeout is 124; other signal-only exits fail with 1.
+    // Match shell signal exits. A check can also exit 124 itself; journal.timed_out distinguishes it.
+    const signalNumber =
+      exit.signal === null
+        ? undefined
+        : constants.signals[exit.signal as keyof typeof constants.signals];
     const run = CheckRunSchema.parse({
       run_id: runId,
       check: name,
       sha: sha.data,
-      exit: timedOut ? 124 : (exit.code ?? 1),
+      exit: timedOut ? 124 : (exit.code ?? (signalNumber === undefined ? 1 : 128 + signalNumber)),
       duration_ms: Math.max(0, Math.round(this.opts.clock.monotonicMs() - start)),
       log_sha256: sha256Hex(log),
       ...parseCheckCounts(log.toString("utf8"), definition.parser),

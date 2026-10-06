@@ -167,10 +167,17 @@ describe("trusted checks runner", () => {
     await git.run(["rm", ".skep/checks.toml"], { cwd: writer });
     const missingBase = await commitFile(git, writer, "empty.txt", "changed\n");
     await mirror.fetch("app");
-    await expect(runner().load("app", missingBase)).rejects.toThrow(ChecksError);
+    await expect(runner().load("app", missingBase)).rejects.toThrow("Missing trusted checks");
     expect(emptyBase).not.toBe(missingBase);
     await configure('schema = "skep.checks/v1"\n[checks.unit]\nargv = "shell string"\n');
     await expect(runner().run(options())).rejects.toThrow("valid checks file");
+  });
+
+  it("distinguishes an unfetched base commit from a missing checks file", async () => {
+    const unfetched = await commitFile(git, writer, "later.txt", "later commit\n");
+    await expect(runner().load("app", unfetched)).rejects.toThrow("fetch it first");
+    await mirror.fetch("app");
+    expect((await runner().load("app", unfetched)).checks.unit).toBeDefined();
   });
 
   it("uses literal argv, a safe cwd, agent identity and sanitized build variables", async () => {
@@ -319,6 +326,30 @@ describe("trusted checks runner", () => {
     expect(signalGroup).toHaveBeenCalledExactlyOnceWith("SIGKILL");
     expect(wait).toHaveBeenCalledOnce();
   });
+
+  it.each([
+    { code: null, signal: "SIGKILL", expected: 137 },
+    { code: null, signal: "SIGTERM", expected: 143 },
+    { code: null, signal: "SIGABRT", expected: 134 },
+    { code: null, signal: "unknown", expected: 1 },
+    { code: 124, signal: null, expected: 124 },
+  ])(
+    "preserves signal exit conventions and distinguishes a check's own exit 124: %j",
+    async ({ code, signal, expected }) => {
+      const spawn = vi.fn<RuntimeBackend["spawn"]>(async () => ({
+        pid: 42,
+        pgid: 42,
+        startToken: "start",
+        wait: async () => ({ code, signal }),
+        signalGroup: vi.fn(),
+      }));
+      const [run] = await runner({ runtime: { name: "native", spawn, isAlive: vi.fn() } }).run(
+        options(),
+      );
+      expect(run?.exit).toBe(expected);
+      expect((await journal.read(attempt))[1]).toMatchObject({ signal, timed_out: false });
+    },
+  );
 
   it.skipIf(!["linux", "darwin"].includes(platform()))(
     "kills native grandchildren after a timeout, including when the leader has already exited",
