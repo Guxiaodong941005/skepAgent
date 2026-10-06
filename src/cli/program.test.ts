@@ -196,7 +196,6 @@ describe("task new language guard", () => {
 
 describe("stubs", () => {
   const invocations: string[][] = [
-    ["init", "--device", "mac", "--blackboard", "git@github.com:o/bb.git"],
     ["agent", "start"],
     ["agent", "stop", "--role-dir", "/tmp/role"],
     ["task", "new", "Fix the login redirect", "--repo", "app"],
@@ -216,7 +215,6 @@ describe("stubs", () => {
     ["log", TASK],
     ["logs", AGENT],
     ["logs", AGENT, "--follow"],
-    ["doctor"],
   ];
 
   for (const argv of invocations) {
