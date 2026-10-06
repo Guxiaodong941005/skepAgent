@@ -288,7 +288,7 @@ against buggy or forged-but-signed writers.
 | `replan.requested` | holder \| owner \| human | task_rev | summary, evidence[], item |
 | `barrier.closed` | owner \| human | task_rev | barrier_id, missing[] |
 | `item.merged` | any daemon \| human | task_rev, item | item, pr_number, merge_sha |
-| `task.verified` | owner | task_rev, owner_gen, plan_hash | top_of_stack_sha, check_runs[], passed |
+| `task.verified` | owner | task_rev, owner_gen, plan_hash | top_of_stack_sha, check_runs[], passed (`false` ⇒ escalate, D14) |
 | `human.decided` | human | task_rev | decision, note?, new_owner? |
 
 `work.failed.class` ∈ `invalid_output | checks_failed | timeout | permission_prompt | crash |
@@ -362,6 +362,8 @@ TaskState
 ├── epochs: { [itemId]: highest epoch ever granted }        // survives plan versions
 ├── items:  { [itemId]: ItemState }                           // items of the ACTIVE plan
 └── escalation, verified, cancelled
+    // escalation.reason ∈ review_rounds | replans | item_failed | budget_exceeded
+    //                     | verification_failed (D14)
 
 ItemState: id, title, assignee, depends_on, requires, status, lease, delivered, merged, failure,
            last_checkpoint, attempts_this_plan
@@ -431,8 +433,11 @@ not exist, `task_exists`); task not terminal (`task_terminal`); then the §4.2 `
 set `active_plan_version = v`, rebuild `items` from the plan in `stack_order` (first item `ready`,
 others `blocked`), carry over `delivered`/`merged` status for an item ID whose canonical item
 definition (title, assignee, depends_on, touches, acceptance, requires) is unchanged from the
-previously active plan, reset `attempts_this_plan`, clear `barrier` and `escalation`, keep
-`epochs`, and set `task.mode = plan.mode` (D13).
+previously active plan, reset `attempts_this_plan`, clear `barrier`, `escalation` and
+`verified`, drop every lease (parked leases end here, D16), keep `epochs`, and set `task.mode = plan.mode` (D13). The resulting status
+is derived from the rebuilt items (D15): every item `merged` ⇒ `done`; every item `delivered` or
+`merged` ⇒ `delivered` (the owner verifies the stack again); otherwise `executing`. "⇒
+`executing`" in the table below means "⇒ the activation status".
 
 | Event | Allowed task status | Checks (reject reason) | Effect |
 |---|---|---|---|
@@ -445,17 +450,17 @@ previously active plan, reset `attempts_this_plan`, clear `barrier` and `escalat
 | plan.locked | reviewing (current plan.mode team) or awaiting_approval (current plan.mode solo, plan_approval=owner) | every override names an existing `block` blocker; missing_reviews == reviewers without a review (`invalid_plan`) | record lock; plan_approval=owner and no `risk: high` item ⇒ activate ⇒ `executing`; else `awaiting_approval` |
 | plan.approved | awaiting_approval | current version locked (`bad_task_state`) | activate ⇒ `executing` |
 | plan.rejected | awaiting_approval | – | review_rounds += 1; `planning` (or `escalated` if > budget) |
-| lease.claimed | executing | barrier null (`barrier_open`); item `ready` (`item_not_ready`); actor == assignee (`not_assignee`); expected_epoch (`epoch_mismatch`); plan_hash == active (`plan_changed`); actor's active leases across all tasks < max_parallel_items (`max_parallel`); attempts_this_plan ≤ item_retries (`retry_budget`); branch == `skep/<task>/<item>/e<epoch+1>` (`bad_branch`) | epochs[item] += 1; lease set; item `leased`; attempts += 1 |
+| lease.claimed | executing | barrier null (`barrier_open`); item `ready` (`item_not_ready`); actor == assignee (`not_assignee`); expected_epoch (`epoch_mismatch`); plan_hash == active (`plan_changed`); actor's active leases (items in status `leased`, D16) across all tasks < max_parallel_items (`max_parallel`); attempts_this_plan ≤ item_retries (`retry_budget`); branch == `skep/<task>/<item>/e<epoch+1>` (`bad_branch`) | epochs[item] += 1; lease set; item `leased`; attempts += 1 |
 | lease.released | executing, interrupting | lease.holder == actor ∧ lease.epoch == payload.epoch (`fenced`) | lease null; item `ready`; in a barrier counts as settled |
 | lease.revoked | executing, interrupting, escalated | lease exists ∧ lease.epoch == payload.epoch (`epoch_mismatch`) | lease null; item `ready` (`unknown` if interrupting); settles barrier |
-| checkpoint.recorded | executing, interrupting, replanning, escalated | fenced as above; snapshot.item/epoch match (`bad_snapshot`); barrier_id null or == task.barrier.id (`no_barrier`) | last_checkpoint; if barrier: item `interrupted`, add to checkpointed; all awaiting settled ⇒ closed_seq, status `replanning` (or `escalated` if barrier.escalate) |
+| checkpoint.recorded | executing, interrupting, replanning, escalated | fenced as above; snapshot.item/epoch match (`bad_snapshot`); barrier_id null or == task.barrier.id (`no_barrier`) | last_checkpoint; if barrier: item `interrupted` (lease parked, D16), add to checkpointed; all awaiting settled ⇒ closed_seq, status `replanning` (or `escalated` if barrier.escalate) |
 | work.delivered | executing | fenced; lease.interrupt null (`interrupted`); branch == lease.branch (`bad_branch`) | item `delivered` (lease null); dependents whose deps are all delivered ⇒ `ready`; all delivered ⇒ task `delivered` |
 | work.failed | executing, interrupting | fenced | item `failed`, lease null; settles barrier; executing: attempts_this_plan ≤ item_retries and class ≠ budget_exceeded ⇒ item `ready`, else task `escalated` |
 | replan.requested | executing ⇒ open; interrupting, replanning ⇒ coalesce | daemon actor needs ≥1 evidence (`missing_evidence`) | executing: replan_count += 1; barrier `B<seq>` with awaiting = items holding leases; flag those leases; escalate = replan_count > budgets.replans; status `interrupting` (or immediately `replanning`/`escalated` if nothing awaited). Otherwise append to barrier.requests (count unchanged) |
 | barrier.closed | interrupting | barrier_id == open barrier (`no_barrier`); missing == awaiting − settled (`pre_mismatch`) | missing items `unknown`, leases cleared; closed; `replanning` (or `escalated`) |
-| item.merged | executing, delivered, escalated | item delivered ∧ pr_number matches (`bad_task_state`) | item `merged`; all merged ⇒ `done` |
-| task.verified | delivered | top_of_stack_sha == delivered head of last stack item (`bad_task_state`) | record verified |
-| human.decided | escalated | decision valid for state (`bad_decision`) | resume_with_plan ⇒ activate active plan again, failed/unknown/interrupted items `ready` ⇒ `executing`; replan ⇒ `planning`, review_rounds = 0, barrier cleared (D12); cancel ⇒ `cancelled`; reassign_owner ⇒ owner/owner_gen += 1, `planning`, review_rounds = 0, barrier cleared (D12) |
+| item.merged | executing, delivered, escalated | item delivered ∧ pr_number matches (`bad_task_state`) | item `merged`; all merged ⇒ `done` (also from `escalated`: merging is a human gate, so merging every PR overrides a failed verification, D14) |
+| task.verified | delivered | top_of_stack_sha == delivered head of last stack item (`bad_task_state`) | record verified; `passed: false` ⇒ `escalated` (reason `verification_failed`), items/deliveries/epochs unchanged (D14) |
+| human.decided | escalated | decision valid for state (`bad_decision`) | resume_with_plan ⇒ activate active plan again, failed/unknown/interrupted items `ready` ⇒ activation status (`executing`, or `delivered`/`done` when nothing is left, D15); replan ⇒ `planning`, review_rounds = 0, barrier cleared (D12); cancel ⇒ `cancelled`; reassign_owner ⇒ owner/owner_gen += 1, `planning`, review_rounds = 0, barrier cleared (D12) |
 
 **Budgets** (PRD §9.9): `replans` and `review_rounds` count *failures allowed*; the failure that
 exceeds the budget escalates (replans: 3rd request with budget 2). A human `human.decided` of
@@ -465,7 +470,27 @@ re-escalate immediately and the task could only be cancelled. `replan_count` is 
 is a lifetime counter, so the human is consulted again on every further replan. `item_retries`: an item may be
 leased `1 + item_retries` times per plan version. `max_invocations` / `max_wall_hours` are
 enforced by the executing daemon (they are not observable on the log); exhaustion ⇒
-`work.failed{class: budget_exceeded}` ⇒ escalate.
+`work.failed{class: budget_exceeded}` ⇒ escalate. A failed top-of-stack verification consumes no
+budget and is never retried automatically: it escalates on the first `task.verified{passed:
+false}` (D14), and the human's decision is the retry gate.
+
+**Failed top-of-stack verification (D14, PRD §9.8).** Once every item is delivered the task is
+`delivered` and no item holds a lease, so the PRD's "`work.failed` on the top item" cannot pass
+fencing (§6.2). Instead the owner records the failing combined result as `task.verified{passed:
+false, check_runs}` (owner only, `pre.owner_gen` + `pre.plan_hash`; a stale owner generation or plan
+is rejected by §4.2). The reducer moves the task to `escalated` with reason `verification_failed`;
+items stay `delivered`/`merged`, `epochs` are unchanged and there is nothing to fence. The human
+then decides:
+
+* `resume_with_plan` ⇒ re-activates the same plan; every item carries over, so by D15 the task
+  returns to `delivered` with `verified = null` and the owner re-runs verification (e.g. after a
+  flaky check or a fix pushed to the base branch).
+* `replan` / `reassign_owner` ⇒ `planning`; the owner proposes `v+1` (input: the failing
+  `check_runs`), typically keeping the delivered items unchanged (carried over by D7) and appending
+  a fix item that depends on the old top item. Activation then makes only the new item `ready`.
+* `cancel` ⇒ `cancelled`. Merging every PR anyway ⇒ `done` (`item.merged` row).
+
+`task.verified{passed: true}` changes only `verified`; the task stays `delivered` until merged.
 
 **Plan mode decides routing (D13, PRD §9.1, §9.3).** `task.mode` is the mode the human asked for
 (`solo` by default, `team` with `--team`); each plan carries its own `plan.mode`. The **plan's**
@@ -493,7 +518,8 @@ agent)`, `leasesHeldBy(s, agent)`, `isOwner(s, task, agent)`, `pendingReviews(s,
 ### 6.1 Claiming
 
 A slot's duty loop computes, from the latest State, the items it may claim
-(`claimableItems`: task `executing`, item `ready`, assignee == me, under max_parallel). For each,
+(`claimableItems`: task `executing`, item `ready`, assignee == me, `activeLeaseCount(s, me) <
+max_parallel_items`, D16). For each,
 it enqueues a **claim intent**:
 
 ```ts
@@ -506,6 +532,18 @@ const claim: Intent = (s) => {
 };
 ```
 
+**Which leases count toward `max_parallel_items` (D16).** Exactly the items in status `leased`
+whose `lease.holder` is the agent, in any task (`activeLeaseCount` in `handlers/lease.ts`, shared
+by the claim handler and `views.ts`). A lease flagged by a barrier (`lease.interrupt` set) still
+counts until its item has checkpointed, because the holder's process may still be running the
+interrupt ladder. Once the item is `interrupted` the lease is **parked**: its record stays on the
+item for audit and fencing until the next plan activation, but it no longer occupies a slot, so
+the agent may claim in other tasks while the human or owner decides. Parked leases never become
+active again; they end by plan activation (`plan.approved`, owner-policy `plan.locked`,
+`human.decided{resume_with_plan}`; items are rebuilt and the previous holder re-claims under a
+new epoch, PRD §9.5 "resume preference"), by `lease.revoked` (allowed in `escalated`), or by
+cancellation. Items made `unknown` by `barrier.closed` or a revoke have no lease at all.
+
 Two daemons racing compute the same `expected_epoch`; only one push lands on that tip; the loser
 re-derives from the new state and gets `null` (dropped). The attempt runner starts only after the
 publisher reports the claim **accepted** at seq N.
@@ -517,8 +555,9 @@ publisher reports the claim **accepted** at seq N.
 * Code branches are epoch-namespaced (`skep/<task>/<item>/e<epoch>`); a stale holder can never
   overwrite the current holder's branch. The current holder's daemon closes PRs from older epochs
   of the same item (`CodeHost.closePr`).
-* No time-based expiry on `main`. Leases end by release, revoke, barrier settlement, plan
-  activation, or cancellation.
+* No time-based expiry on `main`. Leases end by release, revoke, failure, delivery, plan
+  activation, or cancellation; a barrier checkpoint parks a lease (D16) and `barrier.closed`
+  clears the leases of missing items.
 
 ### 6.3 Re-verification before delivery (sleep/wake rule)
 
@@ -775,7 +814,8 @@ every tick (20 s ±25 % with an active local task, 90 s idle; immediately after 
        owner:    planning|replanning → plan invocation → validate → plan.proposed
                  reviewing + all reviews (or 15-min timeout) → plan.locked / revise (v+1)
                  interrupting + 20-min barrier deadline → barrier.closed
-                 delivered → top-of-stack checks → task.verified
+                 delivered ∧ verified == null → top-of-stack checks → task.verified{passed}
+                   (passed:false ⇒ reducer escalates, D14; notify the human)
        reviewer: reviewing ∧ my review missing → review invocation → review.submitted
        assignee: claimable item → claim intent → start attempt runner
        holder:   barrier on my lease → interrupt → snapshot → checkpoint.recorded
@@ -886,8 +926,13 @@ dates from the virtual clock, fixed identities ⇒ identical SHAs for identical 
    that branch.
 6. `replan_count ≤ budget` unless status is `escalated`; review rounds likewise.
 7. `main` contains zero heartbeat commits; each `hb/*` ref has exactly one (orphan) commit.
+8. Task status agrees with its items (D15): `executing` ⇒ at least one item is not
+   `delivered`/`merged`; `delivered` ⇒ every item is `delivered`/`merged` and not all `merged`;
+   `escalated` with reason `verification_failed` ⇒ `verified.passed == false` (D14).
+9. Right after every accepted `lease.claimed`, the actor's `activeLeaseCount` (items in status
+   `leased`; parked `interrupted` leases excluded, D16) ≤ its `max_parallel_items` at that seq.
 
-Pure predicates for 2–4 and 6 live in `core/reducer/invariants.ts` (usable by `skep doctor`).
+Pure predicates for 2–4, 6, 8 and 9 live in `core/reducer/invariants.ts` (usable by `skep doctor`).
 
 ### 13.3 Scenarios (MVP set)
 
@@ -942,3 +987,6 @@ before a task is done.
 | D11 | Added `details` to plan items, `budget_exceeded`/`secret_detected` to failure classes, `passed` to `task.verified` | Gaps in the PRD tables needed by the execution flow. |
 | D12 | `human.decided{replan \| reassign_owner}` resets `review_rounds` to 0 and clears `barrier`; `replan_count` is not reset | Without the reset a review-round escalation deadlocks the task (SK-101 review B1): every new proposal re-escalates. The human explicitly grants a fresh review budget; replans stay a lifetime count so each further replan goes back to the human. |
 | D13 | `plan.mode` decides reviewers, routing and lock rules; upgrade only (solo task may take a team plan, team task only team plans); solo plan = 1 item; activation sets `task.mode = plan.mode` | PRD §9.1: "`--team` or a plan that the human approves with multiple items/devices switches to team mode". SK-101's `plan.mode == task.mode` made that switch impossible. Updating `task.mode` only on activation means the switch happens exactly when the human approves. |
+| D14 | A failed top-of-stack verification is recorded as `task.verified{passed: false}` by the owner and moves the task `delivered → escalated` (reason `verification_failed`). Items, deliveries and epochs are unchanged; no budget is consumed and there is no automatic retry. The human resumes (re-verify, via D15), replans (fix item on top of the carried-over stack) or cancels; merging every PR anyway still completes the task | PRD §9.8 says "`work.failed` on the top item", but in `delivered` no item holds a lease, so a fenced event (PRD §9.5) cannot be accepted, and reopening the lease of a delivered item would undo a fenced, accepted delivery. `task.verified` is already owner-only and `owner_gen`/`plan_hash`-fenced (PRD §11.3), and `passed` exists (D11), so no schema change is needed. Escalation matches PRD §8.6 (a failure with no budget left ⇒ `escalated`) and §9.9 (escalation decisions are a human gate); integration failures span items, so retrying a single item is not a meaningful default. Found in the SK-201 review (note 1). |
+| D15 | Plan activation derives the status from the rebuilt items: all `merged` ⇒ `done`; all `delivered`/`merged` ⇒ `delivered`; otherwise `executing` | With D7 carry-over a replan (or `resume_with_plan`) can keep every item finished. Claims and deliveries are the only way out of `executing` (PRD §8.6), so the task would be stuck forever. The rule reuses the existing `work.delivered`/`item.merged` completion conditions, so it is deterministic, and it clears `verified` so a carried-over stack is verified again under the new plan (PRD §9.8). Found in the SK-201 review (note 3). |
+| D16 | Only items in status `leased` count toward `max_parallel_items`. A lease flagged by a barrier counts until its item checkpoints; after that it is parked (record kept until the next activation, never reactivated, ends on activation, revoke or cancel) and does not count | PRD §9.5 limits *held* leases ("claimant holds < `max_parallel_items`"). A checkpointed lease is fenced (`interrupt` set ⇒ no delivery, §6.3), and its process has stopped (PRD §9.7 ladder), so counting it would block the agent in every other task for as long as the human takes to decide an escalation. Counting a flagged but not yet checkpointed lease stays conservative while the process may still run. Found in the SK-201 review (note 4). |
