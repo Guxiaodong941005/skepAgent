@@ -70,10 +70,10 @@
 
 | ID | Title | Depends on | Assignee | Files/area | Acceptance criteria | Status |
 |---|---|---|---|---|---|---|
-| SK-401 | Sim world, scheduler, faulty git, invariant checker, `empty` scenario | SK-301, SK-302, SK-303, SK-304 | codex | `src/sim/{world,faulty-git,invariants,runner}.ts`, `src/sim/scenarios/empty.ts`, `test/integration/sim/empty.test.ts` | 2 sim daemons on local bare repos with fixed test keys; seeded interleavings reproducible (same seed ⇒ same final tip sha); invariants checked every step | todo |
-| SK-402 | Test keys + `skep sim run` command | SK-401, SK-104 | pi | `test/fixtures/keys/*`, `.gitleaks.toml`, `src/cli/commands/sim.ts` | Test-only keys committed + allowlisted; `skep sim run --seed 42 --scenario empty` prints result JSON with `--machine` | todo |
+| SK-401 | Sim world, scheduler, faulty git, invariant checker, `empty` scenario | SK-301, SK-302, SK-303, SK-304 | codex | `src/sim/{world,faulty-git,invariants,runner}.ts`, `src/sim/scenarios/{index,empty}.ts`, `test/integration/sim/empty.test.ts`, `test/fixtures/keys/*`, `.gitleaks.toml` (fixed test keys moved here from SK-402) | 2 sim daemons on local bare repos with fixed test keys; seeded interleavings reproducible (same seed ⇒ same final tip sha); invariants checked every step | todo |
+| SK-402 | `skep sim run` command | SK-401, SK-104 | pi | `src/cli/commands/sim.ts` | (Keys moved to SK-401.) `skep sim run --seed 42 --scenario empty` prints result JSON with `--machine` | todo |
 | SK-403 | Lease intents, reverify, suspend detection | SK-201, SK-302 | codex | `src/core/intents.ts` (claim/release/revoke/deliver/fail/checkpoint builders), `src/lease/{reverify,suspend}.ts` (+ tests) | Intents return null when no longer valid; the claim intent returns null when `activeLeaseCount` (D16) reaches `max_parallel_items`; reverify does a fresh observation; suspend gap marks leases unverified | todo |
-| SK-404 | Protocol scenarios | SK-401, SK-403 | codex | `src/sim/scenarios/{claim-race,lost-ack,fetch-flaky,forged-commits,sleep-wake-revoke,duplicate-boot,clock-skew}.ts` + tests | Each scenario passes for 50 seeds; sleep-wake-revoke: stale holder never delivers, new holder delivers once | todo |
+| SK-404 | Protocol scenarios | SK-401, SK-403, SK-406 | codex | `src/sim/scenarios/{claim-race,lost-ack,fetch-flaky,forged-commits,sleep-wake-revoke,duplicate-boot,clock-skew}.ts` + tests | Each scenario passes for 50 seeds; sleep-wake-revoke: stale holder never delivers, new holder delivers once | todo |
 | SK-405 | Wave 2b/3 polish: tests and fixtures | SK-304, SK-305, SK-307 | pi | `src/core/reducer/{invariants.ts,replay.property.test.ts}`, `test/integration/golden.test.ts`, `test/fixtures/golden/*`, `test/helpers/golden-scenarios.ts`, `src/adapter/structured.{ts,test.ts}`, `src/transport/fake-hint.ts` | Follow-ups F1–F6 below: negative tests for `replan_budget`/`replan_budget_settle`; `checkInvariants` doc comment on caller state; seventh golden fixture `review-resume` (D20) and `example.invalid` PR URLs (one deliberate `SKEP_UPDATE_GOLDEN=1` run); golden update outside test collection; `extractJson` stray-brace fallback with a test; provider-transform round-trip tests (`toCodexOutputSchema` ⇒ nulls ⇒ normalize ⇒ Zod) for Plan/Review/WorkReport; `FakeHintChannel` publish-before-start documented | todo |
 | SK-406 | Wave 2b/3 polish: runtime, adapter, reducer, liveness | SK-202, SK-207, SK-303, SK-306 | codex | `src/exec/interrupt.{ts,test.ts}`, `src/adapter/codex.{ts,test.ts}`, `src/core/reducer/handlers/replan.{ts,test.ts}`, `src/blackboard/liveness.{ts,test.ts}` | Follow-ups F7–F10 below: ladder returns `killed` once SIGTERM was needed (contract in `adapter/types.ts`); `outputSchema: "off"` stops appending the schema to the prompt (prompts own it); coalesced `replan.requested` validates `payload.item` and `barrier.closed` throws on an impossible missing item (before the first live blackboard; golden hashes must stay unchanged or be regenerated deliberately); observer-side boot-id flip-flop alarm. **Must merge before SK-504** | todo |
 
@@ -101,6 +101,7 @@
 | SK-607 | `skep init`, `skep doctor`, ntfy notifier | SK-301, SK-206 | pi | `src/cli/commands/{init,doctor}.ts`, `src/notify/ntfy.ts` | init writes device.toml, generates daemon key, prints allowed_signers line, optional genesis; doctor runs PRD §13.3 pre-flight + full replay + invariants. **D18:** no step assumes Tailscale or inbound SSH; doctor checks outbound reachability of the blackboard and code remotes only, and reports the optional relay as a warning, never an error | todo |
 | SK-608 | Service units + runbook | SK-601 | pi | `deploy/{skepd.service,com.skepagent.skepd.plist}`, `docs/RUNBOOK.md` | Setup, key rotation, revoke, re-genesis procedures documented. **D18:** provisioning without Tailscale: run `skep init` on the device's own console/shell, copy the printed key line to the controller, install the trust root by any channel with fingerprint comparison (manual until SK-702); **D19:** configure each device's agent CLIs locally on that device — the runbook states that Skep never copies provider credentials or configs; all examples use generic hosts (`example.invalid`) | todo |
 | SK-609 | Real two-device run & metrics | all | codex | `docs/MVP-RUN-REPORT.md` | PRD §16.5 acceptance criteria verified or gaps documented | todo |
+| SK-610 | First public release v0.1.0 | SK-609 | codex (human sign-off) | `package.json` (release fields), `CHANGELOG.md`, `README.md` (quickstart), `docs/RELEASE.md` (checklist + name decision) | See "SK-610 — First public release v0.1.0": SemVer 0.x policy; Keep-a-Changelog `CHANGELOG.md`; README quickstart; npm name availability checked with `npm view` (no publish) and decision recorded; package.json `name`/`bin`/`files`/`engines`/`license`/`repository`; release notes drafted; every pre-release checklist item true; tag and publish only on explicit human go | todo |
 
 ## Wave 7 — transport without a mesh VPN (MVP+, D18)
 
@@ -173,6 +174,288 @@ SK-305 freezes state hashes, so it runs after the reducer stops moving (SK-304's
 SK-303, SK-306 and SK-307 have no blocker and wait only for a free pane (they are off the
 SK-202→SK-304→SK-401 and SK-301/302→SK-401 critical paths, or have slack because SK-401 also waits
 for SK-304).
+
+---
+
+## Wave 4 + early Wave 5 schedule
+
+Baseline: `main` after Wave 2b/3 (all of SK-2xx and SK-30x merged; follow-ups F1–F21 listed under
+"Wave 2b/3 follow-ups"). This phase runs **all of Wave 4** (SK-401..SK-406) and, in parallel,
+the Wave 5 tasks whose dependencies are already on `main` (SK-501, SK-503, SK-506; SK-502 once
+SK-501 lands). **Cap: 5 implementer panes** (6 panes including the architect/orchestrator). One
+git worktree + branch + pane per task; every task branches from the latest `main` when it
+starts. codex implementers cannot commit inside their sandbox (the orchestrator commits), and 7
+subprocess-stdout tests in `src/util/exec.test.ts` fail only inside that sandbox. Judge
+`npm test` outside it.
+
+### Dependency / conflict analysis
+
+| Task | Unfinished prerequisites | File / export overlap with a concurrent task, and resolution | Verdict |
+|---|---|---|---|
+| SK-401 (codex) | none (SK-301..SK-304 merged) | New `src/sim/*` files. **Takes over the fixed test keys** (`test/fixtures/keys/*`, `.gitleaks.toml` allowlist) from SK-402: same-seed ⇒ same-tip determinism needs fixed ed25519 keys, and SK-402 depends on SK-401 anyway. Also owns the new scenario registry `src/sim/scenarios/index.ts`. There is no daemon yet (SK-601), so a "sim daemon" is a `SimNode` composed of the production `BlackboardClone`/`Publisher`/`Sync`/`HeartbeatWriter` plus a pluggable `duties` hook. | **A** (critical path) |
+| SK-403 (codex) | none (SK-201, SK-302 merged) | Adds builders to `src/core/intents.ts` (created by SK-301; SK-403 is now its only editor). New `src/lease/*`. Uses `views.ts`/`Sync` read-only. | **A** (critical path) |
+| SK-406 (codex) | none | `src/exec/interrupt.ts`, `src/adapter/codex.ts`, `handlers/replan.ts`, `src/blackboard/liveness.ts` (+ tests). Nobody else in this phase edits them; SK-401 only imports `liveness.ts`/`replan.ts`. **Must not change golden hashes** (run `test/integration/golden.test.ts`; if a hash would move, stop and report). | **A** (gates SK-504, SK-404, SK-405) |
+| SK-501 (codex) | none (SK-205, SK-206 merged) | New `src/exec/{worktree,sandbox-env}.ts`. | **A** (Wave 5 critical path) |
+| SK-503 (pi) | none (SK-205 merged) | New `src/codehost/*`. | **A** |
+| SK-506 (codex) | none | New `src/exec/redact.ts`; adds an optional `redactor` option to `src/exec/journal.ts` (sole editor in this phase). | **B** (pane cap only) |
+| SK-502 (codex) | **SK-501** (mirror + worktree) | New `src/exec/{checks,evidence,secret-scan}.ts`; imports `NativeRuntime` (SK-306) and `journal.ts` read-only. | **B**, after SK-501 merges |
+| SK-404 (codex) | **SK-401** (world, registry), **SK-403** (intents), **SK-406** (F10 observer boot-id alarm for `duplicate-boot`) | New scenario files; adds entries to `src/sim/scenarios/index.ts` (owned by SK-401, editable by SK-404 only after SK-401 merges). | **B**, after SK-401 + SK-403 + SK-406 |
+| SK-402 (pi) | **SK-401** (`runScenario`, registry) | `src/cli/commands/sim.ts` only (the keys moved to SK-401). | **B**, after SK-401 |
+| SK-405 (pi) | **SK-406**: both touch the golden fixtures' validity (SK-406 changes `replan.ts`) and `toCodexOutputSchema` behaviour (SK-406 edits `codex.ts`; SK-405 tests it) | `invariants.ts`, `replay.property.test.ts`, golden test/fixtures/scenarios, `structured.ts`, `fake-hint.ts`. No overlap with SK-401/403/404 files; SK-401 imports `checkInvariants` and `FakeHintChannel` read-only. | **B**, after SK-406 merges |
+
+Wave 4 internal: SK-401 and SK-403 share no files. SK-404 is the only task that combines them.
+SK-405/SK-406 touch no file owned by SK-401/403/404 or by a Wave 5 task in this phase. They
+are sequenced (SK-406 ⇒ SK-405) because of the golden fixtures and `codex.ts`.
+
+### Schedule
+
+| Batch | Task | Implementer | Gate | Files owned |
+|---|---|---|---|---|
+| A | SK-401 | codex | now | `src/sim/{world,faulty-git,invariants,runner}.ts`, `src/sim/scenarios/{index,empty}.ts`, `test/integration/sim/empty.test.ts`, `test/fixtures/keys/*`, `.gitleaks.toml` |
+| A | SK-403 | codex | now | `src/core/intents.ts` (builders), `src/lease/{reverify,suspend}.ts` (+ tests) |
+| A | SK-406 | codex | now | `src/exec/interrupt.ts`, `src/adapter/codex.ts`, `src/core/reducer/handlers/replan.ts`, `src/blackboard/liveness.ts` (+ tests) |
+| A | SK-501 | codex | now | `src/exec/{worktree,sandbox-env}.ts` (+ tests) |
+| A | SK-503 | pi | now | `src/codehost/{types,fake,gh}.ts` (+ tests) |
+| B | SK-404 | codex | SK-401 + SK-403 + SK-406 merged | `src/sim/scenarios/{claim-race,lost-ack,fetch-flaky,forged-commits,sleep-wake-revoke,duplicate-boot,clock-skew}.ts`, registry entries, `test/integration/sim/*.test.ts` (new files) |
+| B | SK-502 | codex | SK-501 merged | `src/exec/{checks,evidence,secret-scan}.ts` (+ tests) |
+| B | SK-506 | codex | first free pane (no gate) | `src/exec/redact.ts`, `src/exec/journal.ts` (optional redactor) (+ tests) |
+| B | SK-402 | pi | SK-401 merged | `src/cli/commands/sim.ts` (+ test) |
+| B | SK-405 | pi | SK-406 merged | per its row (F1–F6) |
+
+**Fill order when a pane frees** (take the first one whose gate is met; never more than 5
+implementers): SK-404 (critical) → SK-502 (Wave 5 critical path) → SK-506 → SK-402 → SK-405.
+Expected shape: SK-406 and SK-503 finish first, which frees panes for SK-506 and SK-405. SK-501
+⇒ SK-502. SK-401 + SK-403 ⇒ SK-404 last.
+
+**Held back in this phase:**
+
+* SK-504: needs SK-403, SK-406, SK-502, SK-503 and SK-506 merged; it is scheduled in the next phase.
+* SK-505: needs SK-504.
+* All of Wave 6 (SK-601..SK-608): SK-601 needs SK-504, and the others build on SK-601. SK-602 and
+  SK-607 are technically unblocked but are deferred by scope, to keep the pane budget on the
+  critical path.
+* Wave 7 (MVP+).
+* SK-609 and SK-610 (need everything).
+
+### Briefs
+
+All tasks: AGENTS.md rules, generic example values only, no credentials anywhere (D19), `npm run
+lint && npm test` green (outside the codex sandbox).
+
+**SK-401 — Sim world, scheduler, faulty git, invariant checker, `empty` (codex).** Spec:
+ARCHITECTURE §13.1–§13.2, §7.2, §8. Build:
+
+* `SimWorld.create({ seed, devices, root })`: bare blackboard + bare code remotes in a temp dir;
+  human-signed genesis via `createGenesis`. Per device, a `SimNode` with its own clone, `Publisher`,
+  `Sync`, `HeartbeatWriter`, a `FakeClock` view (skew and suspend), a `NullHintChannel`, and an
+  optional `duties(node, state) ⇒ Intent[]` hook (SK-404 scripts actors with it; SK-601 later
+  replaces it with `Daemon.tick`).
+* A discrete-event scheduler on `VirtualTime`, ties broken by `Rng.fork("schedule")`.
+* `faulty-git.ts`: a `GitRunner` decorator with seeded or scripted faults (failed fetch, a
+  competing push before ours, lost ack, delay, partition).
+* `invariants.ts`, checked after every step:
+  * invariant 1: every node at the same tip ⇒ byte-identical `canonicalJson`, and incremental ==
+    full replay;
+  * `checkInvariants` (2–4, 6, 8, 9);
+  * invariant 7: no heartbeat commits on `main`; each `hb/*` ref is a single orphan;
+  * invariant 5 only when a code host is attached (later).
+
+  Violations report seed + step + log dump.
+* `runner.ts`: `runScenario(name, seed, opts) ⇒ { finalTip, steps, violations }`.
+* Registry `scenarios/index.ts` with `empty`.
+* **Fixed test keys** under `test/fixtures/keys/` (README marks them test-only) and the
+  `.gitleaks.toml` allowlist for that path.
+
+Acceptance:
+
+* `empty` (2 nodes, idle, heartbeats) runs with zero violations.
+* The same seed run twice in fresh temp dirs gives the same final tip sha; different seeds may
+  differ.
+* A faulty-git unit test per fault kind.
+
+Pitfalls: commit dates come only from the virtual clock; isolate `GIT_*`/`HOME` via the runner
+env; keep scenarios short (real git is slow); never touch `~/.skep`. Picks up: invariant wiring
+for F13 is SK-601's job, not this task's. Test: `npx vitest run src/sim test/integration/sim`.
+
+**SK-402 — `skep sim run` (pi).** Spec: ARCHITECTURE §13.1, §12 output rules. Build: replace the
+`sim run` stub with `runScenario` from the registry. `--machine` prints the result JSON; human
+mode prints a summary. An unknown scenario ⇒ usage error (exit 2); violations ⇒ exit 1. The keys
+are no longer this task's (moved to SK-401). Acceptance: `skep sim run --seed 42 --scenario empty
+--machine` prints one JSON line with `ok`, `finalTip` and `violations: []`. Test: `npx vitest run
+src/cli`.
+
+**SK-403 — Lease intents, reverify, suspend (codex).** Spec: ARCHITECTURE §6.1–§6.3, D16;
+follow-ups **F15, F16**. Build:
+
+* Pure builders in `src/core/intents.ts`: `claimIntent`, `releaseIntent`, `revokeIntent` (human),
+  `deliverIntent`, `failIntent`, `checkpointIntent`. Each re-derives everything from the state it
+  receives and returns `null` when it is no longer valid (status, lease holder/epoch,
+  `interrupt`, barrier).
+* `claimCandidates(state, agent)` limits claims to `max_parallel_items − activeLeaseCount` (F15).
+* `lease/reverify.ts`: `reverify(sync, lease) ⇒ "ok" | "stale"` via `Sync.observeNow()`.
+* `lease/suspend.ts`: `SuspendDetector(clock, pollMs)`. `Δwall − Δmono > 2 × poll` ⇒ marks held
+  leases unverified, pauses invocations until reverify, and notifies listeners (the daemon wires
+  `LivenessTracker.resetAll`, F16).
+
+Acceptance: each intent returns null for every invalidating state change (table test over
+builder logs); two intents computed from one state ⇒ only one accepted after replay; a suspended
+`FakeClock` triggers the detector, a skewed one does not. Pitfall: never cache state inside an
+intent. Test: `npx vitest run src/core src/lease`.
+
+**SK-404 — Protocol scenarios (codex).** Spec: ARCHITECTURE §13.3, §6, PRD S5. Build the seven
+scenarios with `duties` hooks that use SK-403 intents. Holders are scripted (the attempt pipeline
+is SK-504): **code first, then record**, meaning the scripted holder pushes a trivial commit to the
+epoch branch on the bare code remote before `work.delivered`.
+
+* `claim-race`: 8-way.
+* `lost-ack`, `fetch-flaky`: via faulty git.
+* `forged-commits`: unsigned, wrong principal, a daemon creating a task, a merge commit.
+* `sleep-wake-revoke`: suspended holder, human revoke, re-claim at epoch 2; the stale holder's
+  reverify fails and it never delivers.
+* `duplicate-boot`: both writer-side and observer-side alarms (F10 from SK-406).
+* `clock-skew`: wall skew changes no decision.
+
+Acceptance: every scenario passes 50 seeds with zero violations; `sleep-wake-revoke`: exactly one
+accepted delivery, by epoch 2. Test: `npx vitest run test/integration/sim`.
+
+**SK-405 — Polish: tests and fixtures (pi).** Picks up **F1–F6** exactly as listed. Start after
+SK-406 merged; regenerate goldens once (`SKEP_UPDATE_GOLDEN=1`) for `review-resume` and
+`example.invalid`, and review the diff. Test: `npx vitest run src/core/reducer src/adapter
+test/integration/golden.test.ts`.
+
+**SK-406 — Polish: runtime, adapter, reducer, liveness (codex).** Picks up **F7–F10**. Golden
+hashes must stay unchanged; the replan fixtures use valid items, so F9 rejects nothing there.
+Test: `npx vitest run src/exec src/adapter src/core/reducer src/blackboard
+test/integration/golden.test.ts`.
+
+**SK-501 — Code mirror, worktrees, sanitized env (codex).** Spec: ARCHITECTURE §7.5, §9.7, PRD
+§9.6, §11.4, D19. Build:
+
+* `CodeMirror` per allowlisted repo (bare mirror under `$SKEP_HOME/mirrors/<name>.git`; fetch with
+  the daemon's credentials).
+* `createWorktree({ repo, baseSha, branch, path })` from `base_commit` or the predecessor's
+  delivered head, and `removeWorktree`. Paths go through `safeJoin`; the `.git` admin files are
+  daemon-owned.
+* `sandbox-env.ts`: `agentEnv(opts)` built from an **allowlist** (e.g. `PATH`, `HOME`/`USER` of the
+  agent user, `LANG`, `TMPDIR`, and the agent CLI's documented config-dir variable). It never
+  forwards `GIT_*`, `SSH_AUTH_SOCK`, `GH_TOKEN`/`GITHUB_TOKEN`, credential helpers or anything
+  provider-related (D19).
+* Optional `uid`/`gid` resolution for the agent user.
+
+Acceptance: a worktree at a given sha, on a fresh branch, in a temp dir; the env test proves that
+nothing outside the allowlist passes, including a planted `GIT_ASKPASS` and `SSH_AUTH_SOCK`.
+Test: `npx vitest run src/exec`.
+
+**SK-502 — Trusted checks, evidence verifier, secret scan (codex).** Spec: ARCHITECTURE §9.5–§9.6,
+PRD §9.6, §11.5. Build:
+
+* `checks.ts`: load `.skep/checks.toml` **only** via `git show <base_commit>:…` from the SK-501
+  mirror (`parseChecksFile`). Run each check with `NativeRuntime` (argv, `shell: false`, sanitized
+  env, timeout, group kill) and produce a `CheckRun` with a journal entry and log digest.
+* `evidence.ts`: `file_span`/`command_run`/`check_run` verification against the mirror and the
+  journal.
+* `secret-scan.ts`: gitleaks wrapper; skip with a warning if absent in tests.
+
+Acceptance: a check from the worktree's own (modified) `checks.toml` is ignored; a tampered
+excerpt or hash fails verification; timeouts kill the group. Test: `npx vitest run src/exec`.
+
+**SK-503 — Code host (pi).** Spec: ARCHITECTURE §11.5. `types.ts` interface; `fake.ts` in-memory
+PR registry over a local bare repo (one PR per head branch, `merge(pr)` for scenarios);
+`gh.ts` via `execFileChecked("gh", …, --json …)`, unit-tested with a stub runner and no network.
+Test: `npx vitest run src/codehost`.
+
+**SK-506 — Pattern-based redactor (codex).** Spec: its row, ARCHITECTURE §16. Test: `npx vitest
+run src/exec`.
+
+## SK-610 — First public release v0.1.0 (brief)
+
+Depends on SK-609. Owner: codex, with human sign-off. No `npm publish` and no tag push without
+the human's explicit go.
+
+**Versioning.** SemVer 0.x. `0.1.0` is the first public release (the MVP of PRD §16). While 0.x,
+a **minor** bump may break CLI flags, config or the blackboard protocol, and a **patch** bump may
+not. A protocol or reducer change additionally follows ARCHITECTURE §4.4: a new
+`REDUCER_VERSION` needs golden evidence, and a live blackboard needs a human re-genesis. The
+version lives in `package.json`; `skep --version` prints it together with `REDUCER_VERSION` and
+`protocol_version`.
+
+**CHANGELOG.md.** Keep-a-Changelog format: `## [0.1.0] - <date>` with Added / Changed / Security /
+Known limitations. Sources: conventional-commit subjects on `main` since the scaffold (grouped by
+`feat`/`fix`), the DEV-PLAN task table, and ARCHITECTURE §15 decisions that change user-visible
+behaviour. An `Unreleased` section is kept at the top afterwards.
+
+**README quickstart.**
+
+* Prerequisites: Node ≥ 22.12, git ≥ 2.34, OpenSSH ≥ 8.9, `gh`, gitleaks, a pinned agent CLI
+  installed and logged in **locally** on each device (D19).
+* `npm install -g <package>`, then `skep init` on each device.
+* Trust setup: allowed_signers plus fingerprint comparison.
+* Create the private blackboard repo, then `skep init --genesis` on the controller.
+* `skepd` as a service; `skep task new …` ⇒ `skep plan approve` ⇒ `skep status`.
+* Link to `docs/RUNBOOK.md`, plus an explicit "what Skep never does" box: no credential
+  transport (D19), no inbound connections (D18), no auto-merge.
+
+**npm package name.** Check availability without publishing:
+
+* `npm view skep name version` (exit 0 ⇒ taken; E404 ⇒ free)
+* `npm view skepd name`
+* `npm view @skepagent/skep name`
+* `npm access list packages @skepagent` (does the scope exist, and do we own it)
+* also search the npm registry for close look-alikes
+
+Decision criteria, in order:
+
+1. Use unscoped `skep` only if it is free **and** not confusable with an active package.
+2. Otherwise use a scope the project controls (e.g. `@skepagent/skep`, create the npm org first),
+   published with `--access public`.
+
+The binaries stay `skep` and `skepd` in either case, and `skepd` is not published as a separate
+package. Record the decision and the check output (date, command, result) in the release PR.
+
+**package.json fields.**
+
+* `name` (per the decision above) and `version: "0.1.0"`; remove `"private": true`.
+* `bin: { skep: "dist/bin/skep.js", skepd: "dist/bin/skepd.js" }` with shebangs.
+* `files: ["dist", "README.md", "LICENSE", "CHANGELOG.md"]` (no `src/`, `test/`, fixtures or keys).
+* `engines.node: ">=22.12.0"`, `license: "MIT"`.
+* `repository` / `homepage` / `bugs` pointing at the public repo; `keywords`.
+* `publishConfig.access: "public"` if scoped.
+* `prepublishOnly: "npm run check && npm run build"`.
+
+Verify with `npm pack --dry-run`: the file list contains no test keys, fixtures or `.skep` data.
+
+**GitHub release notes (tag `v0.1.0`).**
+
+* Summary and the MVP scope (PRD §16).
+* Highlights: signed git blackboard, deterministic reducer, epoch-fenced leases, coarse replan,
+  stacked PRs, Codex adapter.
+* Install and quickstart link.
+* Security model: everything signed, local trust root, D18 transports are availability-only, D19
+  non-goal stated verbatim.
+* Known limitations: manual revoke; Codex adapter only; macOS/Linux; no herdr backend; relay and
+  enrollment bundles are Wave 7; single slot per device.
+* Results summary from `docs/MVP-RUN-REPORT.md`; upgrade notes ("first release"); checksums of
+  the `npm pack` tarball.
+
+**Pre-release checklist (all must be true):**
+
+1. SK-609 passed: PRD §16.5 acceptance criteria verified on a real two-device run, documented in
+   `docs/MVP-RUN-REPORT.md` with no open blocking gap.
+2. `npm ci && npm run lint && npm test && npm run build` green on a clean checkout of the release
+   commit (outside any sandbox), plus `SKEP_PROPERTY_LOGS=1000`, the sim scenarios at 50 seeds,
+   and the opt-in real-adapter tests on a device with the pinned CLI.
+3. Secret scan clean: `gitleaks detect` over the full git history and over the `npm pack`
+   tarball; the only allowlisted findings are the documented test keys.
+4. No absolute host paths, real hostnames, IPs or personal emails in the repo (grep check in the
+   release PR).
+5. The D19 non-goal is present in README, ARCHITECTURE (top + §16) and the release notes; the
+   D18 "no inbound connectivity" statement is in README.
+6. All DEV-PLAN MVP tasks are `done` with reviews in `docs/reviews/`; the Wave 2b/3 follow-ups
+   (F1–F21) are closed or explicitly deferred in the CHANGELOG's known limitations.
+7. `REDUCER_VERSION`/`protocol_version` match the golden fixtures; ARCHITECTURE §15 is current.
+8. LICENSE present, `package.json` fields as above, `npm pack --dry-run` reviewed, and the name
+   decision recorded.
+9. Human sign-off on the tag and the publish command (the release task itself never publishes).
 
 ---
 
