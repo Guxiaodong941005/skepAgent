@@ -1,5 +1,12 @@
 import type { SimDeviceOptions, SimWorld } from "../world.js";
+import { claimRace } from "./claim-race.js";
+import { clockSkew } from "./clock-skew.js";
+import { duplicateBoot } from "./duplicate-boot.js";
 import { empty } from "./empty.js";
+import { fetchFlaky } from "./fetch-flaky.js";
+import { forgedCommits } from "./forged-commits.js";
+import { lostAck } from "./lost-ack.js";
+import { sleepWakeRevoke } from "./sleep-wake-revoke.js";
 
 export interface Scenario {
   name: string;
@@ -8,7 +15,16 @@ export interface Scenario {
   setup(world: SimWorld): void | Promise<void>;
 }
 
-export const scenarios: Readonly<Record<string, Scenario>> = { empty };
+export const scenarios: Readonly<Record<string, Scenario>> = {
+  empty,
+  "claim-race": claimRace,
+  "lost-ack": lostAck,
+  "fetch-flaky": fetchFlaky,
+  "forged-commits": forgedCommits,
+  "sleep-wake-revoke": sleepWakeRevoke,
+  "duplicate-boot": duplicateBoot,
+  "clock-skew": clockSkew,
+};
 
 export class UnknownScenarioError extends Error {
   constructor(name: string) {
