@@ -8,11 +8,10 @@
   checkout to that user (PRD §11.4). It is otherwise the same outbound-only process (D18):
   no network listener, no socket in /tmp.
 
-  The socket skepd creates is mode 0600 and owned by root, which the human's CLI cannot
-  open. It needs to be 0660, group skep, with the human's account in that group (the
-  original ARCHITECTURE §12 wording). Socket group and mode are not configurable yet
-  (follow-up on the IPC server); until that lands, publish from the CLI's in-process
-  fallback, which runs as the human and does not need the socket.
+  Create the local group skep and add the human's account to it before starting (D22).
+  The socket-group flag makes the socket 0660 root:skep and its directory 0750 root:skep.
+  A non-root CLI outside that group is denied by the OS before any IPC request is handled.
+  Start a fresh login session after adding group membership so the CLI inherits it.
 
   Install (root):
     cp deploy/com.skepagent.skepd.plist /Library/LaunchDaemons/
@@ -34,6 +33,8 @@
       <string>/usr/local/lib/skep/skepd.js</string>
       <string>--home</string>
       <string>/var/lib/skep</string>
+      <string>--socket-group</string>
+      <string>skep</string>
       <string>--role-dir</string>
       <string>/var/lib/skep-roles/coding</string>
       <string>--agent-user</string>

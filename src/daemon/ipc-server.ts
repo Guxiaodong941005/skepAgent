@@ -2,8 +2,8 @@
  * Daemon-side IPC server (ARCHITECTURE §12, §7.4).
  *
  * Listens on the Unix socket at `$SKEP_HOME/skepd.sock` and speaks the NDJSON frames in
- * `src/ipc/protocol.ts`. The directory is 0700 and the socket 0600, both owned by the daemon
- * user: the socket is local-only (D18 — nothing here binds a network port).
+ * `src/ipc/protocol.ts`. The directory is 0700 and the socket 0600 by default; D22 permits
+ * 0750/0660 with a shared group. Both remain owned by the daemon user and local-only (D18).
  *
  * A `publish` with `signer: "human"` is signed by the CLI, not here. {@link SigningSession}
  * sends a `sign_request` for the commit bytes and waits for the matching `sign_result`; the
@@ -13,8 +13,9 @@
  * §16): handler results, streamed log chunks and error messages alike.
  */
 
-import { chmod, lstat, mkdir, rm } from "node:fs/promises";
+import { chmod, chown, lstat, mkdir, rm } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
+import { z } from "zod";
 import type { Redactor } from "../exec/redact.js";
 import { FrameReadError, FrameReader, FrameWriteError, writeFrame } from "../ipc/framing.js";
 import {
@@ -32,6 +33,7 @@ import {
   SOCKET_DIR_MODE,
   SOCKET_MODE,
 } from "../ipc/protocol.js";
+import { execFileChecked } from "../util/exec.js";
 
 /**
  * What the daemon does for one accepted request. SK-601 implements this against the real daemon.
@@ -83,6 +85,10 @@ export interface IpcServerOptions {
   handlers: IpcHandlers;
   /** Scrubs responses before they leave the daemon (ARCHITECTURE §16). */
   redactor: Redactor;
+  /** Local OS group for both the socket and its directory (ARCHITECTURE §12, D22). */
+  group?: string;
+  /** Defaults to 0600; 0660 also enables group traversal of the directory (0750). */
+  mode?: 0o600 | 0o660;
   /**
    * How long a `sign_request` waits for its `sign_result`. The human signs through an agent,
    * so this bounds a lost CLI rather than the signature itself.
@@ -94,22 +100,65 @@ export interface IpcServerOptions {
 
 const DEFAULT_SIGN_TIMEOUT_MS = 60_000;
 
+const SocketPermissionsSchema = z.strictObject({
+  group: z
+    .string()
+    .regex(/^[a-z_][a-z0-9_.-]*$/i)
+    .optional(),
+  mode: z.union([z.literal(0o600), z.literal(0o660)]).default(SOCKET_MODE),
+});
+
+export class IpcServerError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "IpcServerError";
+  }
+}
+
 export class IpcServer {
   private server: Server | undefined;
   private readonly connections = new Set<Connection>();
   private running = false;
 
-  constructor(private readonly options: IpcServerOptions) {}
+  constructor(
+    private readonly options: IpcServerOptions,
+    private readonly deps: { exec?: typeof execFileChecked } = {},
+  ) {}
 
   /** Create the socket directory and start listening. Replaces a stale socket file. */
   async start(): Promise<void> {
-    if (this.running) throw new Error("IPC server is already listening");
+    if (this.running) throw new IpcServerError("IPC server is already listening");
     const { socketPath } = this.options;
+    const permissions = SocketPermissionsSchema.safeParse({
+      group: this.options.group,
+      mode: this.options.mode,
+    });
+    if (!permissions.success)
+      throw new IpcServerError(
+        "IPC permissions require a local OS group name and mode 0600 or 0660",
+      );
+    const { group, mode } = permissions.data;
     const dir = socketPath.slice(0, socketPath.lastIndexOf("/"));
-    // `recursive` does not apply the mode to parents, and a plain mkdir fails when the
-    // directory already exists, so the mode is enforced explicitly afterwards.
-    await mkdir(dir, { recursive: true });
+    await mkdir(dir, { recursive: true, mode: SOCKET_DIR_MODE });
+    if (!(await lstat(dir)).isDirectory())
+      throw new IpcServerError("IPC socket directory must be a real directory, not a symlink");
+    // D22: keep the directory private until both inodes have their final group and mode.
+    // Explicit chmod also tightens a pre-existing directory, regardless of the umask.
     await enforceMode(dir, SOCKET_DIR_MODE);
+    if (group !== undefined) {
+      try {
+        // chgrp uses the OS group database on both Linux and macOS, including directory services.
+        await (this.deps.exec ?? execFileChecked)("/usr/bin/chgrp", [group, dir], {
+          env: { LC_ALL: "C" },
+        });
+      } catch (cause) {
+        throw new IpcServerError(
+          `Cannot assign IPC socket group ${group}; ensure the group exists and the daemon may use it`,
+          { cause },
+        );
+      }
+    }
+    const gid = (await lstat(dir)).gid;
     await removeStaleSocket(socketPath);
 
     const server = createServer((socket) => this.accept(socket));
@@ -118,16 +167,31 @@ export class IpcServer {
     server.on("error", () => {
       this.running = false;
     });
-    await new Promise<void>((resolve, reject) => {
-      server.once("error", reject);
-      server.listen(socketPath, () => {
-        server.off("error", reject);
-        resolve();
+    let bound = false;
+    try {
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(socketPath, () => {
+          server.off("error", reject);
+          resolve();
+        });
       });
-    });
-    await enforceMode(socketPath, SOCKET_MODE);
-    this.server = server;
-    this.running = true;
+      bound = true;
+      if (group !== undefined || mode === 0o660) await chown(socketPath, -1, gid);
+      await enforceMode(socketPath, mode);
+      await enforceMode(dir, mode === 0o660 ? 0o750 : SOCKET_DIR_MODE);
+      this.server = server;
+      this.running = true;
+    } catch (cause) {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      if (bound) await rm(socketPath, { force: true });
+      throw new IpcServerError(
+        "Cannot start IPC socket; check directory ownership and permissions",
+        {
+          cause,
+        },
+      );
+    }
   }
 
   /** Stop accepting and close every connection. Safe to call twice. */
@@ -147,6 +211,10 @@ export class IpcServer {
   }
 
   private accept(socket: Socket): void {
+    if (!this.running) {
+      socket.destroy();
+      return;
+    }
     socket.setNoDelay(true);
     const connection = new Connection(socket, this.options, () =>
       this.connections.delete(connection),
