@@ -166,6 +166,32 @@ describe("Redactor", () => {
     expect(findSecrets(text)).toEqual([]);
   });
 
+  it("keeps ordinary prose after token, bearer and basic words (SK-507 note 3)", () => {
+    const text = [
+      "token verification_failed_for_item",
+      "Token verification_failed_for_item while checking W1",
+      "the bearer authorization-header-missing case",
+      "Basic configuration.instructions.apply here",
+      "TOKEN VERIFICATION_FAILED_FOR_ITEM",
+    ].join("\n");
+    expect(redactor.redact(text)).toBe(text);
+    expect(findSecrets(text)).toEqual([]);
+  });
+
+  it("still redacts single-case bearer values that carry a digit or base64 symbol", () => {
+    const lowerHex = "0123456789abcdef0123456789abcdef"; // gitleaks:allow
+    const base64 = "dXNlcm5hbWU6cGFzc3dvcmQ="; // gitleaks:allow
+    expect(redactor.redact(`Authorization: Bearer ${lowerHex}`)).toBe(
+      "Authorization: Bearer [REDACTED:bearer-token]",
+    );
+    expect(redactor.redact(`Authorization: Basic ${base64}`)).toBe(
+      "Authorization: Basic [REDACTED:bearer-token]",
+    );
+    expect(redactor.redact("token abcdefghijklmnop/qrstuvwx")).toBe(
+      "token [REDACTED:bearer-token]",
+    );
+  });
+
   it("supports lowercase names, tabs, punctuation and escaped quotes in assignments", () => {
     const value = `${FAKE_BODY}\\"!?%+=/`;
     const text = `example_secret\t=\t"${value}"\n`;

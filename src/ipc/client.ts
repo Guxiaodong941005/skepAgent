@@ -9,6 +9,7 @@
 
 import { createConnection, type Socket } from "node:net";
 import type { Signer } from "../git/signer.js";
+import { type Clock, systemClock } from "../util/clock.js";
 import { FrameReader, FrameWriteError, writeFrame } from "./framing.js";
 import {
   type ClientFrame,
@@ -19,6 +20,14 @@ import {
   type ServerFrame,
   type StreamFrame,
 } from "./protocol.js";
+
+export interface IpcConnectOptions {
+  /**
+   * Times each call's deadline, including the wait for a human signature. Defaults to
+   * {@link systemClock}; tests and the simulator inject a fake (AGENTS.md: no bare setTimeout).
+   */
+  clock?: Clock;
+}
 
 export interface IpcCallOptions {
   /** Bounds one call, including time spent waiting for a signature. */
@@ -87,7 +96,11 @@ export interface IpcClient {
  * is one request frame plus its response, and calls are serialized so sign callbacks cannot
  * cross between requests.
  */
-export function connectIpc(socketPath: string): Promise<IpcClient> {
+export function connectIpc(
+  socketPath: string,
+  connectOpts: IpcConnectOptions = {},
+): Promise<IpcClient> {
+  const clock = connectOpts.clock ?? systemClock;
   return new Promise((resolve, reject) => {
     const socket = createConnection(socketPath);
     let settled = false;
@@ -103,7 +116,7 @@ export function connectIpc(socketPath: string): Promise<IpcClient> {
       socket.setNoDelay(true);
       // Flowing mode would emit 'data' and drop bytes; frames are pulled with read().
       socket.pause();
-      resolve(new SocketClient(socket));
+      resolve(new SocketClient(socket, clock));
     });
     socket.once("error", (error) => {
       fail(
@@ -124,7 +137,8 @@ interface Exchange {
   opts: IpcCallOptions;
   resolve: (result: IpcResult) => void;
   reject: (error: IpcClientError) => void;
-  timer: NodeJS.Timeout;
+  /** Aborting cancels the pending deadline sleep once the exchange is settled. */
+  timer: AbortController;
   onAbort: () => void;
   done: boolean;
 }
@@ -136,7 +150,10 @@ class SocketClient implements IpcClient {
   private tail: Promise<void> = Promise.resolve();
   private current: Exchange | undefined;
 
-  constructor(private readonly socket: Socket) {
+  constructor(
+    private readonly socket: Socket,
+    private readonly clock: Clock,
+  ) {
     socket.on("readable", () => this.read());
     socket.on("error", (error: Error) => {
       this.fail(
@@ -180,10 +197,7 @@ class SocketClient implements IpcClient {
         opts,
         resolve,
         reject,
-        timer: setTimeout(() => {
-          this.socket.destroy();
-          this.fail(new IpcClientError("timeout", `skepd did not answer within ${timeoutMs}ms`));
-        }, timeoutMs),
+        timer: new AbortController(),
         onAbort: () => {
           this.socket.destroy();
           this.fail(new IpcClientError("aborted", "IPC call aborted"));
@@ -194,6 +208,7 @@ class SocketClient implements IpcClient {
         exchange.onAbort();
         return;
       }
+      this.armDeadline(exchange, timeoutMs);
       opts.signal?.addEventListener("abort", exchange.onAbort, { once: true });
       this.current = exchange;
       writeFrame(this.socket, { v: 1, id, method, params }).then(
@@ -201,6 +216,25 @@ class SocketClient implements IpcClient {
         (error: unknown) => this.fail(asClientError(error)),
       );
     });
+  }
+
+  /**
+   * The call deadline on the injected clock (SK-602 review note 2). The sleep is cancelled when
+   * the exchange settles; that cancellation is the only expected rejection, so any other error
+   * fails the call rather than being swallowed.
+   */
+  private armDeadline(exchange: Exchange, timeoutMs: number): void {
+    this.clock.sleep(timeoutMs, exchange.timer.signal).then(
+      () => {
+        if (exchange.done) return;
+        this.socket.destroy();
+        this.fail(new IpcClientError("timeout", `skepd did not answer within ${timeoutMs}ms`));
+      },
+      (error: unknown) => {
+        if (exchange.timer.signal.aborted) return;
+        this.fail(asClientError(error));
+      },
+    );
   }
 
   /** Pull buffered bytes and handle every complete frame they contain. */
@@ -248,7 +282,7 @@ class SocketClient implements IpcClient {
     }
     exchange.done = true;
     this.current = undefined;
-    clearTimeout(exchange.timer);
+    exchange.timer.abort();
     exchange.opts.signal?.removeEventListener("abort", exchange.onAbort);
     if (frame.ok) exchange.resolve({ ok: true, result: frame.result });
     else exchange.resolve({ ok: false, error: frame.error });
@@ -284,7 +318,7 @@ class SocketClient implements IpcClient {
     if (!exchange || exchange.done) return;
     exchange.done = true;
     this.current = undefined;
-    clearTimeout(exchange.timer);
+    exchange.timer.abort();
     exchange.opts.signal?.removeEventListener("abort", exchange.onAbort);
     exchange.reject(error);
   }

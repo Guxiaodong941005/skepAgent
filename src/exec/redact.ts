@@ -140,12 +140,27 @@ function assignmentMatches(text: string): SecretMatch[] {
   return matches;
 }
 
+/**
+ * The bearer rule matches the words "token" and "basic" case-insensitively, so ordinary prose
+ * such as "token verification_failed_for_item" fits its shape (SK-507 review note 3). A
+ * generated credential mixes character classes: it contains a digit, both letter cases, or a
+ * base64 symbol. A value made of single-case letters and `_`/`-`/`.` only is read as prose.
+ */
+function credentialLike(value: string): boolean {
+  return /[0-9+/=~]/.test(value) || (/[a-z]/.test(value) && /[A-Z]/.test(value));
+}
+
 /** Span of one capture group, not the whole match (the scheme or the keyword stays visible). */
-function capturedMatches(text: string, pattern: RegExp, rule: SecretRule): SecretMatch[] {
+function capturedMatches(
+  text: string,
+  pattern: RegExp,
+  rule: SecretRule,
+  accept: (value: string) => boolean = () => true,
+): SecretMatch[] {
   const matches: SecretMatch[] = [];
   for (const match of text.matchAll(pattern)) {
     const value = match[1];
-    if (value === undefined || value.length === 0) continue;
+    if (value === undefined || value.length === 0 || !accept(value)) continue;
     const valueStart = match[0].lastIndexOf(value);
     matches.push({
       rule,
@@ -164,7 +179,7 @@ export function findSecrets(text: string): SecretMatch[] {
     ...tokenMatches(text, GITHUB_TOKEN, "github-token"),
     ...tokenMatches(text, JWT, "jwt"),
     ...tokenMatches(text, SLACK_TOKEN, "slack-token"),
-    ...capturedMatches(text, BEARER_TOKEN, "bearer-token"),
+    ...capturedMatches(text, BEARER_TOKEN, "bearer-token", credentialLike),
     ...capturedMatches(text, URL_CREDENTIAL, "url-credential"),
     ...assignmentMatches(text),
   ];

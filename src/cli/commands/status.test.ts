@@ -15,6 +15,7 @@ import { replay } from "../../core/reducer/replay.js";
 import type { State } from "../../core/reducer/state.js";
 import { statusView } from "../../core/reducer/views.js";
 import { type IpcClient, IpcClientError, type IpcResult } from "../../ipc/client.js";
+import { systemClock } from "../../util/clock.js";
 import type { CliContext } from "../context.js";
 import { runCli } from "../program.js";
 
@@ -86,6 +87,7 @@ function fixtureState(): { state: State; entries: LogBuilder["entries"] } {
 
 afterEach(() => {
   readLogMock.mockReset();
+  vi.restoreAllMocks();
 });
 
 describe("skep status", () => {
@@ -100,23 +102,25 @@ describe("skep status", () => {
           return {
             ok: true,
             result: {
-              ...view,
-              liveness: [
-                {
-                  agent: VPS,
-                  cls: "stale",
-                  sinceChangeMs: 400_000,
-                  intervalMs: 60_000,
-                  bootId: "b_5a1e",
-                  state: "running",
-                  runtime: "native",
-                  lease: { task: T1, item: "W1", epoch: 1 },
-                },
-              ],
-              freshness: { fetchedAtMonoMs: 1_000, invalidCount: 0, reducerVersion: 1 },
-              hints: { name: "relay", connected: false, lastMessageMonoMs: null },
-              alarms: [],
-              nowMonoMs: 7_000,
+              view,
+              extras: {
+                liveness: [
+                  {
+                    agent: VPS,
+                    cls: "stale",
+                    sinceChangeMs: 400_000,
+                    intervalMs: 60_000,
+                    bootId: "b_5a1e",
+                    state: "running",
+                    runtime: "native",
+                    lease: { task: T1, item: "W1", epoch: 1 },
+                  },
+                ],
+                freshness: { checkedAgoMs: 6_000, invalidCount: 0, reducerVersion: 1 },
+                hints: { name: "relay", connected: false, lastMessageMonoMs: null },
+                alarms: [],
+                readOnly: false,
+              },
             },
           };
         }),
@@ -168,15 +172,34 @@ describe("skep status", () => {
     const { state } = fixtureState();
     const view = statusView(state);
     const cap = capture();
+    // The machine timestamps are on the CLI's own clock: the daemon only sends an age.
+    vi.spyOn(systemClock, "monotonicMs").mockReturnValue(5_000);
+    const alarms = [{ kind: "invalid_commit", detail: "1 invalid commit(s) in the log" }];
+    const hints = { name: "null", connected: false, lastMessageMonoMs: null };
     const result = {
       ...view,
       liveness: [],
       freshness: { checkedAtMonoMs: 1_000, invalidCount: 1, reducerVersion: 1 },
-      hints: { name: "null", connected: false, lastMessageMonoMs: null },
-      alarms: [{ kind: "invalid_commit", detail: "1 invalid commit(s) in the log" }],
+      hints,
+      alarms,
       nowMonoMs: 5_000,
     };
-    cap.ctx.connectDaemon = () => Promise.resolve(daemon(() => ({ ok: true, result })));
+    cap.ctx.connectDaemon = () =>
+      Promise.resolve(
+        daemon(() => ({
+          ok: true,
+          result: {
+            view,
+            extras: {
+              liveness: [],
+              freshness: { checkedAgoMs: 4_000, invalidCount: 1, reducerVersion: 1 },
+              hints,
+              alarms,
+              readOnly: false,
+            },
+          },
+        })),
+      );
     const code = await runCli(["--machine", "status"], cap.ctx);
     expect(code).toBe(0);
     const line = cap.stdout.replace(/\n$/, "");
@@ -189,6 +212,61 @@ describe("skep status", () => {
     // Key order is canonical, not the order the object was built in.
     expect(line).toBe(canonicalJson({ ok: true, result }));
     expect(line).not.toContain("fetchedAtMonoMs");
+  });
+
+  it("rejects a flat status result instead of guessing its shape (H11)", async () => {
+    const { state } = fixtureState();
+    const cap = capture();
+    cap.ctx.connectDaemon = () =>
+      Promise.resolve(
+        daemon(() => ({
+          ok: true,
+          result: {
+            ...statusView(state),
+            liveness: [],
+            freshness: { checkedAgoMs: 0, invalidCount: 0, reducerVersion: 1 },
+            hints: { name: "null", connected: false, lastMessageMonoMs: null },
+            alarms: [],
+          },
+        })),
+      );
+    expect(await runCli(["--machine", "status"], cap.ctx)).toBe(1);
+    const body = JSON.parse(cap.stdout) as { ok: boolean; error: { code: string } };
+    expect(body).toMatchObject({ ok: false, error: { code: "bad_status" } });
+  });
+
+  it("ignores daemon monotonic timestamps and nowMonoMs without an age (H11)", async () => {
+    const { state } = fixtureState();
+    const cap = capture();
+    vi.spyOn(systemClock, "monotonicMs").mockReturnValue(50);
+    cap.ctx.connectDaemon = () =>
+      Promise.resolve(
+        daemon(() => ({
+          ok: true,
+          result: {
+            view: statusView(state),
+            extras: {
+              liveness: [],
+              // Daemon-clock values: comparing them with the CLI clock would be meaningless.
+              freshness: { fetchedAtMonoMs: 1_000, checkedAtMonoMs: 1_000, invalidCount: 0 },
+              hints: { name: "null", connected: false, lastMessageMonoMs: null },
+              alarms: [],
+              nowMonoMs: 7_000,
+            },
+          },
+        })),
+      );
+    expect(await runCli(["--machine", "status"], cap.ctx)).toBe(0);
+    const line = JSON.parse(cap.stdout) as {
+      result: { freshness: { checkedAtMonoMs: number | null }; nowMonoMs: number };
+    };
+    expect(line.result.freshness.checkedAtMonoMs).toBeNull();
+    expect(line.result.nowMonoMs).toBe(50);
+
+    const human = capture();
+    human.ctx.connectDaemon = cap.ctx.connectDaemon;
+    expect(await runCli(["status"], human.ctx)).toBe(0);
+    expect(human.stdout).toContain("checked never");
   });
 
   it("falls back to a local replay when the daemon is down", async () => {

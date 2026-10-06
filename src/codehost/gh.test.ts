@@ -69,13 +69,15 @@ describe("GhCodeHost", () => {
     const present = stub([ref(SHA)]);
     const presentHost = new GhCodeHost({ run: present.run, env: {} });
     expect(await presentHost.remoteBranchSha(REPO, "main")).toBe(SHA);
-    expect(present.calls[0]).toEqual([
-      "gh",
-      "api",
-      "--hostname",
-      "github.com",
-      "repos/example/demo/git/ref/heads/main",
-    ]);
+    expect(present.calls[0]).toEqual(["gh", "api", "repos/example/demo/git/ref/heads/main"]);
+  });
+
+  it("omits --hostname for an owner/repo name so gh uses its configured default host", async () => {
+    const { run, calls } = stub([ref(SHA)]);
+    const host = new GhCodeHost({ run, env: {} });
+    expect(await host.remoteBranchSha("example/demo", "main")).toBe(SHA);
+    expect(calls[0]).not.toContain("--hostname");
+    expect(calls.flat().some((arg) => arg.includes("github.com"))).toBe(false);
   });
 
   it("resolves an https repo URL into the API host and owner/repo", async () => {
