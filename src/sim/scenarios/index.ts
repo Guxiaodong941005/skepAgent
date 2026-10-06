@@ -7,6 +7,8 @@ import { fetchFlaky } from "./fetch-flaky.js";
 import { forgedCommits } from "./forged-commits.js";
 import { lostAck } from "./lost-ack.js";
 import { sleepWakeRevoke } from "./sleep-wake-revoke.js";
+import { soloHappy } from "./solo-happy.js";
+import { teamStacked } from "./team-stacked.js";
 
 export interface Scenario {
   name: string;
@@ -24,6 +26,8 @@ export const scenarios: Readonly<Record<string, Scenario>> = {
   "sleep-wake-revoke": sleepWakeRevoke,
   "duplicate-boot": duplicateBoot,
   "clock-skew": clockSkew,
+  "solo-happy": soloHappy,
+  "team-stacked": teamStacked,
 };
 
 export class UnknownScenarioError extends Error {

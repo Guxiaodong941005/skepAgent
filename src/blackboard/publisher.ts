@@ -1,5 +1,6 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { mkdir, rm, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { type EventId, eventPath, parseEventPath, type Sha } from "../core/ids.js";
 import { finalizeEvent, type Intent } from "../core/intents.js";
 import { replay } from "../core/reducer/replay.js";
@@ -14,6 +15,31 @@ import { backoffDelay } from "../util/backoff.js";
 import { type Clock, isoUtc } from "../util/clock.js";
 import { newEventId, type RandomSource } from "../util/random.js";
 import type { BlackboardClone } from "./clone.js";
+
+const cloneQueues = new Map<string, Promise<void>>();
+const heldClones = new AsyncLocalStorage<ReadonlySet<string>>();
+
+/** F12: a publisher may call Sync.replayTo while holding this same clone lock (§7.2). */
+export function withCloneLock<T>(
+  clone: Pick<BlackboardClone, "dir">,
+  work: () => Promise<T>,
+): Promise<T> {
+  const key = resolve(clone.dir);
+  const held = heldClones.getStore();
+  if (held?.has(key)) return work();
+  const result = (cloneQueues.get(key) ?? Promise.resolve()).then(() =>
+    heldClones.run(new Set([...(held ?? []), key]), work),
+  );
+  const tail = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  cloneQueues.set(key, tail);
+  void tail.then(() => {
+    if (cloneQueues.get(key) === tail) cloneQueues.delete(key);
+  });
+  return result;
+}
 
 export interface StateSource {
   replayTo(tip: Sha): Promise<State>;
@@ -128,59 +154,61 @@ export class Publisher {
     let pendingSha: Sha | null = null;
     for (let attempt = 0; attempt < this.maxAttempts; attempt++) {
       try {
-        const state = await this.observe();
-        const seen = this.seenResult(state, eventId);
-        if (seen) return seen;
-        // D3 excludes unauthorized/invalid events from seen IDs. A known landed SHA still lets
-        // us report that failure after a lost acknowledgement without appending it again.
-        const landed = state.outcomes.find((outcome) => outcome.sha === pendingSha);
-        if (landed) return this.outcomeResult(landed, eventId);
-        const eventDraft = intent(state);
-        if (eventDraft === null) return { status: "dropped", eventId };
-        const nowMs = this.deps.clock.nowMs();
-        const event = finalizeEvent(eventDraft, {
-          event_id: eventId,
-          observed_tip: state.tip,
-          created_at: isoUtc(nowMs),
+        return await withCloneLock(this.deps.clone, async () => {
+          const state = await this.observe();
+          const seen = this.seenResult(state, eventId);
+          if (seen) return seen;
+          // D3 excludes unauthorized/invalid events from seen IDs. A known landed SHA still lets
+          // us report that failure after a lost acknowledgement without appending it again.
+          const landed = state.outcomes.find((outcome) => outcome.sha === pendingSha);
+          if (landed) return this.outcomeResult(landed, eventId);
+          const eventDraft = intent(state);
+          if (eventDraft === null) return { status: "dropped", eventId };
+          const nowMs = this.deps.clock.nowMs();
+          const event = finalizeEvent(eventDraft, {
+            event_id: eventId,
+            observed_tip: state.tip,
+            created_at: isoUtc(nowMs),
+          });
+          const path = eventPath(event.task_id, eventId);
+          if (parseEventPath(path) === null) throw new PublishError(`Invalid event path ${path}`);
+          const content = serializeEvent(event);
+          if (Buffer.byteLength(content, "utf8") > MAX_EVENT_BYTES) {
+            throw new PublishError(`Event ${eventId} exceeds ${MAX_EVENT_BYTES} bytes`);
+          }
+          const file = join(this.deps.clone.dir, path);
+          await mkdir(dirname(file), { recursive: true });
+          await writeFile(file, content, { flag: "wx", mode: 0o600 });
+          try {
+            await this.deps.git.run(["add", "--", path], { cwd: this.deps.clone.dir });
+          } catch (error) {
+            // A failed add can leave an untracked file that reset --hard will not discard (§7.2).
+            await rm(file, { force: true });
+            throw error;
+          }
+          const ident = { ...this.deps.ident, timestampSec: Math.floor(nowMs / 1000) };
+          pendingSha = await writeSignedCommit(this.deps.git, this.deps.clone.dir, {
+            tree: await writeTreeFromIndex(this.deps.git, this.deps.clone.dir),
+            parents: [state.tip],
+            author: ident,
+            committer: ident,
+            message: `${event.type} ${event.task_id ?? "_skep"} ${eventId}`,
+            signer,
+          });
+          await this.deps.git.run(["update-ref", "refs/heads/main", pendingSha, state.tip], {
+            cwd: this.deps.clone.dir,
+          });
+          await this.deps.git.run(["push", "origin", `${pendingSha}:refs/heads/main`], {
+            cwd: this.deps.clone.dir,
+          });
+          const observed = await this.observe();
+          const result = this.seenResult(observed, eventId);
+          if (result) return result;
+          const outcome = observed.outcomes.find((entry) => entry.sha === pendingSha);
+          if (!outcome)
+            throw new PublishError(`Pushed commit ${pendingSha} is absent from remote main`);
+          return this.outcomeResult(outcome, eventId);
         });
-        const path = eventPath(event.task_id, eventId);
-        if (parseEventPath(path) === null) throw new PublishError(`Invalid event path ${path}`);
-        const content = serializeEvent(event);
-        if (Buffer.byteLength(content, "utf8") > MAX_EVENT_BYTES) {
-          throw new PublishError(`Event ${eventId} exceeds ${MAX_EVENT_BYTES} bytes`);
-        }
-        const file = join(this.deps.clone.dir, path);
-        await mkdir(dirname(file), { recursive: true });
-        await writeFile(file, content, { flag: "wx", mode: 0o600 });
-        try {
-          await this.deps.git.run(["add", "--", path], { cwd: this.deps.clone.dir });
-        } catch (error) {
-          // A failed add can leave an untracked file that reset --hard will not discard (§7.2).
-          await rm(file, { force: true });
-          throw error;
-        }
-        const ident = { ...this.deps.ident, timestampSec: Math.floor(nowMs / 1000) };
-        pendingSha = await writeSignedCommit(this.deps.git, this.deps.clone.dir, {
-          tree: await writeTreeFromIndex(this.deps.git, this.deps.clone.dir),
-          parents: [state.tip],
-          author: ident,
-          committer: ident,
-          message: `${event.type} ${event.task_id ?? "_skep"} ${eventId}`,
-          signer,
-        });
-        await this.deps.git.run(["update-ref", "refs/heads/main", pendingSha, state.tip], {
-          cwd: this.deps.clone.dir,
-        });
-        await this.deps.git.run(["push", "origin", `${pendingSha}:refs/heads/main`], {
-          cwd: this.deps.clone.dir,
-        });
-        const observed = await this.observe();
-        const result = this.seenResult(observed, eventId);
-        if (result) return result;
-        const outcome = observed.outcomes.find((entry) => entry.sha === pendingSha);
-        if (!outcome)
-          throw new PublishError(`Pushed commit ${pendingSha} is absent from remote main`);
-        return this.outcomeResult(outcome, eventId);
       } catch (error) {
         lastError = error instanceof Error ? error.message : String(error);
         if (!(error instanceof GitError)) return { status: "failed", eventId, reason: lastError };

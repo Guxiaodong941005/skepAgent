@@ -11,7 +11,7 @@ import { backoffDelay } from "../util/backoff.js";
 import type { Clock } from "../util/clock.js";
 import type { RandomSource } from "../util/random.js";
 import type { BlackboardClone } from "./clone.js";
-import type { StateSource } from "./publisher.js";
+import { type StateSource, withCloneLock } from "./publisher.js";
 
 export class SyncError extends Error {
   constructor(message: string, options?: ErrorOptions) {
@@ -49,6 +49,10 @@ interface SyncDeps {
   rng: RandomSource;
   hints?: HintChannel;
   intervals?: Partial<SyncIntervals>;
+  /** F11: only work assigned to local slots should select the fast interval. */
+  isActive?: (state: State) => boolean;
+  /** F13: called under the clone lock after every fetch, including heartbeat-only changes. */
+  onFetch?: (state: State) => Promise<void>;
 }
 
 const IntervalsSchema = z
@@ -138,7 +142,8 @@ export class Sync implements StateSource {
   }
 
   replayTo(tip: Sha): Promise<State> {
-    return this.enqueue(async () => {
+    // Do not wait behind a poll queued on this clone: the publisher can already own its lock.
+    return withCloneLock(this.deps.clone, async () => {
       const requestedTip = ShaSchema.parse(tip);
       const cached = this.state;
       // A publisher's fetched tip can precede a concurrent poll's cache update (§7.2).
@@ -151,13 +156,28 @@ export class Sync implements StateSource {
       ) {
         return structuredClone(await this.fullReplay(requestedTip));
       }
-      return structuredClone(await this.readState(requestedTip));
+      const state = await this.readState(requestedTip);
+      await this.deps.onFetch?.(structuredClone(state));
+      return structuredClone(state);
+    }).catch((error: unknown) => {
+      if (error instanceof RangeError)
+        this.alarm(
+          "sync_failed",
+          "Reducer replay requires an upgrade; publishing is disabled",
+          error,
+        );
+      throw error;
     });
   }
 
   /** A delivery re-verification always fetches, even when the polling shortcut could apply. */
   observeNow(): Promise<State> {
     return this.enqueue(async () => structuredClone(await this.observe(true)));
+  }
+
+  /** A normal daemon tick preserves the adaptive poller's unchanged-ref shortcut (D18). */
+  pollNow(): Promise<State> {
+    return this.enqueue(async () => structuredClone(await this.observe(false)));
   }
 
   start(): Promise<void> {
@@ -196,7 +216,7 @@ export class Sync implements StateSource {
   }
 
   private enqueue<T>(work: () => Promise<T>): Promise<T> {
-    const result = this.tail.then(work);
+    const result = this.tail.then(() => withCloneLock(this.deps.clone, work));
     // A failed observation must not poison subsequent publisher or poller observations (§7.2).
     this.tail = result.then(
       () => undefined,
@@ -280,6 +300,7 @@ export class Sync implements StateSource {
     );
     const fetched = refsSnapshot(stdout, true);
     const state = await this.readState(fetched.main);
+    await this.deps.onFetch?.(structuredClone(state));
     this.fetchedRefsKey = fetched.key;
     this.fetchedAtMonoMs = this.deps.clock.monotonicMs();
     return state;
@@ -302,11 +323,12 @@ export class Sync implements StateSource {
   }
 
   private intervalMs(): number {
-    // No device identity is supplied by the Sync contract, so any unfinished task keeps polling
-    // active. The daemon may supply its configured intervals (§11.1).
-    const active = Object.values(this.state?.tasks ?? {}).some(
-      (task) => !TERMINAL_TASK_STATUSES.includes(task.status),
-    );
+    const active =
+      this.state && this.deps.isActive
+        ? this.deps.isActive(this.state)
+        : Object.values(this.state?.tasks ?? {}).some(
+            (task) => !TERMINAL_TASK_STATUSES.includes(task.status),
+          );
     const baseMs = active ? this.intervals.activeMs : this.intervals.idleMs;
     return backoffDelay(0, this.deps.rng, {
       baseMs,

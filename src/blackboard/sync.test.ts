@@ -129,6 +129,49 @@ function unitFixture(options: { intervals?: Partial<SyncIntervals>; rng?: Random
   return { sync, deps, refs, log, fetch, read, vt, clock, sleep, hints, alarms };
 }
 
+describe("daemon sync wiring", () => {
+  afterEach(() => vi.restoreAllMocks());
+  it("uses isActive(state) for local-work polling instead of remote unfinished tasks (F11)", async () => {
+    const f = unitFixture();
+    f.log.append({ type: "agent.registered", actor: MAC, payload: agentRegistered() });
+    f.log.append({
+      type: "task.created",
+      actor: "human",
+      payload: taskCreated({ owner: MAC, repo: "https://example.invalid/code.git" }),
+    });
+    f.refs.remote["refs/heads/main"] = f.log.tip;
+    const isActive = vi.fn(() => false);
+    const sync = new Sync({ ...f.deps, isActive });
+    await sync.start();
+    expect(isActive).toHaveBeenCalledWith(
+      expect.objectContaining({ tasks: expect.objectContaining({ [T1]: expect.any(Object) }) }),
+    );
+    expect(f.sleep.mock.calls.at(-1)?.[0]).toBe(90_000);
+    await sync.stop();
+    isActive.mockReturnValue(true);
+    await sync.start();
+    expect(f.sleep.mock.calls.at(-1)?.[0]).toBe(20_000);
+    await sync.stop();
+  });
+  it("observes heartbeat-only fetches and publisher replay under the same clone lock (F13)", async () => {
+    const f = unitFixture();
+    const onFetch = vi.fn(async (state: State) => {
+      state.seq = 999;
+    });
+    const sync = new Sync({ ...f.deps, onFetch });
+    await sync.observeNow();
+    f.refs.remote["refs/heads/hb/mac.coding"] = fakeSha("heartbeat-change");
+    await sync.pollNow();
+    expect(onFetch).toHaveBeenCalledTimes(2);
+    await sync.pollNow();
+    expect(f.fetch).toHaveBeenCalledTimes(2);
+    expect(onFetch).toHaveBeenCalledTimes(2);
+    await sync.replayTo(f.log.tip);
+    expect(onFetch).toHaveBeenCalledTimes(3);
+    expect(sync.current().state?.seq).toBe(0);
+  });
+});
+
 describe("sync observations and cache", () => {
   afterEach(() => vi.restoreAllMocks());
 
