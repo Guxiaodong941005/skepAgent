@@ -70,22 +70,22 @@
 
 | ID | Title | Depends on | Assignee | Files/area | Acceptance criteria | Status |
 |---|---|---|---|---|---|---|
-| SK-401 | Sim world, scheduler, faulty git, invariant checker, `empty` scenario | SK-301, SK-302, SK-303, SK-304 | codex | `src/sim/{world,faulty-git,invariants,runner}.ts`, `src/sim/scenarios/{index,empty}.ts`, `test/integration/sim/empty.test.ts`, `test/fixtures/keys/*`, `.gitleaks.toml` (fixed test keys moved here from SK-402) | 2 sim daemons on local bare repos with fixed test keys; seeded interleavings reproducible (same seed ⇒ same final tip sha); invariants checked every step | todo |
-| SK-402 | `skep sim run` command | SK-401, SK-104 | pi | `src/cli/commands/sim.ts` | (Keys moved to SK-401.) `skep sim run --seed 42 --scenario empty` prints result JSON with `--machine` | todo |
-| SK-403 | Lease intents, reverify, suspend detection | SK-201, SK-302 | codex | `src/core/intents.ts` (claim/release/revoke/deliver/fail/checkpoint builders), `src/lease/{reverify,suspend}.ts` (+ tests) | Intents return null when no longer valid; the claim intent returns null when `activeLeaseCount` (D16) reaches `max_parallel_items`; reverify does a fresh observation; suspend gap marks leases unverified | todo |
-| SK-404 | Protocol scenarios | SK-401, SK-403, SK-406 | codex | `src/sim/scenarios/{claim-race,lost-ack,fetch-flaky,forged-commits,sleep-wake-revoke,duplicate-boot,clock-skew}.ts` + tests | Each scenario passes for 50 seeds; sleep-wake-revoke: stale holder never delivers, new holder delivers once | todo |
-| SK-405 | Wave 2b/3 polish: tests and fixtures | SK-304, SK-305, SK-307 | pi | `src/core/reducer/{invariants.ts,replay.property.test.ts}`, `test/integration/golden.test.ts`, `test/fixtures/golden/*`, `test/helpers/golden-scenarios.ts`, `src/adapter/structured.{ts,test.ts}`, `src/transport/fake-hint.ts` | Follow-ups F1–F6 below: negative tests for `replan_budget`/`replan_budget_settle`; `checkInvariants` doc comment on caller state; seventh golden fixture `review-resume` (D20) and `example.invalid` PR URLs (one deliberate `SKEP_UPDATE_GOLDEN=1` run); golden update outside test collection; `extractJson` stray-brace fallback with a test; provider-transform round-trip tests (`toCodexOutputSchema` ⇒ nulls ⇒ normalize ⇒ Zod) for Plan/Review/WorkReport; `FakeHintChannel` publish-before-start documented | todo |
-| SK-406 | Wave 2b/3 polish: runtime, adapter, reducer, liveness | SK-202, SK-207, SK-303, SK-306 | codex | `src/exec/interrupt.{ts,test.ts}`, `src/adapter/codex.{ts,test.ts}`, `src/core/reducer/handlers/replan.{ts,test.ts}`, `src/blackboard/liveness.{ts,test.ts}` | Follow-ups F7–F10 below: ladder returns `killed` once SIGTERM was needed (contract in `adapter/types.ts`); `outputSchema: "off"` stops appending the schema to the prompt (prompts own it); coalesced `replan.requested` validates `payload.item` and `barrier.closed` throws on an impossible missing item (before the first live blackboard; golden hashes must stay unchanged or be regenerated deliberately); observer-side boot-id flip-flop alarm. **Must merge before SK-504** | todo |
+| SK-401 | Sim world, scheduler, faulty git, invariant checker, `empty` scenario | SK-301, SK-302, SK-303, SK-304 | codex | `src/sim/{world,faulty-git,invariants,runner}.ts`, `src/sim/scenarios/{index,empty}.ts`, `test/integration/sim/empty.test.ts`, `test/fixtures/keys/*`, `.gitleaks.toml` (fixed test keys moved here from SK-402) | 2 sim daemons on local bare repos with fixed test keys; seeded interleavings reproducible (same seed ⇒ same final tip sha); invariants checked every step | done (PASS_WITH_NOTES) |
+| SK-402 | `skep sim run` command | SK-401, SK-104 | pi | `src/cli/commands/sim.ts` | (Keys moved to SK-401.) `skep sim run --seed 42 --scenario empty` prints result JSON with `--machine` | done (PASS_WITH_NOTES) |
+| SK-403 | Lease intents, reverify, suspend detection | SK-201, SK-302 | codex | `src/core/intents.ts` (claim/release/revoke/deliver/fail/checkpoint builders), `src/lease/{reverify,suspend}.ts` (+ tests) | Intents return null when no longer valid; the claim intent returns null when `activeLeaseCount` (D16) reaches `max_parallel_items`; reverify does a fresh observation; suspend gap marks leases unverified | done (PASS) |
+| SK-404 | Protocol scenarios | SK-401, SK-403, SK-406 | codex | `src/sim/scenarios/{claim-race,lost-ack,fetch-flaky,forged-commits,sleep-wake-revoke,duplicate-boot,clock-skew}.ts` + tests | Each scenario passes for 50 seeds (`SKEP_SIM_SEEDS=50`; `npm test` defaults to 3 seeds per scenario plus the seed-42 outcome tests); sleep-wake-revoke: stale holder never delivers, new holder delivers once | done (PASS_WITH_NOTES; seed-tiering follow-up PASS) |
+| SK-405 | Wave 2b/3 polish: tests and fixtures | SK-304, SK-305, SK-307 | pi | `src/core/reducer/{invariants.ts,replay.property.test.ts}`, `test/integration/golden.test.ts`, `test/fixtures/golden/*`, `test/helpers/golden-scenarios.ts`, `src/adapter/structured.{ts,test.ts}`, `src/transport/fake-hint.ts` | Follow-ups F1–F6 below: negative tests for `replan_budget`/`replan_budget_settle`; `checkInvariants` doc comment on caller state; seventh golden fixture `review-resume` (D20) and `example.invalid` PR URLs (one deliberate `SKEP_UPDATE_GOLDEN=1` run); golden update outside test collection; `extractJson` stray-brace fallback with a test; provider-transform round-trip tests (`toCodexOutputSchema` ⇒ nulls ⇒ normalize ⇒ Zod) for Plan/Review/WorkReport; `FakeHintChannel` publish-before-start documented | done (PASS_WITH_NOTES) |
+| SK-406 | Wave 2b/3 polish: runtime, adapter, reducer, liveness | SK-202, SK-207, SK-303, SK-306 | codex | `src/exec/interrupt.{ts,test.ts}`, `src/adapter/codex.{ts,test.ts}`, `src/core/reducer/handlers/replan.{ts,test.ts}`, `src/blackboard/liveness.{ts,test.ts}` | Follow-ups F7–F10 below: ladder returns `killed` once SIGTERM was needed (contract in `adapter/types.ts`); `outputSchema: "off"` stops appending the schema to the prompt (prompts own it); coalesced `replan.requested` validates `payload.item` and `barrier.closed` throws on an impossible missing item (before the first live blackboard; golden hashes must stay unchanged or be regenerated deliberately); observer-side boot-id flip-flop alarm. **Must merge before SK-504** | done (PASS) |
 
 ## Wave 5 — execution core
 
 | ID | Title | Depends on | Assignee | Files/area | Acceptance criteria | Status |
 |---|---|---|---|---|---|---|
-| SK-501 | Code mirror, worktrees, sanitized agent env | SK-205, SK-206 | codex | `src/exec/{worktree,sandbox-env}.ts` (+ tests) | Mirror per allowlisted repo; worktree from base or predecessor SHA; env strips GIT_*, SSH_AUTH_SOCK, GH_TOKEN, credential helpers; optional uid/gid | todo |
-| SK-502 | Trusted checks runner, evidence verifier, secret scan | SK-501 | codex | `src/exec/{checks,evidence,secret-scan}.ts` (+ tests) | Checks only from `base_commit`; CheckRun + journal; file_span/command_run/check_run verification; gitleaks wrapper (skip with warning if absent in tests) | todo |
-| SK-503 | Code host interface, fake host, gh host | SK-205 | pi | `src/codehost/{types,fake,gh}.ts` (+ tests) | Interface per ARCHITECTURE §11.5; fake enforces one PR per head; gh implementation via `gh` JSON output (unit-tested with a stub runner) | todo |
+| SK-501 | Code mirror, worktrees, sanitized agent env | SK-205, SK-206 | codex | `src/exec/{worktree,sandbox-env}.ts` (+ tests) | Mirror per allowlisted repo; worktree from base or predecessor SHA; env strips GIT_*, SSH_AUTH_SOCK, GH_TOKEN, credential helpers; optional uid/gid | done (PASS_WITH_NOTES) |
+| SK-502 | Trusted checks runner, evidence verifier, secret scan | SK-501 | codex | `src/exec/{checks,evidence,secret-scan}.ts` (+ tests) | Checks only from `base_commit`; CheckRun + journal; file_span/command_run/check_run verification; gitleaks wrapper (skip with warning if absent in tests) | done (PASS after fix round; B1 secret-scan bypass fixed) |
+| SK-503 | Code host interface, fake host, gh host | SK-205 | pi | `src/codehost/{types,fake,gh}.ts` (+ tests) | Interface per ARCHITECTURE §11.5; fake enforces one PR per head; gh implementation via `gh` JSON output (unit-tested with a stub runner) | done (PASS_WITH_NOTES) |
 | SK-504 | Attempt pipeline + mechanical snapshot | SK-306, SK-307, SK-403, SK-406, SK-502, SK-503, SK-506 | codex | `src/exec/{attempt,snapshot}.ts` (+ tests) | Journaled steps per ARCHITECTURE §9.7; one fix-up; code first then record; reverify before PR and before `work.delivered`; snapshot from verifiable facts. **D19:** adapter output, check logs and journal records go through the `Redactor` (SK-506); before any publication `findSecrets` runs next to gitleaks and a hit ⇒ `work.failed{secret_detected}` with nothing published; the daemon adds no credentials to any agent, check, git or gh environment | todo |
-| SK-506 | Pattern-based secret redactor (D19 defence in depth) | SK-205 | codex | `src/exec/redact.ts`, `src/exec/journal.ts` (optional `redactor` constructor option) (+ tests) | ARCHITECTURE §16: `Redactor` with built-in rules for common key/token formats (provider-style API keys, GitHub tokens, private-key blocks, `*_KEY=`/`*_TOKEN=`/`*_SECRET=` assignments with high-entropy values) replacing matches with `[REDACTED:<rule>]`, including matches split across streamed chunks; `findSecrets(text)` for the pre-publication scan; journal records pass through the redactor before the fsync'd write (test: a record with a fake key such as `sk-test-…` never reaches disk); default no-op keeps SK-205 behaviour; Skep never loads provider credentials to redact (D19), so the redactor is pattern-based only; fixtures use obviously fake values allowlisted in gitleaks | todo |
+| SK-506 | Pattern-based secret redactor (D19 defence in depth) | SK-205 | codex | `src/exec/redact.ts`, `src/exec/journal.ts` (optional `redactor` constructor option) (+ tests) | ARCHITECTURE §16: `Redactor` with built-in rules for common key/token formats (provider-style API keys, GitHub tokens, private-key blocks, `*_KEY=`/`*_TOKEN=`/`*_SECRET=` assignments with high-entropy values) replacing matches with `[REDACTED:<rule>]`, including matches split across streamed chunks; `findSecrets(text)` for the pre-publication scan; journal records pass through the redactor before the fsync'd write (test: a record with a fake key such as `sk-test-…` never reaches disk); default no-op keeps SK-205 behaviour; Skep never loads provider credentials to redact (D19), so the redactor is pattern-based only; fixtures use obviously fake values allowlisted in gitleaks | done (PASS_WITH_NOTES) |
 | SK-505 | Restart reconciliation + crash scenario | SK-504, SK-401 | codex | `src/exec/reconcile.ts`, `src/sim/scenarios/crash-every-step.ts` (+ tests) | Crash at every journal step ⇒ no duplicate events, executions or PRs | todo |
 
 ## Wave 6 — daemon, flows, CLI
@@ -178,6 +178,10 @@ for SK-304).
 ---
 
 ## Wave 4 + early Wave 5 schedule
+
+> **Status: complete.** SK-401..SK-406, SK-501, SK-502, SK-503 and SK-506 are merged on `main`
+> (verdicts in the task tables and in `docs/reviews/`); open review notes are tracked under
+> "Wave 4 / early Wave 5 follow-ups" below.
 
 Baseline: `main` after Wave 2b/3 (all of SK-2xx and SK-30x merged; follow-ups F1–F21 listed under
 "Wave 2b/3 follow-ups"). This phase runs **all of Wave 4** (SK-401..SK-406) and, in parallel,
@@ -403,11 +407,26 @@ behaviour. An `Unreleased` section is kept at the top afterwards.
 * `npm access list packages @skepagent` (does the scope exist, and do we own it)
 * also search the npm registry for close look-alikes
 
+**Availability snapshot (orchestrator, 2026-10-06, read-only GET requests to the public npm
+registry):**
+
+* `skep`: **taken**, by an unrelated package (latest `0.0.2`, last modified 2022).
+* `skepd`, `skep-agent`, `skepagent`, `@skepagent/skep`: **404**, not published.
+* The npm org page for `skepagent`: **404**, so the org most likely does not exist yet.
+
+Re-run every check at release time; registry state can change.
+
 Decision criteria, in order:
 
-1. Use unscoped `skep` only if it is free **and** not confusable with an active package.
-2. Otherwise use a scope the project controls (e.g. `@skepagent/skep`, create the npm org first),
-   published with `--access public`.
+1. Unscoped `skep` is **not available** (see snapshot). Do not try to reclaim or name-squat it.
+2. **Preferred:** the scoped `@skepagent/skep`, after the human creates the `skepagent` npm org
+   (and ideally the matching GitHub org), published with `--access public`. The bin names stay
+   `skep` and `skepd`.
+3. Fallback, if the org cannot be created: an unscoped, still-free, non-confusable name such as
+   `skep-agent` (re-check with `npm view`), with the same bin names. Note the possible collision
+   of the `skep` *binary* with the unrelated package for users who install both.
+4. **The final choice is a human decision**, recorded in `docs/RELEASE.md` with the re-check
+   output.
 
 The binaries stay `skep` and `skepd` in either case, and `skepd` is not published as a separate
 package. Record the decision and the check output (date, command, result) in the release PR.
@@ -1119,6 +1138,39 @@ owned by the named future task; a task's brief inherits the items listed for it.
 | F19 | On restart, send SIGKILL to the recorded process group (ESRCH ignored) before declaring an attempt dead; journal start tokens verbatim and treat `""` as "not adoptable, kill the group" | SK-306 | SK-505 |
 | F20 | `skep status`: print `statusView` via `canonicalJson`; label `fetchedAtMonoMs` as "checked" (it includes unchanged `ls-remote` checks); render the 3–5 min liveness gap distinctly (a `late` label; architect decision with SK-604) | SK-204, SK-302, SK-303 | SK-604 |
 | F21 | Relay: enforce the topic format `^[a-z2-7]{26}$`, reuse `HintSchema` on both ends, `TextEncoder` instead of `Buffer` for sizes in the worker | SK-308 | SK-701 |
+
+---
+
+## Wave 4 / early Wave 5 follow-ups
+
+Collected from the Wave 4 / early Wave 5 reviews (`docs/reviews/SK-40x.md`, `SK-50x.md`). Each
+item is owned by the named future task; a task's brief inherits the items listed for it.
+Wave 2b/3 follow-ups closed in this phase: F1–F6 (SK-405), F7–F10 (SK-406), F15 (SK-403
+`claimCandidates`), F16 (SK-403 suspend listener hook; the daemon wiring remains SK-601).
+
+| # | Item | Source | Owner |
+|---|---|---|---|
+| G1 | Run the full sim sweep `SKEP_SIM_SEEDS=50 npx vitest run test/integration/sim` before release, and in any CI job; `npm test` keeps the 3-seed default | SK-404 | SK-610 |
+| G2 | Document the MVP limitation "moving an item to another agent requires a revoke plus a human-approved replan (no reassign event; claims require the plan assignee)" | SK-404 | SK-608 (runbook), SK-610 (release notes) |
+| G3 | Replace the scenarios' `ScriptedCode` with SK-503's `FakeCodeHost` (plus a `pullRequests()` listing for invariant 5); optionally move shared helpers out of `claim-race.ts` into `scenarios/common.ts` | SK-404 | SK-505 |
+| G4 | `skep sim run` outside a source checkout: the fixture keys resolve under `test/`; ship the sim fixtures in the package or fail with an actionable message | SK-401, SK-402 | SK-610 |
+| G5 | Machine envelope consistency: a failed sim run prints `{"ok":true,"result":{"ok":false…}}` with exit 1; add an `Output` path that prints top-level `ok:false` with the result. Also include `seed` and `scenario` in the `skep sim run` machine result | SK-402 | SK-603 / SK-604 |
+| G6 | Redactor hardening: cap `RedactionStream` buffering for newline-free output (redact and release beyond ~1 MiB, holding a tail); add bearer-token, JWT, Slack-token and URL-embedded-credential patterns | SK-506 | SK-504 |
+| G7 | Wire the redactor everywhere: journal, adapter log capture (streams), published or prompted check-log excerpts (raw logs stay local for evidence digests), PR and commit text; run `findSecrets` + gitleaks before every publication | SK-502, SK-506 | SK-504 |
+| G8 | Code-host hardening before use: reject a leading `-` in repo and ref names and pass `--flag=value`; read branch tips via `gh api …/git/ref/heads/<branch>` instead of HTTPS `ls-remote` (one auth path, no prompt; `GIT_TERMINAL_PROMPT=0` for any git call); enforce one PR per head in any state | SK-503 | SK-504 |
+| G9 | Record the `PrInfo` shape (`number, url, head, base, title, state, mergeSha`) in ARCHITECTURE §11.5 | SK-503 | architect (with SK-504) |
+| G10 | Reconcile PRs via the journaled PR number and `prState` before falling back to `findPr` (which only sees open PRs) | SK-503 | SK-505 |
+| G11 | Document `GH_TOKEN` for headless `gh` (passed explicitly; the daemon's own code-host credential, not a provider credential, D19) and the conservative check-env denylist (`*_KEY` etc. are stripped) | SK-503, SK-502 | SK-608 |
+| G12 | `resolveAgentUser`: call `/usr/bin/id` by absolute path; the daemon passes an agent-specific `PATH` (from config) to `agentEnv`, not its own | SK-501 | SK-601 |
+| G13 | Agents cannot run git in their worktree (daemon-owned `.git`): state it in the work prompt, and give fix-ups a read-only diff | SK-501 | SK-504 |
+| G14 | `ChecksRunner.load` and `scanSecrets` need the base commit in the mirror: fetch first (both now fail with "fetch first") | SK-502 | SK-504 |
+| G15 | `SuspendDetector`: isolate listener exceptions; implement the stale-lease loop (stale ⇒ journal `stale` ⇒ drop from `setHeldLeases` ⇒ re-verify) | SK-403 | SK-601 (loop also SK-504) |
+| G16 | Reducer `RangeError` on an impossible state ⇒ daemon enters read-only mode with an alarm (like a reducer-version mismatch), no crash loop; poll `LivenessTracker.alarms()` and route to status/ntfy | SK-406 | SK-601 |
+| G17 | Cap `extractJson`'s stray-brace fallback (O(n²) parse attempts on large malformed output) with a timing test; move the misplaced D14/D15 doc comment in `golden-scenarios.ts` | SK-405 | SK-504 |
+| G18 | Suppress the pre-existing gitleaks false positive in `src/git/trust.test.ts` (dummy `ssh-ed25519` body) so a full-history `gitleaks git` scan is clean | SK-502 fix round | SK-610 (or any earlier small fix) |
+| G19 | Optional cleanups: split `SimScheduler` out of `src/sim/world.ts`; per-scenario expectation hooks instead of one `switch` in `protocol.test.ts`; cap the per-agent superseded-boot set in `LivenessTracker` | SK-401, SK-404, SK-406 | SK-505 |
+
+Still open from Wave 2b/3: F11–F14, F17–F20 (SK-504/SK-505/SK-601/SK-604) and F21 (SK-701).
 
 ---
 
