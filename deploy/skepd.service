@@ -1,0 +1,62 @@
+# skepd — one daemon per Linux device (ARCHITECTURE §3, §11).
+#
+# The daemon is outbound-only (D18): it fetches the git remotes and, optionally, posts to an
+# ntfy URL. It never listens on a network port. The CLI reaches it through the Unix socket at
+# /var/lib/skep/skepd.sock (mode 0600, created by skepd itself).
+#
+# Install (paths are the packaged layout, not a checkout):
+#   install -d -m 0755 /etc/skep /usr/local/lib/skep
+#   install -m 0644 deploy/skepd.service /etc/systemd/system/skepd.service
+#   install -m 0755 dist/bin/skepd.js /usr/local/lib/skep/skepd.js
+#   systemctl daemon-reload && systemctl enable --now skepd.service
+#
+# State (device.toml, allowed_signers, the daemon signing key, the blackboard clone) lives in
+# /var/lib/skep, mode 0700, owned by User=. See docs/RUNBOOK.md for provisioning.
+
+[Unit]
+Description=Skep device daemon (signed git blackboard)
+Documentation=https://example.invalid/skep/runbook
+# Local filesystems only. No network-online dependency: a missing remote fails closed and
+# the daemon retries (D18); blocking boot on the network would not make progress correct.
+After=network.target
+
+[Service]
+Type=simple
+# Dedicated unprivileged user. The agent OS user is separate and named by --agent-user
+# (PRD §11.4); it must not be this user, or the agent could read the signing key.
+User=skep
+Group=skep
+# State root. skepd resolves device.toml, the trust root, the lock and the socket under it
+# (src/config/paths.ts). Never point this at a shared or agent-writable directory.
+Environment=SKEP_HOME=/var/lib/skep
+WorkingDirectory=/var/lib/skep
+# No NewPrivileges, and no ambient credentials (D19). Provider configuration lives in the
+# agent user's own home; GH_TOKEN, when a headless gh needs it, is a code-host credential
+# of this daemon user and is passed explicitly — see docs/RUNBOOK.md. It is not set here.
+NoNewPrivileges=true
+# ProtectSystem=strict makes the tree read-only except the paths below. /etc/skep holds
+# optional drop-ins (for example an explicit GH_TOKEN file); /var/lib/skep holds state.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/skep /etc/skep
+# Role directories and code mirrors must be writable, so this device adds them with a
+# drop-in: systemctl edit skepd.service → ReadWritePaths=/var/lib/skep/roles
+# The socket is created by skepd under SKEP_HOME; nothing here opens a port (D18).
+UMask=0077
+Restart=on-failure
+RestartSec=5s
+# SIGTERM stops the tick loop and releases the single-daemon lock (src/bin/skepd.ts).
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+# One slot in the MVP. Repeat --role-dir for a second role on this same device.
+# --agent-path is the only PATH the agent subprocess receives; it is not this unit's PATH.
+ExecStart=/usr/bin/node /usr/local/lib/skep/skepd.js \
+  --home /var/lib/skep \
+  --role-dir /var/lib/skep/roles/coding \
+  --agent-user skep-agent \
+  --agent-home /var/lib/skep-agent \
+  --agent-path /usr/local/bin:/usr/bin
+
+[Install]
+WantedBy=multi-user.target

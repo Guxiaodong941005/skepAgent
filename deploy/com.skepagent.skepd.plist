@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  skepd — one daemon per Mac (ARCHITECTURE §3, §11), supervised by launchd.
+
+  Outbound only (D18): no network listener, no socket in /tmp that other users can see.
+  The CLI talks to the Unix socket at ~/.skep/skepd.sock. The human key stays in ssh-agent
+  on this Mac and never moves to another device (PRD §11.2).
+
+  Install (the example account is "user"; substitute the local account name):
+    cp deploy/com.skepagent.skepd.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.skepagent.skepd.plist
+
+  Provisioning (skep init, the trust root, the agent CLI) is in docs/RUNBOOK.md. Do not put
+  provider credentials or GH_TOKEN in this plist (D19); a headless gh token, if this Mac is
+  the one running gh, goes in that user's own environment, not in the agent user's.
+-->
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>com.skepagent.skepd</string>
+
+    <key>ProgramArguments</key>
+    <array>
+      <string>/usr/local/bin/node</string>
+      <string>/usr/local/lib/skep/skepd.js</string>
+      <string>--home</string>
+      <string>/Users/user/.skep</string>
+      <string>--role-dir</string>
+      <string>/Users/user/.skep/roles/coding</string>
+      <string>--agent-user</string>
+      <string>skep-agent</string>
+      <string>--agent-home</string>
+      <string>/Users/skep-agent</string>
+      <string>--agent-path</string>
+      <string>/usr/local/bin:/usr/bin</string>
+    </array>
+
+    <!-- The daemon user home. device.toml and the signing key live under the home flag. -->
+    <key>WorkingDirectory</key>
+    <string>/Users/user/.skep</string>
+
+    <!-- No GH_TOKEN and no provider variable (D19). See docs/RUNBOOK.md. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+      <key>SKEP_HOME</key>
+      <string>/Users/user/.skep</string>
+    </dict>
+
+    <!-- launchd keeps it running; throttling avoids a crash loop (PRD §10.6). -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <!-- stdout/stderr only. skepd opens no TCP socket; the IPC socket is under the home directory. -->
+    <key>StandardOutPath</key>
+    <string>/Users/user/.skep/skepd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/user/.skep/skepd.err.log</string>
+  </dict>
+</plist>
