@@ -212,8 +212,6 @@ describe("stubs", () => {
     ["decide", TASK, "--replan", "--note", "try again"],
     ["decide", TASK, "--cancel"],
     ["decide", TASK, "--owner", "vps.coding"],
-    ["status"],
-    ["log", TASK],
     ["logs", AGENT],
     ["logs", AGENT, "--follow"],
     ["doctor"],
@@ -246,7 +244,8 @@ describe("stubs", () => {
 describe("--home", () => {
   it("overrides SKEP_HOME and the default for the resolved paths", async () => {
     const cap = capture({ SKEP_HOME: "/tmp/from-env" });
-    const code = await runCli(["--home", "rel/home", "status"], cap.ctx);
+    // `doctor` stays a stub, so the exit code is the skeleton's; `status` now reads a blackboard.
+    const code = await runCli(["--home", "rel/home", "doctor"], cap.ctx);
     expect(code).toBe(4);
     expect(cap.ctx.env.SKEP_HOME).toBe("rel/home");
     expect(cap.ctx.paths).toEqual(skepPaths("rel/home"));
