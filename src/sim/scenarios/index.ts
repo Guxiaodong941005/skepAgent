@@ -7,8 +7,12 @@ import { empty } from "./empty.js";
 import { fetchFlaky } from "./fetch-flaky.js";
 import { forgedCommits } from "./forged-commits.js";
 import { lostAck } from "./lost-ack.js";
+import { missingCheckpoint } from "./missing-checkpoint.js";
+import { replanEscalate } from "./replan-escalate.js";
+import { replanOnce } from "./replan-once.js";
 import { sleepWakeRevoke } from "./sleep-wake-revoke.js";
 import { soloHappy } from "./solo-happy.js";
+import { stackedDelivery } from "./stacked-delivery.js";
 import { teamStacked } from "./team-stacked.js";
 
 export interface Scenario {
@@ -29,7 +33,11 @@ export const scenarios: Readonly<Record<string, Scenario>> = {
   "clock-skew": clockSkew,
   "solo-happy": soloHappy,
   "team-stacked": teamStacked,
+  "stacked-delivery": stackedDelivery,
   "crash-every-step": crashEveryStep,
+  "replan-once": replanOnce,
+  "replan-escalate": replanEscalate,
+  "missing-checkpoint": missingCheckpoint,
 };
 
 export class UnknownScenarioError extends Error {
