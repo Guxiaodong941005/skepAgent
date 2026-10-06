@@ -63,11 +63,75 @@ const assignmentFixtures: Fixture[] = ["KEY", "TOKEN", "SECRET"].flatMap((suffix
   })),
 );
 
+// Synthetic, recognizable examples (SK-506 review note 2). None of these is a usable credential.
+const FAKE_JWT = [
+  "eyJ",
+  "hbGciOiJub25lIn0",
+  ".",
+  "eyJ",
+  "leGFtcGxlIjp0cnVlfQ",
+  ".",
+  "EXAMPLEFAKESIG",
+].join(""); // gitleaks:allow
+const FAKE_SLACK = `xoxb-${"0".repeat(12)}-${"a".repeat(12)}`; // gitleaks:allow
+
+const extraFixtures: Fixture[] = [
+  {
+    name: "Authorization bearer token",
+    rule: "bearer-token",
+    text: `Authorization: Bearer ${FAKE_BODY}\n`, // gitleaks:allow
+    redacted: "Authorization: Bearer [REDACTED:bearer-token]\n",
+  },
+  {
+    name: "lowercase bearer token",
+    rule: "bearer-token",
+    text: `authorization: bearer ${FAKE_BODY}\n`, // gitleaks:allow
+    redacted: "authorization: bearer [REDACTED:bearer-token]\n",
+  },
+  {
+    name: "Token scheme credential",
+    rule: "bearer-token",
+    text: `Token ${FAKE_BODY}\n`, // gitleaks:allow
+    redacted: "Token [REDACTED:bearer-token]\n",
+  },
+  {
+    name: "Basic scheme credential",
+    rule: "bearer-token",
+    text: `Basic ${FAKE_BODY}\n`, // gitleaks:allow
+    redacted: "Basic [REDACTED:bearer-token]\n",
+  },
+  {
+    name: "compact JWT",
+    rule: "jwt",
+    text: `before ${FAKE_JWT} after\n`, // gitleaks:allow
+    redacted: "before [REDACTED:jwt] after\n",
+  },
+  {
+    name: "Slack bot token",
+    rule: "slack-token",
+    text: `before ${FAKE_SLACK} after\n`, // gitleaks:allow
+    redacted: "before [REDACTED:slack-token] after\n",
+  },
+  ...["xoxa", "xoxp", "xoxs", "xoxe", "xoxr"].map((prefix) => ({
+    name: `${prefix} Slack token`,
+    rule: "slack-token" as const,
+    text: `before ${prefix}-${"1".repeat(16)} after\n`, // gitleaks:allow
+    redacted: "before [REDACTED:slack-token] after\n",
+  })),
+  {
+    name: "URL-embedded credential",
+    rule: "url-credential",
+    text: `clone https://user:${FAKE_BODY}@example.invalid/example/demo.git\n`, // gitleaks:allow
+    redacted: "clone https://user:[REDACTED:url-credential]@example.invalid/example/demo.git\n",
+  },
+];
+
 const fixtures = [
   ...tokenFixtures,
   ...githubFixtures,
   ...privateKeyFixtures,
   ...assignmentFixtures,
+  ...extraFixtures,
 ];
 
 describe("Redactor", () => {
@@ -92,6 +156,11 @@ describe("Redactor", () => {
       "-----BEGIN PUBLIC KEY-----\nEXAMPLE-PUBLIC-KEY\n-----END PUBLIC KEY-----",
       "ssh-ed25519 EXAMPLE-PUBLIC-KEY mac@example.invalid",
       `ORDINARY_VALUE=${FAKE_BODY}`,
+      "Bearer short",
+      "not a jwt: eyJhbGciOiJub25lIn0.not-json.eHh4",
+      "https://user@example.invalid/example/demo.git",
+      "https://example.invalid/path?token=visible",
+      "xoxb-short",
     ].join("\n");
     expect(redactor.redact(text)).toBe(text);
     expect(findSecrets(text)).toEqual([]);
@@ -149,6 +218,18 @@ describe("Redactor", () => {
     ]);
     expect(redactor.redact(text)).toBe(
       "EXAMPLE_TOKEN='[REDACTED:github-token]' EXAMPLE_KEY=[REDACTED:provider-api-key]",
+    );
+  });
+
+  it("redacts only the secret inside a bearer header and a URL, keeping the surrounding text", () => {
+    const text = `see Authorization: Bearer ${FAKE_BODY} at https://ci:${FAKE_BODY}@example.invalid/demo`; // gitleaks:allow
+    const found = findSecrets(text);
+    expect(found.map((match) => match.rule)).toEqual(["bearer-token", "url-credential"]);
+    expect(text.slice(found[0]?.start, found[0]?.end)).toBe(FAKE_BODY);
+    expect(text.slice(found[1]?.start, found[1]?.end)).toBe(FAKE_BODY);
+    expect(redactor.redact(text)).toBe(
+      "see Authorization: Bearer [REDACTED:bearer-token] at " +
+        "https://ci:[REDACTED:url-credential]@example.invalid/demo",
     );
   });
 
@@ -245,5 +326,58 @@ describe("Redactor streams", () => {
       expect(stream.push(token.slice(offset, offset + 13))).toBe("");
     }
     expect(stream.flush()).toBe("[REDACTED:provider-api-key]");
+  });
+
+  it("redacts and releases newline-free output beyond 2 MiB while holding a tail", () => {
+    const stream = redactor.createStream();
+    // The tail held back is 1 MiB, so the cut falls a mebibyte before the end. The token is
+    // planted across it: releasing without retreating would leak its prefix.
+    const token = FAKE_KEY;
+    const tail = 1024 * 1024;
+    const head = `${"a".repeat(tail - 40)} `;
+    // Spaces bound the token. Without them the run of filler is one long token character class,
+    // so there is no secret for the cut to retreat from.
+    const pad = ` ${"b".repeat(2 * tail - (tail - 40) - 1 - token.length)}`;
+    const text = `${head}${token}${pad}`;
+    expect(findSecrets(text)).toHaveLength(1);
+    const cut = text.length - tail;
+    expect(cut).toBeGreaterThan(head.length);
+    expect(cut).toBeLessThan(head.length + token.length);
+    expect(text.length).toBeGreaterThan(2 * 1024 * 1024);
+    const released = stream.push(text);
+    expect(released.length).toBeGreaterThan(0);
+    expect(released.length).toBeLessThan(text.length);
+    expect(released).not.toContain(FAKE_BODY);
+    expect(released).not.toContain("sk-");
+    expect(/^a+ ?$/.test(released)).toBe(true);
+    const rest = stream.flush();
+    expect(rest).not.toContain(FAKE_BODY);
+    expect(released + rest).toBe(`${head}[REDACTED:provider-api-key]${pad}`);
+  });
+
+  it("keeps holding an open private-key block even after the buffer passes 1 MiB", () => {
+    const stream = redactor.createStream();
+    const header = "-----BEGIN PRIVATE KEY-----\n"; // gitleaks:allow
+    expect(stream.push(header)).toBe("");
+    const body = "A".repeat(2 * 1024 * 1024 + 4096);
+    expect(stream.push(body)).toBe("");
+    expect(stream.push("\n-----END PRIVATE KEY-----")).toBe(""); // gitleaks:allow
+    expect(stream.flush()).toBe("[REDACTED:private-key]");
+  });
+
+  it("releases safe newline-free text ahead of an open private-key block past the cap", () => {
+    const stream = redactor.createStream();
+    const safe = "b".repeat(2 * 1024 * 1024);
+    const header = "-----BEGIN OPENSSH PRIVATE KEY-----"; // gitleaks:allow
+    const released = stream.push(safe + header);
+    // Everything released is the safe filler; the header and the tail ahead of it stay held.
+    expect(released.length).toBeGreaterThan(0);
+    expect(/^b+$/.test(released)).toBe(true);
+    expect(released.length).toBeLessThanOrEqual(safe.length);
+    expect(stream.push("still-open")).toBe("");
+    const rest = stream.flush();
+    expect(rest.endsWith("[REDACTED:private-key]")).toBe(true);
+    expect(rest).not.toContain("BEGIN");
+    expect(released + rest).toBe(`${safe}[REDACTED:private-key]`);
   });
 });

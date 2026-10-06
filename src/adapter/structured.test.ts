@@ -82,6 +82,24 @@ describe("extractJson", () => {
     expect(extractJson('prose { then {"text": "a { brace"}')).toEqual({ text: "a { brace" });
   });
 
+  it("gives up on the stray-brace fallback once the text exceeds the size cap", () => {
+    // The leading `{` keeps the forward scan from returning, so only the fallback could find the
+    // object. Past the cap it must not: a large malformed message is not scanned at all.
+    const object = '{"summary": "Example"}';
+    const capped = `{${"x".repeat(256 * 1024)} ${object}`;
+    expect(extractJson(capped)).toBeNull();
+    const under = `{${"x".repeat(1024)} ${object}`;
+    expect(extractJson(under)).toEqual({ summary: "Example" });
+  });
+
+  it("keeps the stray-brace fallback fast on a large brace-heavy message", () => {
+    // No complete object, so every `}` is a failed candidate. Unbounded this is O(n²) parses.
+    const text = "{ ".repeat(20_000);
+    const started = performance.now();
+    expect(extractJson(text)).toBeNull();
+    expect(performance.now() - started).toBeLessThan(1000);
+  });
+
   it.each([
     "",
     "No JSON here.",

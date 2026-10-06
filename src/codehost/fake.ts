@@ -12,8 +12,9 @@ import {
  *
  * Branch tips are read from the bare repo with the injected {@link GitRunner}; PR identity lives
  * only in memory, which is what the simulator needs (no network, deterministic numbers). The
- * registry asserts one open PR per head branch: a second `createPr` for the same head throws
- * rather than opening a duplicate the reducer could not tell apart.
+ * registry asserts one PR per head branch in any state (sim invariant 5, §13.2): a second
+ * `createPr` for the same head throws, whether the first is open, closed or merged, rather than
+ * opening a duplicate the reducer could not tell apart.
  */
 
 export interface FakeCodeHostOptions {
@@ -80,12 +81,13 @@ export class FakeCodeHost implements CodeHost {
     if (p.head === p.base) {
       throw new CodeHostError(`pull request head and base are both ${p.head}`);
     }
-    const existing = this.openForHead(repo, p.head);
+    const existing = this.prForHead(repo, p.head);
     if (existing !== undefined) {
-      // Invariant 5 (§13.2): at most one PR per head branch. Callers that retry after a crash
-      // must findPr and reuse; creating again would publish a second PR for the same branch.
+      // Invariant 5 (§13.2): at most one PR per head branch, in any state. A closed or merged PR
+      // for the same head is still the one PR that head may have; callers that retry after a
+      // crash must findPr (open) or prState (journaled number) and reuse it.
       throw new CodeHostError(
-        `repo ${repo} already has open pull request #${existing.number} for head ${p.head}`,
+        `repo ${repo} already has pull request #${existing.number} (${existing.state}) for head ${p.head}`,
       );
     }
     const headSha = await this.revParse(p.head);
@@ -196,6 +198,21 @@ export class FakeCodeHost implements CodeHost {
     return out.sort((a, b) => a.number - b.number);
   }
 
+  /**
+   * Listing for sim invariant 5 (§13.2): `{ repo, head }` for every PR, in any state. Not part of
+   * {@link CodeHost}; the simulator reads it to count PRs per head branch.
+   */
+  pullRequests(): readonly { repo: string; head: string; number: number; state: PrState }[] {
+    return [...this.byNumber.values()]
+      .sort((a, b) => a.number - b.number)
+      .map((stored) => ({
+        repo: stored.repo,
+        head: stored.head,
+        number: stored.number,
+        state: stored.state,
+      }));
+  }
+
   /** Two-parent merge commit. `merge-tree --write-tree` exits non-zero on conflicts. */
   private async mergeCommit(stored: StoredPr, baseSha: string, headSha: string): Promise<string> {
     const merged = await this.git.run(["merge-tree", "--write-tree", baseSha, headSha], {
@@ -240,11 +257,22 @@ export class FakeCodeHost implements CodeHost {
     return sha;
   }
 
+  /** The open PR for a head, if any. `findPr` only reuses an open PR (§11.4). */
   private openForHead(repo: string, head: string): StoredPr | undefined {
+    return this.prsForHead(repo, head).find((stored) => stored.state === "open");
+  }
+
+  /** Every PR for a head, in any state. Invariant 5 allows at most one. */
+  private prForHead(repo: string, head: string): StoredPr | undefined {
+    return this.prsForHead(repo, head)[0];
+  }
+
+  private prsForHead(repo: string, head: string): StoredPr[] {
+    const found: StoredPr[] = [];
     for (const stored of this.byNumber.values()) {
-      if (stored.repo === repo && stored.head === head && stored.state === "open") return stored;
+      if (stored.repo === repo && stored.head === head) found.push(stored);
     }
-    return undefined;
+    return found;
   }
 
   private assertOwnRepo(repo: string): void {
@@ -306,7 +334,8 @@ function toInfo(stored: StoredPr): PrInfo {
 
 /** Repo names and URLs are passed to `gh` as one argument; reject anything a shell could split. */
 function assertRepo(repo: string): void {
-  if (repo.length === 0 || repo.length > 512 || /[\0\r\n\t ]/.test(repo)) {
+  // A leading `-` is rejected so a repo name can never be read as an option (SK-503 review note 1).
+  if (repo.length === 0 || repo.length > 512 || repo.startsWith("-") || /[\0\r\n\t ]/.test(repo)) {
     throw new CodeHostError("repo must be a nonempty name or URL without whitespace");
   }
 }
@@ -319,6 +348,7 @@ function assertRefName(name: string, what: string): void {
   if (
     name.length === 0 ||
     name.length > 255 ||
+    name.startsWith("-") ||
     name.startsWith("/") ||
     name.endsWith("/") ||
     name.endsWith(".lock") ||

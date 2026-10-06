@@ -61,22 +61,44 @@ function scanObjects(text: string): unknown | null {
 }
 
 /**
+ * Bound on the stray-brace fallback (SK-405 review note 1). Past this the text is not a model
+ * object wrapped in a little prose, and scanning it is O(n²) parse attempts; give up instead.
+ */
+const STRAY_SCAN_MAX_CHARS = 256 * 1024;
+/**
+ * How many `{` candidates each `}` may try. The real object is the last one, so only the nearest
+ * opens are worth parsing; trying every earlier `{` is what made the scan quadratic.
+ */
+const STRAY_SCAN_MAX_CANDIDATES = 64;
+
+/**
  * Fallback for a stray unmatched `{` ahead of the real object (SK-307 review note 1). Only runs
  * when the forward scan found nothing, so the common path stays one pass. Later candidates
  * overwrite earlier ones, so the last object wins, matching the forward scan.
+ *
+ * Bounded (SK-405 review note 1 / G17): text longer than {@link STRAY_SCAN_MAX_CHARS} is not
+ * scanned, and each `}` tries at most {@link STRAY_SCAN_MAX_CANDIDATES} earlier `{` positions.
  */
 function scanAfterStrayBrace(text: string): unknown | null {
+  if (text.length > STRAY_SCAN_MAX_CHARS) return null;
   // The stray `{` is never closed, so no `}` returns the stack to empty. Any `}` can end the
   // object; the parse attempt decides. Braces inside strings or inside a top-level array are not
   // candidates: the schemas are objects, and an array wrapping one must stay invisible exactly as
   // the forward scan leaves it.
   const skipped = nonCandidateBraces(text);
+  const opens: number[] = [];
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === "{" && !skipped.has(i)) opens.push(i);
+  }
   let last: unknown = null;
   for (let end = 0; end < text.length; end++) {
     if (text[end] !== "}" || skipped.has(end)) continue;
-    // The nearest `{` that parses wins for this `}`; a later `}` then overwrites it.
-    for (let start = end; start >= 0; start--) {
-      if (text[start] !== "{" || skipped.has(start)) continue;
+    // The nearest `{` that parses wins for this `}`; a later `}` then overwrites it. Only the
+    // nearest opens are candidates, so a brace-heavy blob cannot attempt a parse per pair.
+    const from = Math.max(0, opens.length - STRAY_SCAN_MAX_CANDIDATES);
+    for (let candidate = opens.length - 1; candidate >= from; candidate--) {
+      const start = opens[candidate] ?? -1;
+      if (start < 0 || start >= end) continue;
       try {
         const value: unknown = JSON.parse(text.slice(start, end + 1));
         if (isObject(value)) last = value;
