@@ -1,4 +1,15 @@
 #!/usr/bin/env node
-// Entry point for the `skep` CLI. Replaced by the Commander program in SK-104.
-process.stderr.write("skep: CLI not implemented yet (see docs/DEV-PLAN.md SK-104)\n");
-process.exitCode = 2;
+
+import process from "node:process";
+import { runCli } from "../cli/program.js";
+
+const ctx = {
+  stdout: process.stdout,
+  stderr: process.stderr,
+  env: process.env,
+  output(): never {
+    throw new Error("output() called before runCli bound it");
+  },
+};
+
+process.exitCode = await runCli(process.argv.slice(2), ctx);
