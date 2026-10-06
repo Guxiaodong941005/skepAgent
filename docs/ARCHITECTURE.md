@@ -947,7 +947,14 @@ dates from the virtual clock, fixed identities ⇒ identical SHAs for identical 
    nothing.
 5. ≤ 1 PR per head branch; every accepted `work.delivered.head_sha` exists on the code remote at
    that branch.
-6. `replan_count ≤ budget` unless status is `escalated`; review rounds likewise.
+6. Budgets escalate at the transition that exceeds them (D5, D12, D20): (a) every accepted event
+   that raises `replan_count` above `budgets.replans` opens a barrier with `escalate: true`, and a
+   barrier with `escalate: true` only ever settles into `escalated`, never `replanning`; (b) every
+   accepted event that raises `review_rounds` above `budgets.review_rounds` leaves the task
+   `escalated`. A counter may stay above its budget afterwards: `replan_count` is lifetime, and
+   `human.decided{resume_with_plan}` resets neither counter (D12). So a resumed task may be
+   `executing` over budget, and an over-budget barrier is `interrupting` until its leases settle;
+   the next replan or rejected proposal escalates again.
 7. `main` contains zero heartbeat commits; each `hb/*` ref has exactly one (orphan) commit.
 8. Task status agrees with its items (D15): `executing` ⇒ at least one item is not
    `delivered`/`merged`; `delivered` ⇒ every item is `delivered`/`merged` and not all `merged`;
@@ -1016,6 +1023,7 @@ before a task is done.
 | D17 | **WITHDRAWN / REJECTED.** Proposed: end-to-end encrypted sync of one provider config (API key, base URL, model) from the controller to one device × agent. | Rejected by the user: confidentiality of provider secrets in transit and at rest across devices cannot be guaranteed (stolen device keys decrypt captured ciphertext, git hosts retain unreachable objects, the receiving agent can read the key anyway). No design, schema, event or code from it remains; replaced by the hard rule D19. The number is kept so references stay unambiguous. |
 | D18 | No mesh VPN or fixed IP: the hosted git remote is the only rendezvous and authority (adaptive polling, `ls-remote` short-circuit); an optional outbound-only WebSocket relay carries only rate-limited wake-up hints (V1) and never secrets or payloads; direct P2P rejected. Tailscale-dependent features move to signed enrollment/trust bundles (public keys and `allowed_signers` only), local `skep logs` + heartbeat summary for remote agents, and relay hints. Design in §17 | Deviates from PRD §1, §5, §6.1, §11.2, §15.2 and §18, which assume a tailnet. Devices behind NAT, laptops and phones cannot rely on inbound reachability; correctness already comes from signed git (PRD §10), so a transport needs only availability. Polling latency (~10 s active) is small next to work-item durations, so the relay is an optimisation, not a dependency; P2P would need the relay for signalling anyway plus TURN. |
 | D19 | Hard rule / non-goal: Skep never transports, stores, syncs or brokers provider credentials, API keys or provider configurations between devices, in any form: not as plaintext, not as ciphertext, not as a hash, and not as a label. Each device's agent CLIs are configured locally by the human on that device; Skep neither reads nor records that configuration. No provider label either: `agent.registered` carries only `agent_cli` + `cli_version`, and `skep doctor` checks only that the pinned CLI is present (PRD §13.3 step 3's "provider name + config hash" is dropped). Defence in depth: gitleaks + a pattern-based redactor on everything Skep writes or publishes (§16) | Restores and strengthens PRD §3.2 ("no secret storage or secret distribution through the blackboard") and §11.5 after D17 was rejected. A label or hash would be useless to the protocol (routing uses agent IDs, capabilities and `requires_local`) and a hash of a low-entropy config can be guessed. Keeping provider setup entirely local means a blackboard, relay or git-host compromise can never yield a credential. |
+| D20 | Invariant 6 is checked per transition, not per state: the event that pushes `replan_count` or `review_rounds` over budget must escalate (for replans, via a barrier with `escalate: true` that settles only into `escalated`). Counters may legitimately remain over budget afterwards. | The earlier wording ("`replan_count ≤ budget` unless status is `escalated`") is false for legal logs. `replan_count` is lifetime (§5.5, D12) and `resume_with_plan` resets no counter, so a resumed task is `executing` over budget. An over-budget barrier stays `interrupting` until its holders settle (§5.5). Found in the SK-304 review: the literal check flagged a legal review-round escalation followed by `resume_with_plan`. |
 
 ---
 
