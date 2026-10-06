@@ -86,16 +86,17 @@
 | SK-503 | Code host interface, fake host, gh host | SK-205 | pi | `src/codehost/{types,fake,gh}.ts` (+ tests) | Interface per ARCHITECTURE §11.5; fake enforces one PR per head; gh implementation via `gh` JSON output (unit-tested with a stub runner) | done (PASS_WITH_NOTES) |
 | SK-504 | Attempt pipeline + mechanical snapshot | SK-306, SK-307, SK-403, SK-406, SK-502, SK-503, SK-506 | codex | `src/exec/{attempt,snapshot}.ts` (+ tests) | Journaled steps per ARCHITECTURE §9.7; one fix-up; code first then record; reverify before PR and before `work.delivered`; snapshot from verifiable facts. **D19:** adapter output, check logs and journal records go through the `Redactor` (SK-506); before any publication `findSecrets` runs next to gitleaks and a hit ⇒ `work.failed{secret_detected}` with nothing published; the daemon adds no credentials to any agent, check, git or gh environment | todo |
 | SK-506 | Pattern-based secret redactor (D19 defence in depth) | SK-205 | codex | `src/exec/redact.ts`, `src/exec/journal.ts` (optional `redactor` constructor option) (+ tests) | ARCHITECTURE §16: `Redactor` with built-in rules for common key/token formats (provider-style API keys, GitHub tokens, private-key blocks, `*_KEY=`/`*_TOKEN=`/`*_SECRET=` assignments with high-entropy values) replacing matches with `[REDACTED:<rule>]`, including matches split across streamed chunks; `findSecrets(text)` for the pre-publication scan; journal records pass through the redactor before the fsync'd write (test: a record with a fake key such as `sk-test-…` never reaches disk); default no-op keeps SK-205 behaviour; Skep never loads provider credentials to redact (D19), so the redactor is pattern-based only; fixtures use obviously fake values allowlisted in gitleaks | done (PASS_WITH_NOTES) |
+| SK-507 | Wave 5 hardening: code host, redactor, structured fallback | SK-503, SK-506, SK-405 | pi | `src/codehost/{gh,fake}.ts`, `src/exec/redact.ts`, `src/adapter/structured.ts`, `test/helpers/golden-scenarios.ts` (+ tests) | Follow-ups G6, G8, G17 (see "Wave 5 remainder + Wave 6 schedule"); no exported signature changes, so SK-504 runs in parallel | todo |
 | SK-505 | Restart reconciliation + crash scenario | SK-504, SK-401 | codex | `src/exec/reconcile.ts`, `src/sim/scenarios/crash-every-step.ts` (+ tests) | Crash at every journal step ⇒ no duplicate events, executions or PRs | todo |
 
 ## Wave 6 — daemon, flows, CLI
 
 | ID | Title | Depends on | Assignee | Files/area | Acceptance criteria | Status |
 |---|---|---|---|---|---|---|
-| SK-601 | Daemon tick loop, slots, duties, plan validator | SK-504, SK-302, SK-303 | codex | `src/daemon/{daemon,slots,duties,lock}.ts`, `src/exec/plan-validator.ts`, `src/bin/skepd.ts` | Owner plans, reviewer reviews, assignee claims & executes; single-daemon lock; scenarios `solo-happy`, `team-stacked` pass. Claim duty uses `claimableItems` (D16: a parked lease in an escalated/replanning task does not stop the slot from claiming elsewhere); a `delivered` task may appear directly after an activation (D15) and must trigger the owner's verification duty (SK-606). **D18:** daemon wires a `HintChannel` (null by default) into sync and publishes a `tip` hint after each accepted publish; nothing in the daemon requires inbound connectivity | todo |
+| SK-601 | Daemon tick loop, slots, duties, plan validator | SK-504, SK-302, SK-303, SK-602 | codex | `src/daemon/{daemon,slots,duties,lock}.ts`, stub `src/daemon/{replan,delivery}.ts`, `src/sim/scenarios/{index,solo-happy,team-stacked}.ts`, `src/exec/plan-validator.ts`, `src/bin/skepd.ts` | Owner plans, reviewer reviews, assignee claims & executes; single-daemon lock; scenarios `solo-happy`, `team-stacked` pass. Claim duty uses `claimableItems` (D16: a parked lease in an escalated/replanning task does not stop the slot from claiming elsewhere); a `delivered` task may appear directly after an activation (D15) and must trigger the owner's verification duty (SK-606). **D18:** daemon wires a `HintChannel` (null by default) into sync and publishes a `tip` hint after each accepted publish; nothing in the daemon requires inbound connectivity | todo |
 | SK-602 | IPC protocol, server, client with sign callback | SK-301 | pi | `src/ipc/{protocol,client}.ts`, `src/daemon/ipc-server.ts` (+ tests) | NDJSON frames per ARCHITECTURE §12; sign_request/sign_result round trip; version mismatch error; socket perms 0600 | todo |
-| SK-603 | CLI write commands (task, plan, lease, decide, replan, cancel) | SK-602, SK-403 | pi | `src/cli/commands/{task,plan,lease,decide,replan}.ts` | Each command builds the intent, publishes via daemon or in-process fallback, prints accepted/rejected with `#seq`; language guard on `task new` | todo |
-| SK-604 | `skep status`, `skep log`, `skep plan show` rendering | SK-204, SK-602 | pi | `src/cli/commands/{status,log}.ts`, `src/cli/render-status.ts` | Matches PRD §15.1 layout; `--machine` stable JSON; revoke suggestions for stale holders; shows sync freshness and hint-channel health (D18); shows nothing about providers (D19) | todo |
+| SK-603 | CLI write commands (task, plan, lease, decide, replan, cancel) | SK-602, SK-403 | pi | `src/cli/commands/{task,plan,lease,decide,replan,agent,sim}.ts`, `src/cli/output.ts`, `src/core/{intents-human,intent-spec}.ts` (incl. `plan show`, moved from SK-604) | Each command builds the intent, publishes via daemon or in-process fallback, prints accepted/rejected with `#seq`; language guard on `task new` | todo |
+| SK-604 | `skep status`, `skep log` rendering (`plan show` moved to SK-603) | SK-204, SK-602 | pi | `src/cli/commands/{status,log}.ts`, `src/cli/render-status.ts` | Matches PRD §15.1 layout; `--machine` stable JSON; revoke suggestions for stale holders; shows sync freshness and hint-channel health (D18); shows nothing about providers (D19) | todo |
 | SK-605 | Coarse replan flow in the daemon | SK-601 | codex | `src/daemon/replan.ts`, scenarios `replan-once`, `replan-escalate`, `missing-checkpoint` | Interrupt ladder → snapshot → WIP push → checkpoint; barrier deadline ⇒ barrier.closed; third replan escalates | todo |
 | SK-606 | Stacked delivery, task.verified, merge observation & retarget | SK-601, SK-209 | codex | `src/daemon/delivery.ts` (+ scenario test) | W2 starts from W1 delivered SHA, PR base = W1 branch; top-of-stack verification; merged PRs ⇒ item.merged, next PR retargeted. **D14:** owner duty runs when the task is `delivered` ∧ `verified == null` (also after a D15 re-activation); runs every item's acceptance checks once at the top-of-stack SHA; publishes `task.verified{passed, check_runs}` — on failure `passed: false` (**never** `work.failed`, no automatic re-run) and notifies the human. Scenario: failing combined check ⇒ `escalated` (`verification_failed`); `skep decide --resume` ⇒ `delivered` ⇒ re-verify passes ⇒ merges ⇒ `done` | todo |
 | SK-607 | `skep init`, `skep doctor`, ntfy notifier | SK-301, SK-206 | pi | `src/cli/commands/{init,doctor}.ts`, `src/notify/ntfy.ts` | init writes device.toml, generates daemon key, prints allowed_signers line, optional genesis; doctor runs PRD §13.3 pre-flight + full replay + invariants. **D18:** no step assumes Tailscale or inbound SSH; doctor checks outbound reachability of the blackboard and code remotes only, and reports the optional relay as a warning, never an error | todo |
@@ -475,6 +476,300 @@ Verify with `npm pack --dry-run`: the file list contains no test keys, fixtures 
 8. LICENSE present, `package.json` fields as above, `npm pack --dry-run` reviewed, and the name
    decision recorded.
 9. Human sign-off on the tag and the publish command (the release task itself never publishes).
+
+---
+
+## Wave 5 remainder + Wave 6 schedule
+
+Baseline: `main` with Waves 1–4 and SK-501/502/503/506 merged (see the task tables and
+"Wave 4 / early Wave 5 follow-ups"). Scope of this phase: **SK-504, SK-505, SK-507 (new, split out
+of SK-504), and SK-601..SK-608**. **SK-609 (real two-device run) and SK-610 (release) are not
+scheduled.** Cap: **5 implementer panes** (6 including the architect/orchestrator). One worktree
++ branch + pane per task, branched from the latest `main` when the task starts. codex cannot
+commit inside its sandbox, and 7 subprocess-stdout tests fail only there; judge `npm test` outside
+it. `npm test` takes a few minutes; the sim sweeps use `SKEP_SIM_SEEDS` (default 3, acceptance
+sweep 50).
+
+**Rules for every task in this phase:**
+
+* AGENTS.md conventions apply.
+* Generic example values only; never absolute host paths, hostnames, IPs or emails in the repo
+  (use `example.invalid`, temp dirs, fixture agent IDs).
+* **D19:** Skep never reads, stores, passes or logs provider credentials or configs. Agents get
+  `agentEnv` only, and anything published or prompted passes the redactor and the secret scan.
+* **D18:** no inbound connectivity, no device-to-device sockets; the git remote is the only
+  authority; hints are optional.
+* Tests use `SKEP_HOME` temp dirs, local bare repos, fake adapters and fake code hosts.
+
+### SK-209 dependency (SK-606)
+
+SK-606 depends on SK-209 ("close SK-201 protocol gaps D14–D16"). **SK-209 is `done (architect)`**:
+D14 (`task.verified{passed:false}` ⇒ `escalated`), D15 (activation status) and D16
+(`activeLeaseCount`) are on `main`, with tests. Nothing needs to be folded into SK-606 or decided
+by the human; SK-606 builds on that reducer behaviour as it is.
+
+### Dependency / conflict analysis
+
+| Task | Prerequisites | Shared files / exports, and resolution | Verdict |
+|---|---|---|---|
+| SK-504 (codex) | all merged (SK-306/307/403/406/502/503/506) | New `src/exec/{attempt,snapshot}.ts`. Consumes code host, redactor and structured runner **unchanged**; their hardening is split into SK-507 so SK-504 does not edit them. | **A** (critical path) |
+| SK-507 (pi, **new**) | none | Owns follow-up edits to `src/codehost/{gh,fake}.ts`, `src/exec/redact.ts`, `src/adapter/structured.ts`, `test/helpers/golden-scenarios.ts` (doc comment only). **No exported signature changes**, so SK-504 can build in parallel. | **A** |
+| SK-602 (pi) | SK-301 ✓ | New `src/ipc/{protocol,client}.ts`, `src/daemon/ipc-server.ts`; adds an IPC client factory to `src/cli/context.ts` (sole editor in Batch A). **Owns the `IpcHandlers` interface and the `IntentSpec` Zod schema** that SK-601 implements and SK-603 sends. | **A** |
+| SK-607 (pi) | SK-301 ✓, SK-206 ✓ | `src/cli/commands/{init,doctor}.ts`, `src/notify/ntfy.ts`. Independent. | **A** |
+| SK-601 (codex) | **SK-504**, SK-302 ✓, SK-303 ✓, SK-602 (for `IpcHandlers`; it merges first in practice) | Owns `src/daemon/{daemon,slots,duties,lock}.ts`, `src/exec/plan-validator.ts`, `src/bin/skepd.ts`; creates **stub** `src/daemon/{replan,delivery}.ts` with final signatures for SK-605/606 to fill (no later edits to `duties.ts` needed). Small owned edits to `src/blackboard/{publisher,sync}.ts` (clone lock, `isActive`) and `src/lease/suspend.ts` (listener isolation): nobody else edits them in this phase. **Owns `src/sim/scenarios/index.ts` during Batch B.** | **B**, after SK-504 |
+| SK-505 (codex) | **SK-504**, SK-401 ✓ | `src/exec/reconcile.ts`, `src/sim/scenarios/crash-every-step.ts` (+ tests). **Does not edit `scenarios/index.ts`** (SK-601 owns it in Batch B); its test drives the scenario directly, and SK-601 (or the orchestrator at merge, one line) registers it. G3/G19 edits to existing scenario files and the SK-404 protocol test are SK-505's; SK-601 must not touch them. | **B**, after SK-504 |
+| SK-603 (pi) | **SK-602**, SK-403 ✓ | `src/cli/commands/{task,plan,lease,decide,replan,agent}.ts`, a new pure `src/core/intents-human.ts` (human builders; `core/intents.ts` stays SK-403's) and `src/core/intent-spec.ts` (`intentFromSpec`), plus **`src/cli/output.ts`** and `src/cli/commands/sim.ts` (G5). **`plan show` moves here** because SK-603 owns `plan.ts`. | **B**, after SK-602 |
+| SK-604 (pi) | **SK-602**, SK-204 ✓ | `src/cli/commands/{status,log}.ts`, `src/cli/render-status.ts`. Must not edit `output.ts` (SK-603 owns it); uses `output.result()` and prints via `canonicalJson`. | **B**, after SK-602 |
+| SK-605 (codex) | **SK-601** | Fills the stub `src/daemon/replan.ts`; owns `scenarios/index.ts` in Batch C and adds its three scenarios. | **C**, after SK-601 |
+| SK-606 (codex) | **SK-601**, SK-209 ✓ | Fills the stub `src/daemon/delivery.ts`; its scenario test drives the scenario directly and the registry line is added by SK-605 or the orchestrator. | **C**, after SK-601 |
+| SK-608 (pi) | **SK-601** (needs final daemon flags and paths) | `deploy/*`, `docs/RUNBOOK.md`. | **C**, after SK-601 |
+
+**Interfaces later tasks must match:**
+
+* `IpcHandlers` / `IntentSpec` (SK-602 ⇒ SK-601, SK-603).
+* `intentFromSpec(spec): Intent` (SK-603 ⇒ SK-601). SK-601's publish handler takes an injected
+  `resolveIntent`. Whichever of SK-601/SK-603 merges **second** wires `intentFromSpec` into
+  `src/bin/skepd.ts`, a one-line exception to ownership.
+* `ReplanDuty` / `DeliveryDuty` stub signatures (SK-601 ⇒ SK-605/606).
+* `AttemptRunner` and the journal step names (SK-504 ⇒ SK-505, SK-601).
+
+### Schedule
+
+| Batch | Task | Implementer | Gate | Files owned |
+|---|---|---|---|---|
+| A | SK-504 | codex | now | `src/exec/{attempt,snapshot}.ts` (+ tests) |
+| A | SK-507 | pi | now | `src/codehost/{gh,fake}.ts`, `src/exec/redact.ts`, `src/adapter/structured.ts`, `test/helpers/golden-scenarios.ts` (+ tests) |
+| A | SK-602 | pi | now | `src/ipc/{protocol,client}.ts`, `src/daemon/ipc-server.ts`, `src/cli/context.ts` (+ tests) |
+| A | SK-607 | pi | now | `src/cli/commands/{init,doctor}.ts`, `src/notify/ntfy.ts` (+ tests) |
+| B | SK-601 | codex | SK-504 merged (SK-602 merged) | `src/daemon/{daemon,slots,duties,lock}.ts`, stub `src/daemon/{replan,delivery}.ts`, `src/exec/plan-validator.ts`, `src/bin/skepd.ts`, `src/blackboard/{publisher,sync}.ts` (F11/F12 only), `src/lease/suspend.ts` (G15 only), `src/sim/scenarios/{index,solo-happy,team-stacked}.ts`, tests |
+| B | SK-505 | codex | SK-504 merged | `src/exec/reconcile.ts`, `src/sim/scenarios/crash-every-step.ts`, G3/G19 edits in `src/sim/scenarios/*` (not `index.ts`), `src/sim/world.ts`/`scheduler.ts` split, `test/integration/sim/*` |
+| B | SK-603 | pi | SK-602 merged | `src/cli/commands/{task,plan,lease,decide,replan,agent,sim}.ts`, `src/cli/output.ts`, `src/core/{intents-human,intent-spec}.ts` (+ tests) |
+| B | SK-604 | pi | SK-602 merged | `src/cli/commands/{status,log}.ts`, `src/cli/render-status.ts` (+ tests) |
+| C | SK-605 | codex | SK-601 merged | `src/daemon/replan.ts`, `src/sim/scenarios/{index,replan-once,replan-escalate,missing-checkpoint}.ts` (+ tests) |
+| C | SK-606 | codex | SK-601 merged | `src/daemon/delivery.ts`, `src/sim/scenarios/stacked-delivery.ts` (+ test) |
+| C | SK-608 | pi | SK-601 merged | `deploy/*`, `docs/RUNBOOK.md` |
+
+**Fill order when a pane frees** (first one whose gate is met; never more than 5 implementers):
+SK-601 → SK-505 → SK-603 → SK-604 → SK-605 → SK-606 → SK-608. The critical path is SK-504 ⇒
+SK-601 ⇒ SK-605/SK-606 (⇒ SK-609). Expected shape: Batch A uses 4 panes; when SK-602 merges,
+SK-603/SK-604 start; when SK-504 merges, SK-601 and SK-505 start (up to 5 panes); SK-605/606/608
+start after SK-601.
+
+**Held back:**
+
+* **SK-609:** real two-device run; the human must provision devices, repos, keys and local agent
+  CLI logins, and it needs every MVP task merged.
+* **SK-610:** release; depends on SK-609 plus human sign-off on the name and publish.
+* Their follow-ups (G1 full 50-seed sweep, G2 release-notes part, G4 sim packaging, G18 gitleaks
+  false positive) stay with SK-609/SK-610.
+* Wave 7 (MVP+).
+
+### Briefs
+
+**SK-504 — Attempt pipeline + mechanical snapshot (codex, A).** Spec: ARCHITECTURE §9.6–§9.7,
+§6.3, §7.5, §10.7, §16, D19, D21; PRD §9.6, §10.6–§10.7.
+
+Build `src/exec/attempt.ts`: an `AttemptRunner` that runs the journaled steps of §9.7 in order:
+
+```text
+claimed → worktree_created → preflight_ok → invoked → invocation_done → committed
+        → checks → [one fixup] → secret_scan_ok → pushed → reverified → pr → reverified
+        → delivered_published
+```
+
+It produces `work.failed{class}` or `checkpointed` on the side exits. Dependencies are injected:
+`CodeMirror`, `agentEnv`, `runStructured` + adapter, `ChecksRunner`, `scanSecrets`, `Redactor`,
+`CodeHost`, `reverify`, `Publisher`, `Journal` and `Clock`. Build `src/exec/snapshot.ts`: a
+mechanical `skep.snapshot/v1` made only from verifiable facts (diffstat, head, pushed,
+`invocation_state`, check runs).
+
+Acceptance criteria (row) **plus**:
+
+* **F17:** persist the publish `eventId` in the journal before the first attempt; recovery
+  re-publishes with `opts.eventId`.
+* **F18:** bound the interrupt ladder with an attempt-level timeout; record
+  `invocation_state: unknown` if the group never exits.
+* **G7:** redact the journal, adapter capture (streams), prompted or published log excerpts, and
+  PR/commit text; run `findSecrets` + gitleaks before every publication, and a hit ⇒
+  `work.failed{secret_detected}` with nothing published.
+* **G13:** the work prompt states the worktree has no usable git; fix-ups receive a read-only diff.
+* **G14:** fetch the mirror before `ChecksRunner.load`/`scanSecrets`.
+* **G15 (attempt side):** reverify `stale` ⇒ journal `stale`, keep the branch, no PR, no event.
+
+Code first, then record (§7.5). Check and git subprocesses get no agent or provider env. Use
+FakeAdapter + FakeCodeHost + local bare repos.
+
+Pitfalls:
+
+* Never publish model text unredacted.
+* Commit as the daemon; the agent never touches `.git`.
+* Every step must be idempotent for SK-505.
+
+Test: `npx vitest run src/exec`.
+
+**SK-507 — Wave 5 hardening (pi, A; new).** Picks up:
+
+* **G6:** cap `RedactionStream` buffering for newline-free output (redact and release beyond
+  ~1 MiB, holding a tail); add bearer-token, JWT, Slack-token and URL-credential patterns.
+* **G8:** code host:
+  * reject a leading `-` in repo and ref names, and use `--flag=value`;
+  * read branch tips with `gh api …/git/ref/heads/<branch>` (404 ⇒ null) with
+    `GIT_TERMINAL_PROMPT=0` for any git call;
+  * `FakeCodeHost`: one PR per head in **any** state, plus a `pullRequests()` listing for sim
+    invariant 5.
+* **G17:** cap `extractJson`'s stray-brace fallback (bounded candidates/size, timing test); move
+  the misplaced doc comment in `golden-scenarios.ts`.
+
+No exported signature changes, so SK-504 builds against the current ones. Test: `npx vitest run
+src/codehost src/exec src/adapter test/integration/golden.test.ts`.
+
+**SK-505 — Restart reconciliation + crash scenario (codex, B).** Spec: ARCHITECTURE §11.4, §9.7;
+PRD §10.6. Build `reconcile.ts`: for each unfinished attempt, re-adopt or terminate a live process
+group (start-token check), skip pushes already on the remote, reuse an existing PR, reverify, then
+finish the publication or mark the attempt `stale`. Never re-run an invocation with an unknown
+outcome (⇒ `work.failed{crash}` or `checkpoint{unknown}`). `crash-every-step` crashes at each
+journal step.
+
+Acceptance criteria (row) **plus**:
+
+* **F17:** re-publish with the journaled `eventId`.
+* **F19:** SIGKILL the recorded pgid before declaring an attempt dead; treat a `""` start token as
+  "not adoptable, kill the group".
+* **G3:** replace `ScriptedCode` with `FakeCodeHost` in the SK-404 scenarios; optionally move
+  helpers to `scenarios/common.ts`.
+* **G10:** reconcile PRs via the journaled PR number + `prState` before `findPr`.
+* **G19** (optional): split `SimScheduler` into `scheduler.ts`; per-scenario expectation hooks in
+  `protocol.test.ts`; cap `LivenessTracker`'s superseded-boot set.
+
+Must not edit `scenarios/index.ts`. Test: `npx vitest run src/exec src/sim test/integration/sim`.
+
+**SK-601 — Daemon tick loop, slots, duties, plan validator (codex, B).** Spec: ARCHITECTURE §3,
+§11.1–§11.2, §6, §8, §17.3, D16, D18, D19; PRD §6.2, §9.2.
+
+* `Daemon.tick()` per §11.1: suspend check ⇒ sync ⇒ alarms ⇒ duties per slot ⇒ heartbeat ⇒
+  publisher.
+* Slot registry (role dir + AGENT.md + adapter binding).
+* Owner, reviewer and assignee duties.
+* Single-daemon lock (`lock.ts`).
+* Plan validator (§11.2).
+* `skepd.ts` wiring, including the SK-602 IPC server with `IpcHandlers` implemented.
+* Stub `src/daemon/{replan,delivery}.ts` with the final duty signatures.
+
+Scenarios `solo-happy` and `team-stacked` are registered and pass.
+
+Acceptance criteria (row) **plus**:
+
+* **F11:** `Sync` `isActive(state)` option (fast poll only for local work).
+* **F12:** one clone-level lock serializing Sync and publisher git operations.
+* **F13:** `Sync` as the publisher's `StateSource`; `hints.publish(tip)` after an accepted
+  publish; `readHeartbeats` ⇒ `LivenessTracker.observe` each fetch.
+* **F14:** gate invocations on `probe()` + exact equality with AGENT.md `cli_version`.
+* **F15:** claim via `claimCandidates` (free slots only).
+* **F16:** `onSuspend` ⇒ `LivenessTracker.resetAll`.
+* **G12:** `/usr/bin/id` absolute path in `resolveAgentUser`; agent-specific `PATH` from config.
+* **G15:** isolate `SuspendDetector` listener exceptions; implement the stale-lease loop.
+* **G16:** reducer `RangeError` ⇒ read-only mode + alarm, not a crash loop; route
+  `LivenessTracker.alarms()` to status/ntfy.
+* D18: nothing listens on a network port; the IPC socket is local only.
+
+Pitfalls:
+
+* All timing via `Clock`.
+* `Daemon.tick()` must be callable by the simulator.
+* Do not edit SK-505's scenario files.
+
+Test: `npx vitest run src/daemon src/exec src/blackboard src/lease test/integration/sim`.
+
+**SK-602 — IPC protocol, server, client with sign callback (pi, A).** Spec: ARCHITECTURE §12, §7.4.
+
+* NDJSON frames (Zod, strict, 1 MiB cap); methods `status`, `log`, `publish`, `agent.start`,
+  `agent.stop`, `logs.tail` (local agents only, D18), `doctor`, `ping`.
+* `sign_request`/`sign_result` round trip for `signer: "human"` (the private key never leaves the
+  CLI process).
+* `v` mismatch ⇒ `protocol_version` error.
+* Socket 0600 in a 0700 dir.
+* Export `IpcHandlers`, `IntentSpec` (all CLI write kinds) and the CLI client factory in
+  `context.ts`.
+
+Acceptance criteria (row): round trip with a fake signer; bad frames, oversized frames, version
+mismatch; permission test. Responses pass through the redactor (§16). Test: `npx vitest run
+src/ipc src/daemon src/cli`.
+
+**SK-603 — CLI write commands (pi, B).** Spec: ARCHITECTURE §12, PRD §15.2.
+
+* `task new/cancel`, `plan approve/reject/show`, `lease revoke`, `decide`, `replan`,
+  `agent start/stop`.
+* Pure human builders in `src/core/intents-human.ts` and `intentFromSpec` in
+  `src/core/intent-spec.ts`; all of them re-derive from state and return `null` when invalid.
+* Publish via the daemon (IPC, human sign callback) or the in-process fallback publisher; print
+  `accepted`/`rejected` with `#seq`; language guard on `task new`.
+
+Acceptance criteria (row) **plus G5**: `output.ts` gains a failure path that keeps one machine line
+with top-level `ok:false` and the result (`skep sim run` with violations uses it); the `sim run`
+machine result includes `seed` and `scenario`. Test: `npx vitest run src/cli src/core`.
+
+**SK-604 — `skep status`, `skep log` (pi, B).** Spec: PRD §15.1, ARCHITECTURE §5.6, §12.
+
+* `status` via IPC (or a local replay fallback) rendering `statusView` + liveness + freshness +
+  hint health + alarms.
+* `log <task>` shows outcomes with reasons.
+
+Acceptance criteria (row) **plus F20**: print `--machine` via `canonicalJson`; label freshness
+"checked" (it includes unchanged `ls-remote` checks); render the 3–5 min liveness gap as `late`
+(**architect decision, recorded here:** use `late` when a holder's age is between 3 × interval and
+`staleMs`). Revoke suggestions for stale/lost holders. Nothing about providers (D19). Do not edit
+`output.ts`. Test: `npx vitest run src/cli`.
+
+**SK-605 — Coarse replan flow in the daemon (codex, C).** Spec: ARCHITECTURE §5.5, §9.7, §11.1;
+PRD §9.7.
+
+* Fill `src/daemon/replan.ts`: holder ⇒ interrupt ladder ⇒ mechanical snapshot ⇒ WIP push ⇒
+  `checkpoint.recorded`.
+* Owner ⇒ 20-min barrier deadline (monotonic) ⇒ `barrier.closed{missing}`.
+* A daemon `replan.requested` carries verified evidence.
+* Third replan escalates.
+
+Scenarios `replan-once`, `replan-escalate`, `missing-checkpoint` are registered (owns
+`scenarios/index.ts` in Batch C) and pass at the default seeds and at `SKEP_SIM_SEEDS=50`. Test:
+`npx vitest run src/daemon test/integration/sim`.
+
+**SK-606 — Stacked delivery, verification, merge observation (codex, C).** Spec: ARCHITECTURE
+§5.5 (D14/D15), §9.8 in the PRD, §11.5.
+
+* Fill `src/daemon/delivery.ts`: W2 starts from W1's delivered head with PR base = W1's branch.
+* The owner verifies when `delivered ∧ verified == null` (also after a D15 re-activation),
+  publishes `task.verified{passed}` (never `work.failed`), and notifies the human on failure.
+* Merged PRs ⇒ `item.merged`; the next PR is retargeted.
+* Stale-epoch PRs are closed.
+
+Acceptance criteria (row, including the verify-fail ⇒ resume ⇒ done scenario). The scenario test
+drives `stacked-delivery` directly; registration is a one-liner by SK-605 or the orchestrator.
+Test: `npx vitest run src/daemon test/integration/sim`.
+
+**SK-607 — `skep init`, `skep doctor`, ntfy (pi, A).** Spec: ARCHITECTURE §17.6, PRD §13.3, D18,
+D19.
+
+* `init` writes `device.toml`, generates the daemon key, prints the allowed_signers line, and
+  optionally creates the genesis (human signer).
+* `doctor` runs the §13.3 pre-flight (no provider checks: the pinned CLI presence/version only;
+  gitleaks present; outbound reachability of the blackboard and code remotes; relay only as a
+  warning), a full replay and `checkInvariants`.
+* `ntfy.ts`: a notifier with a redacted message body.
+
+Acceptance criteria (row). Test: `npx vitest run src/cli src/notify`.
+
+**SK-608 — Service units + runbook (pi, C).** Spec: ARCHITECTURE §3, §17.6, D18, D19.
+`deploy/skepd.service`, `deploy/com.skepagent.skepd.plist`, `docs/RUNBOOK.md`.
+
+Acceptance criteria (row) **plus**:
+
+* **G2:** a runbook section "moving an item to another agent requires a revoke plus a
+  human-approved replan".
+* **G11:** `GH_TOKEN` for headless `gh` (passed explicitly; a daemon code-host credential, not a
+  provider credential) and the conservative check-env denylist.
+* Examples use `example.invalid` only.
+
+Test: `npm run lint` (docs/units only).
 
 ---
 
@@ -1155,9 +1450,9 @@ Wave 2b/3 follow-ups closed in this phase: F1–F6 (SK-405), F7–F10 (SK-406), 
 | G3 | Replace the scenarios' `ScriptedCode` with SK-503's `FakeCodeHost` (plus a `pullRequests()` listing for invariant 5); optionally move shared helpers out of `claim-race.ts` into `scenarios/common.ts` | SK-404 | SK-505 |
 | G4 | `skep sim run` outside a source checkout: the fixture keys resolve under `test/`; ship the sim fixtures in the package or fail with an actionable message | SK-401, SK-402 | SK-610 |
 | G5 | Machine envelope consistency: a failed sim run prints `{"ok":true,"result":{"ok":false…}}` with exit 1; add an `Output` path that prints top-level `ok:false` with the result. Also include `seed` and `scenario` in the `skep sim run` machine result | SK-402 | SK-603 / SK-604 |
-| G6 | Redactor hardening: cap `RedactionStream` buffering for newline-free output (redact and release beyond ~1 MiB, holding a tail); add bearer-token, JWT, Slack-token and URL-embedded-credential patterns | SK-506 | SK-504 |
+| G6 | Redactor hardening: cap `RedactionStream` buffering for newline-free output (redact and release beyond ~1 MiB, holding a tail); add bearer-token, JWT, Slack-token and URL-embedded-credential patterns | SK-506 | SK-507 |
 | G7 | Wire the redactor everywhere: journal, adapter log capture (streams), published or prompted check-log excerpts (raw logs stay local for evidence digests), PR and commit text; run `findSecrets` + gitleaks before every publication | SK-502, SK-506 | SK-504 |
-| G8 | Code-host hardening before use: reject a leading `-` in repo and ref names and pass `--flag=value`; read branch tips via `gh api …/git/ref/heads/<branch>` instead of HTTPS `ls-remote` (one auth path, no prompt; `GIT_TERMINAL_PROMPT=0` for any git call); enforce one PR per head in any state | SK-503 | SK-504 |
+| G8 | Code-host hardening before use: reject a leading `-` in repo and ref names and pass `--flag=value`; read branch tips via `gh api …/git/ref/heads/<branch>` instead of HTTPS `ls-remote` (one auth path, no prompt; `GIT_TERMINAL_PROMPT=0` for any git call); enforce one PR per head in any state | SK-503 | SK-507 |
 | G9 | Record the `PrInfo` shape (`number, url, head, base, title, state, mergeSha`) in ARCHITECTURE §11.5 | SK-503 | architect (with SK-504) |
 | G10 | Reconcile PRs via the journaled PR number and `prState` before falling back to `findPr` (which only sees open PRs) | SK-503 | SK-505 |
 | G11 | Document `GH_TOKEN` for headless `gh` (passed explicitly; the daemon's own code-host credential, not a provider credential, D19) and the conservative check-env denylist (`*_KEY` etc. are stripped) | SK-503, SK-502 | SK-608 |
@@ -1166,7 +1461,7 @@ Wave 2b/3 follow-ups closed in this phase: F1–F6 (SK-405), F7–F10 (SK-406), 
 | G14 | `ChecksRunner.load` and `scanSecrets` need the base commit in the mirror: fetch first (both now fail with "fetch first") | SK-502 | SK-504 |
 | G15 | `SuspendDetector`: isolate listener exceptions; implement the stale-lease loop (stale ⇒ journal `stale` ⇒ drop from `setHeldLeases` ⇒ re-verify) | SK-403 | SK-601 (loop also SK-504) |
 | G16 | Reducer `RangeError` on an impossible state ⇒ daemon enters read-only mode with an alarm (like a reducer-version mismatch), no crash loop; poll `LivenessTracker.alarms()` and route to status/ntfy | SK-406 | SK-601 |
-| G17 | Cap `extractJson`'s stray-brace fallback (O(n²) parse attempts on large malformed output) with a timing test; move the misplaced D14/D15 doc comment in `golden-scenarios.ts` | SK-405 | SK-504 |
+| G17 | Cap `extractJson`'s stray-brace fallback (O(n²) parse attempts on large malformed output) with a timing test; move the misplaced D14/D15 doc comment in `golden-scenarios.ts` | SK-405 | SK-507 |
 | G18 | Suppress the pre-existing gitleaks false positive in `src/git/trust.test.ts` (dummy `ssh-ed25519` body) so a full-history `gitleaks git` scan is clean | SK-502 fix round | SK-610 (or any earlier small fix) |
 | G19 | Optional cleanups: split `SimScheduler` out of `src/sim/world.ts`; per-scenario expectation hooks instead of one `switch` in `protocol.test.ts`; cap the per-agent superseded-boot set in `LivenessTracker` | SK-401, SK-404, SK-406 | SK-505 |
 
