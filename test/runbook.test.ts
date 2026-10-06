@@ -81,12 +81,34 @@ describe("runbook procedures (SK-608)", () => {
     expect(setup).toMatch(/no command that copies it to another device/i);
   });
 
+  it("explains the three capabilities and the macOS root LaunchDaemon", () => {
+    const install = section("1. Setup");
+    expect(install).toMatch(/CAP_SETUID/);
+    expect(install).toMatch(/CAP_SETGID/);
+    expect(install).toMatch(/CAP_CHOWN/);
+    expect(install).toMatch(/exactly three capabilities/);
+    expect(install).toMatch(/LaunchDaemon under root/);
+    // Until the socket group is configurable, the Mac keeps working through the fallback.
+    expect(install).toMatch(/0660/);
+    expect(install).toMatch(
+      /in-process fallback publisher[\s\S]{0,40}remains usable on the[\s\S]{0,10}Mac/,
+    );
+    // Ownership: daemon-only state, agent-readable roles, agent-writable home.
+    const layout = section("Layout on a device");
+    expect(layout).toMatch(/Daemon-only/);
+    expect(layout).toMatch(/Agent-readable/);
+    expect(layout).toMatch(/Agent-writable/);
+    expect(layout).toMatch(/\/var\/lib\/skep-roles/);
+    expect(layout).toMatch(/0750/);
+    expect(layout).toMatch(/ProtectHome=true/);
+  });
+
   it("documents provisioning without Tailscale and fingerprint comparison (D18)", () => {
     expect(runbook).toMatch(/no mesh VPN/i);
     expect(runbook).toMatch(/never[\s\S]{0,20}dependenc/i);
     const trust = section("2. Trust root and fingerprint comparison");
-    expect(trust).toMatch(/ssh-keygen -l -f ~\/\.skep\/keys\/daemon\.pub/);
-    expect(trust).toMatch(/ssh-keygen -l -f ~\/\.skep\/allowed_signers/);
+    expect(trust).toMatch(/ssh-keygen -l -f \/var\/lib\/skep\/keys\/daemon\.pub/);
+    expect(trust).toMatch(/ssh-keygen -l -f \/var\/lib\/skep\/allowed_signers/);
     expect(trust).toMatch(/out of band/i);
     expect(trust).toMatch(/first trust is never taken from the channel/i);
     // Manual until enrollment bundles exist.
@@ -169,6 +191,9 @@ describe("service units (SK-608)", () => {
     expect(service).toMatch(/SKEP_HOME=\/var\/lib\/skep/);
     expect(service).toMatch(/^User=skep$/m);
     expect(service).toMatch(/WantedBy=multi-user\.target/);
+    // Role directories sit outside the 0700 state root, or the agent cannot traverse to them.
+    expect(service).toMatch(/--role-dir \/var\/lib\/skep-roles\/coding/);
+    expect(service).not.toMatch(/--role-dir \/var\/lib\/skep\/roles/);
     expect(plist).toMatch(/<key>Label<\/key>\s*<string>com\.skepagent\.skepd<\/string>/);
     expect(plist).toMatch(/<key>RunAtLoad<\/key>\s*<true\/>/);
     expect(plist).toMatch(/<key>KeepAlive<\/key>\s*<true\/>/);
@@ -184,5 +209,27 @@ describe("service units (SK-608)", () => {
     // The agent user is not the daemon user (PRD §11.4).
     expect(service).toMatch(/--agent-user skep-agent/);
     expect(service).not.toMatch(/--agent-user skep( |\\)/);
+  });
+
+  it("grants exactly the privileges --agent-user needs", () => {
+    // Linux: spawn as the agent uid/gid and chown the checkout. No other capability.
+    expect(service).toMatch(/^AmbientCapabilities=CAP_SETUID CAP_SETGID CAP_CHOWN$/m);
+    expect(service).toMatch(/^CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_CHOWN$/m);
+    expect(service).toMatch(/^NoNewPrivileges=true$/m);
+    expect(service).toMatch(/^User=skep$/m);
+    const granted = service.match(/^AmbientCapabilities=(.+)$/m)?.[1]?.split(/\s+/) ?? [];
+    expect(granted).toEqual(["CAP_SETUID", "CAP_SETGID", "CAP_CHOWN"]);
+    // The agent home must be writable inside the unit's mount namespace.
+    expect(service).toMatch(/^ReadWritePaths=.*\/var\/lib\/skep-agent/m);
+    expect(service).toMatch(/^ReadWritePaths=.*\/var\/lib\/skep-roles/m);
+    expect(service).toMatch(/^ProtectHome=true$/m);
+
+    // macOS: a LaunchDaemon under root is the only way to setuid to the agent account.
+    expect(plist).toMatch(/<key>UserName<\/key>\s*<string>root<\/string>/);
+    expect(plist).toMatch(/\/Library\/LaunchDaemons\//);
+    expect(plist).not.toMatch(/LaunchAgents/);
+    expect(plist).toMatch(/--agent-user[\s\S]{0,40}<string>skep-agent<\/string>/);
+    expect(plist).toMatch(/--role-dir[\s\S]{0,40}<string>\/var\/lib\/skep-roles\/coding<\/string>/);
+    expect(plist).toMatch(/<string>\/Library\/Logs\/skep\/skepd\.out\.log<\/string>/);
   });
 });

@@ -12,8 +12,12 @@ credential off the machine you are typing it on.
 
 One `skepd` per device (ARCHITECTURE §3). It holds `$SKEP_HOME/skepd.lock`, replays the blackboard,
 and is the only process that writes git. The `skep` CLI talks to it through the Unix socket
-`$SKEP_HOME/skepd.sock` (mode 0600, directory 0700). When `skepd` is not running, the CLI falls
-back to its own private clone (`$SKEP_HOME/cli-blackboard`) and the same publisher.
+`$SKEP_HOME/skepd.sock`. On Linux the socket is mode 0600 and the daemon user owns it. On macOS
+the daemon runs as root (see §1.3), so the socket has to be mode 0660 and group `skep`, with the
+human's account in that group, before the CLI can open it. Socket group and mode are not
+configurable yet; until they are, the CLI's in-process fallback publisher remains usable on the
+Mac. The fallback also runs whenever `skepd` is not running, against the CLI's own private clone
+(`$SKEP_HOME/cli-blackboard`).
 
 ```text
 human ──► skep ──unix socket──► skepd ──fetch/push──► git remotes (example.invalid)
@@ -38,20 +42,31 @@ flags `skepd` actually accepts (`--home`, `--role-dir`, `--agent-user`, `--agent
 
 ## Layout on a device
 
-`$SKEP_HOME` defaults to `~/.skep` (override with `--home` or `SKEP_HOME`). Mode 0700, owned by the
-daemon user.
+`$SKEP_HOME` is `/var/lib/skep` in both shipped units (override with `--home` or `SKEP_HOME`). Mode
+0700, owned by the daemon user: `skep` on Linux, `root` on macOS. The agent user cannot traverse
+it, so role directories are **not** inside it.
 
-| Path | What it is |
-|---|---|
-| `device.toml` | Local config (`skep.device/v1`): device name, blackboard URL, repo allowlist, signing key path, optional ntfy URL. Never read from the blackboard. |
-| `keys/daemon`, `keys/daemon.pub` | Daemon SSH signing key (ed25519, no passphrase, mode 0600). The private half never leaves this device. |
-| `allowed_signers` | **The** trust root. Local file, not the copy in the blackboard repo. |
-| `blackboard/` | Daemon's private clone. Do not edit it; `skepd` resets it. |
-| `skepd.sock`, `skepd.lock` | CLI socket and the single-daemon lock. |
-| `roles/<role>/AGENT.md` | Role policy. Owned by the daemon user, not writable by the agent user. |
+| Path | Owner : group | Mode | Who may use it |
+|---|---|---|---|
+| `$SKEP_HOME` itself | daemon : daemon | 0700 | **Daemon-only.** The agent cannot traverse it. |
+| `device.toml` | daemon : daemon | 0600 | **Daemon-only.** Local config (`skep.device/v1`): device name, blackboard URL, repo allowlist, signing key path, optional ntfy URL. Never read from the blackboard. |
+| `keys/daemon`, `keys/daemon.pub` | daemon : daemon | 0600 | **Daemon-only.** SSH signing key (ed25519, no passphrase). The private half never leaves this device. |
+| `allowed_signers` | daemon : daemon | 0600 | **Daemon-only.** **The** trust root. Not the copy in the blackboard repo. |
+| `blackboard/` | daemon : daemon | 0700 | **Daemon-only.** Private clone. Do not edit it; `skepd` resets it. |
+| `skepd.sock` | daemon : `skep` | 0600 Linux, 0660 macOS | The CLI. On macOS the human's account must be in group `skep` (§1.3). |
+| `skepd.lock` | daemon : daemon | 0600 | **Daemon-only.** The single-daemon lock. |
+| `/var/lib/skep-roles` and `/var/lib/skep-roles/<role>` | `skep` : `skep-agent` | 0750 | **Agent-readable.** `AGENT.md` lives here, outside `$SKEP_HOME`, so the agent can traverse the path. Not writable by the agent user (PRD §7.3). |
+| `/var/lib/skep-roles/<role>/.skep/worktrees/…` | `skep` : `skep-agent` | 0750 down to the worktree root | **Agent-readable** through every parent. The checkout handed to the agent is **agent-writable**; the daemon still owns the git metadata. |
+| Agent home (`/var/lib/skep-agent` on Linux, `/Users/skep-agent` on macOS) | `skep-agent` : `skep-agent` | 0750 | **Agent-writable.** The agent CLI's own config and session files (D19). The daemon does not read them. |
 
-The agent OS user (`skep-agent` in the units) can read its role directory and its worktrees. It
-cannot read `keys/`, `device.toml` or the blackboard clone.
+On Linux the unit sets `ProtectHome=true`, which hides `/home` and `/root` from the daemon and
+from the agent subprocess that inherits its mount namespace. That is why the agent home is
+`/var/lib/skep-agent` and not a directory under `/home`. The role path and the agent home are both
+listed in `ReadWritePaths`; `ProtectSystem=strict` would make anything else read-only.
+
+The agent OS user (`skep-agent`) can read its role directory and its worktrees, and can write its
+home and the checkout it was handed. It cannot read `keys/`, `device.toml` or the blackboard
+clone, because it cannot traverse `$SKEP_HOME`.
 
 ## 1. Setup
 
@@ -63,16 +78,16 @@ The human key lives only here, in `ssh-agent` (a presence-confirming key where p
 never copied to `vps` and never readable by the agent user.
 
 ```bash
-# On mac, as the daemon user.
-ssh-keygen -t ed25519 -C human@example.invalid -f ~/.skep/keys/human
+# On mac, as root: the LaunchDaemon's state root is /var/lib/skep, not a user home.
+ssh-keygen -t ed25519 -C human@example.invalid -f /var/lib/skep/keys/human
 # Load it into the agent. The private key stays on mac.
-ssh-add ~/.skep/keys/human
+ssh-add /var/lib/skep/keys/human
 
-skep init \
+skep --home /var/lib/skep init \
   --device mac \
   --blackboard git@git.example.invalid:example/blackboard.git \
   --genesis \
-  --human-key ~/.skep/keys/human \
+  --human-key /var/lib/skep/keys/human \
   --repo demo=git@git.example.invalid:example/demo.git
 ```
 
@@ -122,34 +137,87 @@ it later and still carry public keys only.
 ### 1.3 Install the daemon
 
 Build `dist/bin/skepd.js` (`npm run build`) and install it where the unit points
-(`/usr/local/lib/skep/skepd.js`), with `node` on the path the unit uses.
+(`/usr/local/lib/skep/skepd.js`), with `node` on the path the unit uses. Create the users first:
+`skep` and `skep-agent` on Linux, and the restricted account `skep-agent` on macOS (the daemon
+there runs as root).
+
+**Why the daemon can switch users.** `skepd` does not run the agent CLI as itself. It spawns that
+process with the agent user's uid and gid, and it changes ownership of the checkout to that user
+before the CLI sees it (PRD §11.4). Both need privileges a plain service user does not have.
+
+On Linux the unit keeps `User=skep` and grants exactly three capabilities:
+
+| Capability | Why this one |
+|---|---|
+| `CAP_SETUID` | Spawn the agent CLI with the agent user's uid. |
+| `CAP_SETGID` | Spawn it with the agent user's gid, and `chown` to that group. |
+| `CAP_CHOWN` | Hand the checkout to the agent user (`chown` / `lchown`). |
+
+Nothing else. `CapabilityBoundingSet` lists the same three, so the process cannot acquire any
+more, and `NoNewPrivileges=true` stops it from gaining privileges through a setuid binary. Ambient
+capabilities still work with that setting. Do not add capabilities "just in case": each one is a
+privilege the agent process could try to abuse if it ever compromised the daemon.
+
+On macOS there is no ambient-capability equivalent, and a per-user LaunchAgent cannot `setuid` to
+`skep-agent` at all. So `skepd` runs as a **LaunchDaemon under root** (`/Library/LaunchDaemons`),
+and `--agent-user skep-agent` names the restricted account it switches into. Root is the whole of
+the privilege it gets; keep the plist limited to that and do not run anything else from it.
+
+**The socket on macOS.** A socket created by a root daemon is mode 0600 and owned by root, which
+the human's CLI cannot open. It must be mode **0660**, group **`skep`**, and the human's account
+must be a member of group `skep` (ARCHITECTURE §12: the human's CLI user is in the daemon group on
+the Mac). A socket group and mode option does not exist yet — it is a follow-up on the IPC server,
+not something to patch locally — so **until it does, the CLI's in-process fallback publisher
+remains usable on the Mac.** The fallback signs and publishes as the human without the socket.
+Once the option exists, set the group to `skep` and the mode to 0660 and the CLI will use the
+socket directly.
 
 Linux (`vps`), as root:
 
 ```bash
-install -d -m 0755 -o skep -g skep /var/lib/skep
+install -d -m 0700 -o skep -g skep /var/lib/skep
+install -d -m 0750 -o skep -g skep-agent /var/lib/skep-roles /var/lib/skep-roles/coding
+install -d -m 0750 -o skep-agent -g skep-agent /var/lib/skep-agent
 install -m 0644 deploy/skepd.service /etc/systemd/system/skepd.service
 systemctl daemon-reload
 systemctl enable --now skepd.service
 ```
 
-macOS, as the daemon user (substitute the account name in the plist first):
+`/var/lib/skep` is the state root and stays 0700. `/var/lib/skep-roles` is outside it, 0750 and
+group `skep-agent`, so the agent can traverse it while `SKEP_HOME` stays sealed. The agent home is
+`/var/lib/skep-agent` rather than a directory under `/home`, because the unit's `ProtectHome=true`
+hides `/home` from the daemon and from the agent subprocess. The unit lists `/var/lib/skep`,
+`/var/lib/skep-roles`, `/var/lib/skep-agent` and `/etc/skep` as `ReadWritePaths`.
+
+`Wants=network-online.target` is optional. The shipped unit only orders itself after
+`network.target` and retries a missing remote (D18). Add the `Wants=` line in a drop-in when this
+host's network comes up slowly and the first sync should wait for a configured route; leave it out
+where `network-online.target` never becomes ready.
+
+macOS, as root:
 
 ```bash
-cp deploy/com.skepagent.skepd.plist ~/Library/LaunchAgents/
-launchctl bootstrap "gui/${UID}" ~/Library/LaunchAgents/com.skepagent.skepd.plist
+cp deploy/com.skepagent.skepd.plist /Library/LaunchDaemons/
+install -d -m 0700 -o root -g wheel /var/lib/skep
+install -d -m 0750 -o root -g skep-agent /var/lib/skep-roles /var/lib/skep-roles/coding
+install -d -m 0755 /Library/Logs/skep
+launchctl bootstrap system /Library/LaunchDaemons/com.skepagent.skepd.plist
 ```
 
 Create the role directory before starting, or `skepd` will exit and the supervisor will restart
-it. One slot per device in the MVP:
-
-```bash
-install -d -m 0755 ~/.skep/roles/coding
-# AGENT.md is daemon-owned and must not be writable by the agent user (PRD §7.3).
-```
+it. One slot per device in the MVP. `AGENT.md` goes in `/var/lib/skep-roles/coding`, owned by the
+daemon user and not writable by `skep-agent` (PRD §7.3). The worktree root under it
+(`/var/lib/skep-roles/coding/.skep/worktrees`) keeps mode 0750 and group `skep-agent` all the way
+down, so the agent can reach a checkout that the daemon then makes agent-writable.
 
 `AGENT.md` front matter (`skep.agent/v1`) pins `agent_cli` and `cli_version`. `skepd` refuses the
 slot unless `probe()` reports exactly that version.
+
+The LaunchDaemon writes stdout and stderr to `/Library/Logs/skep/skepd.out.log` and
+`skepd.err.log`. Treat them as root-owned operational logs. They are redacted only for content
+`skepd` writes itself (journal excerpts, notification bodies); a crash trace or a message from a
+subprocess that launchd captures directly is not passed through the redactor, so do not assume a
+secret cannot appear there. Do not ship these files off the machine.
 
 ### 1.4 Configure the agent CLI locally (D19)
 
@@ -213,8 +281,8 @@ not put provider keys in the daemon environment in the first place.
 ### 1.7 Pre-flight
 
 ```bash
-skep doctor
-skep doctor --roles-dir ~/.skep/roles
+skep --home /var/lib/skep doctor
+skep --home /var/lib/skep doctor --roles-dir /var/lib/skep-roles
 ```
 
 `skep doctor` checks `device.toml`, the trust root (it must contain `daemon:<this device>`), the
@@ -237,9 +305,9 @@ before trusting it. Read the fingerprint on the machine that generated the key a
 machine that will trust it, and compare them by eye (or by reading one aloud):
 
 ```bash
-ssh-keygen -l -f ~/.skep/keys/daemon.pub
+ssh-keygen -l -f /var/lib/skep/keys/daemon.pub
 # On the device that received the file:
-ssh-keygen -l -f ~/.skep/allowed_signers
+ssh-keygen -l -f /var/lib/skep/allowed_signers
 ```
 
 `ssh-keygen -l` over `allowed_signers` prints one fingerprint per line. Check the principal
@@ -258,10 +326,11 @@ new key signs successfully.
 
 ### 3.1 Daemon key (`daemon:mac`, `daemon:vps`)
 
-On the device, as the daemon user, with `skepd` stopped so it is not signing mid-rotation:
+On the device, as the user that owns `$SKEP_HOME` (`skep` on Linux, root on macOS), with `skepd`
+stopped so it is not signing mid-rotation:
 
-1. `ssh-keygen -t ed25519 -N "" -C skepd -f ~/.skep/keys/daemon.new`
-2. Note the fingerprint (`ssh-keygen -l -f ~/.skep/keys/daemon.new.pub`).
+1. `ssh-keygen -t ed25519 -N "" -C skepd -f /var/lib/skep/keys/daemon.new`
+2. Note the fingerprint (`ssh-keygen -l -f /var/lib/skep/keys/daemon.new.pub`).
 3. On the controller, append a new line, do not replace the old one yet:
 
    ```text
@@ -387,23 +456,23 @@ On the controller, point a fresh home at the new remote and create the genesis. 
 directory keeps the old trust root intact until the new log verifies:
 
 ```bash
-skep --home ~/.skep-new init \
+skep --home /var/lib/skep-new init \
   --device mac \
   --blackboard git@git.example.invalid:example/blackboard-2.git \
   --genesis \
-  --human-key ~/.skep/keys/human \
+  --human-key /var/lib/skep/keys/human \
   --repo demo=git@git.example.invalid:example/demo.git
 ```
 
 Copy the trust root you still trust (every current public key, after any rotation) into
-`~/.skep-new/allowed_signers`, then compare fingerprints (§2).
+`/var/lib/skep-new/allowed_signers`, then compare fingerprints (§2).
 
 ### 5.3 Checkpoint of current state
 
 The genesis commit carries no task state. Record what you are keeping as ordinary human-signed
 events on the new log, using the CLI against the new home:
 
-* Re-create each task you are keeping with `skep --home ~/.skep-new task new "..." --repo demo
+* Re-create each task you are keeping with `skep --home /var/lib/skep-new task new "..." --repo demo
   --owner <agent>`. Descriptions only; do not paste anything that triggered the purge.
 * For a task whose plan you are keeping, let the owner propose again and approve it. Delivered
   work stays in the code repo; the new plan should describe the remainder, not redo merged items.
@@ -417,7 +486,7 @@ purging.
 
 1. On each other device, replace `blackboard.url` in `device.toml` with the new remote. Install
    the same `allowed_signers` you verified on the controller (§2).
-2. Move the old clone aside (`mv ~/.skep/blackboard ~/.skep/blackboard.old`) so `skepd` clones the
+2. Move the old clone aside (`mv /var/lib/skep/blackboard /var/lib/skep/blackboard.old`) so `skepd` clones the
    new remote instead of fetching into the old one.
 3. Start `skepd` on the controller, then on the other devices. Run `skep doctor` on each. Every
    device should report the new genesis tip and a clean invariant check.
