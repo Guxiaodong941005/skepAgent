@@ -183,34 +183,24 @@ describe("task new language guard", () => {
     expect(body.error?.code).toBe("non_english_task");
   });
 
-  it("allows the same text with --allow-non-english, then stubs", async () => {
+  it("allows the same text with --allow-non-english and attempts to publish", async () => {
     const cap = capture();
     const code = await runCli(
       ["task", "new", chinese, "--repo", "app", "--allow-non-english"],
       cap.ctx,
     );
-    expect(code).toBe(4);
-    expect(cap.stderr).toMatch(/not implemented/);
+    // The guard no longer blocks it. With no daemon and no device.toml the publish cannot
+    // happen, which is an error rather than the old not-implemented stub.
+    expect(code).toBe(1);
+    expect(cap.stderr).not.toMatch(/non-Latin/);
+    expect(cap.stderr).not.toMatch(/not implemented/);
   });
 });
 
 describe("stubs", () => {
+  // init/doctor (SK-607), status/log (SK-604) and the write commands (SK-603) are implemented.
+  // Only `logs` is still the skeleton stub.
   const invocations: string[][] = [
-    ["agent", "start"],
-    ["agent", "stop", "--role-dir", "/tmp/role"],
-    ["task", "new", "Fix the login redirect", "--repo", "app"],
-    ["task", "new", "Fix it", "--repo", "app", "--owner", AGENT, "--team"],
-    ["task", "cancel", TASK, "--reason", "no longer needed"],
-    ["plan", "show", TASK],
-    ["plan", "show", TASK, "--version", "2", "--diff"],
-    ["plan", "approve", TASK, "--note", "looks right"],
-    ["plan", "reject", TASK],
-    ["replan", TASK, "--reason", "the approach fails", "--evidence", "a.log", "b.log"],
-    ["lease", "revoke", TASK, "W2", "--epoch", "3", "--reason", "holder went stale"],
-    ["decide", TASK, "--resume"],
-    ["decide", TASK, "--replan", "--note", "try again"],
-    ["decide", TASK, "--cancel"],
-    ["decide", TASK, "--owner", "vps.coding"],
     ["logs", AGENT],
     ["logs", AGENT, "--follow"],
   ];

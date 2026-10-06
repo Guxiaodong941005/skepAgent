@@ -2,7 +2,7 @@ import type { Command } from "commander";
 import { runScenario, type ScenarioResult } from "../../sim/runner.js";
 import { UnknownScenarioError } from "../../sim/scenarios/index.js";
 import type { CliContext } from "../context.js";
-import { EXIT } from "../output.js";
+import { CliError, EXIT } from "../output.js";
 import { parseNonNegativeInt, parsePositiveInt } from "../validate.js";
 
 interface RunOptions {
@@ -51,22 +51,29 @@ export function register(program: Command, ctx: CliContext): void {
 function report(ctx: CliContext, opts: RunOptions, result: ScenarioResult): void {
   const output = ctx.output();
   const failed = result.violations.length > 0;
-  output.result(machineResult(!failed, result), () => summary(opts, result));
-  if (!failed) return;
-  // Human mode adds the `skep:` line on stderr. Written directly: `output.error` would also
-  // fire from runCli if this threw, and in machine mode it would add a second JSON line.
-  if (!output.machine) ctx.stderr.write(`skep: ${violationMessage(result)}\n`);
+  const body = machineResult(opts, result);
+  if (!failed) {
+    output.result(body, () => summary(opts, result));
+    return;
+  }
+  // G5: the top-level `ok` must agree with the exit code. `output.fail` keeps that to one line,
+  // where `output.error` after `output.result` would print a second one.
+  output.fail(new CliError("invariant_violation", violationMessage(result), EXIT.error), body, () =>
+    summary(opts, result),
+  );
   ctx.exitCode = EXIT.error;
 }
 
 /**
- * One stable object for both outcomes. `ok` mirrors the exit code; `violations` is always an
- * array (empty when the run was clean) so a wrapper does not special-case a missing field. The
- * log dump stays out: it is for the invariant error text, not for a wrapper to parse.
+ * One stable object for both outcomes. `violations` is always an array (empty when the run was
+ * clean) so a wrapper does not special-case a missing field, and `seed`/`scenario` are echoed so
+ * a saved line is self-describing (G5). The log dump stays out: it is for the invariant error
+ * text, not for a wrapper to parse.
  */
-function machineResult(ok: boolean, result: ScenarioResult): unknown {
+function machineResult(opts: RunOptions, result: ScenarioResult): unknown {
   return {
-    ok,
+    scenario: opts.scenario,
+    seed: opts.seed ?? 1,
     finalTip: result.finalTip,
     steps: result.steps,
     violations: result.violations.map((violation) => ({

@@ -16,7 +16,6 @@ import type { CliContext } from "../context.js";
 import { CliError, EXIT } from "../output.js";
 import { renderLog } from "../render-status.js";
 import { parseTaskId } from "../validate.js";
-import { printMachine } from "./machine.js";
 
 interface LogResult {
   task: string;
@@ -32,7 +31,7 @@ export function register(program: Command, ctx: CliContext): void {
     .option("--from <seq>", "first seq to show", parseFromSeq)
     .action(async (task: string, opts: { from?: number }) => {
       const result = await loadLog(ctx, task, opts.from);
-      printMachine(ctx, machineLog(result), renderLog(result.task, result.outcomes));
+      ctx.output().result(machineLog(result), () => renderLog(result.task, result.outcomes));
     });
 }
 

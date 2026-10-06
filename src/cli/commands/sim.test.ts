@@ -75,10 +75,17 @@ describe("skep sim run", () => {
     expect(cap.stderr).toBe("");
     const body = oneLine(cap.stdout) as {
       ok: boolean;
-      result: { ok: boolean; finalTip: string; steps: number; violations: unknown[] };
+      result: {
+        scenario: string;
+        seed: number;
+        finalTip: string;
+        steps: number;
+        violations: unknown[];
+      };
     };
     expect(body.ok).toBe(true);
-    expect(body.result.ok).toBe(true);
+    expect(body.result.scenario).toBe("empty");
+    expect(body.result.seed).toBe(42);
     expect(body.result.finalTip).toMatch(/^[a-f0-9]{40}$/);
     expect(body.result.steps).toBe(12);
     expect(body.result.violations).toEqual([]);
@@ -139,10 +146,19 @@ describe("skep sim run", () => {
     expect(cap.stderr).toBe("");
     const body = oneLine(cap.stdout) as {
       ok: boolean;
-      result: { ok: boolean; finalTip: string; violations: { code: string; detail: string }[] };
+      error: { code: string; message: string };
+      result: {
+        scenario: string;
+        seed: number;
+        finalTip: string;
+        violations: { code: string; detail: string }[];
+      };
     };
-    expect(body.ok).toBe(true);
-    expect(body.result.ok).toBe(false);
+    // G5: a failed run is one line whose top-level ok matches the exit code.
+    expect(body.ok).toBe(false);
+    expect(body.error.code).toBe("invariant_violation");
+    expect(body.result.scenario).toBe("empty");
+    expect(body.result.seed).toBe(42);
     expect(body.result.finalTip).toBe("a".repeat(40));
     expect(body.result.violations).toEqual([
       {

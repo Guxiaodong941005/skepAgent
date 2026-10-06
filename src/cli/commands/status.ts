@@ -25,7 +25,6 @@ import {
   type StatusExtras,
   type StatusFreshness,
 } from "../render-status.js";
-import { printMachine } from "./machine.js";
 
 interface StatusResult {
   view: StatusView;
@@ -45,9 +44,8 @@ export function register(program: Command, ctx: CliContext): void {
     .description("Show the derived view of tasks, items, and agents")
     .action(async () => {
       const result = await loadStatus(ctx);
-      // F20: the machine line is `canonicalJson`, not `JSON.stringify` key order. `output.ts`
-      // belongs to SK-603, so the line is written here (see `printMachine`).
-      printMachine(ctx, machineStatus(result), renderStatus(result.view, result.extras));
+      // F20: `output.result` prints the machine line through `canonicalJson`.
+      ctx.output().result(machineStatus(result), () => renderStatus(result.view, result.extras));
     });
 }
 
