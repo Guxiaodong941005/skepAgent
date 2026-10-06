@@ -532,7 +532,7 @@ describe.skipIf(!["linux", "darwin"].includes(platform()))("NativeRuntime", () =
         }
         await vt.advance(30_000);
       }
-      expect(await result).toBe(mode === "kill" ? "killed" : "interrupted");
+      expect(await result).toBe("killed");
       expect(await handle.wait()).toEqual(
         mode === "kill" && !leaderExits
           ? { code: null, signal: "SIGKILL" }

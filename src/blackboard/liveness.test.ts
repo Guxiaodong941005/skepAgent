@@ -121,6 +121,99 @@ describe("observer-relative liveness", () => {
       sinceChangeMs: 20_000,
       bootId: "b_dcba",
     });
+    expect(tracker.alarms()).toEqual([]);
+  });
+
+  it("alarms when a superseded boot returns and retains the first evidence", () => {
+    const { tracker } = fixture();
+    const restarted = { ...hb, boot_id: "b_dcba", n: 0 };
+    tracker.observe(agent, oid, hb);
+    tracker.observe(agent, nextOid, restarted);
+    tracker.observe(agent, "d".repeat(40), { ...hb, n: 2 });
+    const alarm = {
+      kind: "duplicate-daemon",
+      agent,
+      bootId: hb.boot_id,
+      supersededBy: restarted.boot_id,
+    };
+    expect(tracker.alarms()).toEqual([alarm]);
+    expect(tracker.classify(agent)).toEqual({
+      cls: "unknown",
+      sinceChangeMs: 0,
+      bootId: hb.boot_id,
+    });
+    tracker.observe(agent, "d".repeat(40), { ...hb, n: 2 });
+    expect(tracker.classify(agent).cls).toBe("live");
+    tracker.observe(agent, nextOid, restarted);
+    tracker.observe(agent, oid, hb);
+    expect(tracker.alarms()).toEqual([alarm]);
+  });
+
+  it("allows successive new boots but remembers every superseded boot", () => {
+    const { tracker } = fixture();
+    tracker.observe(agent, oid, hb);
+    tracker.observe(agent, nextOid, { ...hb, boot_id: "b_dcba", n: 0 });
+    tracker.observe(agent, "d".repeat(40), { ...hb, boot_id: "b_abdc", n: 0 });
+    expect(tracker.alarms()).toEqual([]);
+    tracker.observe(agent, "e".repeat(40), { ...hb, n: 3 });
+    expect(tracker.alarms()).toEqual([
+      { kind: "duplicate-daemon", agent, bootId: hb.boot_id, supersededBy: "b_abdc" },
+    ]);
+  });
+
+  it.each(["unverifiable", "suspend"] as const)(
+    "retains boot history and alarms across a liveness reset (%s)",
+    (reset) => {
+      const { tracker } = fixture();
+      tracker.observe(agent, oid, hb);
+      tracker.observe(agent, nextOid, { ...hb, boot_id: "b_dcba", n: 0 });
+      const resetLiveness = () => {
+        if (reset === "unverifiable") tracker.observe(agent, oid, null);
+        else tracker.resetAll();
+      };
+      resetLiveness();
+      expect(tracker.classify(agent)).toEqual({ cls: "unknown", sinceChangeMs: 0 });
+      tracker.observe(agent, oid, hb);
+      const alarms = tracker.alarms();
+      expect(alarms).toEqual([
+        { kind: "duplicate-daemon", agent, bootId: hb.boot_id, supersededBy: "b_dcba" },
+      ]);
+      expect(tracker.classify(agent).cls).toBe("unknown");
+      resetLiveness();
+      expect(tracker.alarms()).toEqual(alarms);
+    },
+  );
+
+  it("isolates boot history by agent and returns sorted alarm snapshots", () => {
+    const { tracker } = fixture();
+    for (const id of ["vps.coding", agent]) {
+      tracker.observe(id, oid, { ...hb, agent: id });
+      tracker.observe(id, nextOid, { ...hb, agent: id, boot_id: "b_dcba", n: 0 });
+    }
+    expect(tracker.alarms()).toEqual([]);
+    for (const id of ["vps.coding", agent]) tracker.observe(id, oid, { ...hb, agent: id });
+    const alarms = tracker.alarms();
+    expect(alarms.map((alarm) => alarm.agent)).toEqual([agent, "vps.coding"]);
+    const first = alarms[0];
+    if (!first) throw new Error("Fixture alarm missing");
+    first.agent = "vps.testing";
+    alarms.pop();
+    expect(tracker.alarms().map((alarm) => alarm.agent)).toEqual([agent, "vps.coding"]);
+  });
+
+  it("validates returning boot observations before updating history or raising an alarm", () => {
+    const { tracker } = fixture();
+    tracker.observe(agent, oid, hb);
+    tracker.observe(agent, nextOid, { ...hb, boot_id: "b_dcba", n: 0 });
+    expect(() => tracker.observe(agent, oid, { ...hb, n: -1 })).toThrow(LivenessError);
+    expect(() => tracker.observe(agent, "--invalid", hb)).toThrow(LivenessError);
+    expect(() => tracker.observe(agent, oid, { ...hb, agent: "vps.coding" })).toThrow(
+      LivenessError,
+    );
+    expect(tracker.alarms()).toEqual([]);
+    expect(tracker.classify(agent).bootId).toBe("b_dcba");
+    tracker.observe(agent, oid, hb);
+    expect(tracker.alarms()).toHaveLength(1);
   });
 
   it("ignores sender timestamps and wall-clock jumps in both directions", async () => {

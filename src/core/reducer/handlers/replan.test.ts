@@ -418,18 +418,46 @@ describe("replan.requested", () => {
     },
   );
 
-  it("rejects a non-null unknown item after checking evidence", () => {
-    const fixture = executing();
-    reject(
-      fixture,
-      {
+  it.each(["executing", "interrupting", "replanning"] as const)(
+    "rejects an unknown item from humans and daemons in %s without mutation",
+    (status) => {
+      const fixture = executing();
+      claim(fixture);
+      if (status !== "executing") request(fixture);
+      if (status === "replanning") checkpoint(fixture);
+      for (const actor of [VPS, "human"]) {
+        reject(
+          fixture,
+          {
+            type: "replan.requested",
+            actor,
+            payload: { ...requestPayload(), item: "W9" },
+          },
+          "unknown_item",
+        );
+      }
+    },
+  );
+
+  it.each(["interrupting", "replanning"] as const)(
+    "coalesces a task-wide request with a null item in %s",
+    (status) => {
+      const fixture = executing();
+      claim(fixture);
+      request(fixture);
+      if (status === "replanning") checkpoint(fixture);
+      append(fixture, {
         type: "replan.requested",
-        actor: VPS,
-        payload: { ...requestPayload(), item: "W9" },
-      },
-      "unknown_item",
-    );
-  });
+        actor: "human",
+        payload: { ...requestPayload(), item: null, evidence: [] },
+      });
+      accepted(fixture);
+      expect(task(fixture).status).toBe(status);
+      expect(task(fixture).replan_count).toBe(1);
+      expect(task(fixture).barrier?.requests).toHaveLength(2);
+      expect(fixture.state).toEqual(replay(fixture.builder.entries));
+    },
+  );
 
   it.each(["planning", "reviewing", "awaiting_approval", "delivered", "escalated"] as const)(
     "rejects %s before checking evidence or item",
@@ -641,6 +669,36 @@ describe("checkpoint.recorded", () => {
 });
 
 describe("barrier.closed", () => {
+  it("throws before mutation when an awaited item is impossibly absent", () => {
+    const fixture = multipleLeases();
+    request(fixture);
+    delete task(fixture).items.W3;
+    const barrierId = task(fixture).barrier?.id ?? "B999";
+    reject(
+      fixture,
+      {
+        type: "barrier.closed",
+        actor: "human",
+        payload: { barrier_id: barrierId, missing: ["W1", "W2"] },
+      },
+      "pre_mismatch",
+    );
+    const event = fixture.builder.event({
+      type: "barrier.closed",
+      actor: "human",
+      payload: { barrier_id: barrierId, missing: ["W1", "W2", "W3"] },
+    }) as Parameters<typeof handleBarrierClosed>[1];
+    const before = canonicalJson(fixture.state);
+    expect(() =>
+      handleBarrierClosed(fixture.state, event, {
+        seq: fixture.state.seq + 1,
+        sha: fixture.builder.tip,
+        principal: { kind: "human" },
+      }),
+    ).toThrow(RangeError);
+    expect(canonicalJson(fixture.state)).toBe(before);
+  });
+
   it.each(["human", VPS])(
     "allows %s to close with the exact unsettled items in any order",
     (actor) => {

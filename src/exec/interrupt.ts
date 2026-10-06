@@ -33,7 +33,8 @@ export async function runInterruptLadder(
   if (await exitedWithin(exited, clock, graceMs)) return "interrupted";
 
   h.signalGroup("SIGTERM");
-  if (await exitedWithin(exited, clock, termMs)) return "interrupted";
+  // The adapter contract records any SIGTERM/SIGKILL escalation as killed (§9.2).
+  if (await exitedWithin(exited, clock, termMs)) return "killed";
 
   h.signalGroup("SIGKILL");
   await exited;

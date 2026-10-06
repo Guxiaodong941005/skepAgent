@@ -63,21 +63,28 @@ describe("runInterruptLadder", () => {
     expect(signalGroup.mock.calls).toEqual([["SIGINT"]]);
   });
 
-  it("uses the default 120 s grace, then gives SIGTERM 30 s", async () => {
-    const { h, signalGroup, finish, clock, vt } = processHandle();
-    const result = runInterruptLadder(h, clock);
-    await nextTurn();
-    await vt.advance(119_999);
-    expect(signalGroup.mock.calls).toEqual([["SIGINT"]]);
-    await vt.advance(1);
-    expect(signalGroup.mock.calls).toEqual([["SIGINT"], ["SIGTERM"]]);
-    expect(vt.nextTimerAt()).toBe(150_000);
+  it.each([
+    { code: null, signal: "SIGTERM" },
+    { code: 0, signal: null },
+  ] satisfies ProcessExit[])(
+    "returns killed after SIGTERM was needed, even with exit %j",
+    async (exit) => {
+      const { h, signalGroup, finish, clock, vt } = processHandle();
+      const result = runInterruptLadder(h, clock);
+      await nextTurn();
+      await vt.advance(119_999);
+      expect(signalGroup.mock.calls).toEqual([["SIGINT"]]);
+      await vt.advance(1);
+      expect(signalGroup.mock.calls).toEqual([["SIGINT"], ["SIGTERM"]]);
+      expect(vt.nextTimerAt()).toBe(150_000);
 
-    await vt.advance(29_999);
-    finish({ code: null, signal: "SIGTERM" });
-    expect(await result).toBe("interrupted");
-    expect(vt.nextTimerAt()).toBeNull();
-  });
+      await vt.advance(29_999);
+      finish(exit);
+      expect(await result).toBe("killed");
+      expect(signalGroup.mock.calls).toEqual([["SIGINT"], ["SIGTERM"]]);
+      expect(vt.nextTimerAt()).toBeNull();
+    },
+  );
 
   it("escalates SIGINT → SIGTERM → SIGKILL and waits for the confirmed exit", async () => {
     const { h, signalGroup, finish, clock, vt } = processHandle();
@@ -128,7 +135,7 @@ describe("runInterruptLadder", () => {
     await vt.advance(1);
     expect(signalGroup).toHaveBeenLastCalledWith("SIGTERM");
     finish({ code: null, signal: "SIGTERM" });
-    expect(await result).toBe("interrupted");
+    expect(await result).toBe("killed");
     expect(vt.nextTimerAt()).toBeNull();
   });
 

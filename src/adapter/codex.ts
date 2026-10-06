@@ -385,10 +385,8 @@ export class CodexAdapter implements AgentAdapter {
         // or inspect agent-local provider configuration. RuntimeBackend closes stdin after this.
         env: inv.env,
         logPath,
-        stdin:
-          this.outputSchemaMode === "strict"
-            ? inv.prompt
-            : `${inv.prompt}\n\nReturn only JSON matching this original JSON Schema:\n${JSON.stringify(inv.outputSchema)}\n`,
+        // ARCHITECTURE §9.3: prompt builders own schema instructions, including in off mode.
+        stdin: inv.prompt,
       });
       const events = new CodexEvents(logPath);
       const { outcome, exit } = await this.supervise(
