@@ -1,0 +1,40 @@
+{
+  "name": "skep",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Cross-device, decentralized collaboration for AI coding agents over a signed git blackboard.",
+  "license": "UNLICENSED",
+  "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "bin": {
+    "skep": "dist/bin/skep.js",
+    "skepd": "dist/bin/skepd.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "biome check . && tsc -p tsconfig.json --noEmit",
+    "format": "biome format --write .",
+    "fix": "biome check --write .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check": "npm run lint && npm test",
+    "skep": "tsx src/bin/skep.ts",
+    "skepd": "tsx src/bin/skepd.ts"
+  },
+  "dependencies": {
+    "commander": "^15.0.0",
+    "smol-toml": "^1.9.0",
+    "yaml": "^2.9.1",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.15",
+    "@types/node": "^22.20.5",
+    "tsx": "^4.23.15",
+    "typescript": "~5.9.3",
+    "vitest": "^5.0.3"
+  }
+}

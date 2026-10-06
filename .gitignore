@@ -1,0 +1,12 @@
+node_modules/
+dist/
+coverage/
+*.log
+.DS_Store
+# simulation scratch output (seeded runs write here)
+.skep-sim/
+# local editor / agent state
+.vscode/
+.idea/
+.env
+.env.*
