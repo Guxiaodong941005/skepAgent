@@ -701,6 +701,7 @@ export async function runDaemon(
     .name("skepd")
     .description("Run the per-device Skep daemon with a local Unix socket")
     .option("--home <dir>", "Skep state directory")
+    .option("--socket-group <name>", "local group for a 0660 socket and 0750 socket directory")
     .option("--role-dir <dir...>", "trusted role directories")
     .option("--agent-user <user>", "local OS user for agent subprocesses")
     .option("--agent-home <dir>", "agent user's local home directory")
@@ -715,6 +716,7 @@ export async function runDaemon(
   }
   const args = program.opts<{
     home?: string;
+    socketGroup?: string;
     roleDir?: string[];
     agentUser?: string;
     agentHome?: string;
@@ -748,7 +750,11 @@ export async function runDaemon(
       ...(args.agentConfigDir ? { configDir: args.agentConfigDir } : {}),
     })),
     resolveIntent: (spec) => intentFromSpec(spec, { rng: random, nowMs: clock.nowMs() }),
-    ipcFactory: (options) => new IpcServer(options),
+    ipcFactory: (options) =>
+      new IpcServer({
+        ...options,
+        ...(args.socketGroup !== undefined ? { group: args.socketGroup, mode: 0o660 } : {}),
+      }),
   });
   let resolveStop: () => void = () => {};
   const stopped = new Promise<void>((resolve) => {

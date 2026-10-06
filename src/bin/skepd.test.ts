@@ -1,4 +1,5 @@
-import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { T1 } from "../../test/helpers/log-builder.js";
@@ -13,6 +14,7 @@ import { IpcServer } from "../daemon/ipc-server.js";
 import { EvidenceVerifier } from "../exec/evidence.js";
 import type { JournalRecord } from "../exec/journal.js";
 import { Redactor } from "../exec/redact.js";
+import { execFileChecked } from "../util/exec.js";
 import {
   bindAgentRuntime,
   bindCodeHost,
@@ -74,6 +76,7 @@ describe("daemon entrypoint", () => {
     try {
       await runDaemon(["--help"], { SKEP_HOME: ".skep-sim/home" });
       expect(write.mock.calls.map(([text]) => text).join("")).toContain("--agent-path");
+      expect(write.mock.calls.map(([text]) => text).join("")).toContain("--socket-group <name>");
     } finally {
       write.mockRestore();
     }
@@ -127,6 +130,55 @@ describe("daemon entrypoint", () => {
     } finally {
       resolve.mockRestore();
     }
+  });
+  it.each([false, true])("applies CLI socket permissions with group flag = %s", async (shared) => {
+    const home = await mkdtemp(join(tmpdir(), "skep-socket-cli-"));
+    const group = (await execFileChecked("/usr/bin/id", ["-gn"])).stdout.trim();
+    const interrupted = new Error("Stop after checking socket permissions");
+    const bootstrap = async (options: DaemonBootstrapOptions) => {
+      const socketPath = join(options.home, "skepd.sock");
+      const server = options.ipcFactory({
+        socketPath,
+        redactor: new Redactor(),
+        handlers: {
+          status: vi.fn(),
+          log: vi.fn(),
+          publish: vi.fn(),
+          agentStart: vi.fn(),
+          agentStop: vi.fn(),
+          logsTail: vi.fn(),
+          doctor: vi.fn(),
+          ping: vi.fn(),
+        },
+      });
+      return {
+        start: async () => {
+          await server.start();
+          expect((await stat(socketPath)).mode & 0o777).toBe(shared ? 0o660 : 0o600);
+          expect((await stat(home)).mode & 0o777).toBe(shared ? 0o750 : 0o700);
+          expect((await stat(socketPath)).gid).toBe(process.getgid?.());
+          expect((await stat(home)).gid).toBe(process.getgid?.());
+          throw interrupted;
+        },
+        stop: () => server.stop(),
+      };
+    };
+    try {
+      await expect(
+        runDaemon(["--home", home, ...(shared ? ["--socket-group", group] : [])], {}, bootstrap),
+      ).rejects.toBe(interrupted);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+  it("configures the Mac LaunchDaemon example for the skep socket group", async () => {
+    const plist = await readFile(
+      new URL("../../deploy/com.skepagent.skepd.plist", import.meta.url),
+      "utf8",
+    );
+    const args = plist.match(/<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/)?.[1];
+    expect(args).toMatch(/<string>--socket-group<\/string>\s*<string>skep<\/string>/);
+    expect(plist).toContain("A non-root CLI outside that group is denied by the OS");
   });
 });
 
