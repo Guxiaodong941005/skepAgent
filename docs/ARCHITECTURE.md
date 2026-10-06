@@ -517,8 +517,7 @@ override. A `solo` plan has exactly one item. Activating a plan sets `task.mode 
 the task switches to team mode only when a human approves the plan (or an owner-policy lock
 activates it, §9.4), and from then on it stays team (later replans must be team plans too). The
 owner's plan validator (§11.2) picks `team` whenever the plan has more than one item or an item
-assigned to an agent on another device than the owner. Implemented by SK-208 (SK-101 currently
-requires `plan.mode == task.mode`).
+assigned to an agent on another device than the owner. Implemented by SK-208.
 
 ### 5.6 Views
 
@@ -751,6 +750,23 @@ async function runStructured<T>(adapter, inv, schema: z.ZodType<T>): Promise<
 `outputSchema = z.toJSONSchema(schema)`; extract the last JSON object from `finalMessage`
 (tolerate code fences); validate; on failure exactly **one** `repair` invocation with the
 validator errors; still invalid ⇒ `invalid_output`.
+
+**Schema roles (D21).**
+
+* `AdapterInvocation.outputSchema` is always the **strict, Zod-derived** JSON Schema of the
+  expected document. The runner hands each adapter its own copy.
+* An adapter **may transform its copy** into whatever its provider's structured-output mode
+  accepts. Example: the Codex strict-mode transform in `codex.ts` (`toCodexOutputSchema`, SK-207
+  B1) rewrites `oneOf` ⇒ `anyOf`, makes every property required with optional ones nullable,
+  collapses tuples and drops unsupported validation keywords. The transform is a lossy
+  *generation constraint*, never a validator.
+* The adapter returns the raw final message unchanged.
+* `structured.ts` (SK-307) extracts the JSON, then removes `null` placeholders for properties that
+  the **original** schema does not require (`normalizeOptionalNulls`). It then validates with the
+  original Zod schema, which is **always the validation authority** (refinements included).
+* A provider rejecting the transformed schema is a configuration error (`CodexAdapterError`). It
+  propagates and is never repaired. Process failures (non-`completed` outcomes, non-zero exit ⇒
+  `crash`) also never consume the repair.
 
 ### 9.4 Work report (`skep.work_report/v1`)
 
@@ -1024,6 +1040,7 @@ before a task is done.
 | D18 | No mesh VPN or fixed IP: the hosted git remote is the only rendezvous and authority (adaptive polling, `ls-remote` short-circuit); an optional outbound-only WebSocket relay carries only rate-limited wake-up hints (V1) and never secrets or payloads; direct P2P rejected. Tailscale-dependent features move to signed enrollment/trust bundles (public keys and `allowed_signers` only), local `skep logs` + heartbeat summary for remote agents, and relay hints. Design in §17 | Deviates from PRD §1, §5, §6.1, §11.2, §15.2 and §18, which assume a tailnet. Devices behind NAT, laptops and phones cannot rely on inbound reachability; correctness already comes from signed git (PRD §10), so a transport needs only availability. Polling latency (~10 s active) is small next to work-item durations, so the relay is an optimisation, not a dependency; P2P would need the relay for signalling anyway plus TURN. |
 | D19 | Hard rule / non-goal: Skep never transports, stores, syncs or brokers provider credentials, API keys or provider configurations between devices, in any form: not as plaintext, not as ciphertext, not as a hash, and not as a label. Each device's agent CLIs are configured locally by the human on that device; Skep neither reads nor records that configuration. No provider label either: `agent.registered` carries only `agent_cli` + `cli_version`, and `skep doctor` checks only that the pinned CLI is present (PRD §13.3 step 3's "provider name + config hash" is dropped). Defence in depth: gitleaks + a pattern-based redactor on everything Skep writes or publishes (§16) | Restores and strengthens PRD §3.2 ("no secret storage or secret distribution through the blackboard") and §11.5 after D17 was rejected. A label or hash would be useless to the protocol (routing uses agent IDs, capabilities and `requires_local`) and a hash of a low-entropy config can be guessed. Keeping provider setup entirely local means a blackboard, relay or git-host compromise can never yield a credential. |
 | D20 | Invariant 6 is checked per transition, not per state: the event that pushes `replan_count` or `review_rounds` over budget must escalate (for replans, via a barrier with `escalate: true` that settles only into `escalated`). Counters may legitimately remain over budget afterwards. | The earlier wording ("`replan_count ≤ budget` unless status is `escalated`") is false for legal logs. `replan_count` is lifetime (§5.5, D12) and `resume_with_plan` resets no counter, so a resumed task is `executing` over budget. An over-budget barrier stays `interrupting` until its holders settle (§5.5). Found in the SK-304 review: the literal check flagged a legal review-round escalation followed by `resume_with_plan`. |
+| D21 | Adapters receive the strict Zod-derived `outputSchema` and may transform their copy into a provider-compatible schema; `structured.ts` normalizes optional nulls against the original schema and validates with Zod, the only validation authority (§9.3) | Provider strict modes reject parts of the Zod JSON Schema (`oneOf`, optional properties, tuples; SK-207 B1, verified against the real CLI). Provider quirks stay in the adapter (§9.1), and validation stays in one place, so a lossy transform can never weaken validation. |
 
 ---
 
