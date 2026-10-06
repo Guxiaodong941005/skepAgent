@@ -84,25 +84,38 @@
 | SK-501 | Code mirror, worktrees, sanitized agent env | SK-205, SK-206 | codex | `src/exec/{worktree,sandbox-env}.ts` (+ tests) | Mirror per allowlisted repo; worktree from base or predecessor SHA; env strips GIT_*, SSH_AUTH_SOCK, GH_TOKEN, credential helpers; optional uid/gid | done (PASS_WITH_NOTES) |
 | SK-502 | Trusted checks runner, evidence verifier, secret scan | SK-501 | codex | `src/exec/{checks,evidence,secret-scan}.ts` (+ tests) | Checks only from `base_commit`; CheckRun + journal; file_span/command_run/check_run verification; gitleaks wrapper (skip with warning if absent in tests) | done (PASS after fix round; B1 secret-scan bypass fixed) |
 | SK-503 | Code host interface, fake host, gh host | SK-205 | pi | `src/codehost/{types,fake,gh}.ts` (+ tests) | Interface per ARCHITECTURE §11.5; fake enforces one PR per head; gh implementation via `gh` JSON output (unit-tested with a stub runner) | done (PASS_WITH_NOTES) |
-| SK-504 | Attempt pipeline + mechanical snapshot | SK-306, SK-307, SK-403, SK-406, SK-502, SK-503, SK-506 | codex | `src/exec/{attempt,snapshot}.ts` (+ tests) | Journaled steps per ARCHITECTURE §9.7; one fix-up; code first then record; reverify before PR and before `work.delivered`; snapshot from verifiable facts. **D19:** adapter output, check logs and journal records go through the `Redactor` (SK-506); before any publication `findSecrets` runs next to gitleaks and a hit ⇒ `work.failed{secret_detected}` with nothing published; the daemon adds no credentials to any agent, check, git or gh environment | todo |
+| SK-504 | Attempt pipeline + mechanical snapshot | SK-306, SK-307, SK-403, SK-406, SK-502, SK-503, SK-506 | codex | `src/exec/{attempt,snapshot}.ts` (+ tests) | Journaled steps per ARCHITECTURE §9.7; one fix-up; code first then record; reverify before PR and before `work.delivered`; snapshot from verifiable facts. **D19:** adapter output, check logs and journal records go through the `Redactor` (SK-506); before any publication `findSecrets` runs next to gitleaks and a hit ⇒ `work.failed{secret_detected}` with nothing published; the daemon adds no credentials to any agent, check, git or gh environment | done (PASS after fix round: secret hit publishes fenced work.failed{secret_detected}) |
 | SK-506 | Pattern-based secret redactor (D19 defence in depth) | SK-205 | codex | `src/exec/redact.ts`, `src/exec/journal.ts` (optional `redactor` constructor option) (+ tests) | ARCHITECTURE §16: `Redactor` with built-in rules for common key/token formats (provider-style API keys, GitHub tokens, private-key blocks, `*_KEY=`/`*_TOKEN=`/`*_SECRET=` assignments with high-entropy values) replacing matches with `[REDACTED:<rule>]`, including matches split across streamed chunks; `findSecrets(text)` for the pre-publication scan; journal records pass through the redactor before the fsync'd write (test: a record with a fake key such as `sk-test-…` never reaches disk); default no-op keeps SK-205 behaviour; Skep never loads provider credentials to redact (D19), so the redactor is pattern-based only; fixtures use obviously fake values allowlisted in gitleaks | done (PASS_WITH_NOTES) |
-| SK-507 | Wave 5 hardening: code host, redactor, structured fallback | SK-503, SK-506, SK-405 | pi | `src/codehost/{gh,fake}.ts`, `src/exec/redact.ts`, `src/adapter/structured.ts`, `test/helpers/golden-scenarios.ts` (+ tests) | Follow-ups G6, G8, G17 (see "Wave 5 remainder + Wave 6 schedule"); no exported signature changes, so SK-504 runs in parallel | todo |
-| SK-505 | Restart reconciliation + crash scenario | SK-504, SK-401 | codex | `src/exec/reconcile.ts`, `src/sim/scenarios/crash-every-step.ts` (+ tests) | Crash at every journal step ⇒ no duplicate events, executions or PRs | todo |
+| SK-507 | Wave 5 hardening: code host, redactor, structured fallback | SK-503, SK-506, SK-405 | pi | `src/codehost/{gh,fake}.ts`, `src/exec/redact.ts`, `src/adapter/structured.ts`, `test/helpers/golden-scenarios.ts` (+ tests) | Follow-ups G6, G8, G17 (see "Wave 5 remainder + Wave 6 schedule"); no exported signature changes, so SK-504 runs in parallel | done (PASS_WITH_NOTES) |
+| SK-505 | Restart reconciliation + crash scenario | SK-504, SK-401 | codex | `src/exec/reconcile.ts`, `src/sim/scenarios/crash-every-step.ts` (+ tests) | Crash at every journal step ⇒ no duplicate events, executions or PRs | done (PASS_WITH_NOTES) |
 
 ## Wave 6 — daemon, flows, CLI
 
 | ID | Title | Depends on | Assignee | Files/area | Acceptance criteria | Status |
 |---|---|---|---|---|---|---|
-| SK-601 | Daemon tick loop, slots, duties, plan validator | SK-504, SK-302, SK-303, SK-602 | codex | `src/daemon/{daemon,slots,duties,lock}.ts`, stub `src/daemon/{replan,delivery}.ts`, `src/sim/scenarios/{index,solo-happy,team-stacked}.ts`, `src/exec/plan-validator.ts`, `src/bin/skepd.ts` | Owner plans, reviewer reviews, assignee claims & executes; single-daemon lock; scenarios `solo-happy`, `team-stacked` pass. Claim duty uses `claimableItems` (D16: a parked lease in an escalated/replanning task does not stop the slot from claiming elsewhere); a `delivered` task may appear directly after an activation (D15) and must trigger the owner's verification duty (SK-606). **D18:** daemon wires a `HintChannel` (null by default) into sync and publishes a `tip` hint after each accepted publish; nothing in the daemon requires inbound connectivity | todo |
-| SK-602 | IPC protocol, server, client with sign callback | SK-301 | pi | `src/ipc/{protocol,client}.ts`, `src/daemon/ipc-server.ts` (+ tests) | NDJSON frames per ARCHITECTURE §12; sign_request/sign_result round trip; version mismatch error; socket perms 0600 | todo |
-| SK-603 | CLI write commands (task, plan, lease, decide, replan, cancel) | SK-602, SK-403 | pi | `src/cli/commands/{task,plan,lease,decide,replan,agent,sim}.ts`, `src/cli/output.ts`, `src/core/{intents-human,intent-spec}.ts` (incl. `plan show`, moved from SK-604) | Each command builds the intent, publishes via daemon or in-process fallback, prints accepted/rejected with `#seq`; language guard on `task new` | todo |
-| SK-604 | `skep status`, `skep log` rendering (`plan show` moved to SK-603) | SK-204, SK-602 | pi | `src/cli/commands/{status,log}.ts`, `src/cli/render-status.ts` | Matches PRD §15.1 layout; `--machine` stable JSON; revoke suggestions for stale holders; shows sync freshness and hint-channel health (D18); shows nothing about providers (D19) | todo |
-| SK-605 | Coarse replan flow in the daemon | SK-601 | codex | `src/daemon/replan.ts`, scenarios `replan-once`, `replan-escalate`, `missing-checkpoint` | Interrupt ladder → snapshot → WIP push → checkpoint; barrier deadline ⇒ barrier.closed; third replan escalates | todo |
-| SK-606 | Stacked delivery, task.verified, merge observation & retarget | SK-601, SK-209 | codex | `src/daemon/delivery.ts` (+ scenario test) | W2 starts from W1 delivered SHA, PR base = W1 branch; top-of-stack verification; merged PRs ⇒ item.merged, next PR retargeted. **D14:** owner duty runs when the task is `delivered` ∧ `verified == null` (also after a D15 re-activation); runs every item's acceptance checks once at the top-of-stack SHA; publishes `task.verified{passed, check_runs}` — on failure `passed: false` (**never** `work.failed`, no automatic re-run) and notifies the human. Scenario: failing combined check ⇒ `escalated` (`verification_failed`); `skep decide --resume` ⇒ `delivered` ⇒ re-verify passes ⇒ merges ⇒ `done` | todo |
-| SK-607 | `skep init`, `skep doctor`, ntfy notifier | SK-301, SK-206 | pi | `src/cli/commands/{init,doctor}.ts`, `src/notify/ntfy.ts` | init writes device.toml, generates daemon key, prints allowed_signers line, optional genesis; doctor runs PRD §13.3 pre-flight + full replay + invariants. **D18:** no step assumes Tailscale or inbound SSH; doctor checks outbound reachability of the blackboard and code remotes only, and reports the optional relay as a warning, never an error | todo |
-| SK-608 | Service units + runbook | SK-601 | pi | `deploy/{skepd.service,com.skepagent.skepd.plist}`, `docs/RUNBOOK.md` | Setup, key rotation, revoke, re-genesis procedures documented. **D18:** provisioning without Tailscale: run `skep init` on the device's own console/shell, copy the printed key line to the controller, install the trust root by any channel with fingerprint comparison (manual until SK-702); **D19:** configure each device's agent CLIs locally on that device — the runbook states that Skep never copies provider credentials or configs; all examples use generic hosts (`example.invalid`) | todo |
-| SK-609 | Real two-device run & metrics | all | codex | `docs/MVP-RUN-REPORT.md` | PRD §16.5 acceptance criteria verified or gaps documented | todo |
+| SK-601 | Daemon tick loop, slots, duties, plan validator | SK-504, SK-302, SK-303, SK-602 | codex | `src/daemon/{daemon,slots,duties,lock}.ts`, stub `src/daemon/{replan,delivery}.ts`, `src/sim/scenarios/{index,solo-happy,team-stacked}.ts`, `src/exec/plan-validator.ts`, `src/bin/skepd.ts` | Owner plans, reviewer reviews, assignee claims & executes; single-daemon lock; scenarios `solo-happy`, `team-stacked` pass. Claim duty uses `claimableItems` (D16: a parked lease in an escalated/replanning task does not stop the slot from claiming elsewhere); a `delivered` task may appear directly after an activation (D15) and must trigger the owner's verification duty (SK-606). **D18:** daemon wires a `HintChannel` (null by default) into sync and publishes a `tip` hint after each accepted publish; nothing in the daemon requires inbound connectivity | done (PASS after fix round: static IPC imports, status {view, extras}, crash-every-step registered) |
+| SK-602 | IPC protocol, server, client with sign callback | SK-301 | pi | `src/ipc/{protocol,client}.ts`, `src/daemon/ipc-server.ts` (+ tests) | NDJSON frames per ARCHITECTURE §12; sign_request/sign_result round trip; version mismatch error; socket perms 0600 | done (PASS_WITH_NOTES) |
+| SK-603 | CLI write commands (task, plan, lease, decide, replan, cancel) | SK-602, SK-403 | pi | `src/cli/commands/{task,plan,lease,decide,replan,agent,sim}.ts`, `src/cli/output.ts`, `src/core/{intents-human,intent-spec}.ts` (incl. `plan show`, moved from SK-604) | Each command builds the intent, publishes via daemon or in-process fallback, prints accepted/rejected with `#seq`; language guard on `task new` | done (PASS_WITH_NOTES after fix round: fallback clone.init, merge conflict, --hash pin, one machine path) |
+| SK-604 | `skep status`, `skep log` rendering (`plan show` moved to SK-603) | SK-204, SK-602 | pi | `src/cli/commands/{status,log}.ts`, `src/cli/render-status.ts` | Matches PRD §15.1 layout; `--machine` stable JSON; revoke suggestions for stale holders; shows sync freshness and hint-channel health (D18); shows nothing about providers (D19) | done (PASS_WITH_NOTES) |
+| SK-605 | Coarse replan flow in the daemon | SK-601 | codex | `src/daemon/replan.ts`, scenarios `replan-once`, `replan-escalate`, `missing-checkpoint` | Interrupt ladder → snapshot → WIP push → checkpoint; barrier deadline ⇒ barrier.closed; third replan escalates | done (PASS_WITH_NOTES) |
+| SK-606 | Stacked delivery, task.verified, merge observation & retarget | SK-601, SK-209 | codex | `src/daemon/delivery.ts` (+ scenario test) | W2 starts from W1 delivered SHA, PR base = W1 branch; top-of-stack verification; merged PRs ⇒ item.merged, next PR retargeted. **D14:** owner duty runs when the task is `delivered` ∧ `verified == null` (also after a D15 re-activation); runs every item's acceptance checks once at the top-of-stack SHA; publishes `task.verified{passed, check_runs}` — on failure `passed: false` (**never** `work.failed`, no automatic re-run) and notifies the human. Scenario: failing combined check ⇒ `escalated` (`verification_failed`); `skep decide --resume` ⇒ `delivered` ⇒ re-verify passes ⇒ merges ⇒ `done` | done (PASS_WITH_NOTES) |
+| SK-607 | `skep init`, `skep doctor`, ntfy notifier | SK-301, SK-206 | pi | `src/cli/commands/{init,doctor}.ts`, `src/notify/ntfy.ts` | init writes device.toml, generates daemon key, prints allowed_signers line, optional genesis; doctor runs PRD §13.3 pre-flight + full replay + invariants. **D18:** no step assumes Tailscale or inbound SSH; doctor checks outbound reachability of the blackboard and code remotes only, and reports the optional relay as a warning, never an error | done (PASS after fix round: doctor compares the full codex-cli version line) |
+| SK-608 | Service units + runbook | SK-601 | pi | `deploy/{skepd.service,com.skepagent.skepd.plist}`, `docs/RUNBOOK.md` | Setup, key rotation, revoke, re-genesis procedures documented. **D18:** provisioning without Tailscale: run `skep init` on the device's own console/shell, copy the printed key line to the controller, install the trust root by any channel with fingerprint comparison (manual until SK-702); **D19:** configure each device's agent CLIs locally on that device — the runbook states that Skep never copies provider credentials or configs; all examples use generic hosts (`example.invalid`) | done (PASS_WITH_NOTES after fix round: Linux caps, macOS root LaunchDaemon, role dirs outside SKEP_HOME) |
+| SK-609 | Real two-device run & metrics | all MVP tasks, SK-611..SK-614 | codex | `docs/MVP-RUN-REPORT.md` | PRD §16.5 acceptance criteria verified or gaps documented; follow the "SK-609 — Real two-device run" checklist | todo |
 | SK-610 | First public release v0.1.0 | SK-609 | codex (human sign-off) | `package.json` (release fields), `CHANGELOG.md`, `README.md` (quickstart), `docs/RELEASE.md` (checklist + name decision) | See "SK-610 — First public release v0.1.0": SemVer 0.x policy; Keep-a-Changelog `CHANGELOG.md`; README quickstart; npm name availability checked with `npm view` (no publish) and decision recorded; package.json `name`/`bin`/`files`/`engines`/`license`/`repository`; release notes drafted; every pre-release checklist item true; tag and publish only on explicit human go | todo |
+
+## Wave 6b — pre-run hardening (before SK-609)
+
+From the Wave 5/6 reviews (see "Wave 5/6 follow-ups"). All must merge before SK-609.
+
+| ID | Title | Depends on | Assignee | Files/area | Acceptance criteria | Status |
+|---|---|---|---|---|---|---|
+| SK-611 | Wire agent replan requests into the attempt pipeline | SK-504, SK-605 | codex | `src/exec/attempt.ts`, `src/daemon/replan.ts`, `src/daemon/duties.ts` (+ tests, a scenario variant) | H12–H13: a work report with `replan_request` is **not** delivered; `publishReplanRequest` runs with the evidence journal key of the invocation that produced the report (no `W1`/epoch-1 guess); `accepted` ⇒ the attempt checkpoints for the barrier via the replan duty; `dropped` (no verified evidence) ⇒ journaled "replan request ignored" and the attempt continues normally (§9.5); an agent-originated S3 sim run passes | todo |
+| SK-612 | Socket group/mode for the daemon IPC socket | SK-601, SK-602 | codex | `src/daemon/ipc-server.ts`, `src/bin/skepd.ts`, `deploy/com.skepagent.skepd.plist` (+ tests) | H7 / D22: `IpcServer` option `{ group?: string; mode?: 0o600 \| 0o660 }`; `skepd --socket-group <name>` sets 0660 + group (the directory 0750 with the same group); default stays 0600; the plist example passes `--socket-group skep`; test: group-accessible socket, wrong-group rejection documented | todo |
+| SK-613 | Reliability hardening: restart, verification journal, code-host load | SK-505, SK-606 | codex | `src/exec/reconcile.ts`, `src/daemon/delivery.ts`, `src/exec/journal.ts` (verification key only) (+ tests) | H1: an empty-token pgid kill only when the journaled boot id / process start time proves the group predates no reboot; H14: verification checks journaled under their own key, so finished attempts stay terminal; H15: cache terminal PR states and "no stale PR" per (task, item, epoch), with `closeStale` only on epoch changes; H2/H3 (optional): settle a barrier with `checkpoint{unknown}` for a pending delivery; publish `work.failed{crash}` when the PR was merged/closed before `work.delivered` | todo |
+| SK-614 | Polish + runbook (pi) | SK-602, SK-603, SK-604, SK-607, SK-608 | pi | `src/codehost/gh.ts`, `src/exec/redact.ts` (+ test), `src/ipc/client.ts`/`src/daemon/ipc-server.ts` (sign timeout only, coordinated with SK-612: run after it), `src/cli/publish-output.ts`, `src/cli/commands/status.ts`, `docs/RUNBOOK.md` | H5: no hard-coded `github.com` (omit `--hostname` unless a URL names a host); H6: pin prose that must survive the bearer rule; H9: the sign timeout uses the injected `Clock`; H10: `dropped`/`rejected`/`failed` verdicts use `Output.fail` (top-level `ok:false`); H11: drop the flat/`fetchedAtMonoMs` status fallback; H16: the runbook documents the Mac human's own CLI home (`~/.skep` with `human_signing_key` + `allowed_signers`), the human key in the human's account, and `--socket-group` | todo |
+
+---
 
 ## Wave 7 — transport without a mesh VPN (MVP+, D18)
 
@@ -481,6 +494,9 @@ Verify with `npm pack --dry-run`: the file list contains no test keys, fixtures 
 
 ## Wave 5 remainder + Wave 6 schedule
 
+> **Status: complete.** SK-504..SK-507 and SK-601..SK-608 are merged (verdicts in the task tables
+> and `docs/reviews/`); open notes are tracked under "Wave 5/6 follow-ups" and Wave 6b.
+
 Baseline: `main` with Waves 1–4 and SK-501/502/503/506 merged (see the task tables and
 "Wave 4 / early Wave 5 follow-ups"). Scope of this phase: **SK-504, SK-505, SK-507 (new, split out
 of SK-504), and SK-601..SK-608**. **SK-609 (real two-device run) and SK-610 (release) are not
@@ -770,6 +786,209 @@ Acceptance criteria (row) **plus**:
 * Examples use `example.invalid` only.
 
 Test: `npm run lint` (docs/units only).
+
+---
+
+## SK-609 — Real two-device run (brief and human checklist)
+
+Depends on every MVP task plus the Wave 6b pre-run tasks (SK-611..SK-614). The agent (codex)
+prepares `docs/MVP-RUN-REPORT.md` and drives the CLI; **the human provisions devices, keys,
+repositories and agent CLI logins, and performs every human gate**. Values below are
+placeholders: replace `example.invalid` hosts, the `example/…` repos and the account names with
+your own **locally**, and never commit them. Commands follow `docs/RUNBOOK.md` and the units in
+`deploy/` as they are on `main`.
+
+### 0. Preconditions (agent, on a clean checkout of the run commit)
+
+1. `npm ci && npm run lint && npm test && npm run build` all green, outside any sandbox.
+2. `SKEP_SIM_SEEDS=50 npx vitest run test/integration/sim`, and optionally
+   `SKEP_PROPERTY_LOGS=1000`; both green (G1).
+3. SK-611..SK-614 merged. In particular: agent replan requests are wired (SK-611), and `skepd
+   --socket-group` exists (SK-612). Record the commit sha in the report.
+
+### 1. Code-host side (human)
+
+1. Create an **empty private** blackboard repo (no README; the genesis must be the root
+   commit), e.g. `git@git.example.invalid:example/blackboard.git`.
+2. Create a private test code repo, e.g. `git@git.example.invalid:example/demo.git`, with on its
+   base branch:
+   * a tiny project whose tests run with one command;
+   * `.skep/checks.toml`:
+
+     ```toml
+     schema = "skep.checks/v1"
+
+     [checks.unit]
+     argv = ["npm", "test"]
+     timeout_sec = 600
+     ```
+3. For each device's **daemon user** (`skep` on Linux, `root` on the Mac), set up git push access
+   to both repos (an SSH deploy key or the user's SSH key) and `gh auth login` as that user. On a
+   headless device, use an explicit `GH_TOKEN` for the daemon only (RUNBOOK §1.5). The agent user
+   gets **no** git or `gh` credentials.
+4. Verify as each daemon user: `git ls-remote <blackboard url>`, `git ls-remote <demo url>` and
+   `gh auth status` all succeed.
+
+### 2. Software on both devices (human)
+
+1. Install Node ≥ 22.12, git ≥ 2.34, OpenSSH ≥ 8.9, `gh`, `gitleaks`, and the pinned agent CLI.
+2. Build and install: `npm ci && npm run build`. Install `dist/bin/skepd.js` at
+   `/usr/local/lib/skep/skepd.js` (the path the units use) and put `dist/bin/skep.js` on `PATH` as
+   `skep`.
+3. Create the agent OS user `skep-agent`. On Linux also create the daemon user `skep`.
+
+### 3. Agent CLI login, locally (human, D19)
+
+On **each** device, as `skep-agent` (e.g. `sudo -u skep-agent -H <cli> …`), log the pinned agent
+CLI in with that CLI's own login flow, into the agent user's own config directory. Then verify:
+
+* `sudo -u skep-agent -H codex --version` prints **one exact line**, e.g. `codex-cli <x.y.z>`.
+  This full line is the `cli_version` pin (D24).
+* a tiny non-interactive run as `skep-agent` succeeds.
+
+Skep never reads, copies or passes these credentials. Do not export provider keys into any Skep
+unit or environment.
+
+### 4. Directories (human; RUNBOOK §1.3 "Layout")
+
+* **Linux (`vps`), as root:**
+
+  ```bash
+  install -d -m 0700 -o skep -g skep /var/lib/skep
+  install -d -m 0750 -o skep -g skep-agent /var/lib/skep-roles /var/lib/skep-roles/coding
+  install -d -m 0750 -o skep-agent -g skep-agent /var/lib/skep-agent
+  ```
+* **Mac (controller), as root:**
+
+  ```bash
+  install -d -m 0700 -o root -g wheel /var/lib/skep
+  install -d -m 0750 -o root -g skep-agent /var/lib/skep-roles /var/lib/skep-roles/coding
+  ```
+  Also create the group `skep` and add the human's account to it (D22).
+
+### 5. Controller: human key, device init, genesis (human on the Mac)
+
+1. Human key, owned by the **human's account** so the CLI can sign: `ssh-keygen -t ed25519 -f
+   ~/.skep/keys/human` (passphrase/presence per your policy), then `ssh-add ~/.skep/keys/human`.
+2. Daemon state and genesis, as root:
+
+   ```bash
+   sudo skep --home /var/lib/skep init --device mac \
+     --blackboard git@git.example.invalid:example/blackboard.git \
+     --genesis --human-key <path to the human key> \
+     --repo demo=git@git.example.invalid:example/demo.git
+   ```
+   Verify that it prints the `daemon:mac` line, the local trust-root text (human line, then daemon
+   line) and a `genesis` sha. `init` does **not** write the trust root: write the printed text to
+   `/var/lib/skep/allowed_signers` yourself (mode 0600, owner root), per RUNBOOK §1.1. Re-running
+   the same command retries a failed genesis without minting a new key.
+3. **Human CLI home** (SK-614 documents this in the runbook): `~/.skep/device.toml` with the same
+   `device`, `blackboard` and `repos` fields as `/var/lib/skep/device.toml`, a `signing_key` (the
+   schema requires one; human commands sign with `human_signing_key`), **plus**
+   `human_signing_key = "<path to the human key>"`, and a copy of `allowed_signers` at
+   `~/.skep/allowed_signers`. `skep init` does not write `human_signing_key`. The CLI uses this home
+   for signing and for its in-process fallback.
+
+### 6. Worker: device init and trust exchange (human on `vps`)
+
+1. As `skep`:
+
+   ```bash
+   skep --home /var/lib/skep init --device vps \
+     --blackboard git@git.example.invalid:example/blackboard.git \
+     --repo demo=git@git.example.invalid:example/demo.git
+   ```
+   Copy the printed `daemon:vps …` line to the controller **by any channel**.
+2. On the Mac, append that line to `/var/lib/skep/allowed_signers` **and** `~/.skep/allowed_signers`.
+3. Copy the complete `allowed_signers` back to `vps` (`/var/lib/skep/allowed_signers`, 0600, owner
+   `skep`).
+4. Fingerprints (RUNBOOK §2): `ssh-keygen -l -f <key>.pub` on the generating device and
+   `ssh-keygen -l -f allowed_signers` on the receiving device. Compare **out of band**, including
+   the principal names (`human`, `daemon:mac`, `daemon:vps`).
+
+### 7. Roles (human, both devices)
+
+Write `/var/lib/skep-roles/coding/AGENT.md`, owned by the daemon user and not writable by
+`skep-agent`:
+
+```markdown
+---
+schema: skep.agent/v1
+role: coding
+agent_cli: codex
+cli_version: "codex-cli <x.y.z>"      # exactly the line from step 3
+repos:
+  - git@git.example.invalid:example/demo.git   # must equal the device.toml repo URL
+capabilities: [typescript, unit-tests]
+requires_local: []                     # the Mac may add [xcode] for S2
+max_parallel_items: 1
+---
+
+# Responsibilities
+Implement the assigned work item and its tests.
+```
+
+### 8. Services (human)
+
+* **Linux:** `install -m 0644 deploy/skepd.service /etc/systemd/system/skepd.service`, then
+  `systemctl daemon-reload && systemctl enable --now skepd.service`. Verify with `systemctl status
+  skepd` and `journalctl -u skepd` (no `EPERM`; the unit grants `CAP_SETUID/SETGID/CHOWN`).
+* **Mac:** copy `deploy/com.skepagent.skepd.plist` to `/Library/LaunchDaemons/` (after SK-612 it
+  passes `--socket-group skep`; check that it does), then `launchctl bootstrap system
+  /Library/LaunchDaemons/com.skepagent.skepd.plist`. Verify the socket is `0660 root:skep` and that
+  `skep status` as the human connects to it.
+
+### 9. Pre-flight (human, both devices)
+
+`skep --home /var/lib/skep doctor --roles-dir /var/lib/skep-roles` (as the daemon user) ⇒ every
+check `ok`. Warnings are allowed only for the clock and the relay. The replay must be clean with 0
+invalid commits, and `agent_cli.coding` must show the exact pinned line. Then `skep status` on both
+devices shows `mac.coding` and `vps.coding` registered with the same tip.
+
+### 10. Acceptance runs (PRD §16.5; agent drives, human gates)
+
+Record for each run: commands, `#seq` of each event, PR numbers, timings, `skep status
+--machine` snapshots.
+
+1. **S1 / criterion 1:**
+   * `skep task new "Add an example feature" --repo demo --owner vps.coding`
+   * the owner proposes a plan; `skep plan show <task>`, then `skep plan approve <task> --hash
+     <sha256:…>`;
+   * **close the Mac lid**;
+   * `vps` executes, runs checks, pushes and opens a PR. Verify on the code host and with `skep
+     log <task>`.
+2. **S2 / criterion 2:** `skep task new … --team` with two items (W1 `vps.coding` ⇒ W2
+   `mac.coding`). After review and approval, verify that W2's branch parent is W1's delivered SHA
+   and that PR #2's base is W1's branch. Run the top-of-stack verification. Merge bottom-up as
+   the human; verify `item.merged`, the retarget and `done`.
+3. **S3 / criterion 3:** during W1, make the work report raise a replan with verified evidence
+   (SK-611), or use `skep replan <task> --reason …`. Verify:
+   * `interrupting` ⇒ checkpoint (WIP branch pushed) ⇒ `replanning` ⇒ plan v2 approved ⇒ new
+     epoch;
+   * then two more replans ⇒ the third escalates (`skep status`), resolved with `skep decide
+     <task> --cancel` or `--resume`.
+4. **S5 / criterion 4:** a Mac-held lease: sleep the Mac, then from another session
+   `skep lease revoke <task> <item> --epoch <n>`, followed by revoke + replan to move the item
+   (RUNBOOK §4.1). Wake the Mac and verify **no** delivery or PR from the stale epoch, and exactly
+   one delivery at the new epoch.
+5. **Criterion 5:** `systemctl kill -s SIGKILL skepd` on `vps` mid-attempt, then restart; verify
+   no duplicate events, executions or PRs (`skep log`, code host, journal).
+6. **Criterion 6:** push one **unsigned** commit and one commit signed by an untrusted key to the
+   blackboard `main` from a scratch clone. Verify `skep status` alarms and `invalidCount` rises,
+   with no state change. Then publish `task.created` as a daemon (via a test helper) ⇒
+   `unauthorized`.
+7. **Criterion 7:** `skep doctor` on both devices ⇒ identical replay tip and state (compare `skep
+   status --machine` `view`). `git log --first-parent main` contains no `hb/*` commits.
+
+### 11. Report and clean-up (agent + human)
+
+* `docs/MVP-RUN-REPORT.md`: commit sha, versions, each criterion with evidence or a gap, timings,
+  incidents, and follow-ups. **No** hostnames, IPs, emails, tokens or absolute host paths; use
+  placeholders.
+* Run `gitleaks detect` over the blackboard clone and the journals; any finding is a stop
+  condition.
+* Stop the services, archive the journals locally, and rotate any code-host token used for the
+  run.
 
 ---
 
@@ -1466,6 +1685,35 @@ Wave 2b/3 follow-ups closed in this phase: F1–F6 (SK-405), F7–F10 (SK-406), 
 | G19 | Optional cleanups: split `SimScheduler` out of `src/sim/world.ts`; per-scenario expectation hooks instead of one `switch` in `protocol.test.ts`; cap the per-agent superseded-boot set in `LivenessTracker` | SK-401, SK-404, SK-406 | SK-505 |
 
 Still open from Wave 2b/3: F11–F14, F17–F20 (SK-504/SK-505/SK-601/SK-604) and F21 (SK-701).
+
+---
+
+## Wave 5/6 follow-ups
+
+From the Wave 5 remainder / Wave 6 reviews (`docs/reviews/SK-50x.md`, `SK-60x.md`).
+
+| # | Item | Source | Owner |
+|---|---|---|---|
+| H1 | Empty-token process-group kill needs a boot-id or start-time guard | SK-505 | SK-613 |
+| H2 | A pending delivery under a barrier is left until the deadline | SK-505 | SK-613 (optional) |
+| H3 | A PR merged before `work.delivered` leaves the lease held | SK-505 | SK-613 (optional) |
+| H4 | ssh-style / allowlist-name repo refs in the gh code host | SK-507 | **closed** by SK-601's fix round (`bindCodeHost` maps allowlist entries to `owner/repo`) |
+| H5 | `gh.ts` hard-codes `github.com` as the default host | SK-507 | SK-614 |
+| H6 | The bearer rule also redacts prose like "token" + 16 characters | SK-507 | SK-614 |
+| H7 | Socket user model: Mac root LaunchDaemon, socket 0660 group `skep` (D22) ⇒ `IpcServer` group/mode + `skepd --socket-group` | SK-601, SK-608 | SK-612 |
+| H8 | Map repo names for `GhCodeHost` before real PR operations | SK-601 | **closed** (same as H4) |
+| H9 | The IPC sign timeout uses the wall clock | SK-602 | SK-614 |
+| H10 | A `dropped` verdict exits 3 but prints top-level `"ok":true` | SK-603 | SK-614 |
+| H11 | CLI clock fallback for a missing `nowMonoMs` (mitigated by `checkedAgoMs`, D23); remove the flat-shape tolerance | SK-604 | SK-614 |
+| H12 | `publishReplanRequest` is only called from the test scenario; an agent's replan never reaches the blackboard | SK-605 | SK-611 |
+| H13 | Owner-raised replan requests verify evidence against a guessed journal (W1, epoch 1) | SK-605 | SK-611 |
+| H14 | Verification checks are journaled into the top item's finished attempt ⇒ a restart marks it stale | SK-606 | SK-613 |
+| H15 | `prState`/`findPr` every tick can hit code-host rate limits | SK-606 | SK-613 |
+| H16 | The runbook must say the Mac human runs `skep` with their own home | SK-608 | SK-614 |
+
+Still open from earlier phases and kept with the release: G1 (50-seed sweep), G2 (release-notes
+part), G4 (sim fixtures packaging), G18 (gitleaks false positive): SK-609/SK-610. Closed in this
+phase: G9 (`PrInfo` recorded in ARCHITECTURE §11.5).
 
 ---
 

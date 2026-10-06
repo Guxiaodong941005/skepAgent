@@ -893,6 +893,11 @@ interface CodeHost {
 }
 ```
 
+`PrInfo = { number, url, head, base, title, state: "open" | "closed" | "merged", mergeSha }`
+(`url` is https and is what `work.delivered.pr_url` records). `skepd` binds a `CodeHost` to the
+device allowlist (`bindCodeHost`), mapping scp-style or https repo URLs to `owner/repo` and
+refusing anything not allowlisted.
+
 `gh.ts` implements it with `gh pr list --head`, `gh pr create`, `gh pr edit --base`, `gh pr view
 --json`. `fake.ts` keeps an in-memory registry over a local bare repo and asserts "one PR per
 head branch".
@@ -901,9 +906,15 @@ head branch".
 
 ## 12. CLI ↔ daemon socket protocol
 
-* Transport: Unix domain socket `$SKEP_HOME/skepd.sock` (dir 0700, socket 0600, owned by the
-  daemon user; the human's CLI user must be in the daemon group on the Mac). NDJSON frames, one JSON
-  object per line, max 1 MiB per frame.
+* Transport: Unix domain socket `$SKEP_HOME/skepd.sock`, owned by the daemon user; NDJSON frames,
+  one JSON object per line, max 1 MiB per frame. Permissions per D22: 0600 (dir 0700) where no
+  human CLI shares the device (Linux workers, daemon user `skep`); on the Mac controller the
+  daemon is a root LaunchDaemon and the socket is 0660 with group `skep` (`skepd --socket-group`),
+  the human's account being a member.
+* `status.result` = `{ view: statusView(state), extras: { liveness: [{ agent, cls, sinceChangeMs,
+  intervalMs }], freshness: { checkedAgoMs, invalidCount, reducerVersion }, hints, alarms,
+  readOnly } }`. Ages are computed by the daemon; raw monotonic timestamps never cross the socket
+  (D23). The CLI labels the 3 × interval … `staleMs` gap `late` (D26).
 * Frames (Zod schemas in `src/ipc/protocol.ts`):
 
 ```jsonc
@@ -1041,6 +1052,11 @@ before a task is done.
 | D19 | Hard rule / non-goal: Skep never transports, stores, syncs or brokers provider credentials, API keys or provider configurations between devices, in any form: not as plaintext, not as ciphertext, not as a hash, and not as a label. Each device's agent CLIs are configured locally by the human on that device; Skep neither reads nor records that configuration. No provider label either: `agent.registered` carries only `agent_cli` + `cli_version`, and `skep doctor` checks only that the pinned CLI is present (PRD §13.3 step 3's "provider name + config hash" is dropped). Defence in depth: gitleaks + a pattern-based redactor on everything Skep writes or publishes (§16) | Restores and strengthens PRD §3.2 ("no secret storage or secret distribution through the blackboard") and §11.5 after D17 was rejected. A label or hash would be useless to the protocol (routing uses agent IDs, capabilities and `requires_local`) and a hash of a low-entropy config can be guessed. Keeping provider setup entirely local means a blackboard, relay or git-host compromise can never yield a credential. |
 | D20 | Invariant 6 is checked per transition, not per state: the event that pushes `replan_count` or `review_rounds` over budget must escalate (for replans, via a barrier with `escalate: true` that settles only into `escalated`). Counters may legitimately remain over budget afterwards. | The earlier wording ("`replan_count ≤ budget` unless status is `escalated`") is false for legal logs. `replan_count` is lifetime (§5.5, D12) and `resume_with_plan` resets no counter, so a resumed task is `executing` over budget. An over-budget barrier stays `interrupting` until its holders settle (§5.5). Found in the SK-304 review: the literal check flagged a legal review-round escalation followed by `resume_with_plan`. |
 | D21 | Adapters receive the strict Zod-derived `outputSchema` and may transform their copy into a provider-compatible schema; `structured.ts` normalizes optional nulls against the original schema and validates with Zod, the only validation authority (§9.3) | Provider strict modes reject parts of the Zod JSON Schema (`oneOf`, optional properties, tuples; SK-207 B1, verified against the real CLI). Provider quirks stay in the adapter (§9.1), and validation stays in one place, so a lossy transform can never weaken validation. |
+| D22 | Agent isolation needs the daemon to switch users. Linux: `skepd` runs as an unprivileged service user with exactly `CAP_SETUID CAP_SETGID CAP_CHOWN` (ambient, `NoNewPrivileges`). macOS: a root LaunchDaemon. Role directories (worktrees) live outside the 0700 `SKEP_HOME`, group-readable by the agent user. The IPC socket is 0600 on workers and 0660 group `skep` on the Mac controller (`--socket-group`) | Spawning agents with another uid/gid and chowning checkouts (PRD §11.4) is impossible for an unprivileged process, and macOS has no ambient capabilities; the SK-608 review found both units unable to run. A root daemon on the Mac then requires a group-accessible socket for the human's CLI, which restores the original §12 wording. Supersedes the socket note in the SK-601 review. |
+| D23 | The `status` IPC result is `{ view, extras }`, and the daemon sends **ages** (`checkedAgoMs`, per-agent `sinceChangeMs`, `intervalMs`), never raw monotonic timestamps | Monotonic clocks of different processes have unrelated origins (SK-604 review); the observer is the only party that can compute an age. One shape removes CLI-side guessing. |
+| D24 | AGENT.md `cli_version` is the **exact** version line the adapter's `probe()` returns (e.g. `codex-cli <x.y.z>`); `skep doctor`, slot startup and the adapter all compare that full string | SK-207's spike fixed the pin format; SK-607's doctor first compared only an extracted semver, which disagreed with the daemon's gate. One rule, enforced in one comparison style. |
+| D25 | A secret hit (pattern, gitleaks or model output) publishes **no code, PR, commit text or model text**, but **does** publish a fenced `work.failed{class: secret_detected}` with a fixed, secret-free detail | Without an event the lease stays held forever and the human is never told (SK-504 review); `secret_detected` exists in the failure classes (D11) for exactly this record. The event JSON itself is checked with `findSecrets`. |
+| D26 | Liveness display label `late` for a heartbeat age between 3 × interval and `staleMs`; revoke suggestions only for `stale`/`lost` | §8.2's tracker reports `unknown` in that gap, which is also its "fewer than two observations" class; the human needs to tell them apart without being pushed to revoke early. Display only; protocol unaffected. |
 
 ---
 
