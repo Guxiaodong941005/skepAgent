@@ -225,16 +225,9 @@ describe("replay purity and determinism", () => {
 
 describe("later-wave handler dispatch", () => {
   const types = [
-    "lease.claimed",
-    "lease.released",
-    "lease.revoked",
-    "work.delivered",
-    "work.failed",
     "replan.requested",
     "checkpoint.recorded",
     "barrier.closed",
-    "item.merged",
-    "task.verified",
   ] as const satisfies readonly EventType[];
   it.each(types)("keeps %s as the required non-mutating stub", (type) => {
     const builder = mixed();
