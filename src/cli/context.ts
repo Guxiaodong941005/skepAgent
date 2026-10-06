@@ -21,4 +21,9 @@ export interface CliContext {
    * overriding `SKEP_HOME`. Undefined until a command action begins.
    */
   paths?: SkepPaths;
+  /**
+   * Set by an action that has already written its output and must still fail. `runCli` returns
+   * it when the action resolves, so the failure does not need a second error frame.
+   */
+  exitCode?: number;
 }

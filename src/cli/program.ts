@@ -79,6 +79,8 @@ export function buildProgram(ctx: CliContext): Command {
  * Never calls `process.exit`.
  */
 export async function runCli(argv: string[], ctx: CliContext): Promise<number> {
+  // A reused context must not keep a previous action's failure (sim violations set this).
+  ctx.exitCode = undefined;
   const program = buildProgram(ctx);
   // `output()` reads the flag off the program, which Commander has already stored by the time
   // an action or a usage error runs. Help/version never call it.
@@ -86,7 +88,7 @@ export async function runCli(argv: string[], ctx: CliContext): Promise<number> {
 
   try {
     await program.parseAsync(argv, { from: "user" });
-    return EXIT.ok;
+    return ctx.exitCode ?? EXIT.ok;
   } catch (err) {
     return renderError(err, outputFor(program, ctx));
   }
