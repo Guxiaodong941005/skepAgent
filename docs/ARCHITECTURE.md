@@ -432,7 +432,7 @@ set `active_plan_version = v`, rebuild `items` from the plan in `stack_order` (f
 others `blocked`), carry over `delivered`/`merged` status for an item ID whose canonical item
 definition (title, assignee, depends_on, touches, acceptance, requires) is unchanged from the
 previously active plan, reset `attempts_this_plan`, clear `barrier` and `escalation`, keep
-`epochs`.
+`epochs`, and set `task.mode = plan.mode` (D13).
 
 | Event | Allowed task status | Checks (reject reason) | Effect |
 |---|---|---|---|
@@ -440,9 +440,9 @@ previously active plan, reset `attempts_this_plan`, clear `barrier` and `escalat
 | task.created | (new) | owner registered (`unknown_agent`) | new task: `planning`, owner_gen 1, rev 0→1 |
 | task.cancelled | any non-terminal | – | `cancelled`; leases cleared; barrier cleared |
 | owner.transferred | any non-terminal | new_owner registered (`unknown_agent`) | owner = new_owner; owner_gen += 1 |
-| plan.proposed | planning, replanning, reviewing | version = current+1, parent = current, plan.task_id/version match, `contentHash(plan) == plan_hash` (`plan_hash_mismatch`), base_commit == plan.base.commit, plan.base.repo == task.repo, assignees registered, reviewers: solo ⇒ `[]`, team ⇒ 1..4 registered, ≠ owner (`invalid_plan`) | record PlanRecord; current = version; if superseding a version with a `block` review ⇒ review_rounds += 1; status: team ⇒ `reviewing`, solo ⇒ `awaiting_approval` with implicit lock; review_rounds > budget ⇒ `escalated` |
+| plan.proposed | planning, replanning, reviewing | version = current+1, parent = current, plan.task_id/version match, `contentHash(plan) == plan_hash` (`plan_hash_mismatch`), base_commit == plan.base.commit, plan.base.repo == task.repo, assignees registered, mode allowed (D13: task.mode team ⇒ plan.mode team; plan.mode solo ⇒ exactly 1 item), reviewers by **plan.mode**: solo ⇒ `[]`, team ⇒ 1..4 registered, ≠ owner (`invalid_plan`) | record PlanRecord; current = version; if superseding a version with a `block` review ⇒ review_rounds += 1; status by plan.mode: team ⇒ `reviewing`, solo ⇒ `awaiting_approval` with implicit lock; review_rounds > budget ⇒ `escalated` |
 | review.submitted | reviewing | payload plan_version/hash == current (`plan_changed`); block ⇒ ≥1 blocker with evidence (schema) | `reviews[actor]` = latest |
-| plan.locked | reviewing (team) or awaiting_approval (solo, plan_approval=owner) | every override names an existing `block` blocker; missing_reviews == reviewers without a review (`invalid_plan`) | record lock; plan_approval=owner and no `risk: high` item ⇒ activate ⇒ `executing`; else `awaiting_approval` |
+| plan.locked | reviewing (current plan.mode team) or awaiting_approval (current plan.mode solo, plan_approval=owner) | every override names an existing `block` blocker; missing_reviews == reviewers without a review (`invalid_plan`) | record lock; plan_approval=owner and no `risk: high` item ⇒ activate ⇒ `executing`; else `awaiting_approval` |
 | plan.approved | awaiting_approval | current version locked (`bad_task_state`) | activate ⇒ `executing` |
 | plan.rejected | awaiting_approval | – | review_rounds += 1; `planning` (or `escalated` if > budget) |
 | lease.claimed | executing | barrier null (`barrier_open`); item `ready` (`item_not_ready`); actor == assignee (`not_assignee`); expected_epoch (`epoch_mismatch`); plan_hash == active (`plan_changed`); actor's active leases across all tasks < max_parallel_items (`max_parallel`); attempts_this_plan ≤ item_retries (`retry_budget`); branch == `skep/<task>/<item>/e<epoch+1>` (`bad_branch`) | epochs[item] += 1; lease set; item `leased`; attempts += 1 |
@@ -455,13 +455,30 @@ previously active plan, reset `attempts_this_plan`, clear `barrier` and `escalat
 | barrier.closed | interrupting | barrier_id == open barrier (`no_barrier`); missing == awaiting − settled (`pre_mismatch`) | missing items `unknown`, leases cleared; closed; `replanning` (or `escalated`) |
 | item.merged | executing, delivered, escalated | item delivered ∧ pr_number matches (`bad_task_state`) | item `merged`; all merged ⇒ `done` |
 | task.verified | delivered | top_of_stack_sha == delivered head of last stack item (`bad_task_state`) | record verified |
-| human.decided | escalated | decision valid for state (`bad_decision`) | resume_with_plan ⇒ activate active plan again, failed/unknown/interrupted items `ready` ⇒ `executing`; replan ⇒ `planning`; cancel ⇒ `cancelled`; reassign_owner ⇒ owner/owner_gen += 1, `planning` |
+| human.decided | escalated | decision valid for state (`bad_decision`) | resume_with_plan ⇒ activate active plan again, failed/unknown/interrupted items `ready` ⇒ `executing`; replan ⇒ `planning`, review_rounds = 0, barrier cleared (D12); cancel ⇒ `cancelled`; reassign_owner ⇒ owner/owner_gen += 1, `planning`, review_rounds = 0, barrier cleared (D12) |
 
 **Budgets** (PRD §9.9): `replans` and `review_rounds` count *failures allowed*; the failure that
-exceeds the budget escalates (replans: 3rd request with budget 2). `item_retries`: an item may be
+exceeds the budget escalates (replans: 3rd request with budget 2). A human `human.decided` of
+`replan` or `reassign_owner` grants a fresh review budget: `review_rounds` resets to 0 and any
+`barrier` is cleared (D12), otherwise every new proposal after a review-round escalation would
+re-escalate immediately and the task could only be cancelled. `replan_count` is **not** reset: it
+is a lifetime counter, so the human is consulted again on every further replan. `item_retries`: an item may be
 leased `1 + item_retries` times per plan version. `max_invocations` / `max_wall_hours` are
 enforced by the executing daemon (they are not observable on the log); exhaustion ⇒
 `work.failed{class: budget_exceeded}` ⇒ escalate.
+
+**Plan mode decides routing (D13, PRD §9.1, §9.3).** `task.mode` is the mode the human asked for
+(`solo` by default, `team` with `--team`); each plan carries its own `plan.mode`. The **plan's**
+mode decides reviewers (solo ⇒ none, team ⇒ 1..4), the status after `plan.proposed` (solo ⇒
+implicitly locked, `awaiting_approval`; team ⇒ `reviewing`) and which `plan.locked` is allowed.
+Upgrade only: a `solo` task may receive a `team` plan (the capability-split case), but a `team`
+task only accepts `team` plans, because `--team` is an explicit human request the owner cannot
+override. A `solo` plan has exactly one item. Activating a plan sets `task.mode = plan.mode`, so
+the task switches to team mode only when a human approves the plan (or an owner-policy lock
+activates it, §9.4), and from then on it stays team (later replans must be team plans too). The
+owner's plan validator (§11.2) picks `team` whenever the plan has more than one item or an item
+assigned to an agent on another device than the owner. Implemented by SK-208 (SK-101 currently
+requires `plan.mode == task.mode`).
 
 ### 5.6 Views
 
@@ -923,3 +940,5 @@ before a task is done.
 | D9 | Commits built with git plumbing + pluggable `Signer` | Lets the human key sign through the daemon's single writer (sign callback) and keeps sim deterministic. |
 | D10 | Verification via `git log %G?/%GS` with `-c gpg.ssh.allowedSignersFile=<local>` | Uses only the local trust root, one process for the whole walk. |
 | D11 | Added `details` to plan items, `budget_exceeded`/`secret_detected` to failure classes, `passed` to `task.verified` | Gaps in the PRD tables needed by the execution flow. |
+| D12 | `human.decided{replan \| reassign_owner}` resets `review_rounds` to 0 and clears `barrier`; `replan_count` is not reset | Without the reset a review-round escalation deadlocks the task (SK-101 review B1): every new proposal re-escalates. The human explicitly grants a fresh review budget; replans stay a lifetime count so each further replan goes back to the human. |
+| D13 | `plan.mode` decides reviewers, routing and lock rules; upgrade only (solo task may take a team plan, team task only team plans); solo plan = 1 item; activation sets `task.mode = plan.mode` | PRD §9.1: "`--team` or a plan that the human approves with multiple items/devices switches to team mode". SK-101's `plan.mode == task.mode` made that switch impossible. Updating `task.mode` only on activation means the switch happens exactly when the human approves. |

@@ -43,13 +43,14 @@
 
 | ID | Title | Depends on | Assignee | Files/area | Acceptance criteria | Status |
 |---|---|---|---|---|---|---|
-| SK-201 | Reducer: lease & delivery handlers | SK-101 | codex | `src/core/reducer/handlers/{lease,work,merge}.ts` (+ tests) | lease.claimed/released/revoked, work.delivered/failed, item.merged, task.verified per ARCHITECTURE §5.5: epoch increments, `fenced`/`epoch_mismatch`/`max_parallel`/`retry_budget`/`bad_branch` rejections, dependents unblocked, task → delivered → done; stale-holder delivery after revoke is rejected | todo |
-| SK-202 | Reducer: replan, barrier, checkpoint handlers | SK-101 | codex | `src/core/reducer/handlers/replan.ts` (+ tests) | replan.requested opens barrier `B<seq>`, flags leases, blocks claims; coalescing in interrupting/replanning; checkpoints settle barrier ⇒ replanning; barrier.closed ⇒ missing items unknown; 3rd request with budget 2 ⇒ escalated; daemon request without evidence ⇒ `missing_evidence` | todo |
-| SK-203 | Git log reader → `LogEntry[]` (incremental) | SK-102 | codex | `src/git/log-reader.ts` (+ tests) | `readLog(git, dir, trustPath, {fromSha?})` walks `rev-list --first-parent --reverse main`; parents, name-status, added-file contents (size-capped, UTF-8 checked), signatures in one `git log` pass; merge commits/multi-file/oversized files represented faithfully; reducer replay over a real repo equals replay over equivalent builder log | todo |
+| SK-201 | Reducer: lease & delivery handlers | SK-101 | codex | `src/core/reducer/handlers/{lease,work,merge,barrier}.ts` (+ tests) | See task brief. Fills the SK-101 stubs; adds the shared barrier-settlement helper `handlers/barrier.ts`. lease.claimed/released/revoked, work.delivered/failed, item.merged, task.verified per ARCHITECTURE §5.5: epoch increments, `fenced`/`epoch_mismatch`/`max_parallel`/`retry_budget`/`bad_branch` rejections, dependents unblocked, task → delivered → done; stale-holder delivery after revoke is rejected | todo |
+| SK-202 | Reducer: replan, barrier, checkpoint handlers | SK-101, SK-201 (`handlers/barrier.ts`) | codex | `src/core/reducer/handlers/replan.ts` (+ tests) | Uses `settleBarrier` from `handlers/barrier.ts` (SK-201, do not edit it); replan.requested opens barrier `B<seq>`, flags leases, blocks claims; coalescing in interrupting/replanning; checkpoints settle barrier ⇒ replanning; barrier.closed ⇒ missing items unknown; 3rd request with budget 2 ⇒ escalated; daemon request without evidence ⇒ `missing_evidence` | todo |
+| SK-203 | Git log reader → `LogEntry[]` (incremental) | SK-102 | codex | `src/git/log-reader.ts` (+ tests) | See task brief. Builds on `GitRunner` and `verifyCommits` from `src/git`. `readLog(git, dir, trustPath, {from?})` walks `rev-list --first-parent --reverse main`; parents, name-status, added-file contents (size-capped, UTF-8 checked), signatures in one `git log` pass; merge commits/multi-file/oversized files represented faithfully; reducer replay over a real repo equals replay over equivalent builder log | todo |
 | SK-204 | Reducer views + `statusView` | SK-101 | pi | `src/core/reducer/views.ts` (+ tests) | `claimableItems`, `leasesHeldBy`, `isOwner`, `pendingReviews`, `barrierStatus`, `statusView` (stable JSON, sorted keys) with unit tests over builder logs | todo |
-| SK-205 | exec/fs utilities + run journal | SK-001 | pi | `src/util/{exec,fs}.ts`, `src/exec/journal.ts` (+ tests) | `execFileChecked` (shell:false, timeout, maxBuffer, env passthrough), `atomicWrite`, `appendFsync`, `safeJoin` (rejects `..`/absolute/symlink escape); journal append/read/`unfinishedAttempts()` with fsync; torn last line tolerated | todo |
-| SK-206 | Config loaders: device.toml, AGENT.md, checks.toml parsing | SK-104 | pi | `src/config/{device,agent-md}.ts`, `src/exec/checks-file.ts` (+ tests, fixtures under `test/fixtures/config/`) | Parse + validate with the scaffold schemas; helpful error messages with file/line; AGENT.md body extracted; repo allowlist lookup by name/url | todo |
+| SK-205 | exec/fs utilities + run journal | SK-001 | pi | `src/util/{exec,fs}.ts`, `src/exec/journal.ts` (+ tests) | See task brief. `execFileChecked` (shell:false, timeout, maxBuffer, env passthrough), `atomicWrite`, `appendFsync`, `safeJoin` (rejects `..`/absolute/symlink escape); journal append/read/`unfinishedAttempts()` with fsync; torn last line tolerated | todo |
+| SK-206 | Config loaders: device.toml, AGENT.md, checks.toml parsing | SK-104 | pi | `src/config/{device,agent-md,errors}.ts`, `src/exec/checks-file.ts` (+ tests, fixtures under `test/fixtures/config/`) | See task brief. Parse + validate with the scaffold schemas; helpful error messages with file/line; AGENT.md body extracted; repo allowlist lookup by name/url | todo |
 | SK-207 | Adapter spike: pinned Codex CLI | SK-001 | codex | `docs/spikes/adapter-codex.md`, `src/adapter/codex.ts` (+ opt-in test `test/integration/adapter-codex.test.ts`) | Report: exact flags for non-interactive run, output schema, last-message file, JSON events, interrupt behaviour (SIGINT), approval policy, usage fields, version string; `CodexAdapter` implements `AgentAdapter`; decision Codex vs Claude fallback recorded | todo |
+| SK-208 | Reducer: plan-mode routing (D13) | SK-101 | codex | `src/core/reducer/handlers/plan.ts`, `src/core/reducer/handlers/plan.test.ts` | ARCHITECTURE §5.5 "Plan mode decides routing": reviewers, post-proposal status and `plan.locked` gating use the current **plan's** mode; team task + solo plan ⇒ `invalid_plan`; solo plan with ≠ 1 item ⇒ `invalid_plan`; `activatePlan` sets `task.mode = plan.mode`. Tests: solo task + 2-item team plan ⇒ `reviewing` ⇒ lock ⇒ approve ⇒ `executing` with `task.mode` team; rejected/unapproved team plan leaves `task.mode` solo; after the switch a solo plan is rejected; existing solo/team lifecycles unchanged. `npx vitest run src/core/reducer` green | todo |
 
 ## Wave 3 — write path, sync, heartbeats, runtime
 
@@ -270,6 +271,202 @@ must be positive.
 6. No test writes to the real home directory; `npm run skep -- --help` works.
 
 **Test command:** `npx vitest run src/cli src/config && npm run lint && npm test`
+
+## Wave 2 task briefs
+
+All Wave-2 tasks branch from `main` after Wave 1 (SK-101..SK-104 merged). Run `npm ci` first.
+Each task ends with: its test command green, `npm run lint` green, `npm test` green, one or more
+commits on its branch. Tasks below must not edit files from Wave 1 (`src/core/**` contracts,
+`src/git/{runner,trust,signer,commit,verify}.ts`, `test/helpers/*`); extend helpers only inside
+your own test files.
+
+### SK-201 — Reducer: lease & delivery handlers (codex)
+
+Read first: `docs/ARCHITECTURE.md` §5.3, §5.5 (rows lease.* / work.* / item.merged /
+task.verified, budgets), §6.1–§6.2, `src/core/reducer/state.ts`, `src/core/reducer/handlers/plan.ts`
+(`activatePlan`, item statuses), `src/core/reducer/handlers/task.test.ts` (fixtures style).
+
+SK-101 created `handlers/{lease,work,merge}.ts` as **stubs** with final signatures, already wired
+into `apply.ts`. Replace the stub bodies; do not change `apply.ts`, `types.ts` or the exported
+names. `checkPre` already ran (task exists, not terminal, every `pre` key matched) before your
+handler is called.
+
+**Create / modify**
+
+| File | Exports |
+|---|---|
+| `src/core/reducer/handlers/barrier.ts` (new) | `isSettled(task: TaskState, item: ItemId): boolean` — item ∈ `barrier.checkpointed` or its lease is `null` (released, revoked, failed); `settleBarrier(task: TaskState, seq: number): void` — if `task.barrier` is open (`closed_seq === null`) and every `awaiting` item is settled ⇒ `closed_seq = seq`, status `replanning` (or `escalated` with `escalation = { reason: "replans", seq }` if `barrier.escalate`); otherwise no-op. Shared with SK-202 (checkpoint, barrier.closed). |
+| `src/core/reducer/handlers/lease.ts` | `handleLeaseClaimed`, `handleLeaseReleased`, `handleLeaseRevoked` |
+| `src/core/reducer/handlers/work.ts` | `handleWorkDelivered`, `handleWorkFailed` |
+| `src/core/reducer/handlers/merge.ts` | `handleItemMerged`, `handleTaskVerified` |
+| Tests | `handlers/lease.test.ts`, `handlers/work.test.ts`, `handlers/merge.test.ts`, `handlers/barrier.test.ts` (build logs with `LogBuilder`; barrier states may be constructed directly, since `replan.requested` is SK-202) |
+
+Rules (ARCHITECTURE §5.5 is normative; check order = reason precedence):
+
+* `lease.claimed` (status `executing`): barrier null (`barrier_open`); item `ready`
+  (`item_not_ready`); actor == assignee (`not_assignee`); `expected_epoch == epochs[item] ?? 0`
+  (`epoch_mismatch`); `pre.plan_hash` == active plan hash (`plan_changed`); actor's active leases
+  across **all** tasks < `agents[actor].profile.max_parallel_items` (`max_parallel`);
+  `attempts_this_plan ≤ budgets.item_retries` (`retry_budget`); branch ==
+  `workBranch(task, item, epoch + 1)` from `src/core/ids.ts` (`bad_branch`). Effect: `epochs[item]
+  += 1`; lease `{ epoch, holder, attempt_id, branch, plan_version, plan_hash, granted_at_seq,
+  interrupt: null }`; item `leased`; `attempts_this_plan += 1`.
+* Fencing for released/delivered/failed: `lease !== null ∧ lease.holder == actor ∧ lease.epoch ==
+  payload.epoch`, else `fenced`.
+* `lease.released` (executing, interrupting): lease null, item `ready`; then `settleBarrier`.
+* `lease.revoked` (executing, interrupting, escalated): lease exists ∧ epoch matches
+  (`epoch_mismatch`); lease null; item `ready` (`unknown` if interrupting); then `settleBarrier`.
+* `work.delivered` (executing): fenced; `lease.interrupt === null` (`interrupted`); branch ==
+  `lease.branch` (`bad_branch`). Item `delivered` (record `Delivery`), lease null; next item in
+  stack whose deps are all delivered ⇒ `ready`; all delivered ⇒ task `delivered`.
+* `work.failed` (executing, interrupting): fenced; item `failed` (record `failure`), lease null.
+  Interrupting ⇒ `settleBarrier`. Executing ⇒ `attempts_this_plan ≤ item_retries` and class ≠
+  `budget_exceeded` ⇒ item `ready`; else task `escalated` (`escalation.reason = "item_failed"` or
+  `"budget_exceeded"`).
+* `item.merged` (executing, delivered, escalated): item delivered ∧ `pr_number` ==
+  `delivered.pr_number` (`bad_task_state`); item `merged`; all items merged ⇒ task `done`.
+* `task.verified` (delivered): `top_of_stack_sha` == delivered `head_sha` of the last
+  `stack_order` item (`bad_task_state`); record `verified`.
+
+**Acceptance criteria**
+
+1. Claim happy path: epoch 0 → 1, branch `skep/<task>/W1/e1`, item `leased`, attempts 1; each
+   rejection reason above is produced by a test (`barrier_open`, `item_not_ready`, `not_assignee`,
+   `epoch_mismatch`, `plan_changed`, `max_parallel` with a lease in a **second** task,
+   `retry_budget`, `bad_branch`) and leaves state unchanged except the outcome.
+2. Two claims computed from the same state: first accepted, second rejected (`epoch_mismatch` or
+   `item_not_ready`, via replay with correct `observed_tip`).
+3. Revoke epoch 1 then the stale holder's `work.delivered{epoch 1}` ⇒ `fenced`; re-claim ⇒ epoch 2,
+   branch `e2`; delivery by the new holder accepted.
+4. Two-item stack: W1 delivered ⇒ W2 `ready`; W2 delivered ⇒ task `delivered`; `task.verified`
+   with W2 head accepted, with W1 head rejected; `item.merged` W1 then W2 ⇒ `done`; wrong
+   `pr_number` ⇒ `bad_task_state`.
+5. `work.failed`: first failure with `item_retries: 1` ⇒ item `ready` and a re-claim is allowed;
+   failure after the retry budget ⇒ `escalated`; `budget_exceeded` ⇒ `escalated` immediately.
+6. Barrier (constructed state): in `interrupting` with awaiting `[W1, W2]`, releasing W1 keeps the
+   barrier open; failing W2 closes it (`closed_seq` set, status `replanning`); with `escalate:
+   true` ⇒ `escalated`; revoke in `interrupting` ⇒ item `unknown`; `work.delivered` with
+   `lease.interrupt` set ⇒ `interrupted`.
+7. Purity/determinism tests from SK-101 still pass; new handlers don't mutate input (deep-freeze
+   one case).
+
+**Test command:** `npx vitest run src/core/reducer && npm run lint && npm test`
+
+### SK-203 — Git log reader → `LogEntry[]` (codex)
+
+Read first: `docs/ARCHITECTURE.md` §5.1, §5.3 step 1, §7.3, `src/core/log.ts` (contract,
+**normative**), `src/git/{runner,verify}.ts`, `test/helpers/git-fixture.ts`.
+
+**Create**
+
+| File | Exports |
+|---|---|
+| `src/git/log-reader.ts` | `interface ReadLogOptions { ref?: string /* default "refs/heads/main" */; from?: { sha: Sha; seq: number } }`; `class LogReadError extends Error` (also used when `from.sha` is not on the first-parent chain of `ref`, i.e. history was rewritten — the caller alarms and falls back to a full read); `readLog(git: GitRunner, repoDir: string, trustRootPath: string, opts?: ReadLogOptions): Promise<LogEntry[]>` |
+| Tests | `src/git/log-reader.test.ts`, `test/integration/log-reader-replay.test.ts` |
+
+Algorithm (fixed number of git processes per call, independent of commit count where possible):
+
+1. `git rev-list --first-parent --reverse <ref>` (or `<from.sha>..<ref>`); `seq` = index from
+   genesis (or `from.seq + 1 + i`). Verify `from.sha` with `git merge-base --is-ancestor` **and**
+   membership in the first-parent list; otherwise `LogReadError`.
+2. Parents: `git log --no-walk --format=%H%x00%P <shas…>` (one call; batch to keep argv < 64 KiB).
+3. Changes: per commit `git diff-tree -r -z --no-renames --name-status <firstParent> <sha>`
+   (genesis: `--root`). Map `A/M/D/T` to themselves, everything else ⇒ `"other"`. Diff against the
+   **first** parent so merge commits are represented faithfully (the reducer rejects them as
+   `not_linear`).
+4. Added contents: only for `A` paths under `events/` and, for seq 0, `skep.json`. One `git
+   cat-file --batch` process: request `<sha>:<path>`; size > `MAX_EVENT_BYTES` ⇒ `null` without
+   reading more than `MAX_EVENT_BYTES + 1` bytes into a string; invalid UTF-8 (`TextDecoder` with
+   `fatal: true`) ⇒ `null`.
+5. Signatures: a single `verifyCommits(git, repoDir, trustRootPath, shas)` call (SK-102).
+
+**Acceptance criteria**
+
+1. Real repo (temp dir, `git-fixture`): genesis + 3 signed single-file event commits ⇒ 4 entries,
+   seq 0..3, correct parents, `changes` = one `A`, `added` contains the exact file bytes, `signature`
+   `good` with the right principal.
+2. Faithful representation: a merge commit (2 parents, first-parent diff), a commit adding two
+   files, a commit modifying a file, an unsigned commit, an oversized file (`null`), a non-UTF-8
+   file (`null`), and a file outside `events/` (not read) — each produces the expected `LogEntry`
+   and `replay` classifies it with the expected `InvalidReason`.
+3. Incremental: `readLog(..., { from: { sha: entries[k].sha, seq: k } })` equals
+   `entries.slice(k + 1)`; `from` not on the chain (after a force-push to a divergent history) ⇒
+   `LogReadError`.
+4. `test/integration/log-reader-replay.test.ts`: the same logical events written to a real repo
+   (with correct `observed_tip`) and built with `LogBuilder` replay to equal `tasks`, `agents` and
+   outcome kinds/reasons (shas differ by construction; compare with `sha`/`tip` fields stripped).
+5. Process count: reading 50 commits spawns a bounded number of git processes (assert with a
+   counting `GitRunner` wrapper; diff-tree per commit is allowed, cat-file/verify/log are one each).
+6. A repo-local config (e.g. `core.quotePath`, `diff.renames=true`, `log.showSignature`) does not
+   change the output.
+
+**Test command:** `npx vitest run src/git test/integration/log-reader-replay.test.ts && npm run lint && npm test`
+
+### SK-205 — exec/fs utilities + run journal (pi)
+
+Read first: `docs/ARCHITECTURE.md` §9.7, §11.3–§11.4, PRD §10.6, `src/util/clock.ts`, AGENTS.md
+(subprocess rules).
+
+**Create**
+
+| File | Exports |
+|---|---|
+| `src/util/exec.ts` | `interface ExecOptions { cwd?: string; env?: Record<string, string> /* passed as-is, no implicit process.env merge */; input?: string \| Uint8Array; timeoutMs?: number /* default 120_000 */; maxBufferBytes?: number /* default 16 MiB */; allowFailure?: boolean; signal?: AbortSignal }`; `interface ExecResult { code: number \| null; signal: string \| null; stdout: string; stderr: string; timedOut: boolean }`; `class ExecError extends Error { file; args; result }`; `execFileChecked(file: string, args: string[], opts?: ExecOptions): Promise<ExecResult>` — `execFile` with `shell: false`; throws `ExecError` on non-zero exit, signal, timeout or buffer overflow unless `allowFailure` |
+| `src/util/fs.ts` | `atomicWrite(path: string, data: string \| Uint8Array, opts?: { mode?: number }): Promise<void>` (temp file in the same dir ⇒ write ⇒ fsync ⇒ rename ⇒ fsync dir); `appendFsync(path: string, data: string): Promise<void>` (open `a`, write, fsync, close; creates parent dirs); `class PathEscapeError extends Error`; `safeJoin(root: string, rel: string): Promise<string>` — rejects absolute paths, `..` segments, NUL bytes, and results whose deepest existing ancestor's `realpath` lies outside `realpath(root)` (symlink escape) |
+| `src/exec/journal.ts` | `interface AttemptKey { task: TaskId; item: ItemId; epoch: number }`; `type JournalRecord = { ts_mono: number; ts_wall: string; step: string; [k: string]: unknown }`; `TERMINAL_STEPS = ["delivered_published", "failed", "checkpointed", "stale"] as const`; `class Journal { constructor(opts: { roleDir: string; clock: Clock }); path(key): string /* <roleDir>/.skep/journal/<task>/<item>-e<epoch>.jsonl */; append(key, record: { step: string; [k: string]: unknown }): Promise<JournalRecord>; read(key): Promise<JournalRecord[]>; unfinishedAttempts(): Promise<AttemptKey[]> /* last step not terminal; sorted by task, item, epoch */ }` |
+| Tests | `src/util/exec.test.ts`, `src/util/fs.test.ts`, `src/exec/journal.test.ts` |
+
+**Acceptance criteria**
+
+1. `execFileChecked` never uses a shell (argument `"; echo pwned $(id)"` is passed literally to
+   `node -e`); non-zero exit ⇒ `ExecError` with stdout/stderr; `allowFailure` returns the result;
+   `timeoutMs` kills the child (`timedOut: true`); overflowing `maxBufferBytes` ⇒ `ExecError`;
+   `env` is exactly what was passed (child sees no unlisted variable).
+2. `atomicWrite` never leaves a partial target (target content is old or new; no temp files remain
+   after success); `mode` applied.
+3. `safeJoin` rejects `../x`, `/etc/passwd`, `a/../../x`, `a\0b`, and a symlink inside root
+   pointing outside; accepts nested paths that do not exist yet.
+4. Journal: append ⇒ fsync'd JSONL line with `ts_mono`/`ts_wall` from the injected `FakeClock`;
+   `read` returns records in order; a torn last line (partial JSON without newline) is ignored by
+   `read`, and the next `append` starts on a fresh line; a corrupt **middle** line throws a typed
+   error naming file and line.
+5. `unfinishedAttempts` returns exactly the attempts whose last step is non-terminal across several
+   tasks/items/epochs; an empty or missing journal dir ⇒ `[]`.
+6. Tests use temp dirs only; no `Date.now`/`setTimeout` in `src/exec/journal.ts`.
+
+**Test command:** `npx vitest run src/util src/exec && npm run lint && npm test`
+
+### SK-206 — Config loaders: device.toml, AGENT.md, checks.toml (pi)
+
+Read first: PRD §7.1–§7.3, §11.5, `src/core/schemas/config.ts` (normative), `src/config/paths.ts`
+(SK-104). Dependencies already present: `smol-toml`, `yaml`.
+
+**Create**
+
+| File | Exports |
+|---|---|
+| `src/config/errors.ts` | `class ConfigError extends Error { file: string; line: number \| null }` — message format `<file>[:<line>]: <problem>`; Zod issues rendered as `<dotted.path>: <message>`, one per line |
+| `src/config/device.ts` | `parseDeviceConfig(text: string, file: string): DeviceConfig`; `loadDeviceConfig(path: string): Promise<DeviceConfig>`; `findRepo(cfg: DeviceConfig, nameOrUrl: string): { name: string; url: string } \| null` (match by `name` or exact `url`; also normalizes a trailing `.git` / trailing `/`) |
+| `src/config/agent-md.ts` | `interface AgentMd { frontMatter: AgentMdFrontMatter; body: string; file: string }`; `parseAgentMd(text: string, file: string): AgentMd` — front-matter between a first line `---` and the next `---` line, parsed with `yaml` (no custom tags), validated with `AgentMdFrontMatterSchema`; body = the rest, trimmed, must be non-empty; `loadAgentMd(roleDir: string): Promise<AgentMd>` reads `<roleDir>/AGENT.md` |
+| `src/exec/checks-file.ts` | `parseChecksFile(text: string, source: string): ChecksFile` — TOML ⇒ `ChecksFileSchema`; pure (loading at `base_commit` via `git show` is SK-502) |
+| Fixtures | `test/fixtures/config/{device.valid.toml, device.bad-repo.toml, agent.valid.md, agent.no-frontmatter.md, checks.valid.toml, checks.bad-argv.toml}` |
+| Tests | `src/config/device.test.ts`, `src/config/agent-md.test.ts`, `src/exec/checks-file.test.ts` |
+
+**Acceptance criteria**
+
+1. Valid fixtures parse; defaults applied (`poll`, `requires_local`, `max_parallel_items`,
+   `budgets`, `timeout_sec`, `parser`).
+2. TOML/YAML syntax errors ⇒ `ConfigError` with the file and the 1-based line from the parser;
+   schema errors ⇒ `ConfigError` naming the dotted path (e.g. `repos.0.name`); unknown keys
+   rejected (strict schemas).
+3. AGENT.md without front-matter, with an unterminated front-matter, or with an empty body ⇒
+   `ConfigError`; body extracted verbatim otherwise.
+4. `findRepo` by name, by URL, with/without `.git`; unknown ⇒ `null`.
+5. checks.toml: a check whose `argv` is a string (not an array), an invalid check name, or an `env`
+   key in lowercase ⇒ `ConfigError`.
+6. No test reads the real `~/.skep`; files come from fixtures or temp dirs.
+
+**Test command:** `npx vitest run src/config src/exec && npm run lint && npm test`
 
 ---
 
