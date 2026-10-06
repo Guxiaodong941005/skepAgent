@@ -436,21 +436,24 @@ describe("CodexAdapter", () => {
     expect((await adapter.invoke(inv)).outcome).toBe("completed");
   });
 
-  it("offers an explicit off fallback with the original schema in stdin and no schema flag", async () => {
-    const { inv, runtime, interrupt, clock } = await setup();
-    const adapter = new CodexAdapter({ runtime, interrupt, clock, outputSchema: "off" });
-    expect((await adapter.invoke(inv)).finalMessage).toBe(runtime.finalMessage);
-    expect(runtime.calls).toHaveLength(1);
-    const spawned = runtime.calls[0];
-    expect(spawned?.argv).not.toContain("--output-schema");
-    expect(spawned?.argv).toContain("--output-last-message");
-    expect(spawned?.stdin).toContain(inv.prompt);
-    expect(spawned?.stdin).toContain(JSON.stringify(inv.outputSchema));
-    expect(spawned?.env).toBe(inv.env);
-    await expect(readFile(path.join(inv.scratchDir, "schema.json"))).rejects.toMatchObject({
-      code: "ENOENT",
-    });
-  });
+  it.each([false, true])(
+    "passes the prompt unchanged in off mode (embedded schema=%s)",
+    async (embedded) => {
+      const { inv, runtime, interrupt, clock } = await setup();
+      if (embedded) inv.prompt += `\nJSON Schema:\n${JSON.stringify(inv.outputSchema)}\n`;
+      const adapter = new CodexAdapter({ runtime, interrupt, clock, outputSchema: "off" });
+      expect((await adapter.invoke(inv)).finalMessage).toBe(runtime.finalMessage);
+      expect(runtime.calls).toHaveLength(1);
+      const spawned = runtime.calls[0];
+      expect(spawned?.argv).not.toContain("--output-schema");
+      expect(spawned?.argv).toContain("--output-last-message");
+      expect(spawned?.stdin).toBe(inv.prompt);
+      expect(spawned?.env).toBe(inv.env);
+      await expect(readFile(path.join(inv.scratchDir, "schema.json"))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    },
+  );
 
   it("reports a missing CLI as an actionable probe failure", async () => {
     const { adapter, runtime } = await setup();

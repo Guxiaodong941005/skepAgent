@@ -15,6 +15,21 @@ export interface LivenessClassification {
   bootId?: string;
 }
 
+export interface LivenessAlarm {
+  kind: "duplicate-daemon";
+  agent: string;
+  /** Previously superseded boot ID that has returned on this agent's heartbeat ref. */
+  bootId: string;
+  /** Boot ID observed immediately before the superseded one returned. */
+  supersededBy: string;
+}
+
+interface BootHistory {
+  bootId: string;
+  superseded: Set<string>;
+  alarm: LivenessAlarm | null;
+}
+
 interface Observation {
   oid: string;
   n: number;
@@ -46,6 +61,7 @@ export class LivenessError extends Error {
 
 export class LivenessTracker {
   private readonly agents = new Map<string, Observation>();
+  private readonly boots = new Map<string, BootHistory>();
   private readonly cfg: LivenessConfig;
 
   constructor(
@@ -69,6 +85,23 @@ export class LivenessTracker {
       throw new LivenessError("Invalid heartbeat observation or mismatched agent", {
         cause: parsed.success ? undefined : parsed.error,
       });
+    }
+    const history = this.boots.get(agent);
+    if (!history) {
+      this.boots.set(agent, { bootId: hb.boot_id, superseded: new Set(), alarm: null });
+    } else if (history.bootId !== hb.boot_id) {
+      // ARCHITECTURE §8.1 / PRD §7.2: a restart uses a fresh ID; a superseded ID returning
+      // indicates competing daemons. Retain the first alarm without flooding on each flip.
+      if (history.superseded.has(hb.boot_id) && history.alarm === null) {
+        history.alarm = {
+          kind: "duplicate-daemon",
+          agent,
+          bootId: hb.boot_id,
+          supersededBy: history.bootId,
+        };
+      }
+      history.superseded.add(history.bootId);
+      history.bootId = hb.boot_id;
     }
     const previous = this.agents.get(agent);
     const restart = previous?.bootId !== hb.boot_id;
@@ -99,8 +132,16 @@ export class LivenessTracker {
     return { cls, sinceChangeMs, bootId: observed.bootId };
   }
 
+  /** Sticky alarms for this observer's lifetime; callers receive a sorted, independent snapshot. */
+  alarms(): LivenessAlarm[] {
+    return [...this.boots.entries()]
+      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+      .flatMap(([, history]) => (history.alarm === null ? [] : [{ ...history.alarm }]));
+  }
+
   resetAll(): void {
     // PRD §10.5: after our own suspend, time we did not observe cannot justify revocation.
+    // Boot identities remain valid evidence of duplicate daemons independently of those timers.
     this.agents.clear();
   }
 }

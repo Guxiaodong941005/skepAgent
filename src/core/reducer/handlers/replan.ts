@@ -1,3 +1,4 @@
+/** ARCHITECTURE §5.5 / PRD §9.7: whole-task interrupt, checkpoint and replan barriers. */
 import { canonicalJson } from "../../canonical.js";
 import { isSettled, settleBarrier } from "./barrier.js";
 import type { Handler } from "./types.js";
@@ -10,6 +11,8 @@ export const handleReplanRequested: Handler<"replan.requested"> = (draft, event,
   const payload = event.payload;
   if (ctx.principal.kind !== "human" && payload.evidence.length === 0)
     return { ok: false, reason: "missing_evidence" };
+  if (payload.item !== null && !task.items[payload.item])
+    return { ok: false, reason: "unknown_item" };
   const request = {
     seq: ctx.seq,
     event_id: event.event_id,
@@ -23,8 +26,6 @@ export const handleReplanRequested: Handler<"replan.requested"> = (draft, event,
     task.barrier.requests.push(request);
     return { ok: true };
   }
-  if (payload.item !== null && !task.items[payload.item])
-    return { ok: false, reason: "unknown_item" };
   const plan = task.plans[String(task.active_plan_version)];
   if (!plan) return { ok: false, reason: "unknown_plan_version" };
   const awaiting = plan.plan.stack_order.filter((id) => task.items[id]?.status === "leased");
@@ -92,12 +93,18 @@ export const handleBarrierClosed: Handler<"barrier.closed"> = (draft, event, ctx
   if (canonicalJson([...event.payload.missing].sort()) !== canonicalJson([...missing].sort()))
     return { ok: false, reason: "pre_mismatch" };
 
-  for (const id of missing) {
+  // An awaiting ID always belongs to the active plan (§5.5); fail before mutating a corrupt draft.
+  const missingItems = missing.map((id) => {
     const item = task.items[id];
-    if (item) {
-      item.lease = null;
-      item.status = "unknown";
-    }
+    if (!item)
+      throw new RangeError(
+        `Barrier ${barrier.id} awaits missing item ${id} in task ${task.task_id}`,
+      );
+    return item;
+  });
+  for (const item of missingItems) {
+    item.lease = null;
+    item.status = "unknown";
   }
   settleBarrier(task, ctx.seq);
   return { ok: true };
