@@ -1,5 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
-import { agentRegistered, fakeSha, LogBuilder, MAC } from "../../test/helpers/log-builder.js";
+import {
+  agentRegistered,
+  fakeEventId,
+  fakeSha,
+  LogBuilder,
+  MAC,
+} from "../../test/helpers/log-builder.js";
 import { draft } from "../core/intents.js";
 import { replay } from "../core/reducer/replay.js";
 import { GitError, type GitRunner } from "../git/runner.js";
@@ -67,6 +73,54 @@ describe("publisher retry and state boundaries", () => {
     const intent = vi.fn(() => null);
     expect(await publisher.publish(intent)).toEqual({ status: "accepted", eventId, seq: 1 });
     expect(intent).not.toHaveBeenCalled();
+  });
+
+  it("uses a caller-supplied seen event ID without drawing randomness or evaluating the intent", async () => {
+    const { publisher, source, reset, log, deps } = setup();
+    const eventId = fakeEventId(301);
+    log.append({
+      type: "agent.registered",
+      actor: MAC,
+      payload: agentRegistered(),
+      event_id: eventId,
+    });
+    const state = replay(log.entries);
+    source.replayTo.mockResolvedValue(state);
+    reset.mockResolvedValue(state.tip);
+    const bytes = vi.spyOn(deps.rng, "bytes");
+    const intent = vi.fn(() => null);
+    expect(await publisher.publish(intent, { eventId })).toEqual({
+      status: "accepted",
+      eventId,
+      seq: 1,
+    });
+    expect(intent).not.toHaveBeenCalled();
+    expect(bytes).not.toHaveBeenCalled();
+    expect(deps.git.run).not.toHaveBeenCalled();
+  });
+
+  it("rejects invalid supplied event IDs before queueing and preserves the queue for valid IDs", async () => {
+    const { publisher, fetch, deps } = setup();
+    const bytes = vi.spyOn(deps.rng, "bytes");
+    const eventId = fakeEventId(302);
+    const intent = vi.fn(() => null);
+    for (const invalid of [
+      "",
+      "evt_invalid",
+      "../../event",
+      eventId.toUpperCase(),
+      `${eventId}\n`,
+      `${eventId}\r`,
+      `${eventId}\u2028`,
+      `${eventId}\u2029`,
+    ]) {
+      expect(() => publisher.publish(intent, { eventId: invalid })).toThrow(PublishError);
+    }
+    expect(fetch).not.toHaveBeenCalled();
+    expect(intent).not.toHaveBeenCalled();
+    expect(bytes).not.toHaveBeenCalled();
+    expect(await publisher.publish(intent, { eventId })).toEqual({ status: "dropped", eventId });
+    expect(bytes).not.toHaveBeenCalled();
   });
 
   it("uses the injected clock and jittered backoff for all eight attempts, then fails closed", async () => {
