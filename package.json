@@ -3,7 +3,7 @@
   "version": "0.0.1",
   "private": true,
   "description": "Cross-device, decentralized collaboration for AI coding agents over a signed git blackboard.",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "type": "module",
   "engines": {
     "node": ">=22.12.0"
