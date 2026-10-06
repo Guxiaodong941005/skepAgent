@@ -46,6 +46,18 @@ describe("FakeHintChannel", () => {
     expect(clock.nowMs()).toBe(11_042);
   });
 
+  it("discards a publication made before start instead of replaying it on restart", async () => {
+    // Documented (SK-308 review note 2): publishing before `start()` is a dropped hint, not a
+    // queued one, so a test that forgets to start the channel fails visibly.
+    const { channel } = fixture();
+    await expect(channel.publish(tip)).resolves.toBeUndefined();
+    expect(channel.published).toEqual([]);
+    await channel.start(vi.fn());
+    expect(channel.published).toEqual([]);
+    await channel.publish(wake);
+    expect(channel.published).toEqual([wake]);
+  });
+
   it("records valid publications without echoing them or updating receipt time", async () => {
     const { channel } = fixture();
     const onHint = vi.fn();

@@ -179,7 +179,7 @@
         }
       ],
       "added": {
-        "events/T-20261005-0000/evt_7704156f-afb7-4e5b-8acb-ddf91cf6b2e5.json": "{\n  \"schema\": \"skep.event/v1\",\n  \"event_id\": \"evt_7704156f-afb7-4e5b-8acb-ddf91cf6b2e5\",\n  \"type\": \"work.delivered\",\n  \"task_id\": \"T-20261005-0000\",\n  \"actor\": \"vps.coding\",\n  \"observed_tip\": \"ae3d171861932b187d4f62f4fa280331622fd3e0\",\n  \"pre\": {\n    \"task_rev\": 6,\n    \"item\": \"W1\"\n  },\n  \"created_at\": \"2026-10-05T09:00:00Z\",\n  \"lang\": \"en\",\n  \"payload\": {\n    \"item\": \"W1\",\n    \"epoch\": 1,\n    \"branch\": \"skep/T-20261005-0000/W1/e1\",\n    \"head_sha\": \"e382de1b1388b46eba9e357d1ab0367cf374de54\",\n    \"pr_url\": \"https://example.com/example/app/pull/1\",\n    \"pr_number\": 1,\n    \"check_runs\": [\n      {\n        \"run_id\": \"run-1\",\n        \"check\": \"unit\",\n        \"sha\": \"e382de1b1388b46eba9e357d1ab0367cf374de54\",\n        \"exit\": 0,\n        \"duration_ms\": 10,\n        \"passed\": 1,\n        \"failed\": 0,\n        \"log_sha256\": \"52fc0803bc5b78e2eda8d96486c9c6bbb9528d23000000000000000000000000\"\n      }\n    ]\n  }\n}\n"
+        "events/T-20261005-0000/evt_7704156f-afb7-4e5b-8acb-ddf91cf6b2e5.json": "{\n  \"schema\": \"skep.event/v1\",\n  \"event_id\": \"evt_7704156f-afb7-4e5b-8acb-ddf91cf6b2e5\",\n  \"type\": \"work.delivered\",\n  \"task_id\": \"T-20261005-0000\",\n  \"actor\": \"vps.coding\",\n  \"observed_tip\": \"ae3d171861932b187d4f62f4fa280331622fd3e0\",\n  \"pre\": {\n    \"task_rev\": 6,\n    \"item\": \"W1\"\n  },\n  \"created_at\": \"2026-10-05T09:00:00Z\",\n  \"lang\": \"en\",\n  \"payload\": {\n    \"item\": \"W1\",\n    \"epoch\": 1,\n    \"branch\": \"skep/T-20261005-0000/W1/e1\",\n    \"head_sha\": \"e382de1b1388b46eba9e357d1ab0367cf374de54\",\n    \"pr_url\": \"https://example.invalid/example/app/pull/1\",\n    \"pr_number\": 1,\n    \"check_runs\": [\n      {\n        \"run_id\": \"run-1\",\n        \"check\": \"unit\",\n        \"sha\": \"e382de1b1388b46eba9e357d1ab0367cf374de54\",\n        \"exit\": 0,\n        \"duration_ms\": 10,\n        \"passed\": 1,\n        \"failed\": 0,\n        \"log_sha256\": \"52fc0803bc5b78e2eda8d96486c9c6bbb9528d23000000000000000000000000\"\n      }\n    ]\n  }\n}\n"
       }
     },
     {
@@ -215,7 +215,7 @@
         }
       ],
       "added": {
-        "events/T-20261005-0000/evt_35c119c7-53c3-4280-86fb-7ca69b917158.json": "{\n  \"schema\": \"skep.event/v1\",\n  \"event_id\": \"evt_35c119c7-53c3-4280-86fb-7ca69b917158\",\n  \"type\": \"work.delivered\",\n  \"task_id\": \"T-20261005-0000\",\n  \"actor\": \"mac.coding\",\n  \"observed_tip\": \"46cf93959393e671b1e2f8bfbeb6aebb1493c5db\",\n  \"pre\": {\n    \"task_rev\": 8,\n    \"item\": \"W2\"\n  },\n  \"created_at\": \"2026-10-05T09:00:00Z\",\n  \"lang\": \"en\",\n  \"payload\": {\n    \"item\": \"W2\",\n    \"epoch\": 1,\n    \"branch\": \"skep/T-20261005-0000/W2/e1\",\n    \"head_sha\": \"57c03b2eeb3581b23285c5f7a89000322e41e532\",\n    \"pr_url\": \"https://example.com/example/app/pull/2\",\n    \"pr_number\": 2,\n    \"check_runs\": [\n      {\n        \"run_id\": \"run-1\",\n        \"check\": \"unit\",\n        \"sha\": \"57c03b2eeb3581b23285c5f7a89000322e41e532\",\n        \"exit\": 0,\n        \"duration_ms\": 10,\n        \"passed\": 1,\n        \"failed\": 0,\n        \"log_sha256\": \"6a44248fd4bf5743b27cdab8816b3dc8bf0539be000000000000000000000000\"\n      }\n    ]\n  }\n}\n"
+        "events/T-20261005-0000/evt_35c119c7-53c3-4280-86fb-7ca69b917158.json": "{\n  \"schema\": \"skep.event/v1\",\n  \"event_id\": \"evt_35c119c7-53c3-4280-86fb-7ca69b917158\",\n  \"type\": \"work.delivered\",\n  \"task_id\": \"T-20261005-0000\",\n  \"actor\": \"mac.coding\",\n  \"observed_tip\": \"46cf93959393e671b1e2f8bfbeb6aebb1493c5db\",\n  \"pre\": {\n    \"task_rev\": 8,\n    \"item\": \"W2\"\n  },\n  \"created_at\": \"2026-10-05T09:00:00Z\",\n  \"lang\": \"en\",\n  \"payload\": {\n    \"item\": \"W2\",\n    \"epoch\": 1,\n    \"branch\": \"skep/T-20261005-0000/W2/e1\",\n    \"head_sha\": \"57c03b2eeb3581b23285c5f7a89000322e41e532\",\n    \"pr_url\": \"https://example.invalid/example/app/pull/2\",\n    \"pr_number\": 2,\n    \"check_runs\": [\n      {\n        \"run_id\": \"run-1\",\n        \"check\": \"unit\",\n        \"sha\": \"57c03b2eeb3581b23285c5f7a89000322e41e532\",\n        \"exit\": 0,\n        \"duration_ms\": 10,\n        \"passed\": 1,\n        \"failed\": 0,\n        \"log_sha256\": \"6a44248fd4bf5743b27cdab8816b3dc8bf0539be000000000000000000000000\"\n      }\n    ]\n  }\n}\n"
       }
     },
     {
@@ -273,5 +273,5 @@
       }
     }
   ],
-  "state_hash": "sha256:4778ea55f8ca1be138d643c3ebe368bf08bb862fe34d67218f9c79779baa24be"
+  "state_hash": "sha256:14f9d3595e4647cf898cd46d838f3786085fec1f1fc0dc5dfec0d93712cb7da3"
 }

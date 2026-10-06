@@ -8,8 +8,20 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-/** Last complete JSON object, with balanced containers and JSON string escaping (§9.3). */
+/**
+ * Last complete JSON object, with balanced containers and JSON string escaping (§9.3). Top-level
+ * arrays are ignored on purpose: every model-facing schema is an object.
+ *
+ * A stray unmatched `{` in prose before the object would leave the container stack never empty,
+ * so the forward scan alone misses it (SK-307 review note 1). When that happens, the fallback
+ * parses from each `{` up to each later `}` and keeps the last object that parses.
+ */
 export function extractJson(text: string): unknown | null {
+  return scanObjects(text) ?? scanAfterStrayBrace(text);
+}
+
+/** Forward balanced-container scan. Returns the last object, or null when none closes cleanly. */
+function scanObjects(text: string): unknown | null {
   const stack: string[] = [];
   let start = 0;
   let inString = false;
@@ -46,6 +58,75 @@ export function extractJson(text: string): unknown | null {
     }
   }
   return last;
+}
+
+/**
+ * Fallback for a stray unmatched `{` ahead of the real object (SK-307 review note 1). Only runs
+ * when the forward scan found nothing, so the common path stays one pass. Later candidates
+ * overwrite earlier ones, so the last object wins, matching the forward scan.
+ */
+function scanAfterStrayBrace(text: string): unknown | null {
+  // The stray `{` is never closed, so no `}` returns the stack to empty. Any `}` can end the
+  // object; the parse attempt decides. Braces inside strings or inside a top-level array are not
+  // candidates: the schemas are objects, and an array wrapping one must stay invisible exactly as
+  // the forward scan leaves it.
+  const skipped = nonCandidateBraces(text);
+  let last: unknown = null;
+  for (let end = 0; end < text.length; end++) {
+    if (text[end] !== "}" || skipped.has(end)) continue;
+    // The nearest `{` that parses wins for this `}`; a later `}` then overwrites it.
+    for (let start = end; start >= 0; start--) {
+      if (text[start] !== "{" || skipped.has(start)) continue;
+      try {
+        const value: unknown = JSON.parse(text.slice(start, end + 1));
+        if (isObject(value)) last = value;
+        break;
+      } catch (error) {
+        if (!(error instanceof SyntaxError)) throw error;
+      }
+    }
+  }
+  return last;
+}
+
+/**
+ * Positions of `{` and `}` the fallback must not treat as object boundaries: those inside JSON
+ * strings, and those nested in a `[...]` that is not itself inside an object.
+ *
+ * A `"` only opens a string when a structural token precedes it. A quoted word in prose is not
+ * one, or the fallback would hide the object that follows it.
+ */
+function nonCandidateBraces(text: string): Set<number> {
+  const skipped = new Set<number>();
+  const stack: string[] = [];
+  let inString = false;
+  let escaped = false;
+  let structural = true;
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i] ?? "";
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      else if (char === "{" || char === "}") skipped.add(i);
+      continue;
+    }
+    if (char === '"' && structural) {
+      inString = true;
+      structural = false;
+    } else if ("{[ ,:".includes(char)) {
+      structural = true;
+    } else if (char.trim() !== "") {
+      structural = false;
+    }
+    if ((char === "{" || char === "}") && stack.includes("[")) skipped.add(i);
+    if (char === "{" || char === "[") stack.push(char);
+    else if (char === "}" || char === "]") {
+      if (stack.at(-1) === (char === "}" ? "{" : "[")) stack.pop();
+      else stack.length = 0;
+    }
+  }
+  return skipped;
 }
 
 function matchesType(value: unknown, type: unknown): boolean {

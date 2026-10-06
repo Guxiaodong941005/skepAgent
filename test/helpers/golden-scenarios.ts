@@ -40,7 +40,7 @@ export interface Scenario {
 }
 
 export function buildScenarios(): Scenario[] {
-  return [solo(), team(), replan(), escalate(), forged(), verifyFailResume()];
+  return [solo(), team(), replan(), escalate(), forged(), verifyFailResume(), reviewResume()];
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -121,7 +121,7 @@ function replan(): Scenario {
   log.claim("W2");
   log.deliver("W2");
   return log.scenario(
-    "One in-budget replan carries the delivered item over (D7) and delivers the replacement (D15).",
+    "One in-budget replan carries the delivered item over (D7) and delivers the replacement item (D15).",
   );
 }
 
@@ -171,6 +171,32 @@ function forged(): Scenario {
  * D14/D15: a failed top-of-stack verification escalates with reason `verification_failed`; the
  * human resumes, the owner re-verifies, the human merges, and the task is done.
  */
+/**
+ * D20: three plan rejections push `review_rounds` over the budget and escalate; the human's
+ * `resume_with_plan` returns the task to `executing` with the counter still over budget (D12).
+ * The legal-but-surprising state the SK-304 review pinned, frozen as a golden fixture.
+ */
+function reviewResume(): Scenario {
+  const log = new Script("review-resume");
+  log.register(VPS);
+  const task = log.createTask("solo", VPS, { review_rounds: 2 });
+  // v1 is approved, so there is an active plan for resume_with_plan to re-activate.
+  log.propose(task, "solo", [item("W1", VPS, [])]);
+  log.approve();
+  log.requestReplan();
+  // Nothing is leased, so the barrier settles immediately and the task is `replanning`.
+  log.propose(task, "solo", [item("W1", VPS, [])], "Second attempt at the same item.");
+  log.reject();
+  log.propose(task, "solo", [item("W1", VPS, [])], "Third attempt at the same item.");
+  log.reject();
+  log.propose(task, "solo", [item("W1", VPS, [])], "Fourth attempt at the same item.");
+  log.reject();
+  log.decide("resume_with_plan");
+  return log.scenario(
+    "Review-round escalation resumed with the same plan stays executing over budget (D12, D20).",
+  );
+}
+
 function verifyFailResume(): Scenario {
   const log = new Script("verify-fail-resume");
   log.register(VPS);
@@ -184,7 +210,7 @@ function verifyFailResume(): Scenario {
   log.verify(true);
   log.merge("W1");
   return log.scenario(
-    "Failed verification escalates; resume, re-verification and merge reach done (D14/D15).",
+    "Failed verification escalates, resume returns to delivered, re-verification and merge reach done (D14/D15).",
   );
 }
 
@@ -354,6 +380,23 @@ class Script {
     );
   }
 
+  /** Human rejection: increments `review_rounds` and returns the task to `planning` (§5.4). */
+  reject(): void {
+    const plan = this.plan();
+    this.step(
+      built("plan.rejected", {
+        task_id: this.task().task_id,
+        actor: "human",
+        pre: { task_rev: this.task().rev, plan_version: plan.version, plan_hash: plan.plan_hash },
+        payload: {
+          plan_version: plan.version,
+          plan_hash: plan.plan_hash,
+          note: "Needs changes.",
+        },
+      }),
+    );
+  }
+
   claim(id: string): void {
     const task = this.task();
     const itemState = this.item(id);
@@ -396,7 +439,7 @@ class Script {
           epoch: lease.epoch,
           branch: lease.branch,
           head_sha: head,
-          pr_url: `https://example.com/example/app/pull/${pr}`,
+          pr_url: `https://example.invalid/example/app/pull/${pr}`,
           pr_number: pr,
           check_runs: [checkRun(head)],
         },
@@ -625,6 +668,7 @@ interface PayloadMap {
   "review.submitted": PayloadOf<"review.submitted">;
   "plan.locked": PayloadOf<"plan.locked">;
   "plan.approved": PayloadOf<"plan.approved">;
+  "plan.rejected": PayloadOf<"plan.rejected">;
   "lease.claimed": PayloadOf<"lease.claimed">;
   "work.delivered": PayloadOf<"work.delivered">;
   "replan.requested": PayloadOf<"replan.requested">;

@@ -1,7 +1,15 @@
 import type { Clock } from "../util/clock.js";
 import { type Hint, type HintChannel, HintSchema } from "./types.js";
 
-/** Test helper for SK-302: delivery is explicit and synchronous, with no network or real timers. */
+/**
+ * @internal Test helper for SK-302 (ships in `src/` so the sync tests can import it; not a
+ * production transport). Delivery is explicit and synchronous, with no network or real timers.
+ *
+ * `publish` before `start()` is discarded, not queued (SK-308 review note 2): the channel never
+ * rejects, and a hint published while stopped would otherwise reappear on restart and surprise a
+ * test that forgot to start the channel. `published` only records what a live subscriber could
+ * have observed.
+ */
 export class FakeHintChannel implements HintChannel {
   readonly name = "fake";
   readonly published: Hint[] = [];
@@ -15,6 +23,9 @@ export class FakeHintChannel implements HintChannel {
   }
 
   async publish(hint: Hint): Promise<void> {
+    // Before `start()` (and after `stop()`) there is no subscriber, so the hint is dropped rather
+    // than recorded or queued (SK-308 review note 2). A test that forgets to start the channel
+    // sees an empty `published`, which is the bug; queueing would hide it until restart.
     if (this.onHint === null) return;
     const parsed = HintSchema.safeParse(hint);
     if (parsed.success) this.published.push(parsed.data);

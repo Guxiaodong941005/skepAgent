@@ -27,7 +27,30 @@ import { buildScenarios, type Scenario } from "../helpers/golden-scenarios.js";
 
 const UPDATE = process.env.SKEP_UPDATE_GOLDEN === "1";
 
-const EXPECTED = ["solo", "team", "replan", "escalate", "forged", "verify-fail-resume"] as const;
+const EXPECTED = [
+  "solo",
+  "team",
+  "replan",
+  "escalate",
+  "forged",
+  "verify-fail-resume",
+  "review-resume",
+] as const;
+
+/**
+ * The rewrite used to run in the `describe.each` body, which executes at collection time. A watch
+ * or parallel run with the env var set would rewrite the fixtures once per reload (SK-305 review
+ * note 3). Refuse the combination, and otherwise rewrite once in `beforeAll`.
+ */
+const WATCH =
+  process.argv.includes("--watch") ||
+  process.argv.includes("watch") ||
+  process.argv.includes("dev");
+if (UPDATE && WATCH) {
+  throw new Error(
+    "SKEP_UPDATE_GOLDEN=1 rewrites fixtures; run it with `vitest run`, not watch mode",
+  );
+}
 
 function scenarioByName(name: string): Scenario {
   const scenario = buildScenarios().find((candidate) => candidate.name === name);
@@ -41,18 +64,24 @@ function updateFixture(scenario: Scenario): void {
 }
 
 describe("golden replay fixtures", () => {
+  // Written once, here, rather than inside `describe.each`: that body re-runs for every test in
+  // the case, so a watch reload would rewrite the fixtures repeatedly (SK-305 review note 3).
+  // `beforeAll` is too late — the cases below read the fixtures while the file is collected.
+  if (UPDATE) {
+    for (const name of EXPECTED) updateFixture(scenarioByName(name));
+  }
+
   const files = readdirSync("test/fixtures/golden")
     .filter((file) => file.endsWith(".json"))
     .map((file) => file.replace(/\.json$/, ""))
     .sort();
 
-  it("pins exactly the six required paths", () => {
+  it("pins exactly the seven required paths", () => {
     expect(files).toEqual([...EXPECTED].sort());
   });
 
   describe.each(EXPECTED)("%s", (name) => {
     const scenario = scenarioByName(name);
-    if (UPDATE) updateFixture(scenario);
     const fixture = loadFixture(name);
 
     it("replays to its pinned content hash", () => {
@@ -92,6 +121,7 @@ describe("golden replay fixtures", () => {
     expect(status("escalate")).toBe("escalated");
     expect(status("forged")).toBe("delivered");
     expect(status("verify-fail-resume")).toBe("done");
+    expect(status("review-resume")).toBe("executing");
   });
 
   it("carries the delivered item across the replan and redelivers higher (D7, D15)", () => {
@@ -168,6 +198,27 @@ describe("golden replay fixtures", () => {
     expect(task.items.W1?.status).toBe("merged");
     // The resume did not grant a new epoch: the same delivery stands.
     expect(task.epochs).toEqual({ W1: 1 });
+  });
+
+  it("resumes a review-round escalation with the counter still over budget (D12, D20)", () => {
+    const task = taskOf(replayFixture(loadFixture("review-resume")).state);
+    expect(task.review_rounds).toBe(3);
+    expect(task.budgets.review_rounds).toBe(2);
+    expect(task.status).toBe("executing");
+    // resume_with_plan resets neither counter and clears the escalation (D12).
+    expect(task.escalation).toBeNull();
+    expect(task.active_plan_version).toBe(1);
+  });
+
+  it("uses example.invalid for every recorded PR URL", () => {
+    for (const name of EXPECTED) {
+      const fixture = loadFixture(name);
+      const urls = fixture.entries
+        .flatMap((entry) => Object.values(entry.added ?? {}))
+        .filter((body): body is string => body?.includes("pr_url") === true);
+      for (const body of urls) expect(body).toContain("https://example.invalid/");
+      for (const body of urls) expect(body).not.toContain("example.com");
+    }
   });
 
   it("stores fixtures under test/fixtures/golden", () => {
