@@ -8,6 +8,8 @@ import {
   writeAllowedSigners,
 } from "../../test/helpers/git-fixture.js";
 import { genesisDoc } from "../../test/helpers/log-builder.js";
+import { genesisState } from "../core/reducer/genesis.js";
+import { replay } from "../core/reducer/replay.js";
 import { readLog } from "../git/log-reader.js";
 import { NodeGitRunner } from "../git/runner.js";
 import { SshKeySigner } from "../git/signer.js";
@@ -85,6 +87,10 @@ describe("human-signed genesis bootstrap", () => {
       tip: sha,
       seq: 0,
     });
+    const rootEntry = entries[0];
+    if (!rootEntry) throw new Error("Missing created genesis root");
+    expect(genesisState(rootEntry)).toEqual(state);
+    expect(replay(entries)).toEqual(state);
   });
 
   it("refuses an existing remote main even from a fresh private clone", async () => {

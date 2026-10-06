@@ -9,7 +9,7 @@ import { replay } from "../../src/core/reducer/replay.js";
 import type { State } from "../../src/core/reducer/state.js";
 import { MAX_EVENT_BYTES } from "../../src/core/schemas/common.js";
 import { parseEventFile } from "../../src/core/schemas/events.js";
-import { readLog } from "../../src/git/log-reader.js";
+import { LogReadError, readLog } from "../../src/git/log-reader.js";
 import {
   GitError,
   type GitRunner,
@@ -20,7 +20,14 @@ import { type Signer, SshKeySigner } from "../../src/git/signer.js";
 import { Rng } from "../../src/sim/rng.js";
 import type { Clock } from "../../src/util/clock.js";
 import { generateKey, initRepo, tempDir, writeAllowedSigners } from "../helpers/git-fixture.js";
-import { agentRegistered, genesisDoc, MAC, T1, taskCreated } from "../helpers/log-builder.js";
+import {
+  agentRegistered,
+  fakeEventId,
+  genesisDoc,
+  MAC,
+  T1,
+  taskCreated,
+} from "../helpers/log-builder.js";
 
 class RecordingGit implements GitRunner {
   readonly commands: { args: string[]; input?: string | Uint8Array }[] = [];
@@ -154,7 +161,7 @@ describe("publisher on local bare remotes", () => {
         "task.created",
         T1,
         "human",
-        taskCreated({ owner: MAC, repo: "https://example.com/code.git" }),
+        taskCreated({ owner: MAC, repo: "https://example.invalid/code.git" }),
         {},
       );
   }
@@ -267,6 +274,51 @@ describe("publisher on local bare remotes", () => {
     expect(await entries()).toHaveLength(2);
   });
 
+  it("recovers a landed caller-supplied event ID after restart without appending a duplicate", async () => {
+    const original = await writer("mac");
+    const eventId = fakeEventId(301);
+    const first = await original.publisher.publish(registration(), { eventId });
+    expect(first).toEqual({ status: "accepted", seq: 1, eventId });
+
+    const restarted = await writer("vps");
+    const intent = vi.fn(registration());
+    expect(await restarted.publisher.publish(intent, { eventId })).toEqual(first);
+    expect(intent).not.toHaveBeenCalled();
+    expect(restarted.recording.attemptedPushes).toHaveLength(0);
+    const log = await entries();
+    expect(log).toHaveLength(2);
+    expect(replay(log).outcomes.map((outcome) => outcome.outcome)).toEqual(["accepted"]);
+  });
+
+  it("fails closed on a non-GitError after push and recovers with the same event ID after restart", async () => {
+    const original = await writer("mac");
+    const replayTo = original.source.replayTo;
+    vi.spyOn(original.source, "replayTo")
+      .mockImplementationOnce(replayTo)
+      .mockRejectedValueOnce(new LogReadError("Temporary observation failure"));
+    const eventId = fakeEventId(302);
+    expect(await original.publisher.publish(registration(), { eventId })).toEqual({
+      status: "failed",
+      eventId,
+      reason: "Temporary observation failure",
+    });
+    expect(original.recording.attemptedPushes).toHaveLength(1);
+    expect(original.clock.delays).toHaveLength(0);
+
+    const restarted = await writer("vps");
+    const intent = vi.fn(registration());
+    expect(await restarted.publisher.publish(intent, { eventId })).toEqual({
+      status: "accepted",
+      seq: 1,
+      eventId,
+    });
+    expect(intent).not.toHaveBeenCalled();
+    expect(restarted.recording.attemptedPushes).toHaveLength(0);
+    const log = await entries();
+    expect(log).toHaveLength(2);
+    expect(replay(log).outcomes.map((outcome) => outcome.outcome)).toEqual(["accepted"]);
+  });
+
   it("discards an untracked event after a failed add so a retry can land the same event ID", async () => {
     const instance = await writer();
     instance.recording.failAdd = true;
@@ -364,7 +416,7 @@ describe("publisher on local bare remotes", () => {
     const instance = await writer();
     const payload = taskCreated({
       owner: MAC,
-      repo: "https://example.com/code.git",
+      repo: "https://example.invalid/code.git",
       body: "\u0000".repeat(16_000),
     });
     expect(JSON.stringify(payload).length).toBeGreaterThan(MAX_EVENT_BYTES);

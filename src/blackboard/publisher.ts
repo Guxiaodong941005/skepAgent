@@ -4,7 +4,7 @@ import { type EventId, eventPath, parseEventPath, type Sha } from "../core/ids.j
 import { finalizeEvent, type Intent } from "../core/intents.js";
 import { replay } from "../core/reducer/replay.js";
 import type { LogOutcome, State } from "../core/reducer/state.js";
-import { MAX_EVENT_BYTES } from "../core/schemas/common.js";
+import { EventIdSchema, MAX_EVENT_BYTES } from "../core/schemas/common.js";
 import { serializeEvent } from "../core/schemas/events.js";
 import { type Ident, writeSignedCommit, writeTreeFromIndex } from "../git/commit.js";
 import { readLog } from "../git/log-reader.js";
@@ -25,6 +25,11 @@ export function fullReplaySource(git: GitRunner, dir: string, trustPath: string)
   };
 }
 
+/**
+ * Non-GitError failures inside the write loop return "failed" immediately (fail closed). An
+ * observation failure after a successful push may leave the event committed despite that status.
+ * Recover by publishing with the same eventId to consult seen_event_ids (ARCHITECTURE §7.2, §11.4).
+ */
 export interface PublishResult {
   status: "accepted" | "rejected" | "dropped" | "failed";
   seq?: number;
@@ -61,8 +66,19 @@ export class Publisher {
     }
   }
 
-  publish(intent: Intent, opts?: { signer?: Signer }): Promise<PublishResult> {
-    const eventId = newEventId(this.deps.rng);
+  /**
+   * Persist eventId with the intent before publishing for restart recovery (ARCHITECTURE §11.4).
+   * Invalid event IDs throw PublishError before queueing.
+   */
+  publish(intent: Intent, opts?: { signer?: Signer; eventId?: EventId }): Promise<PublishResult> {
+    const eventId = opts?.eventId === undefined ? newEventId(this.deps.rng) : opts.eventId;
+    const parsed = EventIdSchema.safeParse(eventId);
+    // The shared regex's '$' also matches before a final line terminator; require the entire ID.
+    if (!parsed.success || parsed.data !== parsed.data.trim()) {
+      throw new PublishError(
+        "eventId must match the evt_<UUID> format without surrounding whitespace",
+      );
+    }
     const signer = opts?.signer ?? this.deps.signer;
     const result = this.tail.then(() => this.run(intent, eventId, signer));
     // A failing callback must not poison the FIFO for every subsequent local intent (§7.2).
