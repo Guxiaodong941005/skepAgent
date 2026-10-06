@@ -56,6 +56,8 @@ export function activatePlan(task: TaskState, version: number, seq: number): voi
   }
   task.items = items;
   task.active_plan_version = version;
+  // D13 (ARCHITECTURE §5.5): a proposed team plan upgrades the task only on activation.
+  task.mode = record.plan.mode;
   // D15 (ARCHITECTURE §5.5): a plan whose items all carried over as delivered/merged (D7) has no
   // work left to claim, so no work.delivered would ever move the task on from `executing`.
   const statuses = Object.values(items).map((item) => item.status);
@@ -93,10 +95,11 @@ export const handlePlanProposed: Handler<"plan.proposed"> = (draft, event, ctx) 
     plan.parent_version !== payload.parent_version ||
     payload.base_commit !== plan.base.commit ||
     plan.base.repo !== task.repo ||
-    plan.mode !== task.mode ||
+    (task.mode === "team" && plan.mode !== "team") ||
+    (plan.mode === "solo" && plan.items.length !== 1) ||
     plan.items.some((item) => !draft.agents[item.assignee]) ||
     new Set(payload.reviewers).size !== payload.reviewers.length ||
-    (task.mode === "solo"
+    (plan.mode === "solo"
       ? payload.reviewers.length !== 0
       : payload.reviewers.length < 1 ||
         payload.reviewers.length > 4 ||
@@ -120,11 +123,11 @@ export const handlePlanProposed: Handler<"plan.proposed"> = (draft, event, ctx) 
     proposed_seq: ctx.seq,
     owner_gen: task.owner_gen,
     reviews: {},
-    locked: task.mode === "solo" ? { seq: ctx.seq, overrides: [], missing_reviews: [] } : null,
+    locked: plan.mode === "solo" ? { seq: ctx.seq, overrides: [], missing_reviews: [] } : null,
     decision: null,
   };
   task.current_plan_version = payload.version;
-  task.status = task.mode === "team" ? "reviewing" : "awaiting_approval";
+  task.status = plan.mode === "team" ? "reviewing" : "awaiting_approval";
   enforceReviewBudget(task, ctx.seq);
   return { ok: true };
 };
@@ -149,13 +152,19 @@ export const handleReviewSubmitted: Handler<"review.submitted"> = (draft, event,
 export const handlePlanLocked: Handler<"plan.locked"> = (draft, event, ctx) => {
   const task = draft.tasks[event.task_id];
   if (!task) return { ok: false, reason: "unknown_task" };
-  if (
-    !(task.mode === "team" && task.status === "reviewing") &&
-    !(task.mode === "solo" && task.status === "awaiting_approval" && task.plan_approval === "owner")
-  )
+  if (task.status !== "reviewing" && task.status !== "awaiting_approval")
     return { ok: false, reason: "bad_task_state" };
   const record = task.plans[String(task.current_plan_version)];
   if (!record) return { ok: false, reason: "unknown_plan_version" };
+  if (
+    !(record.plan.mode === "team" && task.status === "reviewing") &&
+    !(
+      record.plan.mode === "solo" &&
+      task.status === "awaiting_approval" &&
+      task.plan_approval === "owner"
+    )
+  )
+    return { ok: false, reason: "bad_task_state" };
   const payload = event.payload;
   if (payload.plan_version !== record.version || payload.plan_hash !== record.plan_hash)
     return { ok: false, reason: "plan_changed" };
