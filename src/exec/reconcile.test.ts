@@ -28,7 +28,7 @@ import {
   AttemptRunner,
   type AttemptRunnerDependencies,
 } from "./attempt.js";
-import { type AttemptKey, Journal } from "./journal.js";
+import { type AttemptKey, Journal, verificationKey } from "./journal.js";
 import {
   AttemptReconciler,
   nativeReconcileProcesses,
@@ -153,7 +153,11 @@ describe("restart reconciliation", () => {
       reverify: vi.fn(async (lease) =>
         isCurrentLease(replay(log.entries), lease) ? "ok" : "stale",
       ),
-      processes: { startToken: vi.fn(async () => null), killGroup: vi.fn(async () => {}) },
+      processes: {
+        startToken: vi.fn(async () => null),
+        bootId: vi.fn(async () => "os-boot-current"),
+        killGroup: vi.fn(async () => {}),
+      },
       publisher: {
         publish: vi.fn(async (intent, options): Promise<PublishResult> => {
           const state = replay(log.entries);
@@ -196,13 +200,14 @@ describe("restart reconciliation", () => {
     await expect(new AttemptRunner({ ...deps, journal: saved }).run(input)).rejects.toThrow(Crash);
   }
   const recover = () => new AttemptReconciler(deps).reconcile();
-  async function processRecord(token: string) {
+  async function processRecord(token: string, bootId?: string) {
     await journal.append(key, {
       step: "invoked",
       kind: "work",
       pid: 123,
       pgid: 123,
       start_token: token,
+      ...(bootId ? { boot_id: bootId } : {}),
     });
   }
 
@@ -218,20 +223,33 @@ describe("restart reconciliation", () => {
   it.each([
     { saved: "start-123", actual: "start-123", kills: 1 },
     { saved: "start-123", actual: null, kills: 1 },
-    { saved: "", actual: null, kills: 1 },
-    { saved: "", actual: "new-start", kills: 1 },
+    { saved: "", actual: null, kills: 0 },
+    { saved: "", actual: "new-start", kills: 0 },
+    { saved: "", actual: null, boot: "os-boot-current", kills: 1 },
+    { saved: "", actual: "new-start", boot: "os-boot-current", kills: 0 },
+    { saved: "", actual: null, boot: "os-boot-previous", kills: 0 },
+    { saved: "", actual: "new-start", boot: "os-boot-previous", kills: 0 },
     { saved: "start-123", actual: "new-start", kills: 0 },
   ])(
-    "fences and terminates the recorded group ($saved/$actual)",
-    async ({ saved, actual, kills }) => {
+    "fences and terminates the recorded group ($saved/$actual/$boot)",
+    async ({ saved, actual, boot, kills }) => {
       await stopAt("preflight_ok");
-      await processRecord(saved);
+      await processRecord(saved, boot);
       if (!deps.processes) throw new Error("Missing process port");
       vi.mocked(deps.processes.startToken).mockResolvedValue(actual);
       expect(await recover()).toMatchObject([
         { key, result: { status: "failed", class: "crash" } },
       ]);
       expect(deps.processes.killGroup).toHaveBeenCalledTimes(kills);
+      if (!kills) {
+        expect(await journal.read(key)).toContainEqual(
+          expect.objectContaining({
+            step:
+              saved === "" && boot !== "os-boot-current" ? "process_unverified" : "process_reused",
+            pgid: 123,
+          }),
+        );
+      }
       if (kills) {
         expect(deps.processes.killGroup).toHaveBeenCalledWith(123);
         expect(vi.mocked(deps.processes.killGroup).mock.invocationCallOrder[0]).toBeLessThan(
@@ -245,7 +263,7 @@ describe("restart reconciliation", () => {
 
   it("leaves an attempt unfinished when group termination fails", async () => {
     await stopAt("preflight_ok");
-    await processRecord("");
+    await processRecord("", "os-boot-current");
     if (!deps.processes) throw new Error("Missing process port");
     vi.mocked(deps.processes.killGroup).mockRejectedValue(new ReconcileError("Cannot stop group"));
     await expect(recover()).rejects.toThrow("Cannot stop group");
@@ -253,7 +271,7 @@ describe("restart reconciliation", () => {
     expect(await journal.unfinishedAttempts()).toEqual([key]);
   });
 
-  it("kills groups with empty start tokens without requiring readable leader metadata", async () => {
+  it("does not inspect or kill an empty-token group without journaled boot evidence", async () => {
     await stopAt("preflight_ok");
     await processRecord("");
     if (!deps.processes) throw new Error("Missing process port");
@@ -262,7 +280,34 @@ describe("restart reconciliation", () => {
     );
     expect(await recover()).toMatchObject([{ result: { status: "failed", class: "crash" } }]);
     expect(deps.processes.startToken).not.toHaveBeenCalled();
-    expect(deps.processes.killGroup).toHaveBeenCalledWith(123);
+    expect(deps.processes.killGroup).not.toHaveBeenCalled();
+  });
+
+  it.each([null, undefined])(
+    "skips empty-token groups when current boot identity is %s",
+    async (boot) => {
+      await stopAt("preflight_ok");
+      await processRecord("", "os-boot-current");
+      if (!deps.processes) throw new Error("Missing process port");
+      if (boot === undefined) delete deps.processes.bootId;
+      else deps.processes.bootId = vi.fn(async () => boot);
+      expect(await recover()).toMatchObject([{ result: { status: "failed", class: "crash" } }]);
+      expect(deps.processes.killGroup).not.toHaveBeenCalled();
+      expect(deps.processes.startToken).not.toHaveBeenCalled();
+    },
+  );
+
+  it("requires readable group leader metadata even when the boot matches", async () => {
+    await stopAt("preflight_ok");
+    await processRecord("", "os-boot-current");
+    if (!deps.processes) throw new Error("Missing process port");
+    vi.mocked(deps.processes.startToken).mockRejectedValue(
+      new ReconcileError("Cannot read leader"),
+    );
+    await expect(recover()).rejects.toThrow("Cannot read leader");
+    expect(deps.processes.killGroup).not.toHaveBeenCalled();
+    expect(deps.publisher.publish).not.toHaveBeenCalled();
+    expect(await journal.unfinishedAttempts()).toEqual([key]);
   });
 
   it("stops orphan checks and never repeats checks with an unknown outcome", async () => {
@@ -277,6 +322,23 @@ describe("restart reconciliation", () => {
     expect(deps.processes?.killGroup).toHaveBeenCalledWith(456);
     expect(deps.checks.run).not.toHaveBeenCalled();
     expect(adapter.invoke).toHaveBeenCalledOnce();
+  });
+
+  it("stops an interrupted verification without reopening the delivered attempt", async () => {
+    expect(await new AttemptRunner(deps).run(input)).toMatchObject({ status: "delivered" });
+    const finished = await journal.read(key);
+    const verification = verificationKey(T1, "activation-1");
+    await journal.append(verification, {
+      step: "check_started",
+      pid: 456,
+      pgid: 456,
+      start_token: "check-456",
+    });
+    expect(await recover()).toMatchObject([{ key: verification, result: { status: "stale" } }]);
+    expect(deps.processes?.killGroup).toHaveBeenCalledWith(456);
+    expect(await journal.read(key)).toEqual(finished);
+    expect(replay(log.entries).tasks[T1]?.status).toBe("delivered");
+    expect(await recover()).toEqual([]);
   });
 
   it("settles a newly opened barrier with an unknown checkpoint", async () => {
@@ -303,7 +365,7 @@ describe("restart reconciliation", () => {
 
   it("kills recorded groups before marking a revoked attempt stale", async () => {
     await stopAt("preflight_ok");
-    await processRecord("");
+    await processRecord("", "os-boot-current");
     const event = revokeIntent({
       task_id: T1,
       item: "W1",
@@ -329,6 +391,48 @@ describe("restart reconciliation", () => {
     });
     expect(adapter.invoke).toHaveBeenCalledOnce();
     expect(host.list()).toHaveLength(1);
+  });
+
+  it("replaces a pending delivery with a durable unknown checkpoint under a barrier", async () => {
+    await stopAt("publish_pending");
+    const saved = AttemptPublicationSchema.parse(
+      (await journal.read(key)).findLast((record) => record.step === "publish_pending")
+        ?.publication,
+    );
+    log.append(
+      draft(
+        "replan.requested",
+        T1,
+        "human",
+        { item: "W1", summary: "Checkpoint the example delivery.", evidence: [] },
+        { task_rev: replay(log.entries).tasks[T1]?.rev },
+      ),
+    );
+    vi.mocked(deps.publisher.publish).mockResolvedValueOnce({
+      status: "failed",
+      reason: "Example outage",
+      eventId: saved.event_id,
+    });
+    expect(await recover()).toMatchObject([{ result: { status: "pending" } }]);
+    const publications = (await journal.read(key))
+      .filter((record) => record.step === "publish_pending")
+      .map((record) => AttemptPublicationSchema.parse(record.publication));
+    expect(publications).toHaveLength(2);
+    expect(publications[0]).toEqual(saved);
+    const checkpoint = publications[1];
+    expect(checkpoint?.type).toBe("checkpoint.recorded");
+    expect(checkpoint?.event_id).not.toBe(saved.event_id);
+    expect(await recover()).toMatchObject([
+      {
+        result: { status: "checkpointed", snapshot: { invocation_state: "unknown" } },
+      },
+    ]);
+    for (const [, options] of vi.mocked(deps.publisher.publish).mock.calls)
+      expect(options?.eventId).toBe(checkpoint?.event_id);
+    expect(replay(log.entries).tasks[T1]?.status).toBe("replanning");
+    expect(replay(log.entries).tasks[T1]?.barrier?.checkpointed).toEqual(["W1"]);
+    expect(adapter.invoke).toHaveBeenCalledOnce();
+    expect(await recover()).toEqual([]);
   });
 
   it("acknowledges an already accepted event after its lease has ended", async () => {
@@ -387,23 +491,32 @@ describe("restart reconciliation", () => {
     expect(create).not.toHaveBeenCalled();
   });
 
-  it.each(["closed", "merged"] as const)(
-    "checks a journaled %s PR before open-head lookup",
-    async (state) => {
-      await stopAt("pr");
-      if (state === "closed") await host.closePr("app", 1, "End the example PR.");
-      else await host.merge(1);
-      const prState = vi.spyOn(host, "prState");
-      const find = vi.spyOn(host, "findPr");
-      const create = vi.spyOn(host, "createPr");
-      expect(await recover()).toMatchObject([{ result: { status: "stale" } }]);
-      expect(prState).toHaveBeenCalledWith("app", 1);
-      expect(find).not.toHaveBeenCalled();
-      expect(create).not.toHaveBeenCalled();
-      expect(deps.publisher.publish).not.toHaveBeenCalled();
-      expect(host.list()).toHaveLength(1);
-    },
-  );
+  it.each([
+    { state: "closed", step: "pr" },
+    { state: "merged", step: "pr" },
+    { state: "closed", step: "publish_pending" },
+    { state: "merged", step: "publish_pending" },
+  ])("ends the lease when a PR is $state before delivery ($step)", async ({ state, step }) => {
+    await stopAt(step);
+    if (state === "closed") await host.closePr("app", 1, "End the example PR.");
+    else await host.merge(1);
+    const prState = vi.spyOn(host, "prState");
+    const find = vi.spyOn(host, "findPr");
+    const create = vi.spyOn(host, "createPr");
+    expect(await recover()).toMatchObject([{ result: { status: "failed", class: "crash" } }]);
+    expect(prState).toHaveBeenCalledWith("app", 1);
+    expect(find).not.toHaveBeenCalled();
+    expect(create).not.toHaveBeenCalled();
+    expect(deps.publisher.publish).toHaveBeenCalledOnce();
+    expect(replay(log.entries).tasks[T1]?.items.W1?.lease).toBeNull();
+    expect(log.events.at(-1)).toMatchObject({
+      type: "work.failed",
+      payload: { class: "crash", detail: expect.stringContaining(state) },
+    });
+    expect(host.list()).toHaveLength(1);
+    expect(adapter.invoke).toHaveBeenCalledOnce();
+    expect(await recover()).toEqual([]);
+  });
 
   it("uses the publication's PR number if the PR record is missing", async () => {
     await stopAt("publish_pending");

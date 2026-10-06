@@ -1,5 +1,6 @@
 import { open, readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
+import { sha256Hex } from "../core/canonical.js";
 import { ITEM_ID_RE, type ItemId, TASK_ID_RE, type TaskId } from "../core/ids.js";
 import { type Clock, isoUtc } from "../util/clock.js";
 import { appendFsync } from "../util/fs.js";
@@ -24,6 +25,13 @@ export interface AttemptKey {
   epoch: number;
 }
 
+/** ChecksRunner accepts the same three-field key; verification never shares an item attempt. */
+export function verificationKey(task: TaskId, activation: string): AttemptKey {
+  const key = { task, item: `verification-${sha256Hex(activation)}`, epoch: 1 };
+  assertKey(key);
+  return key;
+}
+
 /** A journal line. `step` is required; callers attach whatever else the pipeline recorded. */
 export type JournalRecord = {
   ts_mono: number;
@@ -40,7 +48,8 @@ export type TerminalStep = (typeof TERMINAL_STEPS)[number];
 const JOURNAL_DIR = path.join(".skep", "journal");
 
 /** `<item>-e<epoch>.jsonl`; epoch is a positive integer so `e` cannot be confused with the item. */
-const FILE_RE = /^(W[1-9]\d{0,2})-e([1-9]\d*)\.jsonl$/;
+const VERIFICATION_ID_RE = /^verification-[0-9a-f]{64}$/;
+const FILE_RE = /^(W[1-9]\d{0,2}|verification-[0-9a-f]{64})-e([1-9]\d*)\.jsonl$/;
 
 export class JournalError extends Error {
   constructor(
@@ -154,6 +163,9 @@ export class Journal {
           if (await fileNonEmpty(journalFile(this.root, key))) unfinished.push(key);
           continue;
         }
+        // Completed verification batches have no lease publication to resume (D14). In-flight
+        // checks remain discoverable so restart reconciliation can stop their process groups.
+        if (VERIFICATION_ID_RE.test(key.item) && last.step === "checks") continue;
         if (!isTerminal(last.step)) unfinished.push(key);
       }
     }
@@ -224,7 +236,7 @@ function assertKey(key: { task: string; item: string; epoch: number }): asserts 
   if (!TASK_ID_RE.test(key.task)) {
     throw new JournalError(key.task, 0, `invalid task id ${JSON.stringify(key.task)}`);
   }
-  if (!ITEM_ID_RE.test(key.item)) {
+  if (!ITEM_ID_RE.test(key.item) && !VERIFICATION_ID_RE.test(key.item)) {
     throw new JournalError(key.item, 0, `invalid item id ${JSON.stringify(key.item)}`);
   }
   if (!Number.isInteger(key.epoch) || key.epoch < 1) {
