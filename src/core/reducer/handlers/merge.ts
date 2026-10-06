@@ -32,5 +32,11 @@ export const handleTaskVerified: Handler<"task.verified"> = (draft, event, ctx) 
     passed: event.payload.passed,
     seq: ctx.seq,
   };
+  // D14 (ARCHITECTURE §5.5): the top item has no lease once the task is delivered, so a failed
+  // combined check cannot be a fenced work.failed (PRD §9.8); it escalates to the human instead.
+  if (!event.payload.passed) {
+    task.status = "escalated";
+    task.escalation = { reason: "verification_failed", seq: ctx.seq };
+  }
   return { ok: true };
 };

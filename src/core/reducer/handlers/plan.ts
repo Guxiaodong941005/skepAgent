@@ -56,7 +56,14 @@ export function activatePlan(task: TaskState, version: number, seq: number): voi
   }
   task.items = items;
   task.active_plan_version = version;
-  task.status = "executing";
+  // D15 (ARCHITECTURE §5.5): a plan whose items all carried over as delivered/merged (D7) has no
+  // work left to claim, so no work.delivered would ever move the task on from `executing`.
+  const statuses = Object.values(items).map((item) => item.status);
+  task.status = statuses.every((status) => status === "merged")
+    ? "done"
+    : statuses.every((status) => status === "delivered" || status === "merged")
+      ? "delivered"
+      : "executing";
   task.last_seq = seq;
   task.barrier = null;
   task.escalation = null;

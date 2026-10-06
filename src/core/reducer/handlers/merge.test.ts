@@ -15,6 +15,7 @@ import { workBranch } from "../../ids.js";
 import type { PayloadOf } from "../../schemas/events.js";
 import { applyEntry, replay } from "../replay.js";
 import type { State, TaskState } from "../state.js";
+import { activatePlan } from "./plan.js";
 
 function task(state: State): TaskState {
   const result = state.tasks[T1];
@@ -128,7 +129,7 @@ function append<T extends "item.merged" | "task.verified">(
         pre: {
           task_rev: t.rev,
           owner_gen: t.owner_gen,
-          plan_hash: t.plans["1"]?.plan_hash,
+          plan_hash: t.plans[String(t.current_plan_version)]?.plan_hash,
           ...("item" in payload ? { item: payload.item } : {}),
         },
       }),
@@ -242,14 +243,35 @@ describe("stack integration and completion", () => {
     },
   );
 
-  it("keeps a failed verification result without completing the task", () => {
+  it("escalates a failed top-of-stack verification and keeps deliveries and epochs (D14)", () => {
     const { builder, state } = fixture(2);
     const after = append(builder, state, "task.verified", verification("W2", false));
     expect(after.outcomes.at(-1)?.outcome).toBe("accepted");
     expect(task(after)).toMatchObject({
-      status: "delivered",
+      status: "escalated",
+      escalation: { reason: "verification_failed", seq: after.seq },
       verified: { top_of_stack_sha: fakeSha("W2"), passed: false, seq: after.seq },
+      items: { W1: { status: "delivered", lease: null }, W2: { status: "delivered", lease: null } },
     });
+    expect(task(after).epochs).toEqual(task(state).epochs);
+    expect(task(after).items).toEqual(task(state).items);
+    expect(after).toEqual(replay(builder.entries));
+  });
+
+  it("rejects a non-owner's failed verification without escalating (D14)", () => {
+    const { builder, state } = fixture(2);
+    const after = append(builder, state, "task.verified", verification("W2", false), MAC);
+    expect(after.outcomes.at(-1)?.reason).toBe("unauthorized");
+    expect(after.tasks).toEqual(state.tasks);
+  });
+
+  it("lets human merges complete a task escalated by failed verification (D14)", () => {
+    const { builder, state: delivered } = fixture(2);
+    let state = append(builder, delivered, "task.verified", verification("W2", false));
+    state = append(builder, state, "item.merged", merge());
+    expect(task(state).status).toBe("escalated");
+    state = append(builder, state, "item.merged", merge("W2"));
+    expect(task(state).status).toBe("done");
   });
 
   it.each(["executing", "interrupting", "replanning", "escalated"] as const)(
@@ -270,6 +292,127 @@ describe("stack integration and completion", () => {
     const after = append(builder, state, "task.verified", verification());
     expect(after.outcomes.at(-1)?.reason).toBe("bad_task_state");
     expect(after.tasks).toEqual(state.tasks);
+  });
+});
+
+function decide(
+  builder: LogBuilder,
+  state: State,
+  decision: PayloadOf<"human.decided">["decision"],
+): State {
+  return applyEntry(
+    state,
+    builder.appendRaw(
+      builder.event({
+        type: "human.decided",
+        actor: "human",
+        payload: { decision },
+        pre: { task_rev: task(state).rev },
+      }),
+    ),
+  );
+}
+
+/** Proposes, locks and approves a v2 whose items are canonical-equal to v1 (D7 carry-over). */
+function approveIdenticalPlan(builder: LogBuilder, state: State): State {
+  const v1 = task(state).plans["1"]?.plan;
+  if (!v1) throw new Error("fixture plan missing");
+  const plan = { ...structuredClone(v1), version: 2, parent_version: 1 };
+  plan.changes_from_parent = "No item changes; re-verify the existing stack.";
+  const proposal = planProposed(plan, [MAC]);
+  const hash = proposal.plan_hash;
+  const owner = { owner_gen: task(state).owner_gen };
+  state = applyEntry(
+    state,
+    builder.appendRaw(
+      builder.event({
+        type: "plan.proposed",
+        actor: VPS,
+        payload: proposal,
+        pre: { task_rev: task(state).rev, ...owner },
+      }),
+    ),
+  );
+  state = applyEntry(
+    state,
+    builder.appendRaw(
+      builder.event({
+        type: "plan.locked",
+        actor: VPS,
+        payload: { plan_version: 2, plan_hash: hash, overrides: [], missing_reviews: [MAC] },
+        pre: { task_rev: task(state).rev, ...owner, plan_version: 2, plan_hash: hash },
+      }),
+    ),
+  );
+  return applyEntry(
+    state,
+    builder.appendRaw(
+      builder.event({
+        type: "plan.approved",
+        actor: "human",
+        payload: { plan_version: 2, plan_hash: hash },
+        pre: { task_rev: task(state).rev, plan_version: 2, plan_hash: hash },
+      }),
+    ),
+  );
+}
+
+describe("activation without remaining work (D15)", () => {
+  it("resuming after a failed verification returns to delivered for re-verification", () => {
+    const { builder, state: delivered } = fixture(2);
+    let state = append(builder, delivered, "task.verified", verification("W2", false));
+    state = decide(builder, state, "resume_with_plan");
+    expect(state.outcomes.at(-1)?.outcome).toBe("accepted");
+    expect(task(state)).toMatchObject({
+      status: "delivered",
+      escalation: null,
+      verified: null,
+      items: { W1: { status: "delivered" }, W2: { status: "delivered" } },
+    });
+    expect(task(state).epochs).toEqual(task(delivered).epochs);
+    state = append(builder, state, "task.verified", verification());
+    expect(task(state).verified?.passed).toBe(true);
+    expect(state).toEqual(replay(builder.entries));
+  });
+
+  it("a replan that carries over every item moves to delivered, then done on merge", () => {
+    const { builder, state: delivered } = fixture(2);
+    let state = append(builder, delivered, "item.merged", merge());
+    state = append(builder, state, "task.verified", verification("W2", false));
+    state = decide(builder, state, "replan");
+    expect(task(state).status).toBe("planning");
+    state = approveIdenticalPlan(builder, state);
+    expect(state.outcomes.slice(-3).map((o) => o.outcome)).toEqual([
+      "accepted",
+      "accepted",
+      "accepted",
+    ]);
+    expect(task(state)).toMatchObject({
+      status: "delivered",
+      active_plan_version: 2,
+      items: { W1: { status: "merged" }, W2: { status: "delivered" } },
+    });
+    state = append(builder, state, "task.verified", verification());
+    expect(state.outcomes.at(-1)?.outcome).toBe("accepted");
+    state = append(builder, state, "item.merged", merge("W2"));
+    expect(task(state).status).toBe("done");
+    expect(state).toEqual(replay(builder.entries));
+  });
+
+  it("activation with every item merged completes the task", () => {
+    const { state } = fixture(2);
+    const t = structuredClone(task(state));
+    for (const item of Object.values(t.items)) item.status = "merged";
+    activatePlan(t, 1, state.seq + 1);
+    expect(t.status).toBe("done");
+  });
+
+  it("activation with remaining work still executes", () => {
+    const { state } = fixture(1);
+    const t = structuredClone(task(state));
+    activatePlan(t, 1, state.seq + 1);
+    expect(t.status).toBe("executing");
+    expect(t.items.W2?.status).toBe("ready");
   });
 });
 

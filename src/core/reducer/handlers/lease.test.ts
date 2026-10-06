@@ -17,7 +17,7 @@ import type { EventOf, PayloadOf } from "../../schemas/events.js";
 import { applyEntry, replay } from "../replay.js";
 import type { State, TaskState } from "../state.js";
 import { settleBarrier } from "./barrier.js";
-import { handleLeaseClaimed } from "./lease.js";
+import { activeLeaseCount, handleLeaseClaimed } from "./lease.js";
 
 const REPO = "https://example.invalid/code.git";
 
@@ -225,6 +225,44 @@ describe("lease.claimed", () => {
     state = claim(builder, state);
     expect(state.outcomes.at(-1)?.outcome).toBe("accepted");
     expect(state).toEqual(replay(builder.entries));
+  });
+
+  it("does not count a lease parked by a checkpointed barrier toward max_parallel (D16)", () => {
+    const { builder } = executing();
+    addTask(builder, T2);
+    let state = claim(builder, replay(builder.entries), T2);
+    // Constructed: T2's barrier settled with W1 checkpointed (replan handlers are SK-202).
+    const parked = task(state, T2);
+    barrier(parked, true);
+    parked.barrier = {
+      ...(parked.barrier as NonNullable<TaskState["barrier"]>),
+      checkpointed: ["W1"],
+    };
+    parked.status = "replanning";
+    const w1 = parked.items.W1;
+    if (!w1?.lease) throw new Error("fixture lease missing");
+    w1.lease.interrupt = "B5";
+    w1.status = "interrupted";
+    expect(activeLeaseCount(state, VPS)).toBe(0);
+    state = claim(builder, state);
+    expect(state.outcomes.at(-1)?.outcome).toBe("accepted");
+    expect(activeLeaseCount(state, VPS)).toBe(1);
+    expect(task(state, T2).items.W1?.lease?.interrupt).toBe("B5");
+  });
+
+  it("still counts a flagged lease that has not checkpointed yet (D16)", () => {
+    const { builder } = executing();
+    addTask(builder, T2);
+    const state = claim(builder, replay(builder.entries), T2);
+    const flagged = task(state, T2);
+    barrier(flagged);
+    flagged.status = "interrupting";
+    const w1 = flagged.items.W1;
+    if (!w1?.lease) throw new Error("fixture lease missing");
+    w1.lease.interrupt = "B5";
+    expect(activeLeaseCount(state, VPS)).toBe(1);
+    const after = claim(builder, state);
+    expect(after.outcomes.at(-1)?.reason).toBe("max_parallel");
   });
 
   it("accepts leases in two tasks up to the configured parallel limit", () => {

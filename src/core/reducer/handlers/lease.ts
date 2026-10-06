@@ -1,6 +1,27 @@
+import type { AgentId } from "../../ids.js";
 import { workBranch } from "../../ids.js";
+import type { ItemState, State } from "../state.js";
 import { settleBarrier } from "./barrier.js";
 import type { Handler } from "./types.js";
+
+/**
+ * D16 (ARCHITECTURE §6.1): only a lease whose item is still `leased` counts toward
+ * `max_parallel_items`. A lease parked by a barrier (item `interrupted` after its checkpoint) keeps
+ * its record for audit until the next plan activation but no longer occupies a slot. A flagged
+ * lease that has not checkpointed yet still counts: its process may still be running.
+ */
+export function countsTowardMaxParallel(item: ItemState, agent: AgentId): boolean {
+  return item.status === "leased" && item.lease?.holder === agent;
+}
+
+/** Active leases of `agent` across all tasks (D16); shared with views (SK-204). */
+export function activeLeaseCount(state: State, agent: AgentId): number {
+  let count = 0;
+  for (const task of Object.values(state.tasks))
+    for (const item of Object.values(task.items))
+      if (countsTowardMaxParallel(item, agent)) count += 1;
+  return count;
+}
 
 export const handleLeaseClaimed: Handler<"lease.claimed"> = (draft, event, ctx) => {
   const task = draft.tasks[event.task_id];
@@ -18,12 +39,8 @@ export const handleLeaseClaimed: Handler<"lease.claimed"> = (draft, event, ctx) 
   if (!plan || event.pre.plan_hash !== plan.plan_hash) return { ok: false, reason: "plan_changed" };
   const agent = draft.agents[event.actor];
   if (!agent) return { ok: false, reason: "unknown_agent" };
-  const held = Object.values(draft.tasks).reduce(
-    (count, other) =>
-      count + Object.values(other.items).filter((i) => i.lease?.holder === event.actor).length,
-    0,
-  );
-  if (held >= agent.profile.max_parallel_items) return { ok: false, reason: "max_parallel" };
+  if (activeLeaseCount(draft, event.actor) >= agent.profile.max_parallel_items)
+    return { ok: false, reason: "max_parallel" };
   if (item.attempts_this_plan > task.budgets.item_retries)
     return { ok: false, reason: "retry_budget" };
   if (payload.branch !== workBranch(task.task_id, payload.item, epoch + 1))
