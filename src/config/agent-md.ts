@@ -22,6 +22,9 @@ export interface AgentMd {
  * AGENT.md is trusted local policy read from the role directory, never from a worktree
  * (PRD §7.1, §7.3). Front-matter is YAML between the opening `---` line and the next `---` line;
  * the body is handed to the model verbatim apart from surrounding whitespace.
+ *
+ * Stricter than the brief: parser warnings (unresolved custom tags, for example) are fatal, not
+ * just errors, so a front-matter cannot silently degrade into plain text.
  */
 export function parseAgentMd(text: string, file: string): AgentMd {
   const split = splitFrontMatter(text, file);
@@ -49,7 +52,7 @@ export async function loadAgentMd(roleDir: string): Promise<AgentMd> {
 interface FrontMatterSplit {
   /** YAML text of the front-matter, without the `---` fences. */
   yaml: string;
-  /** 1-based line of the first YAML line, added to parser-relative lines to reach the file. */
+  /** Added to a parser-relative line (1 = its first line) to reach the file line. */
   yamlStartsAt: number;
   body: string;
 }

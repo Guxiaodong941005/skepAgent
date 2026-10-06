@@ -32,9 +32,12 @@ export function findRepo(
   return null;
 }
 
-/** Compare repo refs independent of a trailing `.git` suffix and trailing slashes. */
+/**
+ * Compare repo refs independent of trailing slashes and a trailing `.git`. Slashes go first:
+ * `…/app.git/` must reduce to the same key as the configured `…/app.git` (PRD §11.5 allowlist).
+ */
 function repoKey(ref: string): string {
-  return ref.replace(/\.git$/i, "").replace(/\/+$/, "");
+  return ref.replace(/\/+$/, "").replace(/\.git$/i, "");
 }
 
 async function readConfigFile(path: string): Promise<string> {

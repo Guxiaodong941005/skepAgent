@@ -116,6 +116,9 @@ describe("findRepo", () => {
     expect(findRepo(device, "git@example.com:owner/app")?.name).toBe("app");
     expect(findRepo(device, "https://example.com/owner/libs/")?.name).toBe("libs");
     expect(findRepo(device, "https://example.com/owner/libs")?.name).toBe("libs");
+    // Slashes are stripped before `.git`, so a slash after the suffix still matches.
+    expect(findRepo(device, "git@example.com:owner/app.git/")?.name).toBe("app");
+    expect(findRepo(device, "https://example.com/owner/libs.git/")?.name).toBe("libs");
   });
 
   it("returns null for an unknown repo", async () => {
