@@ -145,8 +145,12 @@ export async function safeJoin(root: string, rel: string): Promise<string> {
   return path.join(existingReal, ...pending.reverse());
 }
 
-/** True when `candidate` is not `root` and not a path beneath it. */
+/**
+ * True when `candidate` is not `root` and not a path beneath it. The check is the `..` segment,
+ * not a `startsWith("..")`: a name like `..foo` is a child of `root`, not a parent of it.
+ */
 function escapes(root: string, candidate: string): boolean {
   const fromRoot = path.relative(root, candidate);
-  return fromRoot !== "" && (fromRoot.startsWith("..") || path.isAbsolute(fromRoot));
+  if (fromRoot === "") return false;
+  return fromRoot === ".." || fromRoot.startsWith(`..${path.sep}`) || path.isAbsolute(fromRoot);
 }

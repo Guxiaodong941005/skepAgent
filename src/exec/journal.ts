@@ -1,6 +1,6 @@
-import { open, readdir, readFile } from "node:fs/promises";
+import { open, readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
-import type { ItemId, TaskId } from "../core/ids.js";
+import { ITEM_ID_RE, type ItemId, TASK_ID_RE, type TaskId } from "../core/ids.js";
 import { type Clock, isoUtc } from "../util/clock.js";
 import { appendFsync } from "../util/fs.js";
 
@@ -11,6 +11,10 @@ import { appendFsync } from "../util/fs.js";
  * reconciliation reads it back to decide which attempts are still in flight, so a torn final line
  * (crash mid-write) must not hide the records before it, and a corrupt line in the middle must
  * fail loudly rather than be skipped.
+ *
+ * One writer per attempt file. `append` repairs a torn tail and then writes; two overlapping
+ * appends to the same key in one process could truncate each other's line. The attempt runner is
+ * that single writer, so appends are not serialized here.
  */
 
 export interface AttemptKey {
@@ -57,9 +61,14 @@ export class Journal {
     this.clock = opts.clock;
   }
 
-  /** Absolute path of the JSONL file for `key`. Does not create it. */
+  /**
+   * Absolute path of the JSONL file for `key`. Does not create it. Rejects a key whose task,
+   * item or epoch is not a protocol id: `path.join` would otherwise let `../` in a task id write
+   * outside the journal root.
+   */
   path(key: AttemptKey): string {
-    return path.join(this.root, key.task, `${key.item}-e${key.epoch}.jsonl`);
+    assertKey(key);
+    return journalFile(this.root, key);
   }
 
   /**
@@ -70,6 +79,7 @@ export class Journal {
     key: AttemptKey,
     record: { step: string; [k: string]: unknown },
   ): Promise<JournalRecord> {
+    assertKey(key);
     const stamped: JournalRecord = {
       ...record,
       ts_mono: this.clock.monotonicMs(),
@@ -98,7 +108,9 @@ export class Journal {
   /**
    * Attempts whose last complete record is not a terminal step, sorted by task, item, then epoch.
    * A missing journal directory, or one with no files, is an empty result rather than an error:
-   * a fresh role simply has nothing to reconcile.
+   * a fresh role simply has nothing to reconcile. A non-empty file with no complete record is not:
+   * its only line was torn by a crash, and reconciliation must see the attempt rather than skip it.
+   * Directory names that are not task ids are ignored; they are not attempts.
    */
   async unfinishedAttempts(): Promise<AttemptKey[]> {
     let tasks: string[];
@@ -111,6 +123,7 @@ export class Journal {
 
     const unfinished: AttemptKey[] = [];
     for (const task of tasks) {
+      if (!TASK_ID_RE.test(task)) continue;
       const taskDir = path.join(this.root, task);
       let files: string[];
       try {
@@ -125,7 +138,13 @@ export class Journal {
         const key: AttemptKey = { task, item: match[1], epoch: Number(match[2]) };
         const records = await this.read(key);
         const last = records.at(-1);
-        if (last && !isTerminal(last.step)) unfinished.push(key);
+        // No complete record in a non-empty file means the first step was torn. Fail closed:
+        // report the attempt so reconciliation can decide, instead of forgetting it.
+        if (!last) {
+          if (await fileNonEmpty(journalFile(this.root, key))) unfinished.push(key);
+          continue;
+        }
+        if (!isTerminal(last.step)) unfinished.push(key);
       }
     }
 
@@ -157,6 +176,30 @@ export class Journal {
       await handle.close();
     }
   }
+}
+
+function journalFile(root: string, key: AttemptKey): string {
+  return path.join(root, key.task, `${key.item}-e${key.epoch}.jsonl`);
+}
+
+/**
+ * Protocol ids only. `TaskId`/`ItemId` are plain strings, so a value that typechecks can still
+ * contain `../`; `path.join` would then write outside the journal root.
+ */
+function assertKey(key: { task: string; item: string; epoch: number }): asserts key is AttemptKey {
+  if (!TASK_ID_RE.test(key.task)) {
+    throw new JournalError(key.task, 0, `invalid task id ${JSON.stringify(key.task)}`);
+  }
+  if (!ITEM_ID_RE.test(key.item)) {
+    throw new JournalError(key.item, 0, `invalid item id ${JSON.stringify(key.item)}`);
+  }
+  if (!Number.isInteger(key.epoch) || key.epoch < 1) {
+    throw new JournalError(key.item, 0, `invalid epoch ${key.epoch}`);
+  }
+}
+
+async function fileNonEmpty(file: string): Promise<boolean> {
+  return (await stat(file)).size > 0;
 }
 
 function isTerminal(step: string): step is TerminalStep {

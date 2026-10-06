@@ -15,9 +15,12 @@ export interface ExecOptions {
   input?: string | Uint8Array;
   /** Kills the child once exceeded. Defaults to 120 s. */
   timeoutMs?: number;
-  /** Combined stdout+stderr cap. Defaults to 16 MiB; overflow rejects. */
+  /**
+   * Per-stream cap, applied by Node to stdout and stderr separately (not to their sum).
+   * Defaults to 16 MiB. Overflow is a failure, returned instead of thrown when `allowFailure`.
+   */
   maxBufferBytes?: number;
-  /** Return a non-zero exit, signal or timeout as a result instead of throwing. */
+  /** Return a non-zero exit, signal, timeout or buffer overflow as a result instead of throwing. */
   allowFailure?: boolean;
   signal?: AbortSignal;
 }
@@ -63,9 +66,14 @@ function describeFailure(file: string, args: string[], result: ExecResult): stri
  * Node's `ExecException` carries the exit status and any buffered output on the error itself.
  * A timeout sets `killed` and `signal === killSignal` (SIGTERM here); a child that dies of a
  * signal on its own leaves `killed` false, so the two stay distinguishable.
- * `ERR_CHILD_PROCESS_STDIO_MAXBUFFER` is the overflow. A string `code` is a spawn or abort
+ * `ERR_CHILD_PROCESS_STDIO_MAXBUFFER` is the overflow: the child did run, so unlike a spawn
+ * failure it is a result `allowFailure` may return. Any other string `code` is a spawn or abort
  * failure, which has no exit status.
  */
+function isBufferOverflow(error: ExecFileException): boolean {
+  return error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER";
+}
+
 function fromException(error: ExecFileException, stdout: string, stderr: string): ExecResult {
   const code = typeof error.code === "number" ? error.code : null;
   const signal = typeof error.signal === "string" ? error.signal : null;
@@ -89,6 +97,10 @@ function stringify(output: string | Buffer | undefined): string {
  * Runs `file` with `args`. Throws {@link ExecError} on a non-zero exit, a signal, a timeout or a
  * buffer overflow unless `allowFailure` is set, in which case the result is returned instead.
  * Spawn failures (missing binary, `cwd` gone, abort) always throw: there is no result to return.
+ *
+ * Stdin is always closed. With `input` that payload is written first; without it the child sees
+ * an immediate EOF, so a command that reads stdin until EOF (trusted checks, SK-502) cannot block
+ * until the timeout.
  */
 export function execFileChecked(
   file: string,
@@ -119,8 +131,9 @@ export function execFileChecked(
           resolve({ code: 0, signal: null, stdout, stderr, timedOut: false });
           return;
         }
-        // A string `code` is a spawn/abort failure, not an exit status. Nothing ran to completion.
-        if (typeof error.code === "string") {
+        // A string `code` other than the buffer-overflow code is a spawn/abort failure: nothing
+        // ran to completion, so there is no result for `allowFailure` to return.
+        if (typeof error.code === "string" && !isBufferOverflow(error)) {
           reject(new ExecError(file, args, fromException(error, stdout, stderr), { cause: error }));
           return;
         }
@@ -142,6 +155,8 @@ export function execFileChecked(
         );
       }
     });
-    if (opts.input !== undefined) child.stdin?.end(opts.input);
+    // Close stdin either way. Leaving it open makes a child that reads until EOF block until
+    // `timeoutMs` (review: `cat` with no input timed out instead of exiting).
+    child.stdin?.end(opts.input);
   });
 }

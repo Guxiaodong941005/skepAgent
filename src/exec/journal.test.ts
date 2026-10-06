@@ -1,9 +1,9 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { FakeClock, VirtualTime } from "../sim/fake-clock.js";
-import { Journal, JournalError, TERMINAL_STEPS } from "./journal.js";
+import { type AttemptKey, Journal, JournalError, TERMINAL_STEPS } from "./journal.js";
 
 const TASK_A = "T-20261005-aa01";
 const TASK_B = "T-20261005-bb02";
@@ -104,18 +104,52 @@ describe("Journal", () => {
     expect(await journal.unfinishedAttempts()).toEqual([earlier, open]);
   });
 
-  it("treats every terminal step as finished and ignores empty files", async () => {
+  it("treats every terminal step as finished and ignores an empty file", async () => {
     const dir = await roleDir();
     const journal = new Journal({ roleDir: dir, clock: clockAt(0, Date.UTC(2026, 0, 1)) });
 
     for (const step of TERMINAL_STEPS) {
       await journal.append(
         { task: TASK_A, item: "W1", epoch: TERMINAL_STEPS.indexOf(step) + 1 },
-        {
-          step,
-        },
+        { step },
       );
     }
+    const empty = journal.path({ task: TASK_A, item: "W2", epoch: 1 });
+    await mkdir(path.dirname(empty), { recursive: true });
+    await writeFile(empty, "");
+
+    expect(await journal.unfinishedAttempts()).toEqual([]);
+  });
+
+  it("reports an attempt whose only line is torn, so reconciliation cannot miss it", async () => {
+    const dir = await roleDir();
+    const journal = new Journal({ roleDir: dir, clock: clockAt(0, Date.UTC(2026, 0, 1)) });
+    const key = { task: TASK_A, item: "W1", epoch: 1 };
+    const file = journal.path(key);
+    await mkdir(path.dirname(file), { recursive: true });
+    await writeFile(file, '{"step":"clai');
+
+    expect(await journal.read(key)).toEqual([]);
+    expect(await journal.unfinishedAttempts()).toEqual([key]);
+  });
+
+  it("rejects a key that would escape the journal directory", async () => {
+    const dir = await roleDir();
+    const journal = new Journal({ roleDir: dir, clock: clockAt(0, 0) });
+    const escaped: AttemptKey = { task: "../x", item: "W1", epoch: 1 };
+    expect(() => journal.path(escaped)).toThrow(JournalError);
+    await expect(journal.append(escaped, { step: "claimed" })).rejects.toThrow(JournalError);
+  });
+
+  it("ignores a directory whose name is not a task id", async () => {
+    const dir = await roleDir();
+    const journal = new Journal({ roleDir: dir, clock: clockAt(0, 0) });
+    const stray = path.join(dir, ".skep", "journal", "not-a-task", "W1-e1.jsonl");
+    await mkdir(path.dirname(stray), { recursive: true });
+    await writeFile(
+      stray,
+      `${JSON.stringify({ ts_mono: 0, ts_wall: "2026-01-01T00:00:00Z", step: "claimed" })}\n`,
+    );
     expect(await journal.unfinishedAttempts()).toEqual([]);
   });
 

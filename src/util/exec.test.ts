@@ -129,6 +129,34 @@ describe("execFileChecked", () => {
     expect(bytes.stdout).toBe("bytes");
   });
 
+  it("closes stdin when no input is given, so a child reading stdin exits", async () => {
+    const started = Date.now();
+    const result = await execFileChecked("cat", [], {
+      env: { PATH: process.env.PATH ?? "" },
+      timeoutMs: 5_000,
+    });
+    expect(result).toEqual({ code: 0, signal: null, stdout: "", stderr: "", timedOut: false });
+    expect(Date.now() - started).toBeLessThan(2_000);
+  });
+
+  it("returns the truncated output instead of throwing when allowFailure meets a buffer overflow", async () => {
+    const result = await execFileChecked("node", ["-e", "process.stdout.write('x'.repeat(4096))"], {
+      maxBufferBytes: 128,
+      allowFailure: true,
+      env: { PATH: process.env.PATH ?? "" },
+    });
+    expect(result.timedOut).toBe(false);
+    expect(result.stdout.length).toBeGreaterThan(0);
+    expect(result.stdout.length).toBeLessThanOrEqual(128);
+  });
+
+  it("still throws when the binary cannot be spawned, even with allowFailure", async () => {
+    const error = await execFileChecked("no-such-binary-skep", [], { allowFailure: true }).catch(
+      (caught: unknown) => caught,
+    );
+    expect(error).toBeInstanceOf(ExecError);
+  });
+
   it("reports a signal that the child raised itself as a signal, not a timeout", async () => {
     const error = await execFileChecked("node", ["-e", "process.kill(process.pid, 'SIGKILL')"], {
       allowFailure: true,

@@ -122,6 +122,12 @@ describe("safeJoin", () => {
     expect(resolved).toBe(path.join(await realpath(root), "a/b/c.txt"));
   });
 
+  it("accepts a path whose name starts with `..` but is not a parent segment", async () => {
+    const root = await scratch();
+    const resolved = await safeJoin(root, "..foo/bar");
+    expect(resolved).toBe(path.join(await realpath(root), "..foo", "bar"));
+  });
+
   it("accepts an existing file and resolves a symlink that stays inside root", async () => {
     const root = await scratch();
     await writeFile(path.join(root, "inside"), "ok");
