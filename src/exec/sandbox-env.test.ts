@@ -125,8 +125,8 @@ describe("optional agent user resolution", () => {
     );
     expect(await resolveAgentUser("skep-agent", { exec })).toEqual({ uid: 1001, gid: 1002 });
     expect(exec.mock.calls).toEqual([
-      ["id", ["-u", "skep-agent"], { env: { LC_ALL: "C" } }],
-      ["id", ["-g", "skep-agent"], { env: { LC_ALL: "C" } }],
+      ["/usr/bin/id", ["-u", "skep-agent"], { env: { LC_ALL: "C" } }],
+      ["/usr/bin/id", ["-g", "skep-agent"], { env: { LC_ALL: "C" } }],
     ]);
   });
 

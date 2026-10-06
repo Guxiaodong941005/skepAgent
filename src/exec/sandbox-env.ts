@@ -85,8 +85,8 @@ export async function resolveAgentUser(
   try {
     const opts = { env: { LC_ALL: "C" } };
     const [uid, gid] = await Promise.all([
-      exec("id", ["-u", user], opts),
-      exec("id", ["-g", user], opts),
+      exec("/usr/bin/id", ["-u", user], opts),
+      exec("/usr/bin/id", ["-g", user], opts),
     ]);
     if (uid.code !== 0 || gid.code !== 0) {
       throw new SandboxEnvError("OS user lookup did not exit successfully");

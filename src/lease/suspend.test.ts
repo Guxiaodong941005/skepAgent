@@ -66,6 +66,21 @@ function leaseState(): State {
 }
 
 describe("suspend detection", () => {
+  it("isolates listener and alarm-handler exceptions so later listeners still reset liveness (G15)", () => {
+    const clock = new FakeClock(new VirtualTime());
+    const detector = new SuspendDetector(clock, POLL, () => {
+      throw new Error("Alarm sink failed");
+    });
+    detector.onSuspend(() => {
+      throw new Error("Listener failed");
+    });
+    const reset = vi.fn();
+    detector.onSuspend(reset);
+    expect(() => detector.notifyWake()).not.toThrow();
+    expect(reset).toHaveBeenCalledOnce();
+    expect(detector.paused).toBe(true);
+    expect(detector.listenerErrors()).toHaveLength(2);
+  });
   it("marks every held lease unverified and pauses invocations after a suspend gap", async () => {
     const { time, clock, detector } = fixture();
     const second = { ...held, item: "W2" };

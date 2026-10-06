@@ -13,7 +13,7 @@ import { FakeClock, VirtualTime } from "../sim/fake-clock.js";
 import { Rng } from "../sim/rng.js";
 import { newEventId } from "../util/random.js";
 import { BlackboardClone } from "./clone.js";
-import { PublishError, Publisher } from "./publisher.js";
+import { PublishError, Publisher, withCloneLock } from "./publisher.js";
 
 function setup(maxAttempts?: number) {
   const git: GitRunner = {
@@ -48,6 +48,50 @@ function setup(maxAttempts?: number) {
 }
 
 describe("publisher retry and state boundaries", () => {
+  it("releases the clone lock during retry backoff so sync can keep observing (F12)", async () => {
+    const f = setup();
+    f.fetch.mockRejectedValueOnce(new GitError(["fetch"], -1, "Remote unavailable"));
+    const publication = f.publisher.publish(() => null);
+    for (let turn = 0; turn < 100 && f.sleep.mock.calls.length === 0; turn++)
+      await Promise.resolve();
+    expect(f.sleep).toHaveBeenCalledOnce();
+    await withCloneLock(f.deps.clone, async () => {});
+    await f.vt.runNext();
+    expect((await publication).status).toBe("dropped");
+  });
+  it("shares a clone lock, permits publisher-to-Sync reentry, and isolates other clones (F12)", async () => {
+    const clone = { dir: ".skep-sim/lock-shared" };
+    const order: string[] = [];
+    let finish: () => void = () => {};
+    const first = withCloneLock(clone, async () => {
+      order.push("publisher");
+      await withCloneLock({ ...clone }, async () => {
+        order.push("publisher replay");
+      });
+      await new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+    });
+    const second = withCloneLock({ ...clone }, async () => {
+      order.push("sync");
+    });
+    await withCloneLock({ dir: ".skep-sim/lock-other" }, async () => {
+      order.push("other clone");
+    });
+    expect(order).not.toContain("sync");
+    finish();
+    await Promise.all([first, second]);
+    expect(order.indexOf("publisher replay")).toBeLessThan(order.indexOf("sync"));
+    await expect(
+      withCloneLock(clone, async () => {
+        throw new Error("Git failed");
+      }),
+    ).rejects.toThrow("Git failed");
+    await withCloneLock(clone, async () => {
+      order.push("recovered");
+    });
+    expect(order.at(-1)).toBe("recovered");
+  });
   it("drops a null intent without signing or writing anything", async () => {
     const { publisher, deps, source } = setup();
     const intent = vi.fn(() => null);

@@ -25,12 +25,14 @@ export class SuspendDetector {
   private held = new Map<string, LeaseIdentity>();
   private readonly unverified = new Set<string>();
   private readonly listeners = new Set<(notification: SuspendNotification) => void>();
+  private readonly listenerFailures: SuspendError[] = [];
   private generation = 0;
   private needsObservation = false;
 
   constructor(
     private readonly clock: Clock,
     private readonly pollMs: number,
+    private readonly onListenerError: (error: SuspendError) => void = () => {},
   ) {
     if (!Number.isFinite(pollMs) || pollMs <= 0)
       throw new SuspendError("Suspend polling interval must be a positive finite number");
@@ -65,6 +67,10 @@ export class SuspendDetector {
   onSuspend(listener: (notification: SuspendNotification) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
+  }
+
+  listenerErrors(): SuspendError[] {
+    return [...this.listenerFailures];
   }
 
   tick(): boolean {
@@ -107,7 +113,23 @@ export class SuspendDetector {
     for (const key of this.held.keys()) this.unverified.add(key);
     // The daemon subscribes LivenessTracker.resetAll here (ARCHITECTURE §8.2, F16).
     for (const listener of this.listeners) {
-      listener({ reason, gapMs, leases: [...this.held.values()].map((lease) => ({ ...lease })) });
+      try {
+        listener({ reason, gapMs, leases: [...this.held.values()].map((lease) => ({ ...lease })) });
+      } catch (cause) {
+        const error = new SuspendError(
+          `Suspend listener failed: ${cause instanceof Error ? cause.message : String(cause)}`,
+        );
+        this.listenerFailures.push(error);
+        try {
+          this.onListenerError(error);
+        } catch (reportingError) {
+          this.listenerFailures.push(
+            new SuspendError(
+              `Suspend error reporting failed: ${reportingError instanceof Error ? reportingError.message : String(reportingError)}`,
+            ),
+          );
+        }
+      }
     }
   }
 }
