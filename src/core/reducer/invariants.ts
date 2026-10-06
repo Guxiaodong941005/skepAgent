@@ -30,16 +30,16 @@ export interface Violation {
 }
 
 export function checkInvariants(entries: readonly LogEntry[], state: State): Violation[] {
-  const accepted = acceptedEvents(entries, state);
-  // Invariants 4 and 9 both need the state at every seq. Replay the log once and share it;
-  // replaying per invariant dominates `skep doctor` and the property tests on long logs.
+  // One incremental replay serves every invariant that needs state at a seq. Replaying per
+  // invariant dominates `skep doctor` and the property tests on long logs.
   const steps = walk(entries);
+  const accepted = acceptedFrom(steps);
   return [
     ...checkDeliveryUniqueness(accepted),
     ...checkFencedEpochs(accepted, state),
     ...checkRejectedAreNoOps(steps),
     ...checkBarrierAndAuthorization(steps),
-    ...checkBudgets(state),
+    ...checkBudgets(steps, state),
     ...checkStatusAgreesWithItems(state),
     ...checkMaxParallel(steps),
   ];
@@ -50,37 +50,21 @@ interface Accepted {
   event: SkepEvent;
 }
 
-/**
- * Recover the events the reducer accepted, in seq order. Domain effects come from `state`; this
- * walk only reparses entries the outcome log already classified, so a handler is never re-run.
- * A seq gap throws: the predicates are only defined for the contiguous log `replay` consumed.
- */
-function acceptedEvents(entries: readonly LogEntry[], state: State): Accepted[] {
-  const bySeq = new Map<number, LogEntry>();
-  for (const entry of entries) bySeq.set(entry.seq, entry);
+/** Accepted events of one replay, in seq order. Taken from the same pass as the other invariants. */
+function acceptedFrom(steps: readonly Step[]): Accepted[] {
   const accepted: Accepted[] = [];
-  let prevTip = state.genesis_sha;
-  for (let seq = 1; seq <= state.seq; seq++) {
-    const entry = bySeq.get(seq);
-    if (!entry) {
-      throw new RangeError(
-        `Invariant check expected an entry at seq ${seq}; the log has a gap before tip ${state.tip}`,
-      );
-    }
-    const outcome = state.outcomes[seq - 1];
-    if (outcome?.seq !== seq) {
-      throw new RangeError(
-        `Invariant check expected outcome seq ${seq}, found ${outcome?.seq ?? "none"}`,
-      );
-    }
-    if (outcome.outcome === "accepted") {
+  let prevTip: string | null = null;
+  for (const { entry, before, after } of steps) {
+    prevTip ??= before.tip;
+    const outcome = after.outcomes[entry.seq - 1];
+    if (outcome?.outcome === "accepted") {
       const structure = checkStructure(entry, prevTip);
       if (!structure.ok || structure.event.event_id !== outcome.event_id) {
         throw new RangeError(
-          `Outcome at seq ${seq} says ${outcome.event_id} was accepted, but the entry does not parse to that event`,
+          `Outcome at seq ${entry.seq} says ${outcome.event_id} was accepted, but the entry does not parse to that event`,
         );
       }
-      accepted.push({ seq, event: structure.event });
+      accepted.push({ seq: entry.seq, event: structure.event });
     }
     prevTip = entry.sha;
   }
@@ -215,6 +199,20 @@ function checkRejectedAreNoOps(steps: readonly Step[]): Violation[] {
           detail: `${outcome.outcome} event at seq ${entry.seq} (${outcome.reason ?? "no reason"}) changed state other than outcomes and seen_event_ids`,
         });
       }
+      // `invalid` and `duplicate` never consume an event id (replay.ts); a duplicate was consumed
+      // by the earlier copy, so the map must be identical across this entry.
+      if (
+        (outcome.outcome === "invalid" || outcome.outcome === "duplicate") &&
+        canonicalJson(before.seen_event_ids) !== canonicalJson(after.seen_event_ids)
+      ) {
+        violations.push({
+          invariant: 3,
+          seq: entry.seq,
+          task_id: outcome.task_id,
+          code: "noop_consumed_id",
+          detail: `${outcome.outcome} entry at seq ${entry.seq} changed seen_event_ids`,
+        });
+      }
     }
     if (outcome.outcome === "rejected") {
       if (outcome.event_id === null || outcome.reason === null) {
@@ -328,57 +326,63 @@ function checkBarrierAndAuthorization(steps: readonly Step[]): Violation[] {
 }
 
 /**
- * Invariant 6: `replan_count` and `review_rounds` stay within budget unless the task is
- * escalated. `replan_count` is a lifetime counter and is not reset when the human resumes
- * (ARCHITECTURE §5.5, D12), so once a `human.decided` has put the task back to work the count may
- * legally exceed the budget; the next replan escalates again.
+ * Invariant 6 (D20, ARCHITECTURE §13.2): budgets are checked at the transition that exceeds them,
+ * not against the final state. `replan_count` is lifetime and `resume_with_plan` resets neither
+ * counter (D12), so a counter may legally stay over budget afterwards; only the event that pushes
+ * it over must escalate.
  */
-function checkBudgets(state: State): Violation[] {
+function checkBudgets(steps: readonly Step[], state: State): Violation[] {
   const violations: Violation[] = [];
-  const resumed = resumedTasks(state);
-  for (const task of Object.values(state.tasks)) {
-    // Escalation is how an over-budget task stops, and a terminal task is no longer spending.
-    if (task.status === "escalated" || task.status === "cancelled" || task.status === "done")
-      continue;
-    // An over-budget replan still waits for leased items to checkpoint before it escalates
-    // (ARCHITECTURE §5.5: "exhausted replans still wait for holders to settle"), so `interrupting`
-    // with the over-budget barrier open is the rule, not a violation of it.
-    const settling = task.status === "interrupting" && task.barrier?.escalate === true;
-    if (task.replan_count > task.budgets.replans && !resumed.has(task.task_id) && !settling) {
+  for (const point of steps) {
+    const { entry, before } = point;
+    // The final state is the caller's, so a regression test can hand in a state whose last
+    // transition broke the rule. Every earlier transition comes from the replay.
+    const after = entry.seq === state.seq ? state : point.after;
+    const outcome = after.outcomes[entry.seq - 1];
+    if (outcome?.outcome !== "accepted" || outcome.task_id === null) continue;
+    const earlier = before.tasks[outcome.task_id];
+    const later = after.tasks[outcome.task_id];
+    if (!later) continue;
+    const replanBefore = earlier?.replan_count ?? 0;
+    if (later.replan_count > replanBefore && later.replan_count > later.budgets.replans) {
+      // The over-budget request opens a barrier flagged to escalate (handler `replan.ts`).
+      if (later.barrier?.escalate !== true) {
+        violations.push({
+          invariant: 6,
+          seq: entry.seq,
+          task_id: outcome.task_id,
+          code: "replan_budget",
+          detail: `${outcome.task_id} replan_count rose to ${later.replan_count} over budget ${later.budgets.replans} at seq ${entry.seq} without an escalating barrier`,
+        });
+      }
+    }
+    // A barrier opened over budget waits out its leases, then settles only into `escalated`,
+    // never `replanning` (ARCHITECTURE §5.5).
+    if (earlier?.barrier?.escalate === true && later.status === "replanning") {
       violations.push({
         invariant: 6,
-        seq: null,
-        task_id: task.task_id,
-        code: "replan_budget",
-        detail: `${task.task_id} has replan_count ${task.replan_count} over budget ${task.budgets.replans} while ${task.status}`,
+        seq: entry.seq,
+        task_id: outcome.task_id,
+        code: "replan_budget_settle",
+        detail: `${outcome.task_id} settled an escalate barrier into replanning at seq ${entry.seq}`,
       });
     }
-    if (task.review_rounds > task.budgets.review_rounds) {
+    const roundsBefore = earlier?.review_rounds ?? 0;
+    if (
+      later.review_rounds > roundsBefore &&
+      later.review_rounds > later.budgets.review_rounds &&
+      later.status !== "escalated"
+    ) {
       violations.push({
         invariant: 6,
-        seq: null,
-        task_id: task.task_id,
+        seq: entry.seq,
+        task_id: outcome.task_id,
         code: "review_budget",
-        detail: `${task.task_id} has review_rounds ${task.review_rounds} over budget ${task.budgets.review_rounds} while ${task.status}`,
+        detail: `${outcome.task_id} review_rounds rose to ${later.review_rounds} over budget ${later.budgets.review_rounds} at seq ${entry.seq} without escalating`,
       });
     }
   }
   return violations;
-}
-
-/** Tasks a `human.decided` has moved out of escalation, where the lifetime replan count no longer binds. */
-function resumedTasks(state: State): Set<string> {
-  const resumed = new Set<string>();
-  for (const outcome of state.outcomes) {
-    if (
-      outcome.outcome === "accepted" &&
-      outcome.type === "human.decided" &&
-      outcome.task_id !== null
-    ) {
-      resumed.add(outcome.task_id);
-    }
-  }
-  return resumed;
 }
 
 /**
@@ -484,6 +488,11 @@ function walk(entries: readonly LogEntry[]): Step[] {
   let before = replay([genesis]);
   for (const entry of ordered) {
     if (entry.seq === 0) continue;
+    if (entry.seq !== before.seq + 1) {
+      throw new RangeError(
+        `Invariant check expected an entry at seq ${before.seq + 1}; the log has a gap before ${entry.sha}`,
+      );
+    }
     const after = applyEntry(before, entry);
     steps.push({ entry, before, after });
     before = after;

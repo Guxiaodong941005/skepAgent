@@ -59,7 +59,7 @@ const AGENTS: readonly AgentSpec[] = [
   { id: "vps.coding", maxParallel: 1 },
 ];
 
-const REPO = "git@example.com:example/app.git";
+const REPO = "git@example.invalid:example/app.git";
 const BRANCH = "main";
 const AT = "2026-10-05T09:00:00Z";
 const BASE = createHash("sha1").update("random-log-base").digest("hex");
@@ -143,14 +143,17 @@ function choicesFor(rng: Rng, state: State, task: TaskState): Choice[] {
       out.push({ weight: 4, build: () => planProposed(rng, state, task) });
       break;
     case "reviewing":
-      out.push({ weight: 3, build: () => reviewSubmitted(rng, task) });
+      out.push({ weight: 2, build: () => reviewSubmitted(rng, state, task, "approve") });
+      // A block with evidence counts as a failed review round once the next plan supersedes it.
+      out.push({ weight: 2, build: () => reviewSubmitted(rng, state, task, "block") });
       if (plan?.reviewers.every((reviewer) => plan.reviews[reviewer])) {
         out.push({ weight: 3, build: () => planLocked(task) });
       }
       break;
     case "awaiting_approval":
-      out.push({ weight: 4, build: () => planDecision(task, "plan.approved") });
-      out.push({ weight: 1, build: () => planDecision(task, "plan.rejected") });
+      out.push({ weight: 3, build: () => planDecision(task, "plan.approved") });
+      // Repeated rejections are what exhausts the review-round budget (D20).
+      out.push({ weight: 2, build: () => planDecision(task, "plan.rejected") });
       break;
     case "executing":
       for (const item of Object.values(task.items)) {
@@ -307,13 +310,18 @@ function peerReviewers(rng: Rng, state: State, task: TaskState): string[] {
   return peers.length === 0 ? [] : [rng.pick(peers)];
 }
 
-function reviewSubmitted(rng: Rng, task: TaskState): SkepEvent | null {
+function reviewSubmitted(
+  rng: Rng,
+  state: State,
+  task: TaskState,
+  verdict: "approve" | "block",
+): SkepEvent | null {
   const plan = task.plans[String(task.current_plan_version)];
   if (!plan) return null;
   const pending = plan.reviewers.filter((reviewer) => !plan.reviews[reviewer]);
   const reviewer = pending[0] ?? plan.reviewers[0];
   if (!reviewer) return null;
-  const verdict = rng.pick(["approve", "comment"] as const);
+  void rng;
   return event("review.submitted", {
     task_id: task.task_id,
     actor: reviewer,
@@ -322,7 +330,16 @@ function reviewSubmitted(rng: Rng, task: TaskState): SkepEvent | null {
       plan_version: plan.version,
       plan_hash: plan.plan_hash,
       verdict,
-      blockers: [],
+      blockers:
+        verdict === "block"
+          ? [
+              {
+                id: "B1",
+                claim: "The acceptance check does not cover the changed path.",
+                evidence: [evidence(state)],
+              },
+            ]
+          : [],
       suggestions: [],
     },
   });
