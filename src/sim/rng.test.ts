@@ -93,6 +93,19 @@ describe("Rng", () => {
     expect(() => rng.bytes(-1)).toThrow(RangeError);
   });
 
+  it("clamps chance to [0, 1]", () => {
+    const rng = new Rng(3);
+    for (let i = 0; i < 50; i++) {
+      expect(new Rng(i).chance(0)).toBe(false);
+      expect(new Rng(i).chance(-2)).toBe(false);
+      expect(new Rng(i).chance(1)).toBe(true);
+      expect(new Rng(i).chance(4)).toBe(true);
+    }
+    const seen = new Set<boolean>();
+    for (let i = 0; i < 100; i++) seen.add(rng.chance(0.5));
+    expect(seen).toEqual(new Set([false, true]));
+  });
+
   it("picks only members and rejects an empty array", () => {
     const rng = new Rng(5);
     const options = ["x", "y", "z"] as const;

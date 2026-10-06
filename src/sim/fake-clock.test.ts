@@ -176,6 +176,63 @@ describe("FakeClock", () => {
     expect(vt.nextTimerAt()).toBeNull();
   });
 
+  it("does not run a timer while its clock is suspended", async () => {
+    const vt = new VirtualTime();
+    const clock = new FakeClock(vt);
+    let fired = false;
+    void clock.sleep(1000).then(() => {
+      fired = true;
+    });
+    clock.suspend();
+
+    const before = vt.now;
+    expect(await vt.runNext()).toBe(false);
+
+    expect(fired).toBe(false);
+    expect(vt.now).toBe(before);
+    expect(clock.monotonicMs()).toBe(0);
+    expect(clock.suspended).toBe(true);
+  });
+
+  it("ignores suspended clocks when reporting the next timer", async () => {
+    const vt = new VirtualTime();
+    const asleep = new FakeClock(vt);
+    void asleep.sleep(1000);
+    asleep.suspend();
+
+    expect(vt.nextTimerAt()).toBeNull();
+    await vt.advance(500);
+    expect(vt.nextTimerAt()).toBeNull();
+
+    const awake = new FakeClock(vt);
+    void awake.sleep(300);
+    expect(vt.nextTimerAt()).toBe(vt.now + 300);
+  });
+
+  it("runs the awake clock's timer before a suspended one's", async () => {
+    const vt = new VirtualTime();
+    const asleep = new FakeClock(vt);
+    const awake = new FakeClock(vt);
+    const order: string[] = [];
+
+    void asleep.sleep(100).then(() => order.push("asleep"));
+    asleep.suspend();
+    void awake.sleep(500).then(() => order.push("awake"));
+
+    expect(await vt.runNext()).toBe(true);
+    expect(order).toEqual(["awake"]);
+    expect(vt.now).toBe(500);
+    expect(asleep.monotonicMs()).toBe(0);
+
+    expect(await vt.runNext()).toBe(false);
+
+    asleep.resume();
+    expect(vt.nextTimerAt()).toBe(vt.now + 100);
+    expect(await vt.runNext()).toBe(true);
+    expect(order).toEqual(["awake", "asleep"]);
+    expect(asleep.monotonicMs()).toBe(100);
+  });
+
   it("reports the next timer and fires one at a time", async () => {
     const vt = new VirtualTime();
     const clock = new FakeClock(vt);

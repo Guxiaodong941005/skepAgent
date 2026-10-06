@@ -82,9 +82,10 @@ export class Rng {
     return min + Math.floor(this.nextFloat() * span);
   }
 
-  /** True with probability p (clamped to [0, 1]). */
+  /** True with probability p. Values outside [0, 1] are clamped, so 0 is never and 1 is always. */
   chance(p: number): boolean {
-    return this.nextFloat() < p;
+    const clamped = Math.min(1, Math.max(0, p));
+    return this.nextFloat() < clamped;
   }
 
   /** Uniform element of a non-empty array. */

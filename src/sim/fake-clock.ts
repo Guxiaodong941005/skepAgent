@@ -36,19 +36,22 @@ export class VirtualTime {
     return this.time;
   }
 
-  /** Virtual time of the earliest pending timer, or null when nothing is scheduled. */
+  /**
+   * Virtual time of the earliest timer that can actually fire, or null when nothing is runnable.
+   * Timers whose clock is suspended are excluded: their fire time is not knowable until resume,
+   * so reporting it would hand a scheduler a target that moves forever (review B2).
+   */
   nextTimerAt(): number | null {
-    let earliest: number | null = null;
-    for (const timer of this.timers) {
-      const due = this.effectiveAt(timer, this.time);
-      if (earliest === null || due < earliest) earliest = due;
-    }
-    return earliest;
+    const timer = this.earliest();
+    return timer ? this.effectiveAt(timer, this.time) : null;
   }
 
   /**
    * Registers a timer due at absolute virtual time `at`. Passing the owning clock lets a later
    * suspension postpone it; without one the fire time is exactly `at`.
+   *
+   * Callers other than {@link FakeClock} get unsuspendable timers: with no owner there is nothing
+   * to suspend, so the timer always fires at `at` regardless of any clock's state.
    */
   schedule(at: number, resolve: () => void, owner?: FakeClock): Timer {
     const timer: Timer = {
@@ -103,11 +106,13 @@ export class VirtualTime {
     return true;
   }
 
-  /** Earliest timer at or before `target`, ties broken by creation order. */
+  /** Earliest runnable timer at or before `target`, ties broken by creation order. */
   private nextDue(target: number): Timer | null {
     let best: Timer | null = null;
     let bestAt = Number.POSITIVE_INFINITY;
     for (const timer of this.timers) {
+      // A suspended clock's timer cannot fire no matter how far time moves (review B1).
+      if (timer.owner?.suspended) continue;
       const at = this.effectiveAt(timer, target);
       if (at > target) continue;
       if (!best || at < bestAt || (at === bestAt && timer.seq < best.seq)) {
@@ -118,11 +123,15 @@ export class VirtualTime {
     return best;
   }
 
-  /** Earliest pending timer at the suspension accrued so far, ignoring any bound. */
+  /**
+   * Earliest runnable timer, ignoring any bound. Suspended clocks are skipped: their timers become
+   * eligible again on resume, once the postponed fire time is finite.
+   */
   private earliest(): Timer | null {
     let best: Timer | null = null;
     let bestAt = Number.POSITIVE_INFINITY;
     for (const timer of this.timers) {
+      if (timer.owner?.suspended) continue;
       const at = this.effectiveAt(timer, this.time);
       if (!best || at < bestAt || (at === bestAt && timer.seq < best.seq)) {
         best = timer;
