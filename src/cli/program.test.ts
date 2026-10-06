@@ -217,8 +217,6 @@ describe("stubs", () => {
     ["logs", AGENT],
     ["logs", AGENT, "--follow"],
     ["doctor"],
-    ["sim", "run", "--scenario", "empty"],
-    ["sim", "run", "--scenario", "empty", "--seed", "0", "--steps", "10"],
   ];
 
   for (const argv of invocations) {
