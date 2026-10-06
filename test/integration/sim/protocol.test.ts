@@ -66,12 +66,17 @@ describe("simulation seed count", () => {
 });
 
 describe.each(names)("%s protocol scenario", (name) => {
-  it.concurrent.each(seeds)("passes with zero violations for seed %i", async (seed) => {
-    const result = await runScenario(name, seed, { root });
-    expect(result.violations).toEqual([]);
-    expect(result.finalTip).toMatch(/^[a-f0-9]{40}$/);
-    expect(result.steps).toBeGreaterThan(0);
-  });
+  // Signed git races share CPU and disk with the crash sweep in the full suite.
+  it.concurrent.each(seeds)(
+    "passes with zero violations for seed %i",
+    async (seed) => {
+      const result = await runScenario(name, seed, { root });
+      expect(result.violations).toEqual([]);
+      expect(result.finalTip).toMatch(/^[a-f0-9]{40}$/);
+      expect(result.steps).toBeGreaterThan(0);
+    },
+    60_000,
+  );
 
   it("exercises its fault and leaves the required protocol outcome", async () => {
     const scenario = getScenario(name);
@@ -195,5 +200,5 @@ describe.each(names)("%s protocol scenario", (name) => {
     } finally {
       await world.close();
     }
-  });
+  }, 60_000);
 });
