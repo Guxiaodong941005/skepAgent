@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { FakeClock, VirtualTime } from "../sim/fake-clock.js";
 import { type AttemptKey, Journal, JournalError, TERMINAL_STEPS } from "./journal.js";
+import { findSecrets, Redactor } from "./redact.js";
 
 const TASK_A = "T-20261005-aa01";
 const TASK_B = "T-20261005-bb02";
@@ -165,5 +166,116 @@ describe("Journal", () => {
     const journal = new Journal({ roleDir: dir, clock: clockAt(0, 0) });
     const key = { task: TASK_A, item: "W3", epoch: 4 };
     expect(journal.path(key)).toBe(path.join(dir, ".skep", "journal", TASK_A, "W3-e4.jsonl"));
+  });
+
+  it("redacts records before writing and returns exactly the sanitized record", async () => {
+    const dir = await roleDir();
+    const clock = clockAt(0, Date.UTC(2026, 0, 1));
+    const journal = new Journal({ roleDir: dir, clock, redactor: new Redactor() });
+    const key = { task: TASK_A, item: "W1", epoch: 1 };
+    const body = "ExampleFake0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"; // gitleaks:allow
+    const fakeKey = `sk-test-${body}`; // gitleaks:allow
+    const privateKey =
+      "-----BEGIN PRIVATE KEY-----\nEXAMPLE-FAKE-KEY-BODY\n-----END PRIVATE KEY-----"; // gitleaks:allow
+    const input = {
+      step: "invocation_done",
+      output: `quote: "${fakeKey}"\nnext line`,
+      details: {
+        [fakeKey]: [`EXAMPLE_SECRET='${body}'`, { privateKey, passed: false }],
+        absent: null,
+        count: 3,
+      },
+    };
+
+    const stored = await journal.append(key, input);
+    const raw = await readFile(journal.path(key), "utf8");
+    expect(raw).not.toContain(body);
+    expect(raw).not.toContain("EXAMPLE-FAKE-KEY-BODY");
+    expect(raw.endsWith("\n")).toBe(true);
+    expect(raw.split("\n")).toHaveLength(2);
+    expect(stored).toEqual({
+      step: "invocation_done",
+      ts_mono: 0,
+      ts_wall: "2026-01-01T00:00:00Z",
+      output: 'quote: "[REDACTED:provider-api-key]"\nnext line',
+      details: {
+        "[REDACTED:provider-api-key]": [
+          "EXAMPLE_SECRET='[REDACTED:secret-assignment]'",
+          { privateKey: "[REDACTED:private-key]", passed: false },
+        ],
+        absent: null,
+        count: 3,
+      },
+    });
+    expect(JSON.parse(raw)).toEqual(stored);
+    expect(await journal.read(key)).toEqual([stored]);
+    expect(findSecrets(raw)).toEqual([]);
+    expect(input.output).toContain(fakeKey);
+    expect(input.details[fakeKey]).toContain(`EXAMPLE_SECRET='${body}'`);
+  });
+
+  it("redacts strings from toJSON before serialization reaches disk", async () => {
+    const dir = await roleDir();
+    const journal = new Journal({
+      roleDir: dir,
+      clock: clockAt(0, 0),
+      redactor: new Redactor(),
+    });
+    const key = { task: TASK_A, item: "W1", epoch: 1 };
+    const fakeKey = `sk-test-${"ExampleFake0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"}`; // gitleaks:allow
+    const stored = await journal.append(key, {
+      step: "invocation_done",
+      output: { toJSON: () => fakeKey },
+    });
+    expect(stored.output).toBe("[REDACTED:provider-api-key]");
+    expect(await readFile(journal.path(key), "utf8")).not.toContain(fakeKey);
+  });
+
+  it("keeps redaction opt-in and preserves the default SK-205 behavior", async () => {
+    const dir = await roleDir();
+    const journal = new Journal({ roleDir: dir, clock: clockAt(0, 0) });
+    const key = { task: TASK_A, item: "W1", epoch: 1 };
+    const fakeKey = `sk-test-${"ExampleFake0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"}`; // gitleaks:allow
+    const first = await journal.append(key, { step: "invocation_done", output: fakeKey });
+    expect(first.output).toBe(fakeKey);
+    expect(await readFile(journal.path(key), "utf8")).toContain(fakeKey);
+    expect(await journal.read(key)).toEqual([first]);
+  });
+
+  it("propagates redactor errors before repairing or writing the journal", async () => {
+    const dir = await roleDir();
+    const journal = new Journal({
+      roleDir: dir,
+      clock: clockAt(0, 0),
+      redactor: {
+        redact: () => {
+          throw new Error("Redaction unavailable");
+        },
+      },
+    });
+    const key = { task: TASK_A, item: "W1", epoch: 1 };
+    const file = journal.path(key);
+    await mkdir(path.dirname(file), { recursive: true });
+    await writeFile(file, '{"step":"clai');
+    await expect(journal.append(key, { step: "invoked" })).rejects.toThrow("Redaction unavailable");
+    expect(await readFile(file, "utf8")).toBe('{"step":"clai');
+  });
+
+  it("rejects redacted field collisions without exposing secrets or losing data", async () => {
+    const dir = await roleDir();
+    const journal = new Journal({
+      roleDir: dir,
+      clock: clockAt(0, 0),
+      redactor: new Redactor(),
+    });
+    const key = { task: TASK_A, item: "W1", epoch: 1 };
+    const fakeKey = `sk-test-${"ExampleFake0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"}`; // gitleaks:allow
+    const error = await journal
+      .append(key, { step: "invocation_done", details: { [fakeKey]: 1, [`${fakeKey}2`]: 2 } })
+      .catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(JournalError);
+    expect((error as JournalError).message).toContain("use non-secret journal field names");
+    expect((error as JournalError).message).not.toContain(fakeKey);
+    await expect(readFile(journal.path(key))).rejects.toMatchObject({ code: "ENOENT" });
   });
 });

@@ -3,6 +3,7 @@ import path from "node:path";
 import { ITEM_ID_RE, type ItemId, TASK_ID_RE, type TaskId } from "../core/ids.js";
 import { type Clock, isoUtc } from "../util/clock.js";
 import { appendFsync } from "../util/fs.js";
+import type { TextRedactor } from "./redact.js";
 
 /**
  * Append-only, fsync'd JSONL run journal (ARCHITECTURE §11.3, PRD §10.6).
@@ -55,10 +56,12 @@ export class JournalError extends Error {
 export class Journal {
   private readonly root: string;
   private readonly clock: Clock;
+  private readonly redactor: TextRedactor | undefined;
 
-  constructor(opts: { roleDir: string; clock: Clock }) {
+  constructor(opts: { roleDir: string; clock: Clock; redactor?: TextRedactor }) {
     this.root = path.join(opts.roleDir, JOURNAL_DIR);
     this.clock = opts.clock;
+    this.redactor = opts.redactor;
   }
 
   /**
@@ -87,9 +90,16 @@ export class Journal {
       step: record.step,
     };
     const file = this.path(key);
+    let serialized = JSON.stringify(stamped);
+    // Scrub decoded JSON strings so multiline keys and escaped quotes stay valid JSON (D19).
+    // The round trip also covers strings produced by toJSON before anything reaches disk.
+    const stored = this.redactor
+      ? (redactJson(JSON.parse(serialized), this.redactor, file) as JournalRecord)
+      : stamped;
+    if (this.redactor) serialized = JSON.stringify(stored);
     await this.repairTornTail(file);
-    await appendFsync(file, `${JSON.stringify(stamped)}\n`);
-    return stamped;
+    await appendFsync(file, `${serialized}\n`);
+    return stored;
   }
 
   /** Records in write order. A trailing partial line (no newline) is ignored; a bad middle line throws. */
@@ -176,6 +186,30 @@ export class Journal {
       await handle.close();
     }
   }
+}
+
+function redactJson(value: unknown, redactor: TextRedactor, file: string): unknown {
+  if (typeof value === "string") return redactor.redact(value);
+  if (Array.isArray(value)) return value.map((entry) => redactJson(entry, redactor, file));
+  if (typeof value === "object" && value !== null) {
+    const names = new Set<string>();
+    const entries: [string, unknown][] = [];
+    for (const [key, entry] of Object.entries(value)) {
+      const name = redactor.redact(key);
+      // Two secret field names can collapse to one marker; do not silently lose journal data.
+      if (names.has(name)) {
+        throw new JournalError(
+          file,
+          0,
+          "redaction produces duplicate fields; use non-secret journal field names",
+        );
+      }
+      names.add(name);
+      entries.push([name, redactJson(entry, redactor, file)]);
+    }
+    return Object.fromEntries(entries);
+  }
+  return value;
 }
 
 function journalFile(root: string, key: AttemptKey): string {
