@@ -70,6 +70,8 @@ export const handleHumanDecided: Handler<"human.decided"> = (draft, event, ctx) 
   const task = draft.tasks[event.task_id];
   if (!task) return { ok: false, reason: "unknown_task" };
   if (task.status !== "escalated") return { ok: false, reason: "bad_task_state" };
+  // Replan/reassignment grants fresh review rounds (ARCHITECTURE §5.5), while
+  // replan_count still enforces the task's lifetime replan budget.
   switch (event.payload.decision) {
     case "resume_with_plan": {
       const version = task.active_plan_version;
@@ -81,6 +83,8 @@ export const handleHumanDecided: Handler<"human.decided"> = (draft, event, ctx) 
     }
     case "replan":
       task.status = "planning";
+      task.review_rounds = 0;
+      task.barrier = null;
       break;
     case "cancel":
       task.status = "cancelled";
@@ -98,6 +102,8 @@ export const handleHumanDecided: Handler<"human.decided"> = (draft, event, ctx) 
       task.owner = owner;
       task.owner_gen += 1;
       task.status = "planning";
+      task.review_rounds = 0;
+      task.barrier = null;
       break;
     }
   }

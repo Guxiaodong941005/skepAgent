@@ -28,24 +28,32 @@ function planning(): LogBuilder {
   return builder;
 }
 
-function escalated(): LogBuilder {
+function escalated(reviewBudget = 0): LogBuilder {
   const builder = registered();
   const payload = taskCreated();
-  payload.budgets.review_rounds = 0;
+  payload.budgets.review_rounds = reviewBudget;
   builder.append({ type: "task.created", actor: "human", payload });
-  const proposal = planProposed();
-  builder.append({
-    type: "plan.proposed",
-    actor: VPS,
-    payload: proposal,
-    pre: { task_rev: 1, owner_gen: 1 },
-  });
-  builder.append({
-    type: "plan.rejected",
-    actor: "human",
-    payload: { plan_version: 1, plan_hash: proposal.plan_hash },
-    pre: { task_rev: 2, plan_version: 1, plan_hash: proposal.plan_hash },
-  });
+  for (let version = 1; version <= reviewBudget + 1; version++) {
+    const proposal = planProposed(
+      samplePlan({ version, parent_version: version === 1 ? null : version - 1 }),
+    );
+    builder.append({
+      type: "plan.proposed",
+      actor: VPS,
+      payload: proposal,
+      pre: { task_rev: task(replay(builder.entries)).rev, owner_gen: 1 },
+    });
+    builder.append({
+      type: "plan.rejected",
+      actor: "human",
+      payload: { plan_version: version, plan_hash: proposal.plan_hash },
+      pre: {
+        task_rev: task(replay(builder.entries)).rev,
+        plan_version: version,
+        plan_hash: proposal.plan_hash,
+      },
+    });
+  }
   return builder;
 }
 
@@ -318,9 +326,100 @@ describe("human escalation decisions", () => {
       status: "planning",
       rev: 4,
       escalation: null,
-      review_rounds: 1,
+      review_rounds: 0,
     });
   });
+
+  it.each(["replan", "reassign_owner"] as const)(
+    "recovers from a review-round escalation through %s and an approved new plan",
+    (decision) => {
+      const builder = escalated(2);
+      expect(task(replay(builder.entries))).toMatchObject({
+        status: "escalated",
+        review_rounds: 3,
+        current_plan_version: 3,
+        escalation: { reason: "review_rounds" },
+      });
+      const owner = decision === "reassign_owner" ? MAC : VPS;
+      const ownerGen = decision === "reassign_owner" ? 2 : 1;
+      builder.append({
+        type: "human.decided",
+        actor: "human",
+        payload: decision === "reassign_owner" ? { decision, new_owner: owner } : { decision },
+        pre: { task_rev: 7 },
+      });
+      expect(task(replay(builder.entries))).toMatchObject({
+        status: "planning",
+        owner,
+        owner_gen: ownerGen,
+        review_rounds: 0,
+        escalation: null,
+        barrier: null,
+      });
+      const proposal = planProposed(samplePlan({ version: 4, parent_version: 3 }));
+      builder.append({
+        type: "plan.proposed",
+        actor: owner,
+        payload: proposal,
+        pre: { task_rev: 8, owner_gen: ownerGen },
+      });
+      expect(task(replay(builder.entries))).toMatchObject({
+        status: "awaiting_approval",
+        current_plan_version: 4,
+        review_rounds: 0,
+      });
+      builder.append({
+        type: "plan.approved",
+        actor: "human",
+        payload: { plan_version: 4, plan_hash: proposal.plan_hash },
+        pre: { task_rev: 9, plan_version: 4, plan_hash: proposal.plan_hash },
+      });
+      const state = replay(builder.entries);
+      expect(task(state)).toMatchObject({
+        status: "executing",
+        owner,
+        owner_gen: ownerGen,
+        active_plan_version: 4,
+        review_rounds: 0,
+        items: { W1: { status: "ready" } },
+      });
+      expect(state.outcomes.slice(-3).map((outcome) => outcome.outcome)).toEqual([
+        "accepted",
+        "accepted",
+        "accepted",
+      ]);
+    },
+  );
+
+  it.each(["replan", "reassign_owner"] as const)(
+    "clears the barrier and review rounds but preserves lifetime replan_count for %s",
+    (decision) => {
+      const { builder, state } = executing();
+      const t = task(state);
+      addLeaseAndBarrier(t);
+      t.status = "escalated";
+      t.escalation = { reason: "replans", seq: 5 };
+      t.review_rounds = 3;
+      t.replan_count = 3;
+      builder.append({
+        type: "human.decided",
+        actor: "human",
+        payload: decision === "reassign_owner" ? { decision, new_owner: MAC } : { decision },
+        pre: { task_rev: 3 },
+      });
+      const after = applyEntry(state, builder.entries.at(-1) as LogEntry);
+      expect(after.outcomes.at(-1)?.outcome).toBe("accepted");
+      expect(task(after)).toMatchObject({
+        status: "planning",
+        review_rounds: 0,
+        replan_count: 3,
+        barrier: null,
+        escalation: null,
+      });
+      expect(t.review_rounds).toBe(3);
+      expect(t.barrier).not.toBeNull();
+    },
+  );
 
   it.each(["failed", "unknown", "interrupted"] as const)(
     "resumes the active plan with %s work ready and attempts reset",

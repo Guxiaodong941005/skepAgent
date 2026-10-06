@@ -16,6 +16,8 @@ function carryDefinition(item: PlanItem): string {
 }
 
 export function activatePlan(task: TaskState, version: number, seq: number): void {
+  // Callers select an existing plan and PlanSchema validates stack_order (ARCHITECTURE §4.5).
+  // These guards catch internal inconsistencies unreachable from a validated log.
   const record = task.plans[String(version)];
   if (!record)
     throw new RangeError(`Cannot activate missing plan version ${version} for ${task.task_id}`);
