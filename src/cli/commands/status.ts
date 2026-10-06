@@ -31,11 +31,6 @@ interface StatusResult {
   extras: StatusExtras;
 }
 
-/**
- * Reads `{ view, extras }` from `status.result` (ARCHITECTURE §12); the flat response from
- * older daemons remains accepted for compatibility.
- */
-
 /** `skep status` (PRD §15.1, §15.2). Global `--machine` selects the JSON view. */
 export function register(program: Command, ctx: CliContext): void {
   program
@@ -103,31 +98,39 @@ export function decodeStatus(response: IpcResult): StatusResult {
   if (!isRecord(body)) {
     throw new CliError("bad_status", "daemon returned a status that is not an object", EXIT.error);
   }
-  // The daemon may hand back the view flat (its own shape) or nested under `view`.
-  const view = (isRecord(body.view) ? body.view : body) as unknown as StatusView;
+  // One shape only, `{ view, extras }` (ARCHITECTURE §12). The flat bridge from SK-604 is gone
+  // (follow-up H11): every daemon on `main` answers nested.
+  if (!isRecord(body.view) || !isRecord(body.extras)) {
+    throw new CliError(
+      "bad_status",
+      "daemon status is not { view, extras }; skepd and skep must come from the same build",
+      EXIT.error,
+    );
+  }
+  const view = body.view as unknown as StatusView;
   if (typeof view.seq !== "number" || typeof view.tip !== "string" || !Array.isArray(view.tasks)) {
     throw new CliError("bad_status", "daemon status is missing seq, tip or tasks", EXIT.error);
   }
   return {
     view: { ...view, agents: view.agents ?? [], tasks: view.tasks },
-    extras: extrasOf(body),
+    extras: extrasOf(body.extras),
   };
 }
 
-/** Pull observer data out of whatever shape the daemon returned; absent fields render as unknown. */
-function extrasOf(body: Record<string, unknown>): StatusExtras {
-  const nested = isRecord(body.extras) ? body.extras : body;
+/**
+ * Observer data from `extras`; absent fields render as unknown.
+ *
+ * Monotonic clocks of different processes have unrelated origins, so the daemon sends an age
+ * (`checkedAgoMs`, D23) and the CLI anchors it on its own clock. A raw daemon timestamp
+ * (`checkedAtMonoMs`, `fetchedAtMonoMs`) or a daemon `nowMonoMs` is never read: subtracting
+ * it from anything on this process's clock is meaningless (SK-604 review note 1, H11).
+ */
+function extrasOf(nested: Record<string, unknown>): StatusExtras {
   const freshness = isRecord(nested.freshness) ? nested.freshness : {};
   const hints = isRecord(nested.hints) ? nested.hints : {};
-  const nowMonoMs =
-    typeof nested.nowMonoMs === "number" ? nested.nowMonoMs : systemClock.monotonicMs();
-  // Convert an observer-relative age to the renderer's local clock; never compare process clocks.
+  const nowMonoMs = systemClock.monotonicMs();
   const checked =
-    freshness.checkedAgoMs === null
-      ? null
-      : typeof freshness.checkedAgoMs === "number"
-        ? nowMonoMs - freshness.checkedAgoMs
-        : (freshness.checkedAtMonoMs ?? freshness.fetchedAtMonoMs ?? null);
+    typeof freshness.checkedAgoMs === "number" ? nowMonoMs - freshness.checkedAgoMs : null;
   return {
     liveness: Array.isArray(nested.liveness) ? (nested.liveness as StatusExtras["liveness"]) : [],
     freshness: {

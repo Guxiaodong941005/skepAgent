@@ -68,12 +68,13 @@ export class GhCodeHost implements CodeHost {
     assertRefName(branch, "branch");
     const slug = await this.repoSlug(repo);
     // One auth path (gh), so a private repo does not fall back to git's credential helpers.
-    // A missing ref is a 404; anything else is a real failure.
-    const result = await this.exec(
-      "gh",
-      ["api", "--hostname", slug.hostname, endpoint(slug, branch)],
-      { missingOk: true },
-    );
+    // A missing ref is a 404; anything else is a real failure. Without a host named by a URL,
+    // `--hostname` is omitted so gh uses its own configured default host (e.g. an Enterprise
+    // install), never one hard-coded here (SK-507 review note 1).
+    const hostArgs = slug.hostname === null ? [] : ["--hostname", slug.hostname];
+    const result = await this.exec("gh", ["api", ...hostArgs, endpoint(slug, branch)], {
+      missingOk: true,
+    });
     if (result === null) return null;
     const parsed = parseJson(result.stdout, "api");
     if (!isRecord(parsed) || !isRecord(parsed.object) || typeof parsed.object.sha !== "string") {
@@ -166,11 +167,12 @@ export class GhCodeHost implements CodeHost {
   }
 
   /**
-   * `owner/repo` for the git-ref API. A name is used as given; an https URL is reduced to its
-   * host and `owner/repo` path. The daemon never stores a credential in either form (D19).
+   * `owner/repo` for the git-ref API. A name is used as given, with no host (gh's default); an
+   * https URL is reduced to its host and `owner/repo` path. The daemon never stores a credential
+   * in either form (D19).
    */
-  private async repoSlug(repo: string): Promise<{ hostname: string; name: string }> {
-    if (!repo.includes("://")) return { hostname: DEFAULT_HOSTNAME, name: repo };
+  private async repoSlug(repo: string): Promise<{ hostname: string | null; name: string }> {
+    if (!repo.includes("://")) return { hostname: null, name: repo };
     let url: URL;
     try {
       url = new URL(repo);
@@ -217,8 +219,6 @@ export class GhCodeHost implements CodeHost {
     return result;
   }
 }
-
-const DEFAULT_HOSTNAME = "github.com";
 
 /** `--flag=value`: a value that itself starts with `-` stays a value, never a new option. */
 function flag(name: string, value: string): string {

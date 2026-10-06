@@ -136,10 +136,37 @@ describe("write commands through the daemon", () => {
     const code = await runCli(["--machine", "task", "cancel", TASK, "--reason", "stop"], cap.ctx);
     expect(code).toBe(3);
     expect(cap.stderr).toBe("");
+    // Top-level ok agrees with the exit code (G5, H10).
     expect(jsonLine(cap.stdout)).toEqual({
-      ok: true,
+      ok: false,
+      error: {
+        code: "rejected",
+        message: "the intent was committed at #9 but rejected: unauthorized",
+      },
       result: { status: "rejected", seq: 9, reason: "unauthorized" },
     });
+  });
+
+  it.each([
+    ["dropped", { status: "dropped", eventId: "evt_y" }, { status: "dropped", event_id: "evt_y" }],
+    [
+      "failed",
+      { status: "failed", reason: "push refused" },
+      { status: "failed", reason: "push refused" },
+    ],
+  ] as const)("prints a %s verdict with top-level ok:false", async (status, verdict, result) => {
+    const { home } = await daemon(verdict);
+    const cap = capture(home);
+    const code = await runCli(
+      ["--machine", "lease", "revoke", TASK, "W1", "--epoch", "2"],
+      cap.ctx,
+    );
+    expect(code).toBe(3);
+    expect(cap.stderr).toBe("");
+    const line = jsonLine(cap.stdout) as { ok: boolean; error: { code: string }; result: unknown };
+    expect(line.ok).toBe(false);
+    expect(line.error.code).toBe(status);
+    expect(line.result).toEqual(result);
   });
 
   it("prints dropped with no seq when the intent no longer applies", async () => {
@@ -148,6 +175,9 @@ describe("write commands through the daemon", () => {
     const code = await runCli(["lease", "revoke", TASK, "W1", "--epoch", "2"], cap.ctx);
     expect(code).toBe(3);
     expect(cap.stdout).toBe("dropped\n");
+    expect(cap.stderr).toBe(
+      "skep: the intent no longer applies to the current state; nothing was published\n",
+    );
   });
 
   it("sends the plan decision, the replan and the escalation the flags describe", async () => {
@@ -424,7 +454,11 @@ describe("write commands in-process when the daemon is down", () => {
     // publish ran, rather than failing because the directory did not exist.
     expect(code).toBe(3);
     expect(cap.stderr).toBe("");
-    expect(jsonLine(cap.stdout)).toMatchObject({ ok: true, result: { status: "dropped" } });
+    expect(jsonLine(cap.stdout)).toMatchObject({
+      ok: false,
+      error: { code: "dropped" },
+      result: { status: "dropped" },
+    });
     await expect(access(clone)).resolves.toBeUndefined();
   });
 
