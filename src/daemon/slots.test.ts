@@ -90,9 +90,7 @@ describe("slot registry", () => {
     expect(slot.env).not.toHaveProperty("SSH_AUTH_SOCK");
     expect(slot.env).not.toHaveProperty("GH_TOKEN");
     expect(slot.identity).toEqual({ uid: 1000, gid: 1000 });
-    const exec = f.resolveUser.mock.calls[0]?.[1]?.exec;
-    expect(exec).toBeTypeOf("function");
-    expect(String(exec)).toContain("/usr/bin/id");
+    expect(f.resolveUser).toHaveBeenCalledWith("skep");
     await expect(f.slots.start(f.config)).rejects.toThrow("already exists");
   });
   it.each([

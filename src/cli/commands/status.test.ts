@@ -132,6 +132,38 @@ describe("skep status", () => {
     expect(cap.stdout).not.toMatch(/provider|credential|api_key/i);
   });
 
+  it.each([0, 6_000, null])(
+    "renders the daemon's checkedAgoMs=%s on the CLI clock",
+    async (age) => {
+      const { state } = fixtureState();
+      const cap = capture();
+      cap.ctx.connectDaemon = () =>
+        Promise.resolve(
+          daemon(() => ({
+            ok: true,
+            result: {
+              view: statusView(state),
+              extras: {
+                liveness: [],
+                freshness: {
+                  checkedAgoMs: age,
+                  checkedAtMonoMs: 900_000_000,
+                  invalidCount: 2,
+                  reducerVersion: 1,
+                },
+                hints: { name: "null", connected: false, lastMessageMonoMs: null },
+                alarms: [],
+                readOnly: false,
+              },
+            },
+          })),
+        );
+      expect(await runCli(["status"], cap.ctx)).toBe(0);
+      expect(cap.stdout).toContain(age === null ? "checked never" : `checked ${age / 1000}s ago`);
+      expect(cap.stdout).toContain("2 invalid commits");
+    },
+  );
+
   it("prints canonical JSON with --machine, naming the timestamp checkedAtMonoMs", async () => {
     const { state } = fixtureState();
     const view = statusView(state);

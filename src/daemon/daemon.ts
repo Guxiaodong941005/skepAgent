@@ -6,7 +6,7 @@ import type { Sync, SyncAlarm } from "../blackboard/sync.js";
 import type { Intent } from "../core/intents.js";
 import { GenesisError } from "../core/reducer/genesis.js";
 import { REDUCER_VERSION, type State } from "../core/reducer/state.js";
-import { leasesHeldBy, statusView } from "../core/reducer/views.js";
+import { leasesHeldBy, type StatusView, statusView } from "../core/reducer/views.js";
 import { findSecrets, Redactor } from "../exec/redact.js";
 import type { Signer } from "../git/signer.js";
 import type { SuspendDetector } from "../lease/suspend.js";
@@ -16,6 +16,7 @@ import { backoffDelay } from "../util/backoff.js";
 import type { Clock } from "../util/clock.js";
 import type { RandomSource } from "../util/random.js";
 import type { Duties } from "./duties.js";
+import type { IpcHandlers } from "./ipc-server.js";
 import type { DaemonLock } from "./lock.js";
 import { registrationIntent, type SlotConfig, type SlotRegistry } from "./slots.js";
 
@@ -423,35 +424,44 @@ export class Daemon {
       },
       doctor: async (_params: Record<string, never> = {}) => ({
         ok: !this.readOnly,
-        alarms: this.status().alarms,
+        alarms: this.status().extras.alarms,
       }),
       ping: async (_params: Record<string, never> = {}) => ({ reducer_version: REDUCER_VERSION }),
-    };
+    } satisfies IpcHandlers;
   }
   status() {
     const snapshot = this.deps.sync.current();
     const state = snapshot.state;
+    const view: StatusView = state ? statusView(state) : { seq: 0, tip: "", agents: [], tasks: [] };
     return {
-      ...(state ? statusView(state) : { seq: 0, tip: null, agents: [], tasks: [] }),
-      reducer_version: state?.reducer_version ?? REDUCER_VERSION,
-      read_only: this.readOnly,
-      freshness: {
-        fetched_at_mono_ms: snapshot.fetchedAtMonoMs,
-        checked_age_ms:
-          snapshot.fetchedAtMonoMs === null
-            ? null
-            : this.deps.clock.monotonicMs() - snapshot.fetchedAtMonoMs,
-        invalid_count: snapshot.invalidCount,
-      },
-      hints: this.hints.health(),
-      liveness: Object.fromEntries(
-        Object.keys(state?.agents ?? {})
+      view,
+      extras: {
+        liveness: Object.keys(state?.agents ?? {})
           .sort()
-          .map((agent) => [agent, this.deps.liveness.classify(agent)]),
-      ),
-      alarms: [...this.alarms.values()].sort(
-        (a, b) => a.kind.localeCompare(b.kind) || a.message.localeCompare(b.message),
-      ),
+          .map((agent) => {
+            const { cls, sinceChangeMs } = this.deps.liveness.classify(agent);
+            return {
+              agent,
+              cls,
+              sinceChangeMs,
+              intervalMs: state && leasesHeldBy(state, agent).length > 0 ? 60_000 : 300_000,
+            };
+          }),
+        // Monotonic origins differ across processes; only the observer can calculate this age.
+        freshness: {
+          checkedAgoMs:
+            snapshot.fetchedAtMonoMs === null
+              ? null
+              : Math.max(0, this.deps.clock.monotonicMs() - snapshot.fetchedAtMonoMs),
+          invalidCount: snapshot.invalidCount,
+          reducerVersion: state?.reducer_version ?? REDUCER_VERSION,
+        },
+        hints: this.hints.health(),
+        alarms: [...this.alarms.values()]
+          .sort((a, b) => a.kind.localeCompare(b.kind) || a.message.localeCompare(b.message))
+          .map(({ kind, message }) => ({ kind, detail: message })),
+        readOnly: this.readOnly,
+      },
     };
   }
 }

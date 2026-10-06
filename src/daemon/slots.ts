@@ -9,7 +9,6 @@ import type { State } from "../core/reducer/state.js";
 import { type ClaimCandidate, claimableItems } from "../core/reducer/views.js";
 import type { AgentUserIds } from "../exec/sandbox-env.js";
 import { type AgentEnvOptions, agentEnv, resolveAgentUser } from "../exec/sandbox-env.js";
-import { execFileChecked } from "../util/exec.js";
 
 export const SlotConfigSchema = z.strictObject({
   roleDir: z.string().min(1),
@@ -74,11 +73,7 @@ export class SlotRegistry {
       throw new SlotError(`Slot ${agent} already exists`);
     this.starting.add(agent);
     try {
-      // G12: keep the shared helper unchanged while resolving IDs through an absolute executable.
-      const identity = await (this.deps.resolveUser ?? resolveAgentUser)(config.user, {
-        exec: (file, args, options) =>
-          execFileChecked(file === "id" ? "/usr/bin/id" : file, args, options),
-      });
+      const identity = await (this.deps.resolveUser ?? resolveAgentUser)(config.user);
       const adapter = await this.deps.adapter(policy, config, identity);
       if (adapter.cli !== policy.frontMatter.agent_cli)
         throw new SlotError(`Slot ${agent}: adapter does not match AGENT.md agent_cli`);

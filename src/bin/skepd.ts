@@ -23,16 +23,20 @@ import { LivenessTracker } from "../blackboard/liveness.js";
 import { Publisher, withCloneLock } from "../blackboard/publisher.js";
 import { Sync } from "../blackboard/sync.js";
 import { GhCodeHost } from "../codehost/gh.js";
-import { loadDeviceConfig } from "../config/device.js";
+import type { CodeHost } from "../codehost/types.js";
+import { findRepo, loadDeviceConfig } from "../config/device.js";
 import { skepHome, skepPaths } from "../config/paths.js";
+import { intentFromSpec } from "../core/intent-spec.js";
 import { draft, type Intent } from "../core/intents.js";
 import type { TaskState } from "../core/reducer/state.js";
+import type { DeviceConfig } from "../core/schemas/config.js";
 import type { Evidence } from "../core/schemas/evidence.js";
 import { PlanSchema } from "../core/schemas/plan.js";
 import { type Review, ReviewSchema } from "../core/schemas/review.js";
 import { Daemon, DaemonError } from "../daemon/daemon.js";
 import { createDeliveryDuty } from "../daemon/delivery.js";
 import { Duties } from "../daemon/duties.js";
+import { IpcServer, type IpcServerOptions } from "../daemon/ipc-server.js";
 import { DaemonLock } from "../daemon/lock.js";
 import { createReplanDuty } from "../daemon/replan.js";
 import { type Slot, type SlotConfig, SlotRegistry } from "../daemon/slots.js";
@@ -63,12 +67,46 @@ export interface DaemonBootstrapOptions {
   request?: typeof fetch;
   resolveIntent(spec: unknown): Intent | null;
   defaultSlot?: Omit<SlotConfig, "roleDir">;
-  ipcFactory(options: {
-    socketPath: string;
-    handlers: ReturnType<Daemon["handlers"]>;
-    redactor: Redactor;
-    clock: Clock;
-  }): { start(): Promise<void>; stop(): Promise<void> };
+  ipcFactory(options: IpcServerOptions): Pick<IpcServer, "start" | "stop">;
+}
+
+/** Keep protocol repo aliases and git transport URLs out of gh's owner/repo arguments (§11.5). */
+export function bindCodeHost(host: CodeHost, config: DeviceConfig): CodeHost {
+  const resolveRepo = (ref: string): string => {
+    const repo = findRepo(config, ref);
+    if (!repo) throw new DaemonError("Code host repository is not in the device's local allowlist");
+    const remote = repo.url.replace(/\/+$/, "").replace(/\.git$/i, "");
+    if (/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/i.test(remote)) return remote;
+    const scp = /^git@([^/:]+):(.+)$/.exec(remote);
+    let url: URL;
+    try {
+      url = new URL(scp ? `https://${scp[1]}/${scp[2]}` : remote);
+    } catch (cause) {
+      throw new DaemonError("Configure a code host URL naming an owner and repository", { cause });
+    }
+    if (
+      !["https:", "ssh:"].includes(url.protocol) ||
+      url.password !== "" ||
+      (url.username !== "" && (url.protocol !== "ssh:" || url.username !== "git")) ||
+      url.port !== "" ||
+      url.search !== "" ||
+      url.hash !== "" ||
+      !/^\/[a-z0-9_.-]+\/[a-z0-9_.-]+$/i.test(url.pathname)
+    )
+      throw new DaemonError(
+        "Code host URLs must name owner/repo without credentials, ports or queries",
+      );
+    // GhCodeHost extracts the hostname for API calls and gh accepts the same HTTPS repo URL for PRs.
+    return `https://${url.hostname}${url.pathname}`;
+  };
+  return {
+    remoteBranchSha: async (repo, branch) => host.remoteBranchSha(resolveRepo(repo), branch),
+    findPr: async (repo, head) => host.findPr(resolveRepo(repo), head),
+    createPr: async (repo, params) => host.createPr(resolveRepo(repo), params),
+    retargetPr: async (repo, pr, base) => host.retargetPr(resolveRepo(repo), pr, base),
+    closePr: async (repo, pr, comment) => host.closePr(resolveRepo(repo), pr, comment),
+    prState: async (repo, pr) => host.prState(resolveRepo(repo), pr),
+  };
 }
 
 /** ARCHITECTURE §9.5: journal evidence can refer to any local attempt, including older epochs. */
@@ -241,7 +279,7 @@ export async function createDeviceDaemon(options: DaemonBootstrapOptions): Promi
         journal: Journal;
         attempt: AttemptRunner;
         evidence: EvidenceVerifier;
-        codeHost: GhCodeHost;
+        codeHost: CodeHost;
       }
     >();
     const getServices = (slot: Slot) => {
@@ -268,9 +306,12 @@ export async function createDeviceDaemon(options: DaemonBootstrapOptions): Promi
         agentUser: identity,
         random,
       });
-      const codeHost = new GhCodeHost({
-        env: { PATH: options.env.PATH ?? "", HOME: options.env.HOME ?? paths.home },
-      });
+      const codeHost = bindCodeHost(
+        new GhCodeHost({
+          env: { PATH: options.env.PATH ?? "", HOME: options.env.HOME ?? paths.home },
+        }),
+        config,
+      );
       const attempt = new AttemptRunner({
         mirror,
         git,
@@ -603,13 +644,12 @@ export async function createDeviceDaemon(options: DaemonBootstrapOptions): Promi
       socketPath: paths.socket,
       handlers: daemon.handlers(),
       redactor,
-      clock,
     });
     try {
       await sync.observeNow();
     } catch (error) {
       daemon.alarm(error, "sync_failed");
-      if (daemon.status().read_only) return daemon;
+      if (daemon.status().extras.readOnly) return daemon;
       throw error;
     }
     for (const slot of slots.list()) {
@@ -653,6 +693,9 @@ export async function createDeviceDaemon(options: DaemonBootstrapOptions): Promi
 export async function runDaemon(
   argv: string[],
   env: NodeJS.ProcessEnv = process.env,
+  bootstrap: (
+    options: DaemonBootstrapOptions,
+  ) => Promise<Pick<Daemon, "start" | "stop">> = createDeviceDaemon,
 ): Promise<void> {
   const program = new Command()
     .name("skepd")
@@ -680,27 +723,9 @@ export async function runDaemon(
   }>();
   if ((args.roleDir?.length ?? 0) > 0 && (!args.agentUser || !args.agentHome || !args.agentPath))
     throw new DaemonError("Slots require --agent-user, --agent-home and --agent-path");
-  // These are dependencies owned by SK-602/603; defer loading until their modules are merged.
-  const ipcModulePath = "../daemon/ipc-server.js";
-  const intentModulePath = "../core/intent-spec.js";
-  let integrations: {
-    IpcServer: new (
-      options: Parameters<DaemonBootstrapOptions["ipcFactory"]>[0],
-    ) => ReturnType<DaemonBootstrapOptions["ipcFactory"]>;
-    intentFromSpec: (spec: unknown, context: { rng: RandomSource; nowMs: number }) => Intent | null;
-  };
-  try {
-    const [ipc, intents] = await Promise.all([import(ipcModulePath), import(intentModulePath)]);
-    integrations = { IpcServer: ipc.IpcServer, intentFromSpec: intents.intentFromSpec };
-  } catch (cause) {
-    throw new DaemonError(
-      "Daemon IPC wiring requires the SK-602 ipc-server and SK-603 intent-spec modules to be merged",
-      { cause },
-    );
-  }
   const clock = systemClock;
   const random = cryptoRandom;
-  const daemon = await createDeviceDaemon({
+  const daemon = await bootstrap({
     clock,
     random,
     ...(args.agentUser && args.agentHome && args.agentPath
@@ -722,9 +747,8 @@ export async function runDaemon(
       path: args.agentPath ?? "",
       ...(args.agentConfigDir ? { configDir: args.agentConfigDir } : {}),
     })),
-    resolveIntent: (spec) =>
-      integrations.intentFromSpec(spec, { rng: random, nowMs: clock.nowMs() }),
-    ipcFactory: (options) => new integrations.IpcServer(options),
+    resolveIntent: (spec) => intentFromSpec(spec, { rng: random, nowMs: clock.nowMs() }),
+    ipcFactory: (options) => new IpcServer(options),
   });
   let resolveStop: () => void = () => {};
   const stopped = new Promise<void>((resolve) => {

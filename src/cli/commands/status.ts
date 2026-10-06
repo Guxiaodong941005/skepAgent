@@ -32,9 +32,8 @@ interface StatusResult {
 }
 
 /**
- * What this command reads from `status.result` (ARCHITECTURE §12). SK-601's handler is not
- * written yet, so both shapes are accepted: a flat object (`statusView` fields plus
- * `liveness`/`freshness`/`hints`/`alarms` siblings) and `{ view, extras }`.
+ * Reads `{ view, extras }` from `status.result` (ARCHITECTURE §12); the flat response from
+ * older daemons remains accepted for compatibility.
  */
 
 /** `skep status` (PRD §15.1, §15.2). Global `--machine` selects the JSON view. */
@@ -96,7 +95,7 @@ async function loadStatus(ctx: CliContext): Promise<StatusResult> {
   }
 }
 
-function decodeStatus(response: IpcResult): StatusResult {
+export function decodeStatus(response: IpcResult): StatusResult {
   if (!response.ok) {
     throw new CliError(response.error.code, response.error.message, EXIT.error);
   }
@@ -120,7 +119,15 @@ function extrasOf(body: Record<string, unknown>): StatusExtras {
   const nested = isRecord(body.extras) ? body.extras : body;
   const freshness = isRecord(nested.freshness) ? nested.freshness : {};
   const hints = isRecord(nested.hints) ? nested.hints : {};
-  const checked = freshness.checkedAtMonoMs ?? freshness.fetchedAtMonoMs ?? null;
+  const nowMonoMs =
+    typeof nested.nowMonoMs === "number" ? nested.nowMonoMs : systemClock.monotonicMs();
+  // Convert an observer-relative age to the renderer's local clock; never compare process clocks.
+  const checked =
+    freshness.checkedAgoMs === null
+      ? null
+      : typeof freshness.checkedAgoMs === "number"
+        ? nowMonoMs - freshness.checkedAgoMs
+        : (freshness.checkedAtMonoMs ?? freshness.fetchedAtMonoMs ?? null);
   return {
     liveness: Array.isArray(nested.liveness) ? (nested.liveness as StatusExtras["liveness"]) : [],
     freshness: {
@@ -136,7 +143,7 @@ function extrasOf(body: Record<string, unknown>): StatusExtras {
         typeof hints.lastMessageMonoMs === "number" ? hints.lastMessageMonoMs : null,
     } satisfies HintHealth,
     alarms: Array.isArray(nested.alarms) ? (nested.alarms as StatusAlarm[]) : [],
-    nowMonoMs: typeof nested.nowMonoMs === "number" ? nested.nowMonoMs : systemClock.monotonicMs(),
+    nowMonoMs,
   };
 }
 

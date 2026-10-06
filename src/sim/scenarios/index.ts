@@ -1,6 +1,7 @@
 import type { SimDeviceOptions, SimWorld } from "../world.js";
 import { claimRace } from "./claim-race.js";
 import { clockSkew } from "./clock-skew.js";
+import { crashEveryStep } from "./crash-every-step.js";
 import { duplicateBoot } from "./duplicate-boot.js";
 import { empty } from "./empty.js";
 import { fetchFlaky } from "./fetch-flaky.js";
@@ -28,6 +29,7 @@ export const scenarios: Readonly<Record<string, Scenario>> = {
   "clock-skew": clockSkew,
   "solo-happy": soloHappy,
   "team-stacked": teamStacked,
+  "crash-every-step": crashEveryStep,
 };
 
 export class UnknownScenarioError extends Error {

@@ -2,12 +2,24 @@ import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { T1 } from "../../test/helpers/log-builder.js";
+import { GhCodeHost } from "../codehost/gh.js";
+import type { CodeHost } from "../codehost/types.js";
 import { sha256Hex } from "../core/canonical.js";
+import * as intentModule from "../core/intent-spec.js";
+import type { DeviceConfig } from "../core/schemas/config.js";
 import type { Evidence } from "../core/schemas/evidence.js";
 import type { Review } from "../core/schemas/review.js";
+import { IpcServer } from "../daemon/ipc-server.js";
 import { EvidenceVerifier } from "../exec/evidence.js";
 import type { JournalRecord } from "../exec/journal.js";
-import { bindAgentRuntime, runDaemon, verifyReviewEvidence } from "./skepd.js";
+import { Redactor } from "../exec/redact.js";
+import {
+  bindAgentRuntime,
+  bindCodeHost,
+  type DaemonBootstrapOptions,
+  runDaemon,
+  verifyReviewEvidence,
+} from "./skepd.js";
 
 describe("daemon entrypoint", () => {
   it("hands CLI schema and output scratch access to the configured OS user", async () => {
@@ -57,7 +69,7 @@ describe("daemon entrypoint", () => {
       await rm(root, { recursive: true, force: true });
     }
   });
-  it("prints daemon flags without loading device config or integrations", async () => {
+  it("prints daemon flags without loading device config", async () => {
     const write = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
     try {
       await runDaemon(["--help"], { SKEP_HOME: ".skep-sim/home" });
@@ -71,10 +83,123 @@ describe("daemon entrypoint", () => {
       "--agent-user, --agent-home and --agent-path",
     );
   });
-  it("reports missing SK-602/SK-603 integrations without writing device state", async () => {
-    await expect(runDaemon(["--home", ".skep-sim/home"], {})).rejects.toThrow(
-      "requires the SK-602 ipc-server and SK-603 intent-spec",
+  it("wires the merged intent resolver and IPC server through runDaemon", async () => {
+    const resolve = vi.spyOn(intentModule, "intentFromSpec");
+    const interrupted = new Error("Stop before starting native I/O");
+    const stop = vi.fn(async () => {});
+    const bootstrap = vi.fn(async (options: DaemonBootstrapOptions) => {
+      const spec = { kind: "task.cancel", task: T1, reason: "Cancel the example task" };
+      const intent = options.resolveIntent(spec);
+      expect(intent).toBeTypeOf("function");
+      expect(resolve).toHaveBeenCalledWith(spec, {
+        rng: options.random,
+        nowMs: expect.any(Number),
+      });
+      const handlers = {
+        status: vi.fn(),
+        log: vi.fn(),
+        publish: vi.fn(),
+        agentStart: vi.fn(),
+        agentStop: vi.fn(),
+        logsTail: vi.fn(),
+        doctor: vi.fn(),
+        ping: vi.fn(),
+      };
+      const server = options.ipcFactory({
+        socketPath: join(options.home, "skepd.sock"),
+        handlers,
+        redactor: new Redactor(),
+      });
+      expect(server).toBeInstanceOf(IpcServer);
+      return {
+        start: async () => {
+          throw interrupted;
+        },
+        stop,
+      };
+    });
+    try {
+      await expect(runDaemon(["--home", ".skep-sim/home"], {}, bootstrap)).rejects.toBe(
+        interrupted,
+      );
+      expect(bootstrap).toHaveBeenCalledOnce();
+      expect(stop).toHaveBeenCalledOnce();
+    } finally {
+      resolve.mockRestore();
+    }
+  });
+});
+
+describe("daemon code host repository binding", () => {
+  function config(url: string): DeviceConfig {
+    return {
+      schema: "skep.device/v1",
+      device: "mac",
+      blackboard: { url: "https://example.invalid/blackboard.git" },
+      repos: [{ name: "app", url }],
+      signing_key: "daemon.key",
+      poll: { active_sec: 20, idle_sec: 90 },
+    };
+  }
+  it.each([
+    "git@example.com:owner/repo.git",
+    "https://example.com/owner/repo.git",
+    "ssh://git@example.com/owner/repo.git",
+  ])("resolves an allowlisted alias and %s to gh's hostname and owner/repo", async (url) => {
+    const run = vi.fn(async () => ({
+      code: 0,
+      signal: null,
+      timedOut: false,
+      stdout: JSON.stringify({ object: { sha: "a".repeat(40) } }),
+      stderr: "",
+    }));
+    const host = bindCodeHost(new GhCodeHost({ run, env: {} }), config(url));
+    expect(await host.remoteBranchSha("app", "main")).toBe("a".repeat(40));
+    expect(run).toHaveBeenCalledWith(
+      "gh",
+      ["api", "--hostname", "example.com", "repos/owner/repo/git/ref/heads/main"],
+      expect.objectContaining({ env: {} }),
     );
+    expect(await host.remoteBranchSha(url, "main")).toBe("a".repeat(40));
+    await expect(host.remoteBranchSha("other", "main")).rejects.toThrow("local allowlist");
+  });
+  it("normalizes every PR operation and permits an allowlisted owner/repo name", async () => {
+    const backend: CodeHost = {
+      remoteBranchSha: vi.fn(),
+      findPr: vi.fn(),
+      createPr: vi.fn(),
+      retargetPr: vi.fn(),
+      closePr: vi.fn(),
+      prState: vi.fn(),
+    };
+    const host = bindCodeHost(backend, config("git@example.com:owner/repo.git"));
+    const params = { head: "work", base: "main", title: "Example change", body: "Example body" };
+    await host.findPr("app", "work");
+    await host.createPr("app", params);
+    await host.retargetPr("app", 1, "main");
+    await host.closePr("app", 1, "Stale epoch");
+    await host.prState("app", 1);
+    expect(backend.findPr).toHaveBeenCalledWith("https://example.com/owner/repo", "work");
+    expect(backend.createPr).toHaveBeenCalledWith("https://example.com/owner/repo", params);
+    expect(backend.retargetPr).toHaveBeenCalledWith("https://example.com/owner/repo", 1, "main");
+    expect(backend.closePr).toHaveBeenCalledWith(
+      "https://example.com/owner/repo",
+      1,
+      "Stale epoch",
+    );
+    expect(backend.prState).toHaveBeenCalledWith("https://example.com/owner/repo", 1);
+    await bindCodeHost(backend, config("owner/repo.git")).findPr("app", "work");
+    expect(backend.findPr).toHaveBeenLastCalledWith("owner/repo", "work");
+  });
+  it.each([
+    "http://example.com/owner/repo.git",
+    "https://example.com/owner/repo.git?ref=main",
+    "https://example.com/owner",
+  ])("fails closed for an unsupported code host remote %s", async (url) => {
+    const run = vi.fn();
+    const host = bindCodeHost(new GhCodeHost({ run }), config(url));
+    await expect(host.remoteBranchSha("app", "main")).rejects.toThrow("Code host URLs");
+    expect(run).not.toHaveBeenCalled();
   });
 });
 
