@@ -13,6 +13,7 @@ import {
   VPS,
 } from "../../../../test/helpers/log-builder.js";
 import { contentHash } from "../../canonical.js";
+import { workBranch } from "../../ids.js";
 import type { EventType, PayloadOf, Pre } from "../../schemas/events.js";
 import type { Plan, PlanItem } from "../../schemas/plan.js";
 import { replay } from "../replay.js";
@@ -147,6 +148,7 @@ describe("plan lifecycle", () => {
     const builder = planning();
     propose(builder);
     expect(task(builder)).toMatchObject({
+      mode: "solo",
       status: "awaiting_approval",
       current_plan_version: 1,
       active_plan_version: null,
@@ -155,6 +157,7 @@ describe("plan lifecycle", () => {
     });
     decision(builder, "plan.approved");
     expect(task(builder)).toMatchObject({
+      mode: "solo",
       status: "executing",
       rev: 3,
       active_plan_version: 1,
@@ -177,6 +180,7 @@ describe("plan lifecycle", () => {
     decision(builder, "plan.approved");
     const t = task(builder);
     expect(t).toMatchObject({
+      mode: "team",
       status: "executing",
       rev: 5,
       active_plan_version: 1,
@@ -336,6 +340,211 @@ describe("plan lifecycle", () => {
   });
 });
 
+describe("plan-mode routing (D13)", () => {
+  it("reviews and locks a team plan for a solo task, then switches mode on human approval", () => {
+    const builder = planning();
+    propose(builder, teamPlan());
+    expect(task(builder)).toMatchObject({
+      mode: "solo",
+      status: "reviewing",
+      current_plan_version: 1,
+      active_plan_version: null,
+      items: {},
+      plans: { "1": { reviewers: [MAC], locked: null } },
+    });
+
+    const before = task(builder);
+    decision(builder, "plan.approved");
+    expect(replay(builder.entries).outcomes.at(-1)).toMatchObject({
+      outcome: "rejected",
+      reason: "bad_task_state",
+    });
+    expect(task(builder)).toEqual(before);
+
+    review(builder);
+    expect(task(builder).plans["1"]?.reviews[MAC]?.verdict).toBe("approve");
+    lock(builder);
+    expect(task(builder)).toMatchObject({
+      mode: "solo",
+      status: "awaiting_approval",
+      active_plan_version: null,
+      plans: { "1": { locked: { overrides: [], missing_reviews: [] } } },
+    });
+    decision(builder, "plan.approved");
+    expect(task(builder)).toMatchObject({
+      mode: "team",
+      status: "executing",
+      active_plan_version: 1,
+      items: {
+        W1: { status: "ready", assignee: VPS },
+        W2: { status: "blocked", assignee: MAC },
+      },
+    });
+    expect(
+      replay(builder.entries)
+        .outcomes.slice(-3)
+        .map((outcome) => outcome.outcome),
+    ).toEqual(["accepted", "accepted", "accepted"]);
+  });
+
+  it("keeps a rejected team proposal solo and allows a subsequent solo plan", () => {
+    const builder = planning();
+    propose(builder, teamPlan());
+    lock(builder, [], [MAC]);
+    decision(builder, "plan.rejected");
+    expect(task(builder)).toMatchObject({
+      mode: "solo",
+      status: "planning",
+      active_plan_version: null,
+      review_rounds: 1,
+      items: {},
+      plans: { "1": { decision: { kind: "rejected" } } },
+    });
+    propose(builder, samplePlan({ version: 2, parent_version: 1 }));
+    expect(task(builder)).toMatchObject({
+      mode: "solo",
+      status: "awaiting_approval",
+      plans: { "2": { reviewers: [], locked: { overrides: [], missing_reviews: [] } } },
+    });
+    decision(builder, "plan.approved");
+    expect(task(builder)).toMatchObject({
+      mode: "solo",
+      status: "executing",
+      active_plan_version: 2,
+    });
+    expect(
+      replay(builder.entries).outcomes.every((outcome) => outcome.outcome === "accepted"),
+    ).toBe(true);
+  });
+
+  it.each(["normal", "high"] as const)(
+    "activates a %s-risk team upgrade according to owner approval policy",
+    (risk) => {
+      const builder = planning("solo", "owner");
+      const plan = teamPlan();
+      for (const item of plan.items) item.risk = risk;
+      propose(builder, plan);
+      expect(task(builder)).toMatchObject({ mode: "solo", status: "reviewing" });
+      lock(builder, [], [MAC]);
+      if (risk === "high") {
+        expect(task(builder)).toMatchObject({
+          mode: "solo",
+          status: "awaiting_approval",
+          active_plan_version: null,
+        });
+        const before = task(builder);
+        lock(builder, [], [MAC]);
+        expect(replay(builder.entries).outcomes.at(-1)?.reason).toBe("bad_task_state");
+        expect(task(builder)).toEqual(before);
+        decision(builder, "plan.approved");
+      }
+      expect(task(builder)).toMatchObject({
+        mode: "team",
+        status: "executing",
+        active_plan_version: 1,
+      });
+      expect(replay(builder.entries).outcomes.at(-1)?.outcome).toBe("accepted");
+    },
+  );
+
+  it("rejects a solo plan after an activated team upgrade, even when the human replans", () => {
+    const builder = planning();
+    propose(builder, teamPlan());
+    lock(builder, [], [MAC]);
+    decision(builder, "plan.approved");
+    append(builder, {
+      type: "lease.claimed",
+      actor: VPS,
+      payload: { item: "W1", attempt_id: "att_test", branch: workBranch(T1, "W1", 1) },
+      pre: { item: "W1", expected_epoch: 0 },
+    });
+    append(builder, {
+      type: "work.failed",
+      actor: VPS,
+      payload: {
+        item: "W1",
+        epoch: 1,
+        class: "budget_exceeded",
+        detail: "Invocation budget spent",
+      },
+      pre: { item: "W1" },
+    });
+    expect(task(builder)).toMatchObject({ mode: "team", status: "escalated" });
+    append(builder, {
+      type: "human.decided",
+      actor: "human",
+      payload: { decision: "replan" },
+    });
+    expect(
+      replay(builder.entries).outcomes.every((outcome) => outcome.outcome === "accepted"),
+    ).toBe(true);
+    expect(task(builder)).toMatchObject({ mode: "team", status: "planning", review_rounds: 0 });
+
+    const before = task(builder);
+    propose(builder, samplePlan({ version: 2, parent_version: 1 }));
+    expect(replay(builder.entries).outcomes.at(-1)).toMatchObject({
+      outcome: "rejected",
+      reason: "invalid_plan",
+    });
+    expect(task(builder)).toEqual(before);
+    propose(builder, teamPlan({ version: 2, parent_version: 1 }));
+    expect(task(builder)).toMatchObject({
+      mode: "team",
+      status: "reviewing",
+      current_plan_version: 2,
+    });
+    expect(replay(builder.entries).outcomes.at(-1)?.outcome).toBe("accepted");
+  });
+
+  it("rejects a solo proposal for a task explicitly created in team mode", () => {
+    const builder = planning("team");
+    const before = task(builder);
+    propose(builder);
+    expect(replay(builder.entries).outcomes.at(-1)).toMatchObject({
+      outcome: "rejected",
+      reason: "invalid_plan",
+    });
+    expect(task(builder)).toEqual(before);
+  });
+
+  it.each([2, 3, 4])("rejects a solo plan containing %i items", (count) => {
+    const builder = planning();
+    const before = task(builder);
+    const first = samplePlan().items[0];
+    if (!first) throw new Error("fixture item missing");
+    const items = Array.from({ length: count }, (_, index) => ({
+      ...first,
+      id: `W${index + 1}`,
+      depends_on: index === 0 ? [] : [`W${index}`],
+    }));
+    propose(builder, samplePlan({ items, stack_order: items.map((item) => item.id) }));
+    expect(replay(builder.entries).outcomes.at(-1)).toMatchObject({
+      outcome: "rejected",
+      reason: "invalid_plan",
+    });
+    expect(task(builder)).toEqual(before);
+  });
+
+  it("allows a one-item team plan with four distinct registered reviewers for a solo task", () => {
+    const builder = planning();
+    const reviewers = [MAC, "mac.coding.2", "vps.coding.2", "mac.coding.3"];
+    for (const actor of reviewers.slice(1)) {
+      builder.append({ type: "agent.registered", actor, payload: agentRegistered() });
+    }
+    append(builder, {
+      type: "plan.proposed",
+      actor: VPS,
+      payload: planProposed(samplePlan({ mode: "team" }), reviewers),
+    });
+    expect(replay(builder.entries).outcomes.at(-1)?.outcome).toBe("accepted");
+    expect(task(builder)).toMatchObject({
+      mode: "solo",
+      status: "reviewing",
+      plans: { "1": { reviewers, locked: null } },
+    });
+  });
+});
+
 describe("plan semantic validation", () => {
   const invalid: [string, (payload: PayloadOf<"plan.proposed">) => void][] = [
     [
@@ -376,7 +585,7 @@ describe("plan semantic validation", () => {
       },
     ],
     [
-      "mode mismatch",
+      "team plan without reviewers",
       (p) => {
         p.plan.mode = "team";
       },
@@ -412,18 +621,21 @@ describe("plan semantic validation", () => {
     });
   });
 
-  it.each([[], [VPS], ["mac.coding.2"], [MAC, MAC]].map((reviewers) => ({ reviewers })))(
-    "rejects invalid team reviewer set %j",
-    ({ reviewers }) => {
-      const builder = planning("team");
-      append(builder, {
-        type: "plan.proposed",
-        actor: VPS,
-        payload: planProposed(teamPlan(), reviewers),
-      });
-      expect(replay(builder.entries).outcomes.at(-1)?.reason).toBe("invalid_plan");
-    },
-  );
+  it.each(
+    [[], [VPS], ["mac.coding.2"], [MAC, MAC]].flatMap((reviewers) =>
+      (["solo", "team"] as const).map((mode) => ({ mode, reviewers })),
+    ),
+  )("rejects invalid team reviewer set %j", ({ mode, reviewers }) => {
+    const builder = planning(mode);
+    const before = task(builder);
+    append(builder, {
+      type: "plan.proposed",
+      actor: VPS,
+      payload: planProposed(teamPlan(), reviewers),
+    });
+    expect(replay(builder.entries).outcomes.at(-1)?.reason).toBe("invalid_plan");
+    expect(task(builder)).toEqual(before);
+  });
 
   it("recomputes the plan content hash", () => {
     const builder = planning();
