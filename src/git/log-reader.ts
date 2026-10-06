@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { Sha } from "../core/ids.js";
-import type { FileChange, LogEntry } from "../core/log.js";
+import type { FileChange, LogEntry, SignatureCheck } from "../core/log.js";
 import { MAX_EVENT_BYTES, ShaSchema } from "../core/schemas/common.js";
 import { GENESIS_PATH } from "../core/schemas/genesis.js";
 import type { GitRunner } from "./runner.js";
@@ -46,7 +46,7 @@ const GitPathSchema = z
   .refine((path) => !path.includes("\0"));
 const BatchHeaderSchema = z.tuple([
   ObjectIdSchema,
-  z.literal("blob"),
+  z.enum(["blob", "tree", "commit", "tag"]),
   z
     .string()
     .regex(/^(?:0|[1-9]\d*)$/)
@@ -54,6 +54,7 @@ const BatchHeaderSchema = z.tuple([
     .pipe(z.number().int().nonnegative().safe()),
 ]);
 const MAX_ARGV_BYTES = 64 * 1024;
+const MAX_CONTENT_BATCH_BYTES = 8 * 1024 * 1024;
 
 function objectIds(output: string): Sha[] {
   if (output === "") return [];
@@ -64,14 +65,14 @@ function objectIds(output: string): Sha[] {
   return shas;
 }
 
-function batches(prefix: string[], shas: Sha[]): Sha[][] {
+function batches(prefix: string[], shas: Sha[], maxBytes = MAX_ARGV_BYTES): Sha[][] {
   const baseBytes = prefix.reduce((sum, arg) => sum + Buffer.byteLength(arg) + 1, 4);
   const result: Sha[][] = [];
   let batch: Sha[] = [];
   let bytes = baseBytes;
   for (const sha of shas) {
     const size = Buffer.byteLength(sha) + 1;
-    if (bytes + size >= MAX_ARGV_BYTES) {
+    if (bytes + size >= maxBytes) {
       if (batch.length === 0) throw new LogReadError("git arguments exceed the 64 KiB limit");
       result.push(batch);
       batch = [];
@@ -89,6 +90,7 @@ async function readParents(
   repoDir: string,
   shas: Sha[],
 ): Promise<Record<Sha, Sha[]>> {
+  // Keep this format hex-only: hostile commit messages and identities need not be valid UTF-8.
   const prefix = [
     "--no-replace-objects",
     "log",
@@ -145,12 +147,90 @@ interface AddedRequest {
   path: string;
 }
 
-async function readAdded(git: GitRunner, repoDir: string, requests: AddedRequest[]): Promise<void> {
-  if (requests.length === 0) return;
+interface SizedRequest extends AddedRequest {
+  oid: Sha;
+  size: number;
+}
+
+function unreadableRecordEnd(output: string, cursor: number, object: string): number | null {
+  for (const status of ["missing", "ambiguous"]) {
+    const record = `${object} ${status}\n`;
+    if (output.startsWith(record, cursor)) return cursor + record.length;
+  }
+  return null;
+}
+
+async function checkAdded(
+  git: GitRunner,
+  repoDir: string,
+  requests: AddedRequest[],
+): Promise<SizedRequest[]> {
   const input = requests.map(({ entry, path }) => `${entry.sha}:${path}\0`).join("");
+  // PRD §8.2 / src/core/log.ts: reject oversized blobs before the buffered runner reads any body.
+  const { stdout } = await git.run(
+    [
+      "--no-replace-objects",
+      "cat-file",
+      "--batch-check=%(objectname) %(objecttype) %(objectsize)",
+      "-z",
+    ],
+    { cwd: repoDir, input },
+  );
+  const readable: SizedRequest[] = [];
+  let cursor = 0;
+  for (const request of requests) {
+    request.entry.added[request.path] = null;
+    const unreadableEnd = unreadableRecordEnd(
+      stdout,
+      cursor,
+      `${request.entry.sha}:${request.path}`,
+    );
+    if (unreadableEnd !== null) {
+      cursor = unreadableEnd;
+      continue;
+    }
+    const end = stdout.indexOf("\n", cursor);
+    if (end < 0) throw new LogReadError("git cat-file returned a truncated size record");
+    const [oid, type, size] = BatchHeaderSchema.parse(stdout.slice(cursor, end).split(" "));
+    if (type === "blob" && size <= MAX_EVENT_BYTES) readable.push({ ...request, oid, size });
+    cursor = end + 1;
+  }
+  if (cursor !== stdout.length) throw new LogReadError("git cat-file returned extra size records");
+  return readable;
+}
+
+function contentBatches(requests: SizedRequest[]): SizedRequest[][] {
+  const result: SizedRequest[][] = [];
+  let batch: SizedRequest[] = [];
+  let bytes = 0;
+  for (const request of requests) {
+    // Invalid bytes can expand threefold when Node decodes them as U+FFFD. Include header space
+    // so many bounded files also stay below NodeGitRunner's 16 MiB stdout buffer.
+    const size = request.size * 3 + 256;
+    if (bytes + size > MAX_CONTENT_BATCH_BYTES) {
+      result.push(batch);
+      batch = [];
+      bytes = 0;
+    }
+    batch.push(request);
+    bytes += size;
+  }
+  if (batch.length > 0) result.push(batch);
+  return result;
+}
+
+async function readContentBatch(
+  git: GitRunner,
+  repoDir: string,
+  requests: SizedRequest[],
+): Promise<void> {
+  const input = requests.map(({ oid }) => `${oid}\0`).join("");
   // GitRunner decodes stdout before returning it. A commit-derived marker keeps batch frames
-  // identifiable even when malformed UTF-8 changes their decoded byte lengths.
-  const marker = `skep-${createHash("sha256").update(input).digest("hex")} `;
+  // identifiable even when malformed UTF-8 changes their decoded byte lengths. Embedding this
+  // marker in a blob would require a hash fixed point because its commit SHA depends on the blob.
+  const marker = `skep-${createHash("sha256")
+    .update(requests.map(({ entry, path }) => `${entry.sha}:${path}\0`).join(""))
+    .digest("hex")} `;
   const { stdout } = await git.run(
     [
       "--no-replace-objects",
@@ -160,33 +240,53 @@ async function readAdded(git: GitRunner, repoDir: string, requests: AddedRequest
     ],
     { cwd: repoDir, input },
   );
-  let cursor = 0;
+  let cursor = stdout.length;
   const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
-  for (let i = 0; i < requests.length; i++) {
+  // Read backwards so an untrusted body containing the following object's "missing" record
+  // cannot masquerade as a batch boundary. Marked headers depend on the commits themselves.
+  for (let i = requests.length - 1; i >= 0; i--) {
     const request = requests[i];
     if (!request) throw new LogReadError("missing added-file request");
-    const headerEnd = stdout.indexOf("\n", cursor);
-    if (!stdout.startsWith(marker, cursor) || headerEnd < 0) {
-      throw new LogReadError(
-        `git cat-file omitted or malformed ${request.entry.sha}:${request.path}`,
-      );
+    let unreadableStart: number | null = null;
+    for (const status of ["missing", "ambiguous"]) {
+      const record = `${request.oid} ${status}\n`;
+      const start = cursor - record.length;
+      if (
+        start >= 0 &&
+        stdout.startsWith(record, start) &&
+        (start === 0 || stdout[start - 1] === "\n")
+      ) {
+        unreadableStart = start;
+        break;
+      }
     }
-    const [oid, , size] = BatchHeaderSchema.parse(
-      stdout.slice(cursor + marker.length, headerEnd).split(" "),
+    if (unreadableStart !== null) {
+      cursor = unreadableStart;
+      continue;
+    }
+    const headerStart = stdout.lastIndexOf(marker, cursor - 1);
+    const headerEnd = stdout.indexOf("\n", headerStart);
+    if (
+      headerStart < 0 ||
+      (headerStart > 0 && stdout[headerStart - 1] !== "\n") ||
+      headerEnd < 0 ||
+      headerEnd >= cursor
+    ) {
+      throw new LogReadError(`git cat-file omitted or malformed blob ${request.oid}`);
+    }
+    const [oid, type, size] = BatchHeaderSchema.parse(
+      stdout.slice(headerStart + marker.length, headerEnd).split(" "),
     );
-    const start = headerEnd + 1;
-    const next = stdout.indexOf(`\n${marker}`, start);
-    if (i + 1 === requests.length && next >= 0) {
-      throw new LogReadError("git cat-file returned extra blob records");
+    if (oid !== request.oid || type !== "blob" || size !== request.size) {
+      throw new LogReadError(`git cat-file changed metadata for blob ${request.oid}`);
     }
-    const end = i + 1 === requests.length ? stdout.length - 1 : next;
+    const start = headerEnd + 1;
+    const end = cursor - 1;
     if (end < start || stdout[end] !== "\n") {
       throw new LogReadError(`git cat-file returned a truncated blob for ${request.path}`);
     }
     let content: string | null = null;
-    // src/core/log.ts: only bounded event/genesis content is materialized. GitRunner itself
-    // buffers stdout; enforcing a streaming read cap requires a binary/streaming runner contract.
-    if (size <= MAX_EVENT_BYTES && end - start <= MAX_EVENT_BYTES) {
+    if (end - start <= MAX_EVENT_BYTES) {
       const text = stdout.slice(start, end);
       // A blob hash detects lossy decoding, including invalid sequences replaced by U+FFFD
       // without a byte-length change; valid literal U+FFFD remains readable (ARCHITECTURE §5.3).
@@ -200,9 +300,15 @@ async function readAdded(git: GitRunner, repoDir: string, requests: AddedRequest
       }
     }
     request.entry.added[request.path] = content;
-    cursor = end + 1;
+    cursor = headerStart;
   }
-  if (cursor !== stdout.length) throw new LogReadError("git cat-file returned extra blob records");
+  if (cursor !== 0) throw new LogReadError("git cat-file returned extra blob records");
+}
+
+async function readAdded(git: GitRunner, repoDir: string, requests: AddedRequest[]): Promise<void> {
+  if (requests.length === 0) return;
+  const readable = await checkAdded(git, repoDir, requests);
+  for (const batch of contentBatches(readable)) await readContentBatch(git, repoDir, batch);
 }
 
 export async function readLog(
@@ -252,22 +358,11 @@ export async function readLog(
     const shas = chain.slice(start);
     if (shas.length === 0) return [];
     const parentLists = await readParents(git, repoDir, shas);
-    // Keep verifyCommits' trust-root enforcement while bounding its argv for long histories.
-    const signatureGit: GitRunner = {
-      async run(args, options) {
-        const prefix = args.slice(0, args.length - shas.length - 1);
-        const outputs = [];
-        for (const batch of batches(prefix, shas)) {
-          outputs.push(await git.run([...prefix, ...batch, "--"], options));
-        }
-        return {
-          code: 0,
-          stdout: outputs.map((output) => output.stdout).join(""),
-          stderr: outputs.map((output) => output.stderr).join(""),
-        };
-      },
-    };
-    const signatures = await verifyCommits(signatureGit, repoDir, trustRootPath, shas);
+    const signatures: Record<Sha, SignatureCheck> = {};
+    // Reserve room for verifyCommits' options/trust path without depending on its argv layout.
+    for (const batch of batches([], shas, MAX_ARGV_BYTES - 4096)) {
+      Object.assign(signatures, await verifyCommits(git, repoDir, trustRootPath, batch));
+    }
     const entries: LogEntry[] = [];
     const requests: AddedRequest[] = [];
     for (const [i, sha] of shas.entries()) {
@@ -296,6 +391,9 @@ export async function readLog(
       for (const change of entry.changes) {
         if (
           change.status === "A" &&
+          // Raw non-UTF-8 Git filenames are decoded lossily by GitRunner. Protocol paths are
+          // ASCII; leave other paths opaque for the reducer's bad_event_path audit (PRD §8.2).
+          change.path.split("").every((character) => character.charCodeAt(0) <= 0x7f) &&
           (change.path.startsWith("events/") || (seq === 0 && change.path === GENESIS_PATH))
         ) {
           requests.push({ entry, path: change.path });

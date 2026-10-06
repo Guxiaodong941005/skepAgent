@@ -22,9 +22,9 @@ import { eventPath } from "../core/ids.js";
 import { replay } from "../core/reducer/replay.js";
 import { MAX_EVENT_BYTES } from "../core/schemas/common.js";
 import { serializeEvent } from "../core/schemas/events.js";
-import { writeSignedCommit, writeTreeFromIndex } from "./commit.js";
+import { buildCommitText, writeSignedCommit, writeTreeFromIndex } from "./commit.js";
 import { LogReadError, type ReadLogOptions, readLog } from "./log-reader.js";
-import { type GitResult, type GitRunner, NodeGitRunner } from "./runner.js";
+import { type GitResult, type GitRunner, type GitRunOptions, NodeGitRunner } from "./runner.js";
 import { type Signer, SshKeySigner } from "./signer.js";
 
 describe("real Git log reader", () => {
@@ -82,14 +82,16 @@ describe("real Git log reader", () => {
 
   async function commitFiles(
     files: { path: string; content: string | Uint8Array }[],
-    opts: { parents?: string[]; signer?: Signer } = {},
+    opts: { parents?: string[]; signer?: Signer | null } = {},
   ): Promise<string> {
     for (const file of files) {
       const path = join(repo, file.path);
       await mkdir(dirname(path), { recursive: true });
       await writeFile(path, file.content);
     }
-    await git.run(["add", "--", ...files.map((file) => file.path)], { cwd: repo });
+    if (files.length > 0) {
+      await git.run(["add", "--", ...files.map((file) => file.path)], { cwd: repo });
+    }
     const head = (await git.run(["rev-parse", "HEAD"], { cwd: repo })).stdout.trim();
     const ident = {
       name: "Skep Test",
@@ -97,14 +99,22 @@ describe("real Git log reader", () => {
       timestampSec: 1_791_244_800,
       tz: "+0000",
     };
-    const sha = await writeSignedCommit(git, repo, {
+    const fields = {
       tree: await writeTreeFromIndex(git, repo),
       parents: opts.parents ?? [head],
       author: ident,
       committer: ident,
       message: "Test event files\n",
-      signer: opts.signer ?? mac,
-    });
+    };
+    const signer = opts.signer === undefined ? mac : opts.signer;
+    const sha = signer
+      ? await writeSignedCommit(git, repo, { ...fields, signer })
+      : (
+          await git.run(["hash-object", "-t", "commit", "-w", "--stdin"], {
+            cwd: repo,
+            input: buildCommitText(fields),
+          })
+        ).stdout.trim();
     await git.run(["update-ref", "HEAD", sha, head], { cwd: repo });
     return sha;
   }
@@ -240,7 +250,7 @@ describe("real Git log reader", () => {
     expect(await readLog(git, repo, trustPath)).toHaveLength(1);
   });
 
-  it("uses one metadata log, one verification log and one cat-file for 50 commits (AC 5)", async () => {
+  it("uses one metadata log, one verification log and two cat-file calls for 50 commits (AC 5)", async () => {
     let parent = await genesis();
     for (let i = 40; i < 89; i++) {
       const doc = registration(i, parent);
@@ -249,12 +259,12 @@ describe("real Git log reader", () => {
     const run = vi.fn(git.run.bind(git));
     const entries = await readLog({ run }, repo, trustPath);
     expect(entries).toHaveLength(50);
-    expect(run).toHaveBeenCalledTimes(54);
+    expect(run).toHaveBeenCalledTimes(55);
     for (const [command, count] of [
       ["rev-list", 1],
       ["log", 2],
       ["diff-tree", 50],
-      ["cat-file", 1],
+      ["cat-file", 2],
     ] as const) {
       expect(run.mock.calls.filter(([args]) => args.includes(command))).toHaveLength(count);
     }
@@ -263,6 +273,124 @@ describe("real Git log reader", () => {
     expect(typeof batch?.[1].input).toBe("string");
     if (typeof batch?.[1].input !== "string") throw new Error("Missing cat-file batch input");
     expect(batch[1].input.split("\0")).toHaveLength(51);
+    for (const option of ["--batch-check=", "--batch="]) {
+      expect(
+        run.mock.calls.filter(([args]) => args.some((arg) => arg.startsWith(option))),
+      ).toHaveLength(1);
+    }
+  });
+
+  it.each([true, false])(
+    "skips a 20 MiB event without blocking replay (signed: %s, B1)",
+    async (signed) => {
+      const first = await genesis();
+      const before = replay(await readLog(git, repo, trustPath));
+      const path = registration(90, first).path;
+      const content = Buffer.alloc(20 * 1024 * 1024, 0x78);
+      const oversized = await commitFiles([{ path, content }], { signer: signed ? mac : null });
+      const next = registration(91, oversized);
+      await commitFile(git, repo, next.path, next.content, mac);
+      const run = vi.fn(git.run.bind(git));
+      const entries = await readLog({ run }, repo, trustPath);
+      expect(entries).toHaveLength(3);
+      expect(entries[1]?.added).toEqual({ [path]: null });
+      const skipped = replay(entries.slice(0, 2));
+      expect(skipped.tasks).toEqual(before.tasks);
+      expect(skipped.agents).toEqual(before.agents);
+      expect(skipped.seen_event_ids).toEqual(before.seen_event_ids);
+      expect(skipped.outcomes[0]).toMatchObject({
+        outcome: "invalid",
+        reason: signed ? "unreadable_event" : "unsigned",
+      });
+      const state = replay(entries);
+      expect(state.outcomes[1]?.outcome).toBe("accepted");
+      expect(state.agents[MAC]?.registered_seq).toBe(2);
+      const oid = createHash("sha1")
+        .update(`blob ${content.length}\0`)
+        .update(content)
+        .digest("hex");
+      const checks = run.mock.calls.filter(([args]) =>
+        args.some((arg) => arg.startsWith("--batch-check=")),
+      );
+      expect(checks[0]?.[1].input).toContain(`${oversized}:${path}\0`);
+      const reads = run.mock.calls.filter(([args]) =>
+        args.some((arg) => arg.startsWith("--batch=")),
+      );
+      for (const [, options] of reads) expect(String(options.input).split("\0")).not.toContain(oid);
+      expect(await readLog(git, repo, trustPath, { from: { sha: first, seq: 0 } })).toEqual(
+        entries.slice(1),
+      );
+    },
+  );
+
+  it.each([true, false])(
+    "skips a non-UTF-8 event filename and reads subsequent events (signed: %s, B2)",
+    async (signed) => {
+      await genesis();
+      const before = replay(await readLog(git, repo, trustPath));
+      const eventsDir = join(repo, "events", "_skep");
+      await mkdir(eventsDir, { recursive: true });
+      const path = Buffer.concat([
+        Buffer.from(`${eventsDir}/`),
+        Buffer.from([0xff]),
+        Buffer.from(".json"),
+      ]);
+      await writeFile(path, "Hostile filename\n");
+      await git.run(["add", "--all", "--", "events"], { cwd: repo });
+      const malformed = await commitFiles([], { signer: signed ? mac : null });
+      const next = registration(92, malformed);
+      await commitFile(git, repo, next.path, next.content, mac);
+      const run = vi.fn(git.run.bind(git));
+      const entries = await readLog({ run }, repo, trustPath);
+      expect(entries[1]?.changes).toEqual([{ status: "A", path: "events/_skep/\ufffd.json" }]);
+      expect(entries[1]?.added).toEqual({});
+      const skipped = replay(entries.slice(0, 2));
+      expect(skipped.tasks).toEqual(before.tasks);
+      expect(skipped.agents).toEqual(before.agents);
+      expect(skipped.seen_event_ids).toEqual(before.seen_event_ids);
+      expect(skipped.outcomes[0]).toMatchObject({
+        outcome: "invalid",
+        reason: signed ? "bad_event_path" : "unsigned",
+      });
+      expect(replay(entries).outcomes[1]?.outcome).toBe("accepted");
+      for (const [args, options] of run.mock.calls) {
+        if (args.includes("cat-file")) expect(String(options.input)).not.toContain("\ufffd");
+      }
+    },
+  );
+
+  it("bounds combined content reads even when many small invalid blobs expand during UTF-8 decoding", async () => {
+    const first = await genesis();
+    const before = replay(await readLog(git, repo, trustPath));
+    const content = Buffer.alloc(MAX_EVENT_BYTES, 0xff);
+    const files = Array.from({ length: 260 }, (_, i) => ({
+      path: registration(100 + i, first).path,
+      content,
+    }));
+    const hostile = await commitFiles(files);
+    const next = registration(360, hostile);
+    await commitFile(git, repo, next.path, next.content, mac);
+    const run = vi.fn(async (args: string[], options: GitRunOptions) => {
+      const result = await git.run(args, options);
+      if (args.some((arg) => arg.startsWith("--batch="))) {
+        expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(8 * 1024 * 1024);
+      }
+      return result;
+    });
+    const entries = await readLog({ run }, repo, trustPath);
+    expect(entries[1]?.changes).toHaveLength(files.length);
+    expect(Object.values(entries[1]?.added ?? {})).toEqual(
+      Array.from({ length: files.length }, () => null),
+    );
+    expect(
+      run.mock.calls.filter(([args]) => args.some((arg) => arg.startsWith("--batch="))).length,
+    ).toBeGreaterThan(1);
+    const skipped = replay(entries.slice(0, 2));
+    expect(skipped.tasks).toEqual(before.tasks);
+    expect(skipped.agents).toEqual(before.agents);
+    expect(skipped.seen_event_ids).toEqual(before.seen_event_ids);
+    expect(skipped.outcomes[0]?.reason).toBe("not_single_add");
+    expect(replay(entries).outcomes[1]?.outcome).toBe("accepted");
   });
 
   it("ignores repository-local display, rename, signature and trust settings (AC 6)", async () => {
@@ -355,8 +483,16 @@ describe("real Git log reader", () => {
 describe("log reader boundaries", () => {
   const shas = [fakeSha("reader-root"), fakeSha("reader-child")];
   const doc = JSON.stringify(genesisDoc());
-  const git = (override?: (args: string[], result: GitResult) => GitResult): GitRunner => ({
-    run: vi.fn(async (args: string[]) => {
+  const path = eventPath(null, fakeEventId(400));
+  const oidOf = (body: string) =>
+    createHash("sha1")
+      .update(`blob ${Buffer.byteLength(body)}\0${body}`)
+      .digest("hex");
+  const git = (
+    override?: (args: string[], result: GitResult) => GitResult,
+    rootContent = doc,
+  ): GitRunner => ({
+    run: vi.fn(async (args: string[], options: GitRunOptions) => {
       let stdout: string;
       if (args.includes("rev-list")) stdout = `${shas.join("\n")}\n`;
       else if (args.includes("merge-base")) stdout = "";
@@ -370,18 +506,27 @@ describe("log reader boundaries", () => {
           )
           .join("");
       } else if (args.includes("diff-tree")) {
-        stdout = args.includes("--root") ? "A\0skep.json\0" : "A\0events/_skep/test.json\0";
+        stdout = args.includes("--root") ? "A\0skep.json\0" : `A\0${path}\0`;
       } else if (args.includes("cat-file")) {
+        const checks = args.some((arg) => arg.startsWith("--batch-check="));
         const marker = args
           .find((arg) => arg.startsWith("--batch="))
           ?.slice(8)
           .split("%(objectname)")[0];
         const header = (body: string) => {
           const size = Buffer.byteLength(body);
-          const oid = createHash("sha1").update(`blob ${size}\0${body}`).digest("hex");
-          return `${marker}${oid} blob ${size}\n${body}\n`;
+          const oid = oidOf(body);
+          return checks ? `${oid} blob ${size}\n` : `${marker}${oid} blob ${size}\n${body}\n`;
         };
-        stdout = `${header(doc)}${header("{}")}`;
+        stdout = String(options.input)
+          .split("\0")
+          .filter(Boolean)
+          .map((object) =>
+            header(
+              object.endsWith(":skep.json") || object === oidOf(rootContent) ? rootContent : "{}",
+            ),
+          )
+          .join("");
       } else throw new Error(`Unexpected git command ${args.join(" ")}`);
       const result = { code: 0, stdout, stderr: "" };
       return override?.(args, result) ?? result;
@@ -437,6 +582,78 @@ describe("log reader boundaries", () => {
     expect(entries[0]?.added).toEqual({ "skep.json": doc });
   });
 
+  it.each(["missing", "ambiguous"])(
+    "maps %s size records to null and preserves surrounding entries (B2)",
+    async (status) => {
+      const runner = git((args, result) =>
+        args.some((arg) => arg.startsWith("--batch-check="))
+          ? {
+              ...result,
+              stdout: result.stdout.replace(
+                `${oidOf("{}")} blob 2\n`,
+                `${shas[1]}:${path} ${status}\n`,
+              ),
+            }
+          : result,
+      );
+      const entries = await readLog(runner, "/repo", "/local/signers");
+      expect(entries[0]?.added).toEqual({ "skep.json": doc });
+      expect(entries[1]?.added).toEqual({ [path]: null });
+      const state = replay(entries);
+      expect(state.outcomes[0]).toMatchObject({ outcome: "invalid", reason: "unreadable_event" });
+      expect(state.tasks).toEqual({});
+      expect(state.agents).toEqual({});
+      const run = vi.mocked(runner.run);
+      const batch = run.mock.calls.find(([args]) => args.some((arg) => arg.startsWith("--batch=")));
+      expect(String(batch?.[1].input).split("\0")).not.toContain(oidOf("{}"));
+    },
+  );
+
+  it.each(["missing", "ambiguous"])(
+    "maps %s content records to null without losing other frames",
+    async (status) => {
+      const runner = git((args, result) => {
+        if (!args.some((arg) => arg.startsWith("--batch="))) return result;
+        const marker = args
+          .find((arg) => arg.startsWith("--batch="))
+          ?.slice(8)
+          .split("%(objectname)")[0];
+        return {
+          ...result,
+          stdout: result.stdout.replace(
+            `${marker}${oidOf("{}")} blob 2\n{}\n`,
+            `${oidOf("{}")} ${status}\n`,
+          ),
+        };
+      });
+      const entries = await readLog(runner, "/repo", "/local/signers");
+      expect(entries[0]?.added).toEqual({ "skep.json": doc });
+      expect(entries[1]?.added).toEqual({ [path]: null });
+      expect(replay(entries).outcomes[0]?.reason).toBe("unreadable_event");
+    },
+  );
+
+  it("does not mistake a following object's missing record inside a body for a batch boundary", async () => {
+    const content = `${doc}\n${oidOf("{}")} missing\n${oidOf("{}")} ambiguous`;
+    const entries = await readLog(git(undefined, content), "/repo", "/local/signers");
+    expect(entries[0]?.added).toEqual({ "skep.json": content });
+    expect(entries[1]?.added).toEqual({ [path]: "{}" });
+  });
+
+  it("skips non-blob objects reported during size checks", async () => {
+    const runner = git((args, result) =>
+      args.some((arg) => arg.startsWith("--batch-check="))
+        ? {
+            ...result,
+            stdout: result.stdout.replace(`${oidOf("{}")} blob 2\n`, `${oidOf("{}")} tree 2\n`),
+          }
+        : result,
+    );
+    const entries = await readLog(runner, "/repo", "/local/signers");
+    expect(entries[1]?.added).toEqual({ [path]: null });
+    expect(replay(entries).outcomes[0]?.reason).toBe("unreadable_event");
+  });
+
   it("maps unrecognized and rename/copy statuses to other", async () => {
     const entries = await readLog(
       git((args, result) =>
@@ -445,15 +662,7 @@ describe("log reader boundaries", () => {
               ...result,
               stdout: "X\0unknown.txt\0R100\0old.txt\0new.txt\0C100\0source.txt\0copy.txt\0",
             }
-          : args.includes("cat-file")
-            ? {
-                ...result,
-                stdout: result.stdout.slice(
-                  0,
-                  result.stdout.indexOf("\nskep-", result.stdout.indexOf("\n") + 1) + 1,
-                ),
-              }
-            : result,
+          : result,
       ),
       "/repo",
       "/local/signers",
