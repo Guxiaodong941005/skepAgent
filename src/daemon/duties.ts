@@ -5,14 +5,14 @@ import type { State, TaskState } from "../core/reducer/state.js";
 import { pendingReviews } from "../core/reducer/views.js";
 import { type Plan, PlanSchema } from "../core/schemas/plan.js";
 import { type Review, ReviewSchema } from "../core/schemas/review.js";
-import type { AttemptInput, AttemptRunner } from "../exec/attempt.js";
+import type { AttemptInput, AttemptReplanHandler, AttemptRunner } from "../exec/attempt.js";
 import type { PlanValidationContext } from "../exec/plan-validator.js";
 import { validatePlan } from "../exec/plan-validator.js";
 import { isCurrentLease, type LeaseIdentity } from "../lease/reverify.js";
 import type { Clock } from "../util/clock.js";
 import { newAttemptId, type RandomSource } from "../util/random.js";
 import { type DeliveryDuty, deliveryDuty } from "./delivery.js";
-import { type ReplanDuty, replanDuty } from "./replan.js";
+import { publishReplanRequest, type ReplanDuty, replanDuty } from "./replan.js";
 import { claimCandidates, type Slot, type SlotRegistry } from "./slots.js";
 
 export interface DutiesDependencies {
@@ -25,7 +25,9 @@ export interface DutiesDependencies {
   review(slot: Slot, plan: Plan, hash: string, signal: AbortSignal): Promise<unknown>;
   verifyReview(review: Review, task: TaskState, slot: Slot): Promise<Review>;
   validation(slot: Slot, state: State, task: TaskState): PlanValidationContext;
-  attempt(slot: Slot): Pick<AttemptRunner, "run" | "interrupt">;
+  attempt(
+    slot: Slot,
+  ): Pick<AttemptRunner, "run" | "interrupt"> & Partial<Pick<AttemptRunner, "runWithReplan">>;
   onError(error: unknown): void;
   onWarning?: (message: string) => void;
   wake(): void;
@@ -370,14 +372,46 @@ export class Duties {
       const active: ActiveAttempt = { slot, key, input, done: Promise.resolve(), stale: false };
       this.attempts.set(id, active);
       try {
-        active.done = this.deps
-          .attempt(slot)
-          .run(input)
-          .then(() => undefined);
+        const runner = this.deps.attempt(slot);
+        active.done = (
+          runner.runWithReplan
+            ? runner.runWithReplan(input, attemptReplanHandler(this.deps, slot, task, itemId))
+            : runner.run(input)
+        ).then(() => undefined);
         await active.done;
       } finally {
         this.attempts.delete(id);
       }
     });
   }
+}
+
+/** Share the report path with simulation; accepted requests use the same duty as tick (§9.7). */
+export function attemptReplanHandler(
+  deps: Pick<DutiesDependencies, "publisher" | "current" | "clock" | "replan" | "wake" | "attempt">,
+  slot: Slot,
+  task: TaskState,
+  item: string,
+): AttemptReplanHandler {
+  return async ({ report, evidenceKey, eventId, verifier }) => {
+    const outcome = await publishReplanRequest(
+      { task, actor: slot.agent, item, report, evidenceKey, eventId },
+      { verifier, publisher: deps.publisher },
+    );
+    if (outcome.status === "accepted") {
+      const state = deps.current();
+      const current = state.tasks[task.task_id];
+      if (current)
+        await (deps.replan ?? replanDuty)({
+          state,
+          task: current,
+          slot,
+          nowMonoMs: deps.clock.monotonicMs(),
+          publisher: deps.publisher,
+          attempt: deps.attempt(slot),
+        });
+      deps.wake();
+    }
+    return outcome;
+  };
 }

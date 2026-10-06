@@ -23,7 +23,8 @@ import {
 import { EVENT_SCHEMAS, type PayloadOf, WorkFailureClassSchema } from "../core/schemas/events.js";
 import { type Plan, PlanSchema } from "../core/schemas/plan.js";
 import { type InvocationState, type Snapshot, SnapshotSchema } from "../core/schemas/snapshot.js";
-import { WorkReportSchema } from "../core/schemas/work-report.js";
+import { type WorkReport, WorkReportSchema } from "../core/schemas/work-report.js";
+import type { ReplanRequestResult } from "../daemon/replan.js";
 import { type Ident, writeSignedCommit } from "../git/commit.js";
 import type { GitRunner, GitRunOptions } from "../git/runner.js";
 import type { Signer } from "../git/signer.js";
@@ -34,6 +35,7 @@ import type { Clock } from "../util/clock.js";
 import { safeJoin } from "../util/fs.js";
 import { cryptoRandom, newEventId, type RandomSource } from "../util/random.js";
 import type { ChecksRunner } from "./checks.js";
+import { EvidenceVerifier } from "./evidence.js";
 import { runInterruptLadder } from "./interrupt.js";
 import type { AttemptKey, Journal, JournalRecord } from "./journal.js";
 import { findSecrets, type Redactor } from "./redact.js";
@@ -123,6 +125,13 @@ export type AttemptAdapterFactory = (
   runtime: RuntimeBackend,
   interrupt: typeof runInterruptLadder,
 ) => AgentAdapter;
+
+export type AttemptReplanHandler = (request: {
+  report: WorkReport;
+  evidenceKey: AttemptKey;
+  eventId: string;
+  verifier: Pick<EvidenceVerifier, "verifyAll">;
+}) => Promise<ReplanRequestResult>;
 
 export interface AttemptRunnerDependencies {
   mirror: Pick<CodeMirror, "fetch" | "createWorktree" | "mirrorPath" | "worktreeRoot">;
@@ -222,7 +231,11 @@ export class AttemptRunner {
   }
 
   /** Resume durable steps with the same input; unknown invocations are never replayed (§11.4). */
-  async run(input: AttemptInput, signal?: AbortSignal): Promise<AttemptResult> {
+  async run(
+    input: AttemptInput,
+    signal?: AbortSignal,
+    onReplan?: AttemptReplanHandler,
+  ): Promise<AttemptResult> {
     const parsed = InputSchema.safeParse(input);
     if (!parsed.success) throw new AttemptError("Attempt requires a valid lease and approved plan");
     const lease = parsed.data.lease;
@@ -231,13 +244,22 @@ export class AttemptRunner {
     // Reserve before the first journal read so two slots cannot both start the same attempt.
     this.reserved.add(name);
     try {
-      return await this.execute(parsed.data, signal);
+      return await this.execute(parsed.data, signal, onReplan);
     } finally {
       this.reserved.delete(name);
     }
   }
 
-  private async execute(frozen: AttemptInput, signal?: AbortSignal): Promise<AttemptResult> {
+  /** Daemon scheduling supplies the report consumer; process-free attempt fakes need only run. */
+  async runWithReplan(input: AttemptInput, onReplan: AttemptReplanHandler): Promise<AttemptResult> {
+    return this.run(input, undefined, onReplan);
+  }
+
+  private async execute(
+    frozen: AttemptInput,
+    signal?: AbortSignal,
+    onReplan?: AttemptReplanHandler,
+  ): Promise<AttemptResult> {
     const item = frozen.plan.items.find((entry) => entry.id === frozen.lease.item);
     if (frozen.plan.task_id !== frozen.lease.task_id || item?.assignee !== frozen.lease.holder) {
       throw new AttemptError("Attempt lease must match the approved item's task and assignee");
@@ -326,6 +348,8 @@ export class AttemptRunner {
       }
       if (done.error !== null)
         return await this.fail(context, failureOf(done.error), String(done.error));
+      const replan = await this.replan(context, done, "work", onReplan);
+      if (replan) return replan;
       let head = await this.commit(context, "work", false);
       let runs = await this.checks(context, head, "work");
       if (runs.some((run) => run.exit !== 0)) {
@@ -350,6 +374,8 @@ export class AttemptRunner {
         }
         if (fixup.error !== null)
           return await this.fail(context, failureOf(fixup.error), String(fixup.error));
+        const replan = await this.replan(context, fixup, "fixup", onReplan);
+        if (replan) return replan;
         head = await this.commit(context, "fixup", false);
         runs = await this.checks(context, head, "fixup");
         if (runs.some((run) => run.exit !== 0)) {
@@ -419,6 +445,51 @@ export class AttemptRunner {
       );
     }
     return value;
+  }
+
+  private async replan(
+    c: RunningAttempt,
+    done: JournalRecord,
+    phase: "work" | "fixup",
+    handler?: AttemptReplanHandler,
+  ): Promise<AttemptResult | null> {
+    const report = WorkReportSchema.parse(done.report);
+    if (!report.replan_request || last(c, "replan_ignored", phase)) return null;
+    if (!handler) throw new AttemptError("Work report requests replanning; configure its handler");
+    let pending = last(c, "replan_pending", phase);
+    if (!pending)
+      pending = await this.record(c, {
+        step: "replan_pending",
+        phase,
+        event_id: newEventId(this.deps.random ?? cryptoRandom),
+      });
+    const outcome = await handler({
+      report,
+      evidenceKey: { ...c.key },
+      eventId: EventIdSchema.parse(pending.event_id),
+      verifier: new EvidenceVerifier({
+        git: this.git(),
+        mirror: this.deps.mirror,
+        journal: this.deps.journal,
+      }),
+    });
+    await this.record(c, { step: "replan_outcome", phase, outcome });
+    if (outcome.status === "dropped" && outcome.reason === "no_verified_evidence") {
+      await this.record(c, {
+        step: "replan_ignored",
+        phase,
+        message: "replan request ignored",
+        reason: outcome.reason,
+      });
+      return c.abort.signal.aborted ? this.checkpoint(c, stateOf(done)) : null;
+    }
+    if (outcome.status === "failed") return { status: "pending", publication: outcome };
+    if (outcome.status !== "accepted") return this.stale(c);
+    // The replan duty binds the barrier through interrupt(), using this single journal writer.
+    // An accepted request must never fall through to checks, PR creation or delivery (§9.7).
+    if (!c.barrierId || !c.abort.signal.aborted)
+      throw new AttemptError("Accepted replan request has not been interrupted by its barrier");
+    return this.checkpoint(c, stateOf(done));
   }
 
   private async record(c: RunningAttempt, record: { step: string; [key: string]: unknown }) {

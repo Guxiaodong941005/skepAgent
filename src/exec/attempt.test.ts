@@ -15,9 +15,12 @@ import {
 import { FakeAdapter, type FakeScript } from "../adapter/fake.js";
 import type { PublishResult } from "../blackboard/publisher.js";
 import { FakeCodeHost } from "../codehost/fake.js";
+import { sha256Hex } from "../core/canonical.js";
 import { workBranch } from "../core/ids.js";
 import type { Intent } from "../core/intents.js";
 import { replay } from "../core/reducer/replay.js";
+import { attemptReplanHandler } from "../daemon/duties.js";
+import type { Slot } from "../daemon/slots.js";
 import { NodeGitRunner } from "../git/runner.js";
 import { SshKeySigner } from "../git/signer.js";
 import type { ProcessExit, RuntimeBackend } from "../runtime/types.js";
@@ -155,9 +158,15 @@ describe("journaled attempt pipeline", () => {
         if (!event) return { status: "dropped", eventId };
         expect(JSON.stringify(event)).not.toContain(secret);
         const records = await journal.read(key);
-        expect(
-          records.findLast((entry) => entry.step === "publish_pending")?.publication,
-        ).toMatchObject({ event_id: eventId });
+        if (event.type === "replan.requested") {
+          expect(records.findLast((entry) => entry.step === "replan_pending")).toMatchObject({
+            event_id: eventId,
+          });
+        } else {
+          expect(
+            records.findLast((entry) => entry.step === "publish_pending")?.publication,
+          ).toMatchObject({ event_id: eventId });
+        }
         if (event.type === "work.delivered") {
           const payload = event.payload as { head_sha: string };
           expect(await host.remoteBranchSha("app", branch)).toBe(payload.head_sha);
@@ -261,6 +270,142 @@ describe("journaled attempt pipeline", () => {
   }
   const run = () => new AttemptRunner(deps).run(input);
   const worktree = () => join(mirror.worktreeRoot, T1, "W1-e1");
+
+  const requestReport = () => ({
+    ...report,
+    replan_request: {
+      summary: "Revise the example plan.",
+      evidence: [
+        {
+          id: "ev_file",
+          type: "file_span",
+          repo: "app",
+          commit: input.baseSha,
+          path: "result.txt",
+          lines: [1, 1],
+          sha256: sha256Hex("base"),
+          excerpt: "base",
+        },
+      ],
+    },
+  });
+  function replanHandler(runner: AttemptRunner) {
+    return attemptReplanHandler(
+      {
+        publisher: deps.publisher,
+        current: () => replay(log.entries),
+        clock: deps.clock,
+        attempt: () => runner,
+        wake: () => {},
+      },
+      { agent: VPS, roleDir: join(root, "role") } as Slot,
+      required(replay(log.entries).tasks[T1]),
+      "W1",
+    );
+  }
+
+  it.each(["work", "fixup"] as const)(
+    "checkpoints a verified %s request before delivery",
+    async (phase) => {
+      deps.adapter = adapter = fake({
+        work: {
+          kind: "success",
+          files: [{ path: "result.txt", content: phase === "work" ? "good\n" : "bad\n" }],
+          output: phase === "work" ? requestReport() : report,
+        },
+        fixup: { kind: "success", output: requestReport() },
+      });
+      const runner = new AttemptRunner(deps);
+      const result = await runner.run(input, undefined, replanHandler(runner));
+      expect(result).toMatchObject({
+        status: "checkpointed",
+        snapshot: { pushed: true, invocation_state: "completed" },
+      });
+      expect(checkCounter).toBe(phase === "work" ? 0 : 1);
+      expect(await host.findPr("app", branch)).toBeNull();
+      expect(log.events.filter((event) => event?.type === "replan.requested")).toHaveLength(1);
+      expect(log.events.some((event) => event?.type === "work.delivered")).toBe(false);
+      const task = required(replay(log.entries).tasks[T1]);
+      expect(task).toMatchObject({ status: "replanning", replan_count: 1 });
+      expect(log.events.at(-1)).toMatchObject({
+        type: "checkpoint.recorded",
+        payload: { barrier_id: task.barrier?.id },
+      });
+      expect(
+        (await journal.read(key)).some((record) => record.step === "interrupt_requested"),
+      ).toBe(true);
+    },
+  );
+
+  it.each(["work", "fixup"] as const)(
+    "journals an unverified %s request and continues delivery",
+    async (phase) => {
+      const ignored = requestReport();
+      required(ignored.replan_request.evidence[0]).sha256 = "0".repeat(64);
+      deps.adapter = fake({
+        work: {
+          kind: "success",
+          files: [{ path: "result.txt", content: phase === "work" ? "good\n" : "bad\n" }],
+          output: phase === "work" ? ignored : report,
+        },
+        fixup: {
+          kind: "success",
+          files: [{ path: "result.txt", content: "good\n" }],
+          output: ignored,
+        },
+      });
+      const runner = new AttemptRunner(deps);
+      expect(await runner.run(input, undefined, replanHandler(runner))).toMatchObject({
+        status: "delivered",
+      });
+      expect(log.events.some((event) => event?.type === "replan.requested")).toBe(false);
+      expect(
+        (await journal.read(key)).find((record) => record.step === "replan_ignored"),
+      ).toMatchObject({
+        phase,
+        message: "replan request ignored",
+        reason: "no_verified_evidence",
+      });
+    },
+  );
+
+  it("retains the request event id after a lost acknowledgement and never delivers", async () => {
+    deps.adapter = adapter = fake({ work: { kind: "success", output: requestReport() } });
+    let lostAck = true;
+    deps.publisher = {
+      publish: async (intent, options) => {
+        const outcome = await publish(intent, options);
+        if (lostAck && log.events.at(-1)?.type === "replan.requested") {
+          lostAck = false;
+          return { status: "failed", eventId: outcome.eventId, reason: "lost acknowledgement" };
+        }
+        return outcome;
+      },
+    };
+    const runner = new AttemptRunner(deps);
+    const handler = replanHandler(runner);
+    expect(await runner.run(input, undefined, handler)).toMatchObject({ status: "pending" });
+    expect(checkCounter).toBe(0);
+    expect(await host.findPr("app", branch)).toBeNull();
+    expect(await runner.run(input, undefined, handler)).toMatchObject({ status: "checkpointed" });
+    expect(adapter.invocations).toHaveLength(1);
+    expect(log.events.filter((event) => event?.type === "replan.requested")).toHaveLength(1);
+    expect(
+      (await journal.read(key)).filter((record) => record.step === "replan_pending"),
+    ).toHaveLength(1);
+  });
+
+  it("does not deliver when its replan handler is missing or its request is fenced", async () => {
+    deps.adapter = fake({ work: { kind: "success", output: requestReport() } });
+    const runner = new AttemptRunner(deps);
+    await expect(runner.run(input)).rejects.toThrow("configure its handler");
+    expect(
+      await runner.run(input, undefined, async () => ({ status: "dropped", reason: "stale" })),
+    ).toEqual({ status: "stale" });
+    expect(checkCounter).toBe(0);
+    expect(await host.findPr("app", branch)).toBeNull();
+    expect(log.events.some((event) => event?.type === "work.delivered")).toBe(false);
+  });
 
   it("journals the ordered happy path, signs as the daemon and publishes code first", async () => {
     expect(await run()).toMatchObject({ status: "delivered" });

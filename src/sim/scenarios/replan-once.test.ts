@@ -3,6 +3,7 @@ import { runScenario } from "../runner.js";
 import { SimWorld } from "../world.js";
 import { TASK } from "./claim-race.js";
 import { getScenario } from "./index.js";
+import { agentReplanOnce } from "./replan-once.js";
 
 const count = process.env.SKEP_SIM_SEEDS === undefined ? 3 : Number(process.env.SKEP_SIM_SEEDS);
 if (
@@ -70,3 +71,27 @@ it("replays the same replan seed to the same signed tip", async () => {
   const second = await runScenario("replan-once", 42);
   expect(first.finalTip).toBe(second.finalTip);
 }, 120_000);
+
+it.concurrent.each(seeds)(
+  "agent-originated S3 checkpoints and delivers v2 for seed %i",
+  async (seed) => {
+    const world = await SimWorld.create({ seed, devices: agentReplanOnce.devices });
+    try {
+      await world.scheduler.execute(() => agentReplanOnce.setup(world));
+      await world.run(agentReplanOnce.steps);
+      await world.check();
+      expect(world.violations).toEqual([]);
+      const state = world.node("mac").state;
+      expect(state.tasks[TASK]).toMatchObject({
+        status: "delivered",
+        replan_count: 1,
+        active_plan_version: 2,
+        items: { W1: { delivered: { epoch: 2 } } },
+      });
+      expect(state.outcomes.every((outcome) => outcome.outcome === "accepted")).toBe(true);
+    } finally {
+      await world.close();
+    }
+  },
+  120_000,
+);
