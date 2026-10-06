@@ -101,20 +101,6 @@ mode for unsupported schemas. Generation constraints are deliberately lossy: tup
 positive line numbers, identifier patterns, and `superRefine` rules still need original Zod
 validation. No core schema or shared adapter/runtime contract is changed.
 
-The exported generic `normalizeOptionalNulls(value, originalOutputSchema)` in
-`src/adapter/output-schema.ts` belongs at the **SK-307 validation boundary**, before the original
-`schema.parse` or `safeParse`. It removes null placeholders only from originally optional,
-declared properties. It follows nested objects, arrays, tuples, discriminated unions and local
-references, preserves required nulls and unknown keys, and leaves ambiguous union values intact
-for Zod. The adapter's `invoke()` never parses or normalizes its final message. The real tests
-apply the helper and then the original strict Zod schema, matching the required structured runner
-behavior; Zod remains the sole validation authority and controls the single repair.
-
-**SK-307 follow-up:** wire this helper into validation of initial and repair outputs using the
-original `AdapterInvocation.outputSchema`. Its acceptance criteria should include optional-null
-normalization and preservation of required/unknown fields. The review assigns the corresponding
-DEV-PLAN/ARCHITECTURE edits to the architect; those documents are outside this fix's file scope.
-
 `outputSchema: "strict"` is the default constructor option. An explicit `"off"` omits
 `--output-schema`, does not write a generation schema, and appends the **original** JSON Schema
 to the stdin prompt. It retains the other flags, raw last-message result, sanitized environment,
@@ -218,15 +204,15 @@ SKEP_REAL_CODEX=1 npx vitest run test/integration/adapter-codex.test.ts
 
 The last command is opt-in and can contact the CLI's locally configured service. It uses an inline
 test runtime, a temporary worktree/scratch/log, all three model-facing schemas (WorkReport, Plan,
-Review) with original-Zod validation after optional-null normalization, a whitelist
+Review) with original-Zod validation and populated optional fields in the examples, a whitelist
 of non-secret environment variables, and a real process-group SIGINT test. Ordinary tests never
 run model CLIs or contact a network. Unit tests replay generic hand-made fixtures and drive
 timeouts with `FakeClock`; they cover all SK-207 acceptance criteria plus full-tree schema
-compatibility, optional-null normalization, schema-error detection, explicit fallback, version
+compatibility, schema-error detection, explicit fallback, version
 reporting, stale-output removal, telemetry validation, record splitting, and cleanup.
 
-B1 fix validation: 65 adapter tests pass; lint/typecheck and the TypeScript build pass. The current
-sandbox full suite reports **629 passed, 7 failed, 4 opt-in tests skipped**; the same seven
+B1 fix validation after re-review cleanup: 57 adapter tests pass; lint/typecheck passes. The earlier
+fix's TypeScript build passed, and its sandbox full suite reported **629 passed, 7 failed, 4 opt-in tests skipped**; the same seven
 stdout-capture tests fail under this sandbox. The full suite before this fix
 passed outside the implementer's sandbox: the review reports **607 passed, 2 opt-in tests
 skipped**. The earlier seven `src/util/exec.test.ts` stdout-capture failures were specific to the

@@ -9,7 +9,6 @@ import {
   type InterruptLadder,
   PINNED_CODEX_VERSION,
 } from "../../src/adapter/codex.js";
-import { normalizeOptionalNulls } from "../../src/adapter/output-schema.js";
 import type { AdapterInvocation } from "../../src/adapter/types.js";
 import { PlanSchema } from "../../src/core/schemas/plan.js";
 import { ReviewSchema } from "../../src/core/schemas/review.js";
@@ -159,8 +158,8 @@ const cases = [
             check: "unit",
             sha,
             exit: 0,
-            passed: null,
-            failed: null,
+            passed: 1,
+            failed: 0,
             log_sha256: hash,
           },
         ],
@@ -183,11 +182,11 @@ const cases = [
         {
           id: "W1",
           title: "Example item",
-          details: null,
+          details: "Implement example behaviour.",
           role: "coding",
           assignee: "vps.coding",
           depends_on: [],
-          requires: null,
+          requires: [],
           touches: ["src/example.ts"],
           risk: "normal",
           acceptance: [{ kind: "manual", text: "Example behaviour works" }],
@@ -210,7 +209,7 @@ const cases = [
         {
           id: "B1",
           claim: "Example gap",
-          acceptance_gap: null,
+          acceptance_gap: "W1.acceptance[0]",
           evidence: [
             {
               id: "ev_file",
@@ -220,7 +219,7 @@ const cases = [
               path: "src/example.ts",
               lines: [1, 2],
               sha256: hash,
-              excerpt: null,
+              excerpt: "example",
             },
           ],
         },
@@ -261,7 +260,7 @@ describe.skipIf(process.env.SKEP_REAL_CODEX !== "1")("pinned real Codex CLI (opt
     const inv: AdapterInvocation = {
       kind: testCase.kind,
       cwd,
-      prompt: `Do not run tools or modify files. Return only this exact example JSON. Null optional fields are removed before original Zod validation:\n${JSON.stringify(testCase.example)}`,
+      prompt: `Do not run tools or modify files. Return only this exact example JSON:\n${JSON.stringify(testCase.example)}`,
       outputSchema: z.toJSONSchema(testCase.schema),
       timeoutMs: 120_000,
       env,
@@ -279,11 +278,8 @@ describe.skipIf(process.env.SKEP_REAL_CODEX !== "1")("pinned real Codex CLI (opt
       const result = await adapter.invoke(inv);
       expect(result).toMatchObject({ outcome: "completed", exitCode: 0 });
       expect(result.finalMessage).not.toBeNull();
-      // This is the SK-307 validation boundary: normalize only optional placeholders using the
-      // original schema, then let the original strict Zod schema enforce every protocol rule.
-      const value = normalizeOptionalNulls(JSON.parse(result.finalMessage ?? ""), inv.outputSchema);
-      const validated = testCase.schema.parse(value);
-      expect(validated).toEqual(normalizeOptionalNulls(testCase.example, inv.outputSchema));
+      const validated = testCase.schema.parse(JSON.parse(result.finalMessage ?? ""));
+      expect(validated).toEqual(testCase.example);
       if (result.usage !== null) expect(UsageSchema.safeParse(result.usage).success).toBe(true);
       expect(await runtime.isAlive(result.pid ?? -1, `test-process-${result.pid}`)).toBe(false);
       expect(Object.keys(inv.env)).not.toContain("OPENAI_API_KEY");
