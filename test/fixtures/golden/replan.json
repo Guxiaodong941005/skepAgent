@@ -1,0 +1,349 @@
+{
+  "name": "replan",
+  "summary": "One in-budget replan carries the delivered item over (D7) and delivers the replacement item (D15).",
+  "entries": [
+    {
+      "seq": 0,
+      "sha": "7b478d363dba6f462c43c468bccffee656670a4c",
+      "parents": [],
+      "signature": {
+        "status": "good",
+        "principal": "human"
+      },
+      "changes": [
+        {
+          "status": "A",
+          "path": "skep.json"
+        }
+      ],
+      "added": {
+        "skep.json": "{\n  \"schema\": \"skep.genesis/v1\",\n  \"protocol_version\": 1,\n  \"reducer_version\": 1,\n  \"blackboard_id\": \"bb_golden01\",\n  \"created_at\": \"2026-10-05T00:00:00Z\"\n}\n"
+      }
+    },
+    {
+      "seq": 1,
+      "sha": "076f202101cd05531a51de74b43d236d19110e97",
+      "parents": ["7b478d363dba6f462c43c468bccffee656670a4c"],
+      "signature": {
+        "status": "good",
+        "principal": "daemon:vps"
+      },
+      "changes": [
+        {
+          "status": "A",
+          "path": "events/_skep/evt_b241e492-bcae-4e71-8ee9-1e9b9e73e5bc.json"
+        }
+      ],
+      "added": {
+        "events/_skep/evt_b241e492-bcae-4e71-8ee9-1e9b9e73e5bc.json": "{\n  \"schema\": \"skep.event/v1\",\n  \"event_id\": \"evt_b241e492-bcae-4e71-8ee9-1e9b9e73e5bc\",\n  \"type\": \"agent.registered\",\n  \"task_id\": null,\n  \"actor\": \"vps.coding\",\n  \"observed_tip\": \"7b478d363dba6f462c43c468bccffee656670a4c\",\n  \"pre\": {},\n  \"created_at\": \"2026-10-05T09:00:00Z\",\n  \"lang\": \"en\",\n  \"payload\": {\n    \"role\": \"coding\",\n    \"agent_cli\": \"codex\",\n    \"cli_version\": \"0.0.0-test\",\n    \"capabilities\": [\n      \"typescript\"\n    ],\n    \"requires_local\": [],\n    \"max_parallel_items\": 2\n  }\n}\n"
+      }
+    },
+    {
+      "seq": 2,
+      "sha": "d7dc86cf347f64e787bdfc586dce29f0ce0421ba",
+      "parents": ["076f202101cd05531a51de74b43d236d19110e97"],
+      "signature": {
+        "status": "good",
+        "principal": "daemon:mac"
+      },
+      "changes": [
+        {
+          "status": "A",
+          "path": "events/_skep/evt_a61f9d03-759a-48b4-81f3-75bbb6e2ab48.json"
+        }
+      ],
+      "added": {
+        "events/_skep/evt_a61f9d03-759a-48b4-81f3-75bbb6e2ab48.json": "{\n  \"schema\": \"skep.event/v1\",\n  \"event_id\": \"evt_a61f9d03-759a-48b4-81f3-75bbb6e2ab48\",\n  \"type\": \"agent.registered\",\n  \"task_id\": null,\n  \"actor\": \"mac.coding\",\n  \"observed_tip\": \"076f202101cd05531a51de74b43d236d19110e97\",\n  \"pre\": {},\n  \"created_at\": \"2026-10-05T09:00:00Z\",\n  \"lang\": \"en\",\n  \"payload\": {\n    \"role\": \"coding\",\n    \"agent_cli\": \"codex\",\n    \"cli_version\": \"0.0.0-test\",\n    \"capabilities\": [\n      \"typescript\"\n    ],\n    \"requires_local\": [],\n    \"max_parallel_items\": 1\n  }\n}\n"
+      }
+    },
+    {
+      "seq": 3,
+      "sha": "128b7f2edf611102283d8c484f485cd1ac8b8a9e",
+      "parents": ["d7dc86cf347f64e787bdfc586dce29f0ce0421ba"],
+      "signature": {
+        "status": "good",
+        "principal": "human"
+      },
+      "changes": [
+        {
+          "status": "A",
+          "path": "events/T-20261005-0000/evt_4281f608-d631-42e9-8cb6-9179911a2fd0.json"
+        }
+      ],
+      "added": {
+        "events/T-20261005-0000/evt_4281f608-d631-42e9-8cb6-9179911a2fd0.json": "{\n  \"schema\": \"skep.event/v1\",\n  \"event_id\": \"evt_4281f608-d631-42e9-8cb6-9179911a2fd0\",\n  \"type\": \"task.created\",\n  \"task_id\": \"T-20261005-0000\",\n  \"actor\": \"human\",\n  \"observed_tip\": \"d7dc86cf347f64e787bdfc586dce29f0ce0421ba\",\n  \"pre\": {},\n  \"created_at\": \"2026-10-05T09:00:00Z\",\n  \"lang\": \"en\",\n  \"payload\": {\n    \"title\": \"Ship the requested change\",\n    \"body\": \"Implement the change described by the human and cover it with the unit check.\",\n    \"repo\": \"git@example.invalid:example/app.git\",\n    \"base_branch\": \"main\",\n    \"mode\": \"team\",\n    \"owner\": \"vps.coding\",\n    \"budgets\": {\n      \"max_invocations\": 12,\n      \"max_wall_hours\": 6,\n      \"replans\": 2,\n      \"review_rounds\": 2,\n      \"item_retries\": 1\n    },\n    \"plan_approval\": \"human\"\n  }\n}\n"
+      }
+    },
+    {
+      "seq": 4,
+      "sha": "49c1eb62f98cdad3e3cab8a6693c3c9d1a5b60b1",
+      "parents": ["128b7f2edf611102283d8c484f485cd1ac8b8a9e"],
+      "signature": {
+        "status": "good",
+        "principal": "daemon:vps"
+      },
+      "changes": [
+        {
+          "status": "A",
+          "path": "events/T-20261005-0000/evt_d6c68c8d-8931-4b93-819c-c012d28c349f.json"
+        }
+      ],
+      "added": {
+        "events/T-20261005-0000/evt_d6c68c8d-8931-4b93-819c-c012d28c349f.json": "{\n  \"schema\": \"skep.event/v1\",\n  \"event_id\": \"evt_d6c68c8d-8931-4b93-819c-c012d28c349f\",\n  \"type\": \"plan.proposed\",\n  \"task_id\": \"T-20261005-0000\",\n  \"actor\": \"vps.coding\",\n  \"observed_tip\": \"128b7f2edf611102283d8c484f485cd1ac8b8a9e\",\n  \"pre\": {\n    \"task_rev\": 1,\n    \"owner_gen\": 1\n  },\n  \"created_at\": \"2026-10-05T09:00:00Z\",\n  \"lang\": \"en\",\n  \"payload\": {\n    \"version\": 1,\n    \"parent_version\": null,\n    \"plan\": {\n      \"schema\": \"skep.plan/v1\",\n      \"task_id\": \"T-20261005-0000\",\n      \"version\": 1,\n      \"parent_version\": null,\n      \"base\": {\n        \"repo\": \"git@example.invalid:example/app.git\",\n        \"branch\": \"main\",\n        \"commit\": \"8e4d884dfdc8b8c5bd4718ff9982f88b8a4716f0\"\n      },\n      \"mode\": \"team\",\n      \"summary\": \"Plan version 1 for T-20261005-0000.\",\n      \"items\": [\n        {\n          \"id\": \"W1\",\n          \"title\": \"Implement W1\",\n          \"role\": \"coding\",\n          \"assignee\": \"vps.coding\",\n          \"depends_on\": [],\n          \"touches\": [\n            \"src/w1/\"\n          ],\n          \"risk\": \"normal\",\n          \"acceptance\": [\n            {\n              \"kind\": \"check\",\n              \"name\": \"unit\"\n            }\n          ]\n        },\n        {\n          \"id\": \"W2\",\n          \"title\": \"Implement W2\",\n          \"role\": \"coding\",\n          \"assignee\": \"mac.coding\",\n          \"depends_on\": [\n            \"W1\"\n          ],\n          \"touches\": [\n            \"src/w2/\"\n          ],\n          \"risk\": \"normal\",\n          \"acceptance\": [\n            {\n              \"kind\": \"check\",\n              \"name\": \"unit\"\n            }\n          ]\n        }\n      ],\n      \"stack_order\": [\n        \"W1\",\n        \"W2\"\n      ],\n      \"changes_from_parent\": null\n    },\n    \"plan_hash\": \"sha256:cfe154af94a425366e43b17538f61a206fa933f1682a86fa7f215357ad04cc9d\",\n    \"base_commit\": \"8e4d884dfdc8b8c5bd4718ff9982f88b8a4716f0\",\n    \"reviewers\": [\n      \"mac.coding\"\n    ]\n  }\n}\n"
+      }
+    },
+    {
+      "seq": 5,
+      "sha": "2f1228b1972a5ea3a8183e936943b5effbd8d63f",
+      "parents": ["49c1eb62f98cdad3e3cab8a6693c3c9d1a5b60b1"],
+      "signature": {
+        "status": "good",
+        "principal": "daemon:mac"
+      },
+      "changes": [
+        {
+          "status": "A",
+          "path": "events/T-20261005-0000/evt_7ace9fc5-1ca7-469d-8f92-667170bc8ae6.json"
+        }
+      ],
+      "added": {
+        "events/T-20261005-0000/evt_7ace9fc5-1ca7-469d-8f92-667170bc8ae6.json": "{\n  \"schema\": \"skep.event/v1\",\n  \"event_id\": \"evt_7ace9fc5-1ca7-469d-8f92-667170bc8ae6\",\n  \"type\": \"review.submitted\",\n  \"task_id\": \"T-20261005-0000\",\n  \"actor\": \"mac.coding\",\n  \"observed_tip\": \"49c1eb62f98cdad3e3cab8a6693c3c9d1a5b60b1\",\n  \"pre\": {\n    \"task_rev\": 2,\n    \"plan_version\": 1,\n    \"plan_hash\": \"sha256:cfe154af94a425366e43b17538f61a206fa933f1682a86fa7f215357ad04cc9d\"\n  },\n  \"created_at\": \"2026-10-05T09:00:00Z\",\n  \"lang\": \"en\",\n  \"payload\": {\n    \"plan_version\": 1,\n    \"plan_hash\": \"sha256:cfe154af94a425366e43b17538f61a206fa933f1682a86fa7f215357ad04cc9d\",\n    \"verdict\": \"approve\",\n    \"blockers\": [],\n    \"suggestions\": []\n  }\n}\n"
+      }
+    },
+    {
+      "seq": 6,
+      "sha": "ae771b21e3937d93a361935c68b4a874b62ea4f8",
+      "parents": ["2f1228b1972a5ea3a8183e936943b5effbd8d63f"],
+      "signature": {
+        "status": "good",
+        "principal": "daemon:vps"
+      },
+      "changes": [
+        {
+          "status": "A",
+          "path": "events/T-20261005-0000/evt_a55d3c82-e3c3-4b2c-85f0-ceed8054e847.json"
+        }
+      ],
+      "added": {
+        "events/T-20261005-0000/evt_a55d3c82-e3c3-4b2c-85f0-ceed8054e847.json": "{\n  \"schema\": \"skep.event/v1\",\n  \"event_id\": \"evt_a55d3c82-e3c3-4b2c-85f0-ceed8054e847\",\n  \"type\": \"plan.locked\",\n  \"task_id\": \"T-20261005-0000\",\n  \"actor\": \"vps.coding\",\n  \"observed_tip\": \"2f1228b1972a5ea3a8183e936943b5effbd8d63f\",\n  \"pre\": {\n    \"task_rev\": 3,\n    \"owner_gen\": 1,\n    \"plan_version\": 1,\n    \"plan_hash\": \"sha256:cfe154af94a425366e43b17538f61a206fa933f1682a86fa7f215357ad04cc9d\"\n  },\n  \"created_at\": \"2026-10-05T09:00:00Z\",\n  \"lang\": \"en\",\n  \"payload\": {\n    \"plan_version\": 1,\n    \"plan_hash\": \"sha256:cfe154af94a425366e43b17538f61a206fa933f1682a86fa7f215357ad04cc9d\",\n    \"overrides\": [],\n    \"missing_reviews\": []\n  }\n}\n"
+      }
+    },
+    {
+      "seq": 7,
+      "sha": "b7aad3790dcf43677e3f1ce02f20abc6220bf4f1",
+      "parents": ["ae771b21e3937d93a361935c68b4a874b62ea4f8"],
+      "signature": {
+        "status": "good",
+        "principal": "human"
+      },
+      "changes": [
+        {
+          "status": "A",
+          "path": "events/T-20261005-0000/evt_d335e889-82cb-4893-8782-ee235924a1bd.json"
+        }
+      ],
+      "added": {
+        "events/T-20261005-0000/evt_d335e889-82cb-4893-8782-ee235924a1bd.json": "{\n  \"schema\": \"skep.event/v1\",\n  \"event_id\": \"evt_d335e889-82cb-4893-8782-ee235924a1bd\",\n  \"type\": \"plan.approved\",\n  \"task_id\": \"T-20261005-0000\",\n  \"actor\": \"human\",\n  \"observed_tip\": \"ae771b21e3937d93a361935c68b4a874b62ea4f8\",\n  \"pre\": {\n    \"task_rev\": 4,\n    \"plan_version\": 1,\n    \"plan_hash\": \"sha256:cfe154af94a425366e43b17538f61a206fa933f1682a86fa7f215357ad04cc9d\"\n  },\n  \"created_at\": \"2026-10-05T09:00:00Z\",\n  \"lang\": \"en\",\n  \"payload\": {\n    \"plan_version\": 1,\n    \"plan_hash\": \"sha256:cfe154af94a425366e43b17538f61a206fa933f1682a86fa7f215357ad04cc9d\",\n    \"note\": \"Approved.\"\n  }\n}\n"
+      }
+    },
+    {
+      "seq": 8,
+      "sha": "244204a31e6fdcb02fd27da9e63feb85cc7c090f",
+      "parents": ["b7aad3790dcf43677e3f1ce02f20abc6220bf4f1"],
+      "signature": {
+        "status": "good",
+        "principal": "daemon:vps"
+      },
+      "changes": [
+        {
+          "status": "A",
+          "path": "events/T-20261005-0000/evt_f1051fe6-e1e1-4a35-891f-f58342bb2f08.json"
+        }
+      ],
+      "added": {
+        "events/T-20261005-0000/evt_f1051fe6-e1e1-4a35-891f-f58342bb2f08.json": "{\n  \"schema\": \"skep.event/v1\",\n  \"event_id\": \"evt_f1051fe6-e1e1-4a35-891f-f58342bb2f08\",\n  \"type\": \"lease.claimed\",\n  \"task_id\": \"T-20261005-0000\",\n  \"actor\": \"vps.coding\",\n  \"observed_tip\": \"b7aad3790dcf43677e3f1ce02f20abc6220bf4f1\",\n  \"pre\": {\n    \"task_rev\": 5,\n    \"plan_version\": 1,\n    \"plan_hash\": \"sha256:cfe154af94a425366e43b17538f61a206fa933f1682a86fa7f215357ad04cc9d\",\n    \"item\": \"W1\",\n    \"expected_epoch\": 0\n  },\n  \"created_at\": \"2026-10-05T09:00:00Z\",\n  \"lang\": \"en\",\n  \"payload\": {\n    \"item\": \"W1\",\n    \"attempt_id\": \"att_08\",\n    \"branch\": \"skep/T-20261005-0000/W1/e1\"\n  }\n}\n"
+      }
+    },
+    {
+      "seq": 9,
+      "sha": "8f6cf13cf9d8fb89f7c1b0b3498113d4b62f4ed2",
+      "parents": ["244204a31e6fdcb02fd27da9e63feb85cc7c090f"],
+      "signature": {
+        "status": "good",
+        "principal": "daemon:vps"
+      },
+      "changes": [
+        {
+          "status": "A",
+          "path": "events/T-20261005-0000/evt_6eb6b4bb-30a3-41bd-889e-a7db43b388a3.json"
+        }
+      ],
+      "added": {
+        "events/T-20261005-0000/evt_6eb6b4bb-30a3-41bd-889e-a7db43b388a3.json": "{\n  \"schema\": \"skep.event/v1\",\n  \"event_id\": \"evt_6eb6b4bb-30a3-41bd-889e-a7db43b388a3\",\n  \"type\": \"work.delivered\",\n  \"task_id\": \"T-20261005-0000\",\n  \"actor\": \"vps.coding\",\n  \"observed_tip\": \"244204a31e6fdcb02fd27da9e63feb85cc7c090f\",\n  \"pre\": {\n    \"task_rev\": 6,\n    \"item\": \"W1\"\n  },\n  \"created_at\": \"2026-10-05T09:00:00Z\",\n  \"lang\": \"en\",\n  \"payload\": {\n    \"item\": \"W1\",\n    \"epoch\": 1,\n    \"branch\": \"skep/T-20261005-0000/W1/e1\",\n    \"head_sha\": \"c989fb3d81fe3119eba058d07cd7185111eadf8e\",\n    \"pr_url\": \"https://example.com/example/app/pull/1\",\n    \"pr_number\": 1,\n    \"check_runs\": [\n      {\n        \"run_id\": \"run-1\",\n        \"check\": \"unit\",\n        \"sha\": \"c989fb3d81fe3119eba058d07cd7185111eadf8e\",\n        \"exit\": 0,\n        \"duration_ms\": 10,\n        \"passed\": 1,\n        \"failed\": 0,\n        \"log_sha256\": \"8e028223f217fe0622cd570a1528281af43b27ac000000000000000000000000\"\n      }\n    ]\n  }\n}\n"
+      }
+    },
+    {
+      "seq": 10,
+      "sha": "bbb825aaa74623039f10dfb6176a2e6a2252ecc2",
+      "parents": ["8f6cf13cf9d8fb89f7c1b0b3498113d4b62f4ed2"],
+      "signature": {
+        "status": "good",
+        "principal": "daemon:mac"
+      },
+      "changes": [
+        {
+          "status": "A",
+          "path": "events/T-20261005-0000/evt_68698fe1-a04e-4863-8294-2848236e5be1.json"
+        }
+      ],
+      "added": {
+        "events/T-20261005-0000/evt_68698fe1-a04e-4863-8294-2848236e5be1.json": "{\n  \"schema\": \"skep.event/v1\",\n  \"event_id\": \"evt_68698fe1-a04e-4863-8294-2848236e5be1\",\n  \"type\": \"lease.claimed\",\n  \"task_id\": \"T-20261005-0000\",\n  \"actor\": \"mac.coding\",\n  \"observed_tip\": \"8f6cf13cf9d8fb89f7c1b0b3498113d4b62f4ed2\",\n  \"pre\": {\n    \"task_rev\": 7,\n    \"plan_version\": 1,\n    \"plan_hash\": \"sha256:cfe154af94a425366e43b17538f61a206fa933f1682a86fa7f215357ad04cc9d\",\n    \"item\": \"W2\",\n    \"expected_epoch\": 0\n  },\n  \"created_at\": \"2026-10-05T09:00:00Z\",\n  \"lang\": \"en\",\n  \"payload\": {\n    \"item\": \"W2\",\n    \"attempt_id\": \"att_10\",\n    \"branch\": \"skep/T-20261005-0000/W2/e1\"\n  }\n}\n"
+      }
+    },
+    {
+      "seq": 11,
+      "sha": "b4b8828d2abfe9a711c6be7330ce78fcfbd073a3",
+      "parents": ["bbb825aaa74623039f10dfb6176a2e6a2252ecc2"],
+      "signature": {
+        "status": "good",
+        "principal": "daemon:vps"
+      },
+      "changes": [
+        {
+          "status": "A",
+          "path": "events/T-20261005-0000/evt_d368d0f2-53bf-45f1-89d6-30647be84e76.json"
+        }
+      ],
+      "added": {
+        "events/T-20261005-0000/evt_d368d0f2-53bf-45f1-89d6-30647be84e76.json": "{\n  \"schema\": \"skep.event/v1\",\n  \"event_id\": \"evt_d368d0f2-53bf-45f1-89d6-30647be84e76\",\n  \"type\": \"replan.requested\",\n  \"task_id\": \"T-20261005-0000\",\n  \"actor\": \"vps.coding\",\n  \"observed_tip\": \"bbb825aaa74623039f10dfb6176a2e6a2252ecc2\",\n  \"pre\": {\n    \"task_rev\": 8\n  },\n  \"created_at\": \"2026-10-05T09:00:00Z\",\n  \"lang\": \"en\",\n  \"payload\": {\n    \"summary\": \"The plan no longer matches what the code needs.\",\n    \"evidence\": [\n      {\n        \"id\": \"ev_check_1\",\n        \"type\": \"check_run\",\n        \"run_id\": \"run-1\",\n        \"check\": \"unit\",\n        \"sha\": \"7cc00f48b98cd6fa7bd93a19b7559c352fb5af91\",\n        \"exit\": 1,\n        \"log_sha256\": \"abababababababababababababababababababababababababababababababab\"\n      }\n    ],\n    \"item\": \"W2\"\n  }\n}\n"
+      }
+    },
+    {
+      "seq": 12,
+      "sha": "4660a5cb075f865347e0daf2b226f921a5f7f724",
+      "parents": ["b4b8828d2abfe9a711c6be7330ce78fcfbd073a3"],
+      "signature": {
+        "status": "good",
+        "principal": "daemon:mac"
+      },
+      "changes": [
+        {
+          "status": "A",
+          "path": "events/T-20261005-0000/evt_6dbf206a-430f-4485-8315-6f9618ca4e58.json"
+        }
+      ],
+      "added": {
+        "events/T-20261005-0000/evt_6dbf206a-430f-4485-8315-6f9618ca4e58.json": "{\n  \"schema\": \"skep.event/v1\",\n  \"event_id\": \"evt_6dbf206a-430f-4485-8315-6f9618ca4e58\",\n  \"type\": \"checkpoint.recorded\",\n  \"task_id\": \"T-20261005-0000\",\n  \"actor\": \"mac.coding\",\n  \"observed_tip\": \"b4b8828d2abfe9a711c6be7330ce78fcfbd073a3\",\n  \"pre\": {\n    \"task_rev\": 9,\n    \"item\": \"W2\"\n  },\n  \"created_at\": \"2026-10-05T09:00:00Z\",\n  \"lang\": \"en\",\n  \"payload\": {\n    \"item\": \"W2\",\n    \"epoch\": 1,\n    \"barrier_id\": \"B11\",\n    \"snapshot\": {\n      \"schema\": \"skep.snapshot/v1\",\n      \"item\": \"W2\",\n      \"epoch\": 1,\n      \"attempt_id\": \"att_10\",\n      \"branch\": \"skep/T-20261005-0000/W2/e1\",\n      \"base_sha\": \"8e4d884dfdc8b8c5bd4718ff9982f88b8a4716f0\",\n      \"head_sha\": \"c672ea0f59dd9ce40f0c1d76d5220fb7ec276c38\",\n      \"pushed\": true,\n      \"invocation_state\": \"interrupted\",\n      \"diffstat\": {\n        \"files\": 1,\n        \"insertions\": 1,\n        \"deletions\": 0\n      },\n      \"files_changed\": [\n        \"src/w2/\"\n      ],\n      \"check_runs\": [],\n      \"agent_note\": null\n    }\n  }\n}\n"
+      }
+    },
+    {
+      "seq": 13,
+      "sha": "6497c254bd80d66213746894d27c9b1b660c3561",
+      "parents": ["4660a5cb075f865347e0daf2b226f921a5f7f724"],
+      "signature": {
+        "status": "good",
+        "principal": "daemon:vps"
+      },
+      "changes": [
+        {
+          "status": "A",
+          "path": "events/T-20261005-0000/evt_91ef99b5-cc97-4a2e-800e-e7726fc93f2c.json"
+        }
+      ],
+      "added": {
+        "events/T-20261005-0000/evt_91ef99b5-cc97-4a2e-800e-e7726fc93f2c.json": "{\n  \"schema\": \"skep.event/v1\",\n  \"event_id\": \"evt_91ef99b5-cc97-4a2e-800e-e7726fc93f2c\",\n  \"type\": \"plan.proposed\",\n  \"task_id\": \"T-20261005-0000\",\n  \"actor\": \"vps.coding\",\n  \"observed_tip\": \"4660a5cb075f865347e0daf2b226f921a5f7f724\",\n  \"pre\": {\n    \"task_rev\": 10,\n    \"owner_gen\": 1\n  },\n  \"created_at\": \"2026-10-05T09:00:00Z\",\n  \"lang\": \"en\",\n  \"payload\": {\n    \"version\": 2,\n    \"parent_version\": 1,\n    \"plan\": {\n      \"schema\": \"skep.plan/v1\",\n      \"task_id\": \"T-20261005-0000\",\n      \"version\": 2,\n      \"parent_version\": 1,\n      \"base\": {\n        \"repo\": \"git@example.invalid:example/app.git\",\n        \"branch\": \"main\",\n        \"commit\": \"8e4d884dfdc8b8c5bd4718ff9982f88b8a4716f0\"\n      },\n      \"mode\": \"team\",\n      \"summary\": \"Plan version 2 for T-20261005-0000.\",\n      \"items\": [\n        {\n          \"id\": \"W1\",\n          \"title\": \"Implement W1\",\n          \"role\": \"coding\",\n          \"assignee\": \"vps.coding\",\n          \"depends_on\": [],\n          \"touches\": [\n            \"src/w1/\"\n          ],\n          \"risk\": \"normal\",\n          \"acceptance\": [\n            {\n              \"kind\": \"check\",\n              \"name\": \"unit\"\n            }\n          ]\n        },\n        {\n          \"id\": \"W2\",\n          \"title\": \"Fix the gap the first delivery left\",\n          \"role\": \"coding\",\n          \"assignee\": \"vps.coding\",\n          \"depends_on\": [\n            \"W1\"\n          ],\n          \"touches\": [\n            \"src/w2/\"\n          ],\n          \"risk\": \"normal\",\n          \"acceptance\": [\n            {\n              \"kind\": \"check\",\n              \"name\": \"unit\"\n            }\n          ]\n        }\n      ],\n      \"stack_order\": [\n        \"W1\",\n        \"W2\"\n      ],\n      \"changes_from_parent\": \"Keep the delivered item; replace the rest with a fix item.\"\n    },\n    \"plan_hash\": \"sha256:2ecb4c3c2889a433a07efa80768b36003044e48bcb72acefa4c97022c09f8369\",\n    \"base_commit\": \"8e4d884dfdc8b8c5bd4718ff9982f88b8a4716f0\",\n    \"reviewers\": [\n      \"mac.coding\"\n    ]\n  }\n}\n"
+      }
+    },
+    {
+      "seq": 14,
+      "sha": "64f3dbd1354a1528c567589a2cc4cb9669fcca34",
+      "parents": ["6497c254bd80d66213746894d27c9b1b660c3561"],
+      "signature": {
+        "status": "good",
+        "principal": "daemon:mac"
+      },
+      "changes": [
+        {
+          "status": "A",
+          "path": "events/T-20261005-0000/evt_f2d2a349-dea9-4c86-8e7a-970346aa2ce6.json"
+        }
+      ],
+      "added": {
+        "events/T-20261005-0000/evt_f2d2a349-dea9-4c86-8e7a-970346aa2ce6.json": "{\n  \"schema\": \"skep.event/v1\",\n  \"event_id\": \"evt_f2d2a349-dea9-4c86-8e7a-970346aa2ce6\",\n  \"type\": \"review.submitted\",\n  \"task_id\": \"T-20261005-0000\",\n  \"actor\": \"mac.coding\",\n  \"observed_tip\": \"6497c254bd80d66213746894d27c9b1b660c3561\",\n  \"pre\": {\n    \"task_rev\": 11,\n    \"plan_version\": 2,\n    \"plan_hash\": \"sha256:2ecb4c3c2889a433a07efa80768b36003044e48bcb72acefa4c97022c09f8369\"\n  },\n  \"created_at\": \"2026-10-05T09:00:00Z\",\n  \"lang\": \"en\",\n  \"payload\": {\n    \"plan_version\": 2,\n    \"plan_hash\": \"sha256:2ecb4c3c2889a433a07efa80768b36003044e48bcb72acefa4c97022c09f8369\",\n    \"verdict\": \"approve\",\n    \"blockers\": [],\n    \"suggestions\": []\n  }\n}\n"
+      }
+    },
+    {
+      "seq": 15,
+      "sha": "424f1a1d61a80dbd01d4c4e7bc20b816193fe67f",
+      "parents": ["64f3dbd1354a1528c567589a2cc4cb9669fcca34"],
+      "signature": {
+        "status": "good",
+        "principal": "daemon:vps"
+      },
+      "changes": [
+        {
+          "status": "A",
+          "path": "events/T-20261005-0000/evt_a5313603-05ad-444e-85a5-ba891f756537.json"
+        }
+      ],
+      "added": {
+        "events/T-20261005-0000/evt_a5313603-05ad-444e-85a5-ba891f756537.json": "{\n  \"schema\": \"skep.event/v1\",\n  \"event_id\": \"evt_a5313603-05ad-444e-85a5-ba891f756537\",\n  \"type\": \"plan.locked\",\n  \"task_id\": \"T-20261005-0000\",\n  \"actor\": \"vps.coding\",\n  \"observed_tip\": \"64f3dbd1354a1528c567589a2cc4cb9669fcca34\",\n  \"pre\": {\n    \"task_rev\": 12,\n    \"owner_gen\": 1,\n    \"plan_version\": 2,\n    \"plan_hash\": \"sha256:2ecb4c3c2889a433a07efa80768b36003044e48bcb72acefa4c97022c09f8369\"\n  },\n  \"created_at\": \"2026-10-05T09:00:00Z\",\n  \"lang\": \"en\",\n  \"payload\": {\n    \"plan_version\": 2,\n    \"plan_hash\": \"sha256:2ecb4c3c2889a433a07efa80768b36003044e48bcb72acefa4c97022c09f8369\",\n    \"overrides\": [],\n    \"missing_reviews\": []\n  }\n}\n"
+      }
+    },
+    {
+      "seq": 16,
+      "sha": "5560d9dac517b769de10de4564f198c0146578c4",
+      "parents": ["424f1a1d61a80dbd01d4c4e7bc20b816193fe67f"],
+      "signature": {
+        "status": "good",
+        "principal": "human"
+      },
+      "changes": [
+        {
+          "status": "A",
+          "path": "events/T-20261005-0000/evt_acd32475-1a17-494b-8ef0-6d840929ee34.json"
+        }
+      ],
+      "added": {
+        "events/T-20261005-0000/evt_acd32475-1a17-494b-8ef0-6d840929ee34.json": "{\n  \"schema\": \"skep.event/v1\",\n  \"event_id\": \"evt_acd32475-1a17-494b-8ef0-6d840929ee34\",\n  \"type\": \"plan.approved\",\n  \"task_id\": \"T-20261005-0000\",\n  \"actor\": \"human\",\n  \"observed_tip\": \"424f1a1d61a80dbd01d4c4e7bc20b816193fe67f\",\n  \"pre\": {\n    \"task_rev\": 13,\n    \"plan_version\": 2,\n    \"plan_hash\": \"sha256:2ecb4c3c2889a433a07efa80768b36003044e48bcb72acefa4c97022c09f8369\"\n  },\n  \"created_at\": \"2026-10-05T09:00:00Z\",\n  \"lang\": \"en\",\n  \"payload\": {\n    \"plan_version\": 2,\n    \"plan_hash\": \"sha256:2ecb4c3c2889a433a07efa80768b36003044e48bcb72acefa4c97022c09f8369\",\n    \"note\": \"Approved.\"\n  }\n}\n"
+      }
+    },
+    {
+      "seq": 17,
+      "sha": "44dcd7a182d126820857d38f005e9ea185b7f59a",
+      "parents": ["5560d9dac517b769de10de4564f198c0146578c4"],
+      "signature": {
+        "status": "good",
+        "principal": "daemon:vps"
+      },
+      "changes": [
+        {
+          "status": "A",
+          "path": "events/T-20261005-0000/evt_c7f6f7d1-39dc-4199-87ee-230bbaa1edd7.json"
+        }
+      ],
+      "added": {
+        "events/T-20261005-0000/evt_c7f6f7d1-39dc-4199-87ee-230bbaa1edd7.json": "{\n  \"schema\": \"skep.event/v1\",\n  \"event_id\": \"evt_c7f6f7d1-39dc-4199-87ee-230bbaa1edd7\",\n  \"type\": \"lease.claimed\",\n  \"task_id\": \"T-20261005-0000\",\n  \"actor\": \"vps.coding\",\n  \"observed_tip\": \"5560d9dac517b769de10de4564f198c0146578c4\",\n  \"pre\": {\n    \"task_rev\": 14,\n    \"plan_version\": 2,\n    \"plan_hash\": \"sha256:2ecb4c3c2889a433a07efa80768b36003044e48bcb72acefa4c97022c09f8369\",\n    \"item\": \"W2\",\n    \"expected_epoch\": 1\n  },\n  \"created_at\": \"2026-10-05T09:00:00Z\",\n  \"lang\": \"en\",\n  \"payload\": {\n    \"item\": \"W2\",\n    \"attempt_id\": \"att_17\",\n    \"branch\": \"skep/T-20261005-0000/W2/e2\"\n  }\n}\n"
+      }
+    },
+    {
+      "seq": 18,
+      "sha": "7519ff80d56f64dbed281a37747bde5cb922021c",
+      "parents": ["44dcd7a182d126820857d38f005e9ea185b7f59a"],
+      "signature": {
+        "status": "good",
+        "principal": "daemon:vps"
+      },
+      "changes": [
+        {
+          "status": "A",
+          "path": "events/T-20261005-0000/evt_327d7c9c-a92b-43bb-8dbe-6ef8785eb887.json"
+        }
+      ],
+      "added": {
+        "events/T-20261005-0000/evt_327d7c9c-a92b-43bb-8dbe-6ef8785eb887.json": "{\n  \"schema\": \"skep.event/v1\",\n  \"event_id\": \"evt_327d7c9c-a92b-43bb-8dbe-6ef8785eb887\",\n  \"type\": \"work.delivered\",\n  \"task_id\": \"T-20261005-0000\",\n  \"actor\": \"vps.coding\",\n  \"observed_tip\": \"44dcd7a182d126820857d38f005e9ea185b7f59a\",\n  \"pre\": {\n    \"task_rev\": 15,\n    \"item\": \"W2\"\n  },\n  \"created_at\": \"2026-10-05T09:00:00Z\",\n  \"lang\": \"en\",\n  \"payload\": {\n    \"item\": \"W2\",\n    \"epoch\": 2,\n    \"branch\": \"skep/T-20261005-0000/W2/e2\",\n    \"head_sha\": \"e7e9b1ddcba3cf6ccce70f06cab1ba75b8550a65\",\n    \"pr_url\": \"https://example.com/example/app/pull/2\",\n    \"pr_number\": 2,\n    \"check_runs\": [\n      {\n        \"run_id\": \"run-1\",\n        \"check\": \"unit\",\n        \"sha\": \"e7e9b1ddcba3cf6ccce70f06cab1ba75b8550a65\",\n        \"exit\": 0,\n        \"duration_ms\": 10,\n        \"passed\": 1,\n        \"failed\": 0,\n        \"log_sha256\": \"8c3df5d112083cdbe557564ed5009aaac7d51a31000000000000000000000000\"\n      }\n    ]\n  }\n}\n"
+      }
+    }
+  ],
+  "state_hash": "sha256:bdf9e4d860fe018d41e0ab003b515322d5f0452a301d98dde35e2e964724d18b"
+}

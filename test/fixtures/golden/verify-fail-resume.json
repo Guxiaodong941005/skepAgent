@@ -1,0 +1,205 @@
+{
+  "name": "verify-fail-resume",
+  "summary": "Failed verification escalates, resume returns to delivered, re-verification and merge reach done (D14/D15).",
+  "entries": [
+    {
+      "seq": 0,
+      "sha": "f9a1fe41694bc774200bd57c2314234a9936b50f",
+      "parents": [],
+      "signature": {
+        "status": "good",
+        "principal": "human"
+      },
+      "changes": [
+        {
+          "status": "A",
+          "path": "skep.json"
+        }
+      ],
+      "added": {
+        "skep.json": "{\n  \"schema\": \"skep.genesis/v1\",\n  \"protocol_version\": 1,\n  \"reducer_version\": 1,\n  \"blackboard_id\": \"bb_golden01\",\n  \"created_at\": \"2026-10-05T00:00:00Z\"\n}\n"
+      }
+    },
+    {
+      "seq": 1,
+      "sha": "3eb21b3a217d939b444b6f8c12534dfea619cff1",
+      "parents": ["f9a1fe41694bc774200bd57c2314234a9936b50f"],
+      "signature": {
+        "status": "good",
+        "principal": "daemon:vps"
+      },
+      "changes": [
+        {
+          "status": "A",
+          "path": "events/_skep/evt_2ac4afa2-f1bf-4dda-8e1a-cbc428de07fd.json"
+        }
+      ],
+      "added": {
+        "events/_skep/evt_2ac4afa2-f1bf-4dda-8e1a-cbc428de07fd.json": "{\n  \"schema\": \"skep.event/v1\",\n  \"event_id\": \"evt_2ac4afa2-f1bf-4dda-8e1a-cbc428de07fd\",\n  \"type\": \"agent.registered\",\n  \"task_id\": null,\n  \"actor\": \"vps.coding\",\n  \"observed_tip\": \"f9a1fe41694bc774200bd57c2314234a9936b50f\",\n  \"pre\": {},\n  \"created_at\": \"2026-10-05T09:00:00Z\",\n  \"lang\": \"en\",\n  \"payload\": {\n    \"role\": \"coding\",\n    \"agent_cli\": \"codex\",\n    \"cli_version\": \"0.0.0-test\",\n    \"capabilities\": [\n      \"typescript\"\n    ],\n    \"requires_local\": [],\n    \"max_parallel_items\": 1\n  }\n}\n"
+      }
+    },
+    {
+      "seq": 2,
+      "sha": "4c62b14ec3c67b6770d276619cba6c8c6623f89f",
+      "parents": ["3eb21b3a217d939b444b6f8c12534dfea619cff1"],
+      "signature": {
+        "status": "good",
+        "principal": "human"
+      },
+      "changes": [
+        {
+          "status": "A",
+          "path": "events/T-20261005-0000/evt_3e279657-4426-4cba-83b1-e2568e071b45.json"
+        }
+      ],
+      "added": {
+        "events/T-20261005-0000/evt_3e279657-4426-4cba-83b1-e2568e071b45.json": "{\n  \"schema\": \"skep.event/v1\",\n  \"event_id\": \"evt_3e279657-4426-4cba-83b1-e2568e071b45\",\n  \"type\": \"task.created\",\n  \"task_id\": \"T-20261005-0000\",\n  \"actor\": \"human\",\n  \"observed_tip\": \"3eb21b3a217d939b444b6f8c12534dfea619cff1\",\n  \"pre\": {},\n  \"created_at\": \"2026-10-05T09:00:00Z\",\n  \"lang\": \"en\",\n  \"payload\": {\n    \"title\": \"Ship the requested change\",\n    \"body\": \"Implement the change described by the human and cover it with the unit check.\",\n    \"repo\": \"git@example.invalid:example/app.git\",\n    \"base_branch\": \"main\",\n    \"mode\": \"solo\",\n    \"owner\": \"vps.coding\",\n    \"budgets\": {\n      \"max_invocations\": 12,\n      \"max_wall_hours\": 6,\n      \"replans\": 2,\n      \"review_rounds\": 2,\n      \"item_retries\": 1\n    },\n    \"plan_approval\": \"human\"\n  }\n}\n"
+      }
+    },
+    {
+      "seq": 3,
+      "sha": "bcd0e3e19072bd9adc3900070cd64d8dba6e725b",
+      "parents": ["4c62b14ec3c67b6770d276619cba6c8c6623f89f"],
+      "signature": {
+        "status": "good",
+        "principal": "daemon:vps"
+      },
+      "changes": [
+        {
+          "status": "A",
+          "path": "events/T-20261005-0000/evt_bec3e1b2-0eda-4c95-8732-88934ae6f1d5.json"
+        }
+      ],
+      "added": {
+        "events/T-20261005-0000/evt_bec3e1b2-0eda-4c95-8732-88934ae6f1d5.json": "{\n  \"schema\": \"skep.event/v1\",\n  \"event_id\": \"evt_bec3e1b2-0eda-4c95-8732-88934ae6f1d5\",\n  \"type\": \"plan.proposed\",\n  \"task_id\": \"T-20261005-0000\",\n  \"actor\": \"vps.coding\",\n  \"observed_tip\": \"4c62b14ec3c67b6770d276619cba6c8c6623f89f\",\n  \"pre\": {\n    \"task_rev\": 1,\n    \"owner_gen\": 1\n  },\n  \"created_at\": \"2026-10-05T09:00:00Z\",\n  \"lang\": \"en\",\n  \"payload\": {\n    \"version\": 1,\n    \"parent_version\": null,\n    \"plan\": {\n      \"schema\": \"skep.plan/v1\",\n      \"task_id\": \"T-20261005-0000\",\n      \"version\": 1,\n      \"parent_version\": null,\n      \"base\": {\n        \"repo\": \"git@example.invalid:example/app.git\",\n        \"branch\": \"main\",\n        \"commit\": \"693fccc202982759f6483370fd2d03cf77783a52\"\n      },\n      \"mode\": \"solo\",\n      \"summary\": \"Plan version 1 for T-20261005-0000.\",\n      \"items\": [\n        {\n          \"id\": \"W1\",\n          \"title\": \"Implement W1\",\n          \"role\": \"coding\",\n          \"assignee\": \"vps.coding\",\n          \"depends_on\": [],\n          \"touches\": [\n            \"src/w1/\"\n          ],\n          \"risk\": \"normal\",\n          \"acceptance\": [\n            {\n              \"kind\": \"check\",\n              \"name\": \"unit\"\n            }\n          ]\n        }\n      ],\n      \"stack_order\": [\n        \"W1\"\n      ],\n      \"changes_from_parent\": null\n    },\n    \"plan_hash\": \"sha256:ba47a306c5c7d9003d1fad9887c918a045c04b4ff4c02576dc7bf0ceae3048ef\",\n    \"base_commit\": \"693fccc202982759f6483370fd2d03cf77783a52\",\n    \"reviewers\": []\n  }\n}\n"
+      }
+    },
+    {
+      "seq": 4,
+      "sha": "a2c5b404288f87ea607582d2fda67e093bf67ddc",
+      "parents": ["bcd0e3e19072bd9adc3900070cd64d8dba6e725b"],
+      "signature": {
+        "status": "good",
+        "principal": "human"
+      },
+      "changes": [
+        {
+          "status": "A",
+          "path": "events/T-20261005-0000/evt_69721284-32aa-4e61-86c3-0b10cd4b2cf9.json"
+        }
+      ],
+      "added": {
+        "events/T-20261005-0000/evt_69721284-32aa-4e61-86c3-0b10cd4b2cf9.json": "{\n  \"schema\": \"skep.event/v1\",\n  \"event_id\": \"evt_69721284-32aa-4e61-86c3-0b10cd4b2cf9\",\n  \"type\": \"plan.approved\",\n  \"task_id\": \"T-20261005-0000\",\n  \"actor\": \"human\",\n  \"observed_tip\": \"bcd0e3e19072bd9adc3900070cd64d8dba6e725b\",\n  \"pre\": {\n    \"task_rev\": 2,\n    \"plan_version\": 1,\n    \"plan_hash\": \"sha256:ba47a306c5c7d9003d1fad9887c918a045c04b4ff4c02576dc7bf0ceae3048ef\"\n  },\n  \"created_at\": \"2026-10-05T09:00:00Z\",\n  \"lang\": \"en\",\n  \"payload\": {\n    \"plan_version\": 1,\n    \"plan_hash\": \"sha256:ba47a306c5c7d9003d1fad9887c918a045c04b4ff4c02576dc7bf0ceae3048ef\",\n    \"note\": \"Approved.\"\n  }\n}\n"
+      }
+    },
+    {
+      "seq": 5,
+      "sha": "8316cf9a54d262125bf855f95243f70972b98486",
+      "parents": ["a2c5b404288f87ea607582d2fda67e093bf67ddc"],
+      "signature": {
+        "status": "good",
+        "principal": "daemon:vps"
+      },
+      "changes": [
+        {
+          "status": "A",
+          "path": "events/T-20261005-0000/evt_ff3eb154-2ec7-40d3-83ba-9dd541883713.json"
+        }
+      ],
+      "added": {
+        "events/T-20261005-0000/evt_ff3eb154-2ec7-40d3-83ba-9dd541883713.json": "{\n  \"schema\": \"skep.event/v1\",\n  \"event_id\": \"evt_ff3eb154-2ec7-40d3-83ba-9dd541883713\",\n  \"type\": \"lease.claimed\",\n  \"task_id\": \"T-20261005-0000\",\n  \"actor\": \"vps.coding\",\n  \"observed_tip\": \"a2c5b404288f87ea607582d2fda67e093bf67ddc\",\n  \"pre\": {\n    \"task_rev\": 3,\n    \"plan_version\": 1,\n    \"plan_hash\": \"sha256:ba47a306c5c7d9003d1fad9887c918a045c04b4ff4c02576dc7bf0ceae3048ef\",\n    \"item\": \"W1\",\n    \"expected_epoch\": 0\n  },\n  \"created_at\": \"2026-10-05T09:00:00Z\",\n  \"lang\": \"en\",\n  \"payload\": {\n    \"item\": \"W1\",\n    \"attempt_id\": \"att_05\",\n    \"branch\": \"skep/T-20261005-0000/W1/e1\"\n  }\n}\n"
+      }
+    },
+    {
+      "seq": 6,
+      "sha": "1de9453d3a33dd27ad8608afa1d135e73e214e2c",
+      "parents": ["8316cf9a54d262125bf855f95243f70972b98486"],
+      "signature": {
+        "status": "good",
+        "principal": "daemon:vps"
+      },
+      "changes": [
+        {
+          "status": "A",
+          "path": "events/T-20261005-0000/evt_8261002a-1b71-47ae-8f91-2b40a54ae5d2.json"
+        }
+      ],
+      "added": {
+        "events/T-20261005-0000/evt_8261002a-1b71-47ae-8f91-2b40a54ae5d2.json": "{\n  \"schema\": \"skep.event/v1\",\n  \"event_id\": \"evt_8261002a-1b71-47ae-8f91-2b40a54ae5d2\",\n  \"type\": \"work.delivered\",\n  \"task_id\": \"T-20261005-0000\",\n  \"actor\": \"vps.coding\",\n  \"observed_tip\": \"8316cf9a54d262125bf855f95243f70972b98486\",\n  \"pre\": {\n    \"task_rev\": 4,\n    \"item\": \"W1\"\n  },\n  \"created_at\": \"2026-10-05T09:00:00Z\",\n  \"lang\": \"en\",\n  \"payload\": {\n    \"item\": \"W1\",\n    \"epoch\": 1,\n    \"branch\": \"skep/T-20261005-0000/W1/e1\",\n    \"head_sha\": \"3ec09f8bb6b29b19ac9055016584916c0d29b598\",\n    \"pr_url\": \"https://example.com/example/app/pull/1\",\n    \"pr_number\": 1,\n    \"check_runs\": [\n      {\n        \"run_id\": \"run-1\",\n        \"check\": \"unit\",\n        \"sha\": \"3ec09f8bb6b29b19ac9055016584916c0d29b598\",\n        \"exit\": 0,\n        \"duration_ms\": 10,\n        \"passed\": 1,\n        \"failed\": 0,\n        \"log_sha256\": \"be583b51fcadca731112c718931e5729ef966305000000000000000000000000\"\n      }\n    ]\n  }\n}\n"
+      }
+    },
+    {
+      "seq": 7,
+      "sha": "ad7fe80ac776ab944d2e9dcada4df1c2682bb9b0",
+      "parents": ["1de9453d3a33dd27ad8608afa1d135e73e214e2c"],
+      "signature": {
+        "status": "good",
+        "principal": "daemon:vps"
+      },
+      "changes": [
+        {
+          "status": "A",
+          "path": "events/T-20261005-0000/evt_46878475-b605-4ed8-8b6c-7bdf8342ce1a.json"
+        }
+      ],
+      "added": {
+        "events/T-20261005-0000/evt_46878475-b605-4ed8-8b6c-7bdf8342ce1a.json": "{\n  \"schema\": \"skep.event/v1\",\n  \"event_id\": \"evt_46878475-b605-4ed8-8b6c-7bdf8342ce1a\",\n  \"type\": \"task.verified\",\n  \"task_id\": \"T-20261005-0000\",\n  \"actor\": \"vps.coding\",\n  \"observed_tip\": \"1de9453d3a33dd27ad8608afa1d135e73e214e2c\",\n  \"pre\": {\n    \"task_rev\": 5,\n    \"owner_gen\": 1,\n    \"plan_hash\": \"sha256:ba47a306c5c7d9003d1fad9887c918a045c04b4ff4c02576dc7bf0ceae3048ef\"\n  },\n  \"created_at\": \"2026-10-05T09:00:00Z\",\n  \"lang\": \"en\",\n  \"payload\": {\n    \"top_of_stack_sha\": \"3ec09f8bb6b29b19ac9055016584916c0d29b598\",\n    \"check_runs\": [\n      {\n        \"run_id\": \"run-1\",\n        \"check\": \"unit\",\n        \"sha\": \"3ec09f8bb6b29b19ac9055016584916c0d29b598\",\n        \"exit\": 0,\n        \"duration_ms\": 10,\n        \"passed\": 1,\n        \"failed\": 0,\n        \"log_sha256\": \"be583b51fcadca731112c718931e5729ef966305000000000000000000000000\"\n      }\n    ],\n    \"passed\": false\n  }\n}\n"
+      }
+    },
+    {
+      "seq": 8,
+      "sha": "e445503e76c7131f9b92ec8451133a71181fbdbc",
+      "parents": ["ad7fe80ac776ab944d2e9dcada4df1c2682bb9b0"],
+      "signature": {
+        "status": "good",
+        "principal": "human"
+      },
+      "changes": [
+        {
+          "status": "A",
+          "path": "events/T-20261005-0000/evt_28f3b22b-8e2a-418f-8b2e-b7b3f9230bcd.json"
+        }
+      ],
+      "added": {
+        "events/T-20261005-0000/evt_28f3b22b-8e2a-418f-8b2e-b7b3f9230bcd.json": "{\n  \"schema\": \"skep.event/v1\",\n  \"event_id\": \"evt_28f3b22b-8e2a-418f-8b2e-b7b3f9230bcd\",\n  \"type\": \"human.decided\",\n  \"task_id\": \"T-20261005-0000\",\n  \"actor\": \"human\",\n  \"observed_tip\": \"ad7fe80ac776ab944d2e9dcada4df1c2682bb9b0\",\n  \"pre\": {\n    \"task_rev\": 6\n  },\n  \"created_at\": \"2026-10-05T09:00:00Z\",\n  \"lang\": \"en\",\n  \"payload\": {\n    \"decision\": \"resume_with_plan\",\n    \"note\": \"Decided after escalation.\"\n  }\n}\n"
+      }
+    },
+    {
+      "seq": 9,
+      "sha": "ab1941e121608a4fc506d9281b05399ab0ffd523",
+      "parents": ["e445503e76c7131f9b92ec8451133a71181fbdbc"],
+      "signature": {
+        "status": "good",
+        "principal": "daemon:vps"
+      },
+      "changes": [
+        {
+          "status": "A",
+          "path": "events/T-20261005-0000/evt_0fe29f2e-ea43-4fe8-8a60-95937b41a118.json"
+        }
+      ],
+      "added": {
+        "events/T-20261005-0000/evt_0fe29f2e-ea43-4fe8-8a60-95937b41a118.json": "{\n  \"schema\": \"skep.event/v1\",\n  \"event_id\": \"evt_0fe29f2e-ea43-4fe8-8a60-95937b41a118\",\n  \"type\": \"task.verified\",\n  \"task_id\": \"T-20261005-0000\",\n  \"actor\": \"vps.coding\",\n  \"observed_tip\": \"e445503e76c7131f9b92ec8451133a71181fbdbc\",\n  \"pre\": {\n    \"task_rev\": 7,\n    \"owner_gen\": 1,\n    \"plan_hash\": \"sha256:ba47a306c5c7d9003d1fad9887c918a045c04b4ff4c02576dc7bf0ceae3048ef\"\n  },\n  \"created_at\": \"2026-10-05T09:00:00Z\",\n  \"lang\": \"en\",\n  \"payload\": {\n    \"top_of_stack_sha\": \"3ec09f8bb6b29b19ac9055016584916c0d29b598\",\n    \"check_runs\": [\n      {\n        \"run_id\": \"run-1\",\n        \"check\": \"unit\",\n        \"sha\": \"3ec09f8bb6b29b19ac9055016584916c0d29b598\",\n        \"exit\": 0,\n        \"duration_ms\": 10,\n        \"passed\": 1,\n        \"failed\": 0,\n        \"log_sha256\": \"be583b51fcadca731112c718931e5729ef966305000000000000000000000000\"\n      }\n    ],\n    \"passed\": true\n  }\n}\n"
+      }
+    },
+    {
+      "seq": 10,
+      "sha": "923f7f5a3fc9ac63b4fab03f27e05407b59fe49e",
+      "parents": ["ab1941e121608a4fc506d9281b05399ab0ffd523"],
+      "signature": {
+        "status": "good",
+        "principal": "human"
+      },
+      "changes": [
+        {
+          "status": "A",
+          "path": "events/T-20261005-0000/evt_430e950d-fa94-48b3-81f9-09ce0f447231.json"
+        }
+      ],
+      "added": {
+        "events/T-20261005-0000/evt_430e950d-fa94-48b3-81f9-09ce0f447231.json": "{\n  \"schema\": \"skep.event/v1\",\n  \"event_id\": \"evt_430e950d-fa94-48b3-81f9-09ce0f447231\",\n  \"type\": \"item.merged\",\n  \"task_id\": \"T-20261005-0000\",\n  \"actor\": \"human\",\n  \"observed_tip\": \"ab1941e121608a4fc506d9281b05399ab0ffd523\",\n  \"pre\": {\n    \"task_rev\": 8,\n    \"item\": \"W1\"\n  },\n  \"created_at\": \"2026-10-05T09:00:00Z\",\n  \"lang\": \"en\",\n  \"payload\": {\n    \"item\": \"W1\",\n    \"pr_number\": 1,\n    \"merge_sha\": \"82249fa2f74edfdf986e64d9353869b202269fc6\"\n  }\n}\n"
+      }
+    }
+  ],
+  "state_hash": "sha256:17da2b0d037e447fcaf41f821c89a9d053ed7478f052d51ca2b9542ba9e9701b"
+}
