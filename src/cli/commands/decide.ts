@@ -1,6 +1,8 @@
 import type { Command } from "commander";
+import type { IntentSpec } from "../../core/intent-spec.js";
 import type { CliContext } from "../context.js";
-import { notImplemented } from "../output.js";
+import { publishHuman } from "../publish.js";
+import { reportPublished } from "../publish-output.js";
 import { parseAgentId, parseTaskId } from "../validate.js";
 
 /**
@@ -9,7 +11,7 @@ import { parseAgentId, parseTaskId } from "../validate.js";
  * Exactly one of `--resume`, `--replan`, `--cancel`, `--owner` must be given. Commander cannot
  * express "exactly one of these" itself, so the action checks and reports a usage error.
  */
-export function register(program: Command, _ctx: CliContext): void {
+export function register(program: Command, ctx: CliContext): void {
   program
     .command("decide")
     .description("Resolve an escalated task")
@@ -19,12 +21,13 @@ export function register(program: Command, _ctx: CliContext): void {
     .option("--cancel", "cancel the task")
     .option("--owner <agentId>", "transfer ownership to an agent", parseAgentId)
     .option("--note <text>", "note recorded with the decision")
-    .action((_task: string, _opts: unknown, cmd: Command) => {
+    .action(async (taskId: string, _opts: unknown, cmd: Command) => {
       const opts = cmd.opts<{
         resume?: boolean;
         replan?: boolean;
         cancel?: boolean;
         owner?: string;
+        note?: string;
       }>();
       const chosen = [opts.resume, opts.replan, opts.cancel, opts.owner !== undefined].filter(
         Boolean,
@@ -35,6 +38,26 @@ export function register(program: Command, _ctx: CliContext): void {
           { exitCode: 2, code: "usage" },
         );
       }
-      notImplemented("decide");
+      reportPublished(ctx, await publishHuman(ctx, decideSpec(taskId, opts)));
     });
+}
+
+function decideSpec(
+  taskId: string,
+  opts: { resume?: boolean; replan?: boolean; cancel?: boolean; owner?: string; note?: string },
+): IntentSpec {
+  const decision = opts.resume
+    ? "resume_with_plan"
+    : opts.replan
+      ? "replan"
+      : opts.cancel
+        ? "cancel"
+        : "reassign_owner";
+  return {
+    kind: "decide",
+    task: taskId,
+    decision,
+    ...(opts.owner === undefined ? {} : { new_owner: opts.owner }),
+    ...(opts.note === undefined ? {} : { note: opts.note }),
+  };
 }

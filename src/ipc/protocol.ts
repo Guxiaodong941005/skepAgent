@@ -10,17 +10,8 @@
  */
 
 import { z } from "zod";
-import {
-  AgentIdSchema,
-  EpochSchema,
-  ItemIdSchema,
-  PositiveIntSchema,
-  RepoRefSchema,
-  Sha256TaggedSchema,
-  ShortTextSchema,
-  TaskIdSchema,
-} from "../core/schemas/common.js";
-import { EvidenceSchema } from "../core/schemas/evidence.js";
+import { IntentSpecSchema } from "../core/intent-spec.js";
+import { AgentIdSchema, PositiveIntSchema, TaskIdSchema } from "../core/schemas/common.js";
 import { SshSignatureSchema } from "../git/signer.js";
 
 /** Current frame version. Any other `v` is refused with `protocol_version`. */
@@ -67,90 +58,13 @@ const FrameIdSchema = z.string().min(1).max(64);
 const RequestIdSchema = z.string().min(1).max(64);
 
 // ---------------------------------------------------------------------------------------------
-// IntentSpec — every kind a CLI write command can ask the daemon to publish (SK-603 sends these)
+// IntentSpec — every kind a CLI write command can ask the daemon to publish (SK-603 sends these).
+// The schema is defined in `core/intent-spec.ts` next to `intentFromSpec` and re-exported here,
+// so a frame this module accepts is exactly a spec that mapping can build (ARCHITECTURE §2).
 // ---------------------------------------------------------------------------------------------
 
-/** `skep task new`. The daemon re-derives budgets and the task id; the CLI only states the ask. */
-const TaskCreateSpec = z.strictObject({
-  kind: z.literal("task.create"),
-  title: ShortTextSchema,
-  body: z.string().min(1).max(16_000),
-  repo: RepoRefSchema,
-  base_branch: z.string().min(1).max(255).optional(),
-  mode: z.enum(["solo", "team"]),
-  owner: AgentIdSchema.optional(),
-  original_text: z.string().max(16_000).optional(),
-  original_lang: z.string().min(2).max(16).optional(),
-});
-
-/** `skep task cancel`. */
-const TaskCancelSpec = z.strictObject({
-  kind: z.literal("task.cancel"),
-  task: TaskIdSchema,
-  reason: ShortTextSchema,
-});
-
-/** `skep plan approve`. The hash is what the human saw; the daemon re-checks it against state. */
-const PlanApproveSpec = z.strictObject({
-  kind: z.literal("plan.approve"),
-  task: TaskIdSchema,
-  plan_hash: Sha256TaggedSchema.optional(),
-  note: z.string().max(2000).optional(),
-});
-
-/** `skep plan reject`. */
-const PlanRejectSpec = z.strictObject({
-  kind: z.literal("plan.reject"),
-  task: TaskIdSchema,
-  plan_hash: Sha256TaggedSchema.optional(),
-  note: z.string().max(2000).optional(),
-});
-
-/** `skep lease revoke` (ARCHITECTURE §6.4): always human-signed, no heartbeat evidence in the MVP. */
-const LeaseRevokeSpec = z.strictObject({
-  kind: z.literal("lease.revoke"),
-  task: TaskIdSchema,
-  item: ItemIdSchema,
-  epoch: EpochSchema,
-  reason: ShortTextSchema.optional(),
-});
-
-/** `skep decide`. Exactly one decision; `new_owner` only with `reassign_owner`. */
-const DecideSpec = z
-  .strictObject({
-    kind: z.literal("decide"),
-    task: TaskIdSchema,
-    decision: z.enum(["resume_with_plan", "replan", "cancel", "reassign_owner"]),
-    new_owner: AgentIdSchema.optional(),
-    note: z.string().max(2000).optional(),
-  })
-  .refine((spec) => (spec.decision === "reassign_owner") === (spec.new_owner !== undefined), {
-    message: "new_owner is required iff decision is reassign_owner",
-  });
-
-/**
- * `skep replan`. Human evidence is optional (a human request needs none, PRD §9.9); the daemon
- * drops the intent when the task can no longer be replanned.
- */
-const ReplanSpec = z.strictObject({
-  kind: z.literal("replan.request"),
-  task: TaskIdSchema,
-  reason: z.string().min(1).max(4000),
-  evidence: z.array(EvidenceSchema).max(8).optional(),
-  item: ItemIdSchema.nullable().optional(),
-});
-
-export const IntentSpecSchema = z.discriminatedUnion("kind", [
-  TaskCreateSpec,
-  TaskCancelSpec,
-  PlanApproveSpec,
-  PlanRejectSpec,
-  LeaseRevokeSpec,
-  DecideSpec,
-  ReplanSpec,
-]);
-
-export type IntentSpec = z.infer<typeof IntentSpecSchema>;
+export type { IntentSpec } from "../core/intent-spec.js";
+export { IntentSpecSchema } from "../core/intent-spec.js";
 
 /** Every CLI write kind, in spec order. Tests assert the schema covers each of them. */
 export const INTENT_KINDS = [
