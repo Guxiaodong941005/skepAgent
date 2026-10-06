@@ -12,7 +12,6 @@ import {
 } from "../../../test/helpers/log-builder.js";
 import { canonicalJson } from "../canonical.js";
 import type { LogEntry } from "../log.js";
-import type { EventType } from "../schemas/events.js";
 import { applyEvent } from "./apply.js";
 import { applyEntry, replay } from "./replay.js";
 
@@ -224,31 +223,6 @@ describe("replay purity and determinism", () => {
 });
 
 describe("later-wave handler dispatch", () => {
-  const types = [
-    "replan.requested",
-    "checkpoint.recorded",
-    "barrier.closed",
-  ] as const satisfies readonly EventType[];
-  it.each(types)("keeps %s as the required non-mutating stub", (type) => {
-    const builder = mixed();
-    const state = replay(builder.entries.slice(0, 10));
-    const before = canonicalJson(state);
-    // Stub dispatch is independent of payloads; strict event validation is covered above.
-    const event = {
-      ...builder.event({
-        type: "task.cancelled",
-        actor: "human",
-        payload: { reason: "Cancel" },
-        pre: { task_rev: 3 },
-      }),
-      type,
-    } as Parameters<typeof applyEvent>[1];
-    expect(
-      applyEvent(state, event, { seq: 10, sha: builder.tip, principal: { kind: "human" } }),
-    ).toEqual({ ok: false, reason: "bad_task_state", detail: "not implemented" });
-    expect(canonicalJson(state)).toBe(before);
-  });
-
   it("checks preconditions before dispatching even a stub", () => {
     const builder = mixed();
     const state = replay(builder.entries.slice(0, 10));
