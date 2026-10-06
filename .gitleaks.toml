@@ -1,0 +1,6 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Deliberately public, test-only SSH signing keys for deterministic simulations"
+paths = ['''^test/fixtures/keys/''']
