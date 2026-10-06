@@ -7,3 +7,4 @@ export { checkPre } from "./preconditions.js";
 export { applyEntry, replay } from "./replay.js";
 export * from "./state.js";
 export { checkStructure, type StructureResult } from "./structural.js";
+export * from "./views.js";
