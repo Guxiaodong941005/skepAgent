@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { Redactor } from "../exec/redact.js";
-import { type NotifierTransport, NotifyError, NtfyNotifier } from "./ntfy.js";
+import { headerValue, type NotifierTransport, NotifyError, NtfyNotifier } from "./ntfy.js";
 
-const TOPIC = "https://ntfy.example.com/skep-mac";
+const TOPIC = "https://ntfy.example.invalid/skep-mac";
 
 function transport(result = { delivered: true, status: 200 }): {
   posts: { url: string; body: string; headers: Record<string, string> }[];
@@ -106,8 +106,28 @@ describe("NtfyNotifier", () => {
   it("rejects a topic URL that is not http(s)", () => {
     expect(
       () =>
-        new NtfyNotifier({ topicUrl: "git@example.com:owner/bb.git", redactor: new Redactor() }),
+        new NtfyNotifier({
+          topicUrl: "git@example.invalid:owner/bb.git",
+          redactor: new Redactor(),
+        }),
     ).toThrow(NotifyError);
+  });
+
+  it("encodes a non-ASCII title so the header stays Latin-1", async () => {
+    const fake = transport();
+    const notifier = new NtfyNotifier({
+      topicUrl: TOPIC,
+      redactor: new Redactor(),
+      transport: fake.transport,
+    });
+    await notifier.notify({ title: "build failed \u2014 retry", message: "see the log" });
+    const title = fake.posts[0]?.headers.Title ?? "";
+    expect(title).toBe(headerValue("build failed \u2014 retry"));
+    expect(title.startsWith("=?UTF-8?B?")).toBe(true);
+    expect([...title].every((char) => char.charCodeAt(0) <= 0xff)).toBe(true);
+    expect(Buffer.from(title.slice("=?UTF-8?B?".length, -2), "base64").toString("utf8")).toBe(
+      "build failed \u2014 retry",
+    );
   });
 
   it("sends priority and tags when given", async () => {

@@ -329,6 +329,10 @@ async function agentCanWrite(file: string, user: string, deps: DoctorDeps): Prom
 /**
  * D19: presence and pinned version only. The CLI's own config directory is never opened, so a
  * provider name, base URL or key cannot leak into this report.
+ *
+ * The pin is the same string the daemon compares (SK-207, F14): for codex, the whole
+ * `codex-cli <version>` line that `CodexAdapter.probe()` returns, matched exactly against
+ * AGENT.md `cli_version`. Extracting the semver would pass a device the daemon then refuses.
  */
 async function checkCli(
   cli: string,
@@ -337,14 +341,14 @@ async function checkCli(
   checks: DoctorCheck[],
   label: string,
 ): Promise<void> {
-  const probe = CLI_VERSION[cli];
+  const probe = CLI_PROBE[cli];
   if (!probe) {
     checks.push({ name: `agent_cli.${label}`, status: "fail", detail: `unknown agent cli ${cli}` });
     return;
   }
   let result: ExecResult;
   try {
-    result = await deps.exec(cli, probe.args, {
+    result = await deps.exec(cli, ["--version"], {
       env: { PATH: process.env.PATH ?? "", LC_ALL: "C" },
       allowFailure: true,
       timeoutMs: 10_000,
@@ -360,12 +364,33 @@ async function checkCli(
     });
     return;
   }
+  if (result.code !== 0 && result.code !== null) {
+    checks.push({
+      name: `agent_cli.${label}`,
+      status: "fail",
+      detail: `${cli} --version exited ${result.code}`,
+    });
+    return;
+  }
   const reported = probe.version(`${result.stdout}\n${result.stderr}`);
   if (reported === null) {
     checks.push({
       name: `agent_cli.${label}`,
       status: "fail",
       detail: `${cli} did not report a version (wanted ${pinned})`,
+    });
+    return;
+  }
+  // claude and pi have no adapter yet, so a matching line is necessary but not sufficient: the
+  // daemon cannot invoke them. Warn, and still fail a genuine mismatch.
+  if (!probe.supported) {
+    checks.push({
+      name: `agent_cli.${label}`,
+      status: reported === pinned ? "warn" : "fail",
+      detail:
+        reported === pinned
+          ? `${cli} reports ${reported}, which matches the pin, but it is an unsupported adapter`
+          : `${cli} is ${reported}, AGENT.md pins ${pinned} (unsupported adapter)`,
     });
     return;
   }
@@ -380,16 +405,26 @@ async function checkCli(
   );
 }
 
-/** How each supported CLI reports its version. Args only — no config file is read (D19). */
-const CLI_VERSION: Record<string, { args: string[]; version: (text: string) => string | null }> = {
-  codex: { args: ["--version"], version: firstVersion },
-  claude: { args: ["--version"], version: firstVersion },
-  pi: { args: ["--version"], version: firstVersion },
-};
+/**
+ * Same rule as `CodexAdapter.probe()` (`src/adapter/codex.ts`): the output line matching
+ * `^codex-cli \S+$`, compared in full. claude and pi have no adapter, so their pin is the exact
+ * trimmed first line of `--version` and a match is only a warning.
+ */
+const CLI_PROBE: Record<string, { supported: boolean; version: (text: string) => string | null }> =
+  {
+    codex: { supported: true, version: codexVersion },
+    claude: { supported: false, version: firstLine },
+    pi: { supported: false, version: firstLine },
+  };
 
-function firstVersion(text: string): string | null {
-  const match = /(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)/.exec(text);
-  return match?.[1] ?? null;
+/** The line `CodexAdapter.probe()` returns as `version`. Anything else is not a pin. */
+function codexVersion(text: string): string | null {
+  return text.split(/\r?\n/).find((line) => /^codex-cli \S+$/.test(line)) ?? null;
+}
+
+function firstLine(text: string): string | null {
+  const line = text.split(/\r?\n/).find((candidate) => candidate.trim() !== "");
+  return line === undefined ? null : line.trim();
 }
 
 /** AGENT.md repos must be a subset of the device allowlist (PRD §7.3, §11.5). */

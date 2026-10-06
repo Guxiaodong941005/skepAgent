@@ -66,7 +66,10 @@ export class NtfyNotifier {
   async notify(notification: Notification): Promise<NotifyResult> {
     const title = clip(this.deps.redactor.redact(notification.title), MAX_TITLE_CHARS);
     const message = clip(this.deps.redactor.redact(notification.message), MAX_MESSAGE_CHARS);
-    const headers: Record<string, string> = { Title: title };
+    // Header values must be Latin-1. A title with, say, an em dash would make `fetch` throw and
+    // the notification would be silently dropped. RFC 2047 encoded-words stay Latin-1 and ntfy
+    // decodes them (review note 3).
+    const headers: Record<string, string> = { Title: headerValue(title) };
     if (notification.priority !== undefined) {
       headers.Priority = String(clampPriority(notification.priority));
     }
@@ -113,6 +116,16 @@ function isHttpUrl(value: string): boolean {
 
 function clip(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max)}…`;
+}
+
+/**
+ * An RFC 2047 encoded-word (`=?UTF-8?B?…?=`) when the text is not Latin-1, otherwise the text
+ * unchanged. ntfy accepts both in the `Title` header.
+ */
+export function headerValue(text: string): string {
+  if ([...text].every((char) => char.charCodeAt(0) <= 0xff)) return text;
+  const encoded = Buffer.from(text, "utf8").toString("base64");
+  return `=?UTF-8?B?${encoded}?=`;
 }
 
 function clampPriority(priority: number): number {

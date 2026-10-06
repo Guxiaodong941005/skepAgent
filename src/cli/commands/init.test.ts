@@ -10,6 +10,7 @@ import { runCli } from "../program.js";
 import { allowedSignersLine, type InitDeps, initDevice } from "./init.js";
 
 const PUB = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIInitTestKeyMaterialOnlyNotASecret skepd";
+const HUMAN_PUB = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHumanTestKeyMaterialOnlyNotASecret human";
 const roots: string[] = [];
 
 afterEach(async () => {
@@ -76,9 +77,9 @@ describe("initDevice", () => {
       {
         paths,
         device: "mac",
-        blackboardUrl: "git@example.com:owner/blackboard.git",
-        repos: [{ name: "app", url: "git@example.com:owner/app.git" }],
-        notifyUrl: "https://ntfy.example.com/skep-mac",
+        blackboardUrl: "git@example.invalid:owner/blackboard.git",
+        repos: [{ name: "app", url: "git@example.invalid:owner/app.git" }],
+        notifyUrl: "https://ntfy.example.invalid/skep-mac",
         genesis: false,
       },
       { exec: unusedExec, generateKey: fakeKeygen() },
@@ -89,10 +90,10 @@ describe("initDevice", () => {
     const toml = await readFile(paths.deviceToml, "utf8");
     const cfg = parseDeviceConfig(toml, paths.deviceToml);
     expect(cfg.device).toBe("mac");
-    expect(cfg.blackboard.url).toBe("git@example.com:owner/blackboard.git");
+    expect(cfg.blackboard.url).toBe("git@example.invalid:owner/blackboard.git");
     expect(cfg.signing_key).toBe(result.signing_key);
-    expect(cfg.repos).toEqual([{ name: "app", url: "git@example.com:owner/app.git" }]);
-    expect(cfg.notify?.ntfy_topic_url).toBe("https://ntfy.example.com/skep-mac");
+    expect(cfg.repos).toEqual([{ name: "app", url: "git@example.invalid:owner/app.git" }]);
+    expect(cfg.notify?.ntfy_topic_url).toBe("https://ntfy.example.invalid/skep-mac");
     // The daemon key is mode 0600: an agent user must not be able to read it (PRD §11.4).
     expect((await stat(result.signing_key)).mode & 0o777).toBe(0o600);
     expect((await stat(paths.deviceToml)).mode & 0o777).toBe(0o600);
@@ -109,7 +110,7 @@ describe("initDevice", () => {
         {
           paths,
           device: "mac",
-          blackboardUrl: "git@example.com:owner/bb.git",
+          blackboardUrl: "git@example.invalid:owner/bb.git",
           repos: [],
           genesis: false,
         },
@@ -128,7 +129,7 @@ describe("initDevice", () => {
         {
           paths,
           device: "vps",
-          blackboardUrl: "git@example.com:owner/bb.git",
+          blackboardUrl: "git@example.invalid:owner/bb.git",
           repos: [],
           genesis: false,
         },
@@ -144,7 +145,7 @@ describe("initDevice", () => {
         {
           paths: skepPaths(dir),
           device: "mac",
-          blackboardUrl: "git@example.com:owner/bb.git",
+          blackboardUrl: "git@example.invalid:owner/bb.git",
           repos: [],
           genesis: true,
         },
@@ -153,14 +154,80 @@ describe("initDevice", () => {
     ).rejects.toThrow(/--human-key/);
   });
 
+  it("writes the local allowed_signers with the human and daemon lines on genesis", async () => {
+    const dir = await home();
+    const paths = skepPaths(dir);
+    await writeFile(`${path.join(dir, "human-key")}.pub`, `${HUMAN_PUB}\n`);
+    const result = await initDevice(
+      {
+        paths,
+        device: "mac",
+        blackboardUrl: "git@example.invalid:owner/blackboard.git",
+        repos: [],
+        genesis: true,
+        humanKeyPath: path.join(dir, "human-key"),
+        blackboardId: "bb_test0001",
+        createdAt: "2026-10-05T00:00:00Z",
+      },
+      { exec: unusedExec, generateKey: fakeKeygen(), createGenesis: async () => "a".repeat(40) },
+    );
+    const trust = await readFile(paths.allowedSigners, "utf8");
+    expect(trust).toBe(`human namespaces="git" ${HUMAN_PUB}\ndaemon:mac namespaces="git" ${PUB}\n`);
+    expect(result.allowed_signers).toBe(trust);
+    expect((await stat(paths.allowedSigners)).mode & 0o777).toBe(0o600);
+    // The trust root holds public keys only (D19).
+    expect(trust).not.toContain("PRIVATE");
+  });
+
+  it("retries a genesis after a failure without regenerating the key", async () => {
+    const dir = await home();
+    const paths = skepPaths(dir);
+    await writeFile(`${path.join(dir, "human-key")}.pub`, `${HUMAN_PUB}\n`);
+    const request = {
+      paths,
+      device: "mac",
+      blackboardUrl: "git@example.invalid:owner/blackboard.git",
+      repos: [],
+      genesis: true,
+      humanKeyPath: path.join(dir, "human-key"),
+      createdAt: "2026-10-05T00:00:00Z",
+    };
+    await expect(
+      initDevice(request, {
+        exec: unusedExec,
+        generateKey: fakeKeygen(),
+        createGenesis: async () => {
+          throw new Error("human key unusable");
+        },
+      }),
+    ).rejects.toThrow(/human key unusable/);
+    const keyBefore = await readFile(path.join(paths.keysDir, "daemon"), "utf8");
+
+    let mintedAgain = false;
+    const result = await initDevice(request, {
+      exec: unusedExec,
+      generateKey: async (keysDir) => {
+        mintedAgain = true;
+        const generate = fakeKeygen();
+        if (!generate) throw new Error("missing keygen");
+        return generate(keysDir);
+      },
+      createGenesis: async () => "b".repeat(40),
+    });
+    expect(mintedAgain).toBe(false);
+    expect(await readFile(path.join(paths.keysDir, "daemon"), "utf8")).toBe(keyBefore);
+    expect(result.genesis_sha).toBe("b".repeat(40));
+  });
+
   it("creates the genesis with the human signer and records its sha", async () => {
     const dir = await home();
+    await writeFile(`${path.join(dir, "human-key")}.pub`, `${HUMAN_PUB}\n`);
     let seenPrincipal = "";
     const result = await initDevice(
       {
         paths: skepPaths(dir),
         device: "mac",
-        blackboardUrl: "git@example.com:owner/blackboard.git",
+        blackboardUrl: "git@example.invalid:owner/blackboard.git",
         repos: [],
         genesis: true,
         humanKeyPath: path.join(dir, "human-key"),
@@ -189,7 +256,15 @@ describe("initDevice", () => {
     const dir = await home();
     const cap = capture(dir);
     const code = await runCli(
-      ["init", "--device", "mac", "--blackboard", "git@example.com:owner/bb.git", "--repo", "App"],
+      [
+        "init",
+        "--device",
+        "mac",
+        "--blackboard",
+        "git@example.invalid:owner/bb.git",
+        "--repo",
+        "App",
+      ],
       cap.ctx,
     );
     expect(code).toBe(2);
@@ -203,7 +278,7 @@ describe("skep init", () => {
     const cap = capture(dir);
     // The command shells out to ssh-keygen for real here: that is the production path.
     const code = await runCli(
-      ["init", "--device", "mac", "--blackboard", "git@example.com:owner/blackboard.git"],
+      ["init", "--device", "mac", "--blackboard", "git@example.invalid:owner/blackboard.git"],
       cap.ctx,
     );
     expect(code).toBe(0);
@@ -222,7 +297,7 @@ describe("skep init", () => {
         "--device",
         "vps",
         "--blackboard",
-        "git@example.com:o/bb.git",
+        "git@example.invalid:o/bb.git",
       ],
       again.ctx,
     );
@@ -251,7 +326,7 @@ describe("skep init", () => {
         {
           paths,
           device: "mac",
-          blackboardUrl: "git@example.com:owner/bb.git",
+          blackboardUrl: "git@example.invalid:owner/bb.git",
           repos: [],
           genesis: false,
         },

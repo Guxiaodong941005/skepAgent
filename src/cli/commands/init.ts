@@ -54,8 +54,13 @@ interface InitResult {
   device_toml: string;
   signing_key: string;
   public_key: string;
-  /** The line the controller appends to its trust root (PRD §11.2). */
+  /** The daemon line the controller appends to its trust root (PRD §11.2). */
   allowed_signers_line: string;
+  /**
+   * The exact `allowed_signers` text (human line, then daemon line) a genesis needs locally.
+   * Null when no human key was given. Written to disk only when the file is absent.
+   */
+  allowed_signers: string | null;
   genesis_sha: string | null;
 }
 
@@ -105,6 +110,8 @@ export function register(program: Command, ctx: CliContext): void {
 export interface InitPaths {
   home: string;
   deviceToml: string;
+  /** Local trust root. Genesis writes it when it is absent (PRD §11.2). */
+  allowedSigners: string;
   keysDir: string;
   blackboardClone: string;
 }
@@ -146,10 +153,23 @@ export async function initDevice(req: InitRequest, deps: InitDeps): Promise<Init
       "--genesis creates the human-signed blackboard root and needs --human-key",
     );
   }
-  await assertAbsent(req.paths.deviceToml, "device.toml already exists; refusing to overwrite it");
-  const key = await generateDaemonKey(req.paths.keysDir, deps);
-  const document = deviceDocument(req, key.privPath);
-  await writeDeviceToml(req.paths.deviceToml, document);
+  // `--genesis` on an already provisioned device reuses the key and device.toml. A failed
+  // genesis used to strand the device: the re-run refused because the key existed, with no way to
+  // retry just the blackboard root (review note 2).
+  const existing = await deviceAlreadyProvisioned(req.paths);
+  if (existing && !req.genesis) {
+    throw new CliError(
+      "already_initialized",
+      "device.toml already exists; refusing to overwrite it. To retry a failed genesis, re-run `skep init` with the same --device, --blackboard and --genesis --human-key",
+    );
+  }
+  const key = existing
+    ? await readDaemonKey(req.paths.keysDir)
+    : await generateDaemonKey(req.paths.keysDir, deps);
+  if (!existing) await writeDeviceToml(req.paths.deviceToml, deviceDocument(req, key.privPath));
+
+  const trust = await localTrustText(req, key);
+  if (trust !== null) await writeTrustRoot(req.paths.allowedSigners, trust);
 
   let genesisSha: string | null = null;
   if (req.genesis && req.humanKeyPath !== undefined) {
@@ -162,8 +182,42 @@ export async function initDevice(req: InitRequest, deps: InitDeps): Promise<Init
     signing_key: key.privPath,
     public_key: key.pubLine,
     allowed_signers_line: allowedSignersLine(req.device, key.pubLine),
+    allowed_signers: trust,
     genesis_sha: genesisSha,
   };
+}
+
+/** True when a previous init wrote device.toml. The key is then reused, never regenerated. */
+async function deviceAlreadyProvisioned(paths: InitPaths): Promise<boolean> {
+  try {
+    await access(paths.deviceToml);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw new CliError(
+      "init_failed",
+      `could not check ${paths.deviceToml}: ${(error as Error).message}`,
+    );
+  }
+  return true;
+}
+
+/** The daemon key a previous init minted. A retry must not replace it (PRD §11.2). */
+async function readDaemonKey(keysDir: string): Promise<GeneratedKey> {
+  const privPath = path.join(keysDir, DAEMON_KEY_NAME);
+  const pubPath = `${privPath}.pub`;
+  let pubLine: string;
+  try {
+    pubLine = (await readFile(pubPath, "utf8")).trim();
+  } catch (error) {
+    throw new CliError(
+      "already_initialized",
+      `device.toml exists but ${pubPath} is missing, so the genesis cannot be retried: ${(error as Error).message}`,
+    );
+  }
+  if (!pubLine.startsWith("ssh-ed25519 ")) {
+    throw new CliError("already_initialized", `${pubPath} is not an ed25519 public key`);
+  }
+  return { privPath, pubPath, pubLine };
 }
 
 /** `daemon:<device> namespaces="git" ssh-ed25519 AAAA… comment` (PRD §11.2). */
@@ -224,6 +278,56 @@ function sshEnv(): Record<string, string> {
     if (value !== undefined) env[name] = value;
   }
   return env;
+}
+
+/**
+ * The controller's local trust root: the human line, then the daemon line (PRD §11.2). Both are
+ * public keys. Written only when `allowed_signers` is absent, so a hand-edited trust root is
+ * never replaced; the text is also returned so the human can create the file by hand.
+ */
+async function localTrustText(req: InitRequest, daemonKey: GeneratedKey): Promise<string | null> {
+  if (req.humanKeyPath === undefined || req.humanKeyPath === "") return null;
+  const humanPub = await readPublicKey(req.humanKeyPath);
+  return `human namespaces="${GIT_NAMESPACE}" ${humanPub}\n${allowedSignersLine(req.device, daemonKey.pubLine)}\n`;
+}
+
+/** `ssh-keygen -y` over the human private key. The public half is what the trust root stores. */
+async function readPublicKey(keyPath: string): Promise<string> {
+  let text: string;
+  try {
+    text = (await readFile(`${keyPath}.pub`, "utf8")).trim();
+  } catch {
+    throw new CliError(
+      "human_key_unusable",
+      `no public key next to ${keyPath}; expected ${keyPath}.pub (the private key is never copied)`,
+    );
+  }
+  if (!/^ssh-\S+ \S+/.test(text)) {
+    throw new CliError("human_key_unusable", `${keyPath}.pub is not an SSH public key`);
+  }
+  return text;
+}
+
+async function writeTrustRoot(file: string, text: string): Promise<void> {
+  try {
+    await access(file);
+    return;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw new CliError("init_failed", `could not check ${file}: ${(error as Error).message}`);
+    }
+  }
+  const handle = await open(file, "wx", 0o600).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "EEXIST") return null;
+    throw new CliError("init_failed", `could not write ${file}: ${error.message}`);
+  });
+  if (handle === null) return;
+  try {
+    await handle.writeFile(text, "utf8");
+  } finally {
+    await handle.close();
+  }
+  await chmod(file, 0o600);
 }
 
 async function writeDeviceToml(file: string, document: Record<string, unknown>): Promise<void> {
@@ -355,6 +459,13 @@ function renderHuman(result: InitResult): string {
     result.allowed_signers_line,
     "",
   ];
+  if (result.allowed_signers !== null) {
+    lines.push(
+      "Local allowed_signers (written when the file was absent; create it by hand otherwise):",
+      result.allowed_signers.trimEnd(),
+      "",
+    );
+  }
   if (result.genesis_sha !== null) {
     lines.push(`blackboard genesis: ${result.genesis_sha}`, "");
   }

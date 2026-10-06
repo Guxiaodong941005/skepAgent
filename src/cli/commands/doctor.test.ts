@@ -45,11 +45,11 @@ async function writeDevice(dir: string): Promise<void> {
       `signing_key = "${path.join(paths.keysDir, "daemon")}"`,
       "",
       "[blackboard]",
-      'url = "git@example.com:owner/blackboard.git"',
+      'url = "git@example.invalid:owner/blackboard.git"',
       "",
       "[[repos]]",
       'name = "app"',
-      'url = "git@example.com:owner/app.git"',
+      'url = "git@example.invalid:owner/app.git"',
       "",
     ].join("\n"),
     { mode: 0o600 },
@@ -160,11 +160,11 @@ describe("runDoctor pre-flight", () => {
       }),
     );
     expect(probed).toEqual([
-      "git@example.com:owner/blackboard.git",
-      "git@example.com:owner/app.git",
+      "git@example.invalid:owner/blackboard.git",
+      "git@example.invalid:owner/app.git",
     ]);
     // No probe targets another device: every URL is a configured git remote.
-    expect(probed.every((url) => url.startsWith("git@example.com:"))).toBe(true);
+    expect(probed.every((url) => url.startsWith("git@example.invalid:"))).toBe(true);
     expect(check(report, "blackboard_remote").status).toBe("fail");
     expect(check(report, "code_remote.app").status).toBe("ok");
     expect(report.ok).toBe(false);
@@ -198,48 +198,77 @@ describe("runDoctor pre-flight", () => {
     expect(absent.checks.some((item) => item.name === "relay")).toBe(false);
   });
 
-  it("checks the pinned CLI version and nothing about its provider (D19)", async () => {
+  it("compares the whole codex-cli line with the pin, as CodexAdapter.probe does", async () => {
     const dir = await home();
     await writeDevice(dir);
     const roles = path.join(dir, "roles");
     await mkdir(path.join(roles, "coding"), { recursive: true });
     await writeFile(
       path.join(roles, "coding", "AGENT.md"),
-      [
-        "---",
-        "schema: skep.agent/v1",
-        "role: coding",
-        "agent_cli: codex",
-        'cli_version: "1.2.3"',
-        "repos:",
-        "  - git@example.com:owner/app.git",
-        "capabilities: [typescript]",
-        "---",
-        "Implement code.",
-        "",
-      ].join("\n"),
+      agentMd("codex-cli 0.160.0", REPO, "codex"),
     );
     const invocations: string[][] = [];
-    const report = await runDoctor(
+    const matching = await runDoctor(
       skepPaths(dir),
       deps({
         rolesDir: roles,
         exec: async (file, args) => {
           invocations.push([file, ...args]);
           return file === "codex"
-            ? { code: 0, signal: null, stdout: "codex 9.9.9\n", stderr: "", timedOut: false }
+            ? {
+                code: 0,
+                signal: null,
+                stdout: "codex-cli 0.160.0\n",
+                stderr: "",
+                timedOut: false,
+              }
             : execOk(file);
         },
       }),
     );
-    expect(check(report, "agent_md.coding").status).toBe("ok");
-    expect(check(report, "agent_cli.coding").status).toBe("fail");
-    expect(check(report, "agent_cli.coding").detail).toContain("9.9.9");
-    expect(check(report, "repo_allowlist.coding").status).toBe("ok");
-    // The probe is `--version` only. No config directory, provider name or credential is read.
+    // A correctly pinned device must pass. Comparing only the semver would fail it.
+    expect(check(matching, "agent_cli.coding").status).toBe("ok");
+    expect(check(matching, "agent_cli.coding").detail).toContain("codex-cli 0.160.0");
+    expect(check(matching, "repo_allowlist.coding").status).toBe("ok");
     expect(invocations.filter((call) => call[0] === "codex")).toEqual([["codex", "--version"]]);
-    expect(JSON.stringify(report)).not.toMatch(/provider|api.key|OPENAI|sk-/i);
-    expect(report.ok).toBe(false);
+    expect(JSON.stringify(matching)).not.toMatch(/provider|api.key|OPENAI|sk-/i);
+    expect(matching.ok).toBe(true);
+
+    const mismatched = await runDoctor(
+      skepPaths(dir),
+      deps({
+        rolesDir: roles,
+        exec: async (file) =>
+          file === "codex"
+            ? { code: 0, signal: null, stdout: "codex-cli 0.1.0\n", stderr: "", timedOut: false }
+            : execOk(file),
+      }),
+    );
+    expect(check(mismatched, "agent_cli.coding").status).toBe("fail");
+    expect(check(mismatched, "agent_cli.coding").detail).toContain("codex-cli 0.1.0");
+    expect(mismatched.ok).toBe(false);
+  });
+
+  it("warns that claude and pi are unsupported adapters, matching the first line exactly", async () => {
+    const dir = await home();
+    await writeDevice(dir);
+    const roles = path.join(dir, "roles");
+    await mkdir(path.join(roles, "coding"), { recursive: true });
+    await writeFile(path.join(roles, "coding", "AGENT.md"), agentMd("pi 1.2.3", REPO, "pi"));
+    const report = await runDoctor(
+      skepPaths(dir),
+      deps({
+        rolesDir: roles,
+        exec: async (file) =>
+          file === "pi"
+            ? { code: 0, signal: null, stdout: "pi 1.2.3\n", stderr: "", timedOut: false }
+            : execOk(file),
+      }),
+    );
+    expect(check(report, "agent_cli.coding").status).toBe("warn");
+    expect(check(report, "agent_cli.coding").detail).toMatch(/unsupported adapter/);
+    // A warning does not fail the device.
+    expect(report.ok).toBe(true);
   });
 
   it("fails when the agent user can write AGENT.md", async () => {
@@ -292,7 +321,7 @@ describe("runDoctor pre-flight", () => {
     await mkdir(path.join(roles, "coding"), { recursive: true });
     await writeFile(
       path.join(roles, "coding", "AGENT.md"),
-      agentMd("1.2.3", "git@example.com:owner/not-allowed.git"),
+      agentMd("1.2.3", "git@example.invalid:owner/not-allowed.git"),
     );
     const report = await runDoctor(skepPaths(dir), deps({ rolesDir: roles }));
     expect(check(report, "repo_allowlist.coding").status).toBe("fail");
@@ -408,12 +437,14 @@ async function runDoctorCli(
   return out.ctx.exitCode ?? EXIT.ok;
 }
 
-function agentMd(version: string, repo = "git@example.com:owner/app.git"): string {
+const REPO = "git@example.invalid:owner/app.git";
+
+function agentMd(version: string, repo = REPO, cli = "pi"): string {
   return [
     "---",
     "schema: skep.agent/v1",
     "role: coding",
-    "agent_cli: pi",
+    `agent_cli: ${cli}`,
     `cli_version: "${version}"`,
     "repos:",
     `  - ${repo}`,
