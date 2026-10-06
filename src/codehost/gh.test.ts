@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ExecResult } from "../util/exec.js";
-import { GhCodeHost, type GhRunner } from "./gh.js";
+import { GhCodeHost, type GhCodeHostOptions, type GhRunner } from "./gh.js";
 import { type CodeHost, CodeHostError } from "./types.js";
 
 const REPO = "example/demo";
@@ -38,30 +38,59 @@ function stub(script: Array<string | ExecResult | Error>): { run: GhRunner; call
   return { run, calls };
 }
 
+function ref(sha: string): string {
+  return JSON.stringify({ ref: "refs/heads/main", object: { type: "commit", sha } });
+}
+
 describe("GhCodeHost", () => {
   it("implements CodeHost through gh --json and never calls the network itself", async () => {
-    const { run, calls } = stub([
-      JSON.stringify({ url: "https://example.invalid/example/demo" }),
-      ok(`${SHA}\trefs/heads/main\n`),
-      "[]",
-    ]);
+    const { run, calls } = stub([ref(SHA), "[]"]);
     const host: CodeHost = new GhCodeHost({ run, env: { PATH: "/usr/bin", HOME: "/tmp" } });
     expect(await host.remoteBranchSha(REPO, "main")).toBe(SHA);
     expect(await host.findPr(REPO, "skep/T-20260101-abcd/W1/e1")).toBeNull();
-    expect(calls.map((c) => c.slice(0, 3))).toEqual([
-      ["gh", "repo", "view"],
-      ["git", "ls-remote", "--refs"],
-      ["gh", "pr", "list"],
+    expect(calls.map((c) => c.slice(0, 2))).toEqual([
+      ["gh", "api"],
+      ["gh", "pr"],
     ]);
-    expect(calls[2]).toContain("--json");
-    expect(calls[2]).toContain("--head");
-    expect(calls[2]).toContain("skep/T-20260101-abcd/W1/e1");
+    expect(calls[0]).toContain("repos/example/demo/git/ref/heads/main");
+    expect(calls[1]).toContain("--json=number,url,title,state,headRefName,baseRefName,mergeCommit");
+    expect(calls[1]).toContain("--head=skep/T-20260101-abcd/W1/e1");
+    expect(calls[1]).toContain("--repo=example/demo");
+    expect(calls.flat()).not.toContain("ls-remote");
   });
 
-  it("returns null for a branch ls-remote does not list", async () => {
-    const { run } = stub([JSON.stringify({ url: "https://example.invalid/example/demo" }), ok("")]);
-    const host = new GhCodeHost({ run, env: {} });
+  it("returns null when the ref API answers 404 and reads the sha otherwise", async () => {
+    const missing = stub([
+      { code: 1, signal: null, stdout: "", stderr: "gh: HTTP 404: not found\n", timedOut: false },
+    ]);
+    const host = new GhCodeHost({ run: missing.run, env: {} });
     expect(await host.remoteBranchSha(REPO, "missing")).toBeNull();
+
+    const present = stub([ref(SHA)]);
+    const presentHost = new GhCodeHost({ run: present.run, env: {} });
+    expect(await presentHost.remoteBranchSha(REPO, "main")).toBe(SHA);
+    expect(present.calls[0]).toEqual([
+      "gh",
+      "api",
+      "--hostname",
+      "github.com",
+      "repos/example/demo/git/ref/heads/main",
+    ]);
+  });
+
+  it("resolves an https repo URL into the API host and owner/repo", async () => {
+    const { run, calls } = stub([ref(SHA)]);
+    const host = new GhCodeHost({ run, env: {} });
+    expect(await host.remoteBranchSha("https://example.invalid/example/demo.git", "feat/one")).toBe(
+      SHA,
+    );
+    expect(calls[0]).toEqual([
+      "gh",
+      "api",
+      "--hostname",
+      "example.invalid",
+      "repos/example/demo/git/ref/heads/feat/one",
+    ]);
   });
 
   it("creates a PR with gh pr create and reads it back with gh pr view --json", async () => {
@@ -82,11 +111,14 @@ describe("GhCodeHost", () => {
       state: "open",
       mergeSha: null,
     });
-    expect(calls[0]?.slice(0, 4)).toEqual(["gh", "pr", "create", "--repo"]);
-    expect(calls[0]).toContain("--head");
-    expect(calls[0]).toContain("--base");
+    expect(calls[0]?.slice(0, 3)).toEqual(["gh", "pr", "create"]);
+    expect(calls[0]).toContain(`--repo=${REPO}`);
+    expect(calls[0]).toContain("--head=skep/T-20260101-abcd/W1/e1");
+    expect(calls[0]).toContain("--base=main");
+    expect(calls[0]).toContain("--title=W1");
+    expect(calls[0]).toContain("--body=first item");
     expect(calls[1]?.slice(0, 3)).toEqual(["gh", "pr", "view"]);
-    expect(calls[1]).toContain("--json");
+    expect(calls[1]).toContain("--json=number,url,title,state,headRefName,baseRefName,mergeCommit");
     expect(calls[1]).toContain(URL);
   });
 
@@ -106,17 +138,8 @@ describe("GhCodeHost", () => {
     const host = new GhCodeHost({ run, env: {} });
     await host.retargetPr(REPO, 7, "main");
     await host.closePr(REPO, 7, "stale epoch");
-    expect(calls[0]).toEqual(["gh", "pr", "edit", "--repo", REPO, "--base", "main", "7"]);
-    expect(calls[1]).toEqual([
-      "gh",
-      "pr",
-      "close",
-      "--repo",
-      REPO,
-      "--comment",
-      "stale epoch",
-      "7",
-    ]);
+    expect(calls[0]).toEqual(["gh", "pr", "edit", `--repo=${REPO}`, "--base=main", "7"]);
+    expect(calls[1]).toEqual(["gh", "pr", "close", `--repo=${REPO}`, "--comment=stale epoch", "7"]);
   });
 
   it("maps pr view states and only reports a merge sha when merged", async () => {
@@ -186,5 +209,54 @@ describe("GhCodeHost", () => {
     );
     await expect(host.retargetPr(REPO, 0, "main")).rejects.toBeInstanceOf(CodeHostError);
     await expect(host.closePr(REPO, 1, "")).rejects.toBeInstanceOf(CodeHostError);
+  });
+
+  it("rejects a leading dash in repo and ref names before any command runs", async () => {
+    const { run, calls } = stub([]);
+    const host = new GhCodeHost({ run, env: {} });
+    await expect(host.remoteBranchSha("--web", "main")).rejects.toBeInstanceOf(CodeHostError);
+    await expect(host.findPr(REPO, "--delete-branch")).rejects.toBeInstanceOf(CodeHostError);
+    await expect(
+      host.createPr(REPO, { head: "-h", base: "main", title: "t", body: "b" }),
+    ).rejects.toBeInstanceOf(CodeHostError);
+    await expect(host.retargetPr(REPO, 7, "--web")).rejects.toBeInstanceOf(CodeHostError);
+    await expect(
+      host.remoteBranchSha("https://user:secret@example.invalid/example/demo", "main"),
+    ).rejects.toBeInstanceOf(CodeHostError);
+    expect(calls).toEqual([]);
+  });
+
+  it("disables credential prompts on a git call", async () => {
+    const seen: Array<Record<string, string> | undefined> = [];
+    const run: GhRunner = async (_file, _args, opts) => {
+      seen.push(opts?.env);
+      return ok("");
+    };
+    // No production method calls git (tips go through `gh api`). Drive `exec` directly so the
+    // no-prompt guard cannot be dropped unnoticed.
+    const host = new (class extends GhCodeHost {
+      constructor(opts: GhCodeHostOptions) {
+        super(opts);
+      }
+      callGit(args: string[]) {
+        return this.exec("git", args);
+      }
+    })({ run, env: { PATH: "/usr/bin", HOME: "/home/skep" } });
+    await host.callGit(["version"]);
+    expect(seen).toEqual([{ PATH: "/usr/bin", HOME: "/home/skep", GIT_TERMINAL_PROMPT: "0" }]);
+  });
+
+  it("fails closed when the ref API exits for a reason other than 404", async () => {
+    const { run } = stub([
+      {
+        code: 1,
+        signal: null,
+        stdout: "",
+        stderr: "gh: HTTP 401: bad credentials\n",
+        timedOut: false,
+      },
+    ]);
+    const host = new GhCodeHost({ run, env: {} });
+    await expect(host.remoteBranchSha(REPO, "main")).rejects.toThrow(/401/);
   });
 });

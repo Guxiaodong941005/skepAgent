@@ -13,9 +13,16 @@ import {
  *
  * Commands follow the documented invocations: `gh pr list --head`, `gh pr create`,
  * `gh pr edit --base`, `gh pr close`, `gh pr view --json`. Output is `--json`, parsed here and
- * never trusted beyond the fields this file reads. Branch tips use `git ls-remote` against the
- * repo's fetch URL (`gh repo view --json url`), not the REST API. Authentication is `gh`'s own
- * local config on the daemon user (D19): this class adds no token, env, or credential argument.
+ * never trusted beyond the fields this file reads. Flag values are passed as `--flag=value` and
+ * a leading `-` in a repo or ref name is rejected, so a caller-supplied name cannot be parsed as
+ * another option (SK-503 review note 1).
+ *
+ * Branch tips use `gh api repos/<owner>/<repo>/git/ref/heads/<branch>` (a 404 is "no such
+ * branch"), not `git ls-remote`. That keeps one auth path — `gh`'s own — and never prompts
+ * (SK-503 review note 2). This class makes no git call; `exec` still sets `GIT_TERMINAL_PROMPT=0`
+ * for one, so adding a git call later cannot silently drop it.
+ * Authentication is `gh`'s own local config on the daemon user (D19): this class adds no token,
+ * env, or credential argument.
  */
 
 /** Subset of {@link execFileChecked} the stub runner in tests implements. */
@@ -59,16 +66,23 @@ export class GhCodeHost implements CodeHost {
   async remoteBranchSha(repo: string, branch: string): Promise<string | null> {
     assertRepo(repo);
     assertRefName(branch, "branch");
-    const url = await this.fetchUrl(repo);
-    // ls-remote prints nothing and exits 0 when the ref is absent.
-    const result = await this.exec("git", ["ls-remote", "--refs", url, `refs/heads/${branch}`]);
-    const line = result.stdout.trim();
-    if (line === "") return null;
-    const sha = line.split(/\s+/)[0] ?? "";
-    if (!SHA_RE.test(sha)) {
-      throw new CodeHostError(`git ls-remote returned a non-sha for ${branch}: ${line}`);
+    const slug = await this.repoSlug(repo);
+    // One auth path (gh), so a private repo does not fall back to git's credential helpers.
+    // A missing ref is a 404; anything else is a real failure.
+    const result = await this.exec(
+      "gh",
+      ["api", "--hostname", slug.hostname, endpoint(slug, branch)],
+      { missingOk: true },
+    );
+    if (result === null) return null;
+    const parsed = parseJson(result.stdout, "api");
+    if (!isRecord(parsed) || !isRecord(parsed.object) || typeof parsed.object.sha !== "string") {
+      throw new CodeHostError(`gh api returned no sha for ${branch}`);
     }
-    return sha;
+    if (!SHA_RE.test(parsed.object.sha)) {
+      throw new CodeHostError(`gh api returned a non-sha for ${branch}`);
+    }
+    return parsed.object.sha;
   }
 
   async findPr(repo: string, head: string): Promise<PrInfo | null> {
@@ -78,14 +92,10 @@ export class GhCodeHost implements CodeHost {
     const result = await this.gh([
       "pr",
       "list",
-      "--repo",
-      repo,
-      "--head",
-      head,
-      "--state",
-      "open",
-      "--json",
-      VIEW_FIELDS,
+      flag("repo", repo),
+      flag("head", head),
+      flag("state", "open"),
+      flag("json", VIEW_FIELDS),
     ]);
     const rows = parseJson(result.stdout, "pr list");
     if (!Array.isArray(rows)) {
@@ -110,16 +120,11 @@ export class GhCodeHost implements CodeHost {
     const result = await this.gh([
       "pr",
       "create",
-      "--repo",
-      repo,
-      "--head",
-      p.head,
-      "--base",
-      p.base,
-      "--title",
-      p.title,
-      "--body",
-      p.body,
+      flag("repo", repo),
+      flag("head", p.head),
+      flag("base", p.base),
+      flag("title", p.title),
+      flag("body", p.body),
     ]);
     const url = result.stdout.trim().split("\n").at(-1) ?? "";
     if (!/^https:\/\/\S+$/.test(url)) {
@@ -140,14 +145,14 @@ export class GhCodeHost implements CodeHost {
     assertRepo(repo);
     assertPrNumber(pr);
     assertRefName(base, "base");
-    await this.gh(["pr", "edit", "--repo", repo, "--base", base, String(pr)]);
+    await this.gh(["pr", "edit", flag("repo", repo), flag("base", base), String(pr)]);
   }
 
   async closePr(repo: string, pr: number, comment: string): Promise<void> {
     assertRepo(repo);
     assertPrNumber(pr);
     assertText(comment, "comment");
-    await this.gh(["pr", "close", "--repo", repo, "--comment", comment, String(pr)]);
+    await this.gh(["pr", "close", flag("repo", repo), flag("comment", comment), String(pr)]);
   }
 
   async prState(repo: string, pr: number): Promise<{ state: PrState; mergeSha: string | null }> {
@@ -156,33 +161,86 @@ export class GhCodeHost implements CodeHost {
   }
 
   private async view(repo: string, pr: string): Promise<PrInfo> {
-    const result = await this.gh(["pr", "view", "--repo", repo, "--json", VIEW_FIELDS, pr]);
+    const result = await this.gh(["pr", "view", flag("repo", repo), flag("json", VIEW_FIELDS), pr]);
     return toInfo(parseView(parseJson(result.stdout, "pr view"), "pr view"));
   }
 
-  /** `gh repo view --json url` is the fetch URL; the daemon never stores a credential in it. */
-  private async fetchUrl(repo: string): Promise<string> {
-    const result = await this.gh(["repo", "view", "--json", "url", "--repo", repo]);
-    const parsed = parseJson(result.stdout, "repo view");
-    if (
-      !isRecord(parsed) ||
-      typeof parsed.url !== "string" ||
-      !/^https:\/\/\S+$/.test(parsed.url)
-    ) {
-      throw new CodeHostError("gh repo view did not return an https url");
+  /**
+   * `owner/repo` for the git-ref API. A name is used as given; an https URL is reduced to its
+   * host and `owner/repo` path. The daemon never stores a credential in either form (D19).
+   */
+  private async repoSlug(repo: string): Promise<{ hostname: string; name: string }> {
+    if (!repo.includes("://")) return { hostname: DEFAULT_HOSTNAME, name: repo };
+    let url: URL;
+    try {
+      url = new URL(repo);
+    } catch {
+      throw new CodeHostError(`repo is not a usable https URL: ${JSON.stringify(repo)}`);
     }
-    return parsed.url;
+    if (
+      url.protocol !== "https:" ||
+      url.username !== "" ||
+      url.password !== "" ||
+      url.port !== ""
+    ) {
+      throw new CodeHostError("repo URL must be https without embedded credentials or a port");
+    }
+    const name = url.pathname.replace(/^\//, "").replace(/\.git$/, "");
+    if (!/^[^/]+\/[^/]+$/.test(name)) {
+      throw new CodeHostError(`repo URL does not name owner/repo: ${JSON.stringify(repo)}`);
+    }
+    return { hostname: url.hostname, name };
   }
 
-  private gh(args: string[]): Promise<ExecResult> {
-    return this.exec("gh", args);
-  }
-
-  private async exec(file: string, args: string[]): Promise<ExecResult> {
-    const result = await this.run(file, args, { env: this.env, timeoutMs: this.timeoutMs });
-    if (result.code !== 0) throw ghFailed(`${file} ${args.join(" ")}`, result);
+  private async gh(args: string[]): Promise<ExecResult> {
+    const result = await this.exec("gh", args);
+    if (result === null) throw new CodeHostError("gh returned no result");
     return result;
   }
+
+  /**
+   * `missingOk` turns a 404 into null (an absent branch). Every other non-zero exit is a
+   * failure. Git cannot prompt for credentials: `GIT_TERMINAL_PROMPT=0` on every git call
+   * (SK-503 review note 2). No production path calls git; branch tips go through `gh api`.
+   */
+  protected async exec(
+    file: string,
+    args: string[],
+    opts: { missingOk?: boolean } = {},
+  ): Promise<ExecResult | null> {
+    const env = file === "git" ? { ...this.env, GIT_TERMINAL_PROMPT: "0" } : this.env;
+    const result = await this.run(file, args, { env, timeoutMs: this.timeoutMs });
+    if (result.code !== 0) {
+      if (opts.missingOk && isNotFound(result)) return null;
+      throw ghFailed(`${file} ${args.join(" ")}`, result);
+    }
+    return result;
+  }
+}
+
+const DEFAULT_HOSTNAME = "github.com";
+
+/** `--flag=value`: a value that itself starts with `-` stays a value, never a new option. */
+function flag(name: string, value: string): string {
+  return `--${name}=${value}`;
+}
+
+/** Percent-encode each path segment so a branch name cannot add or escape a path segment. */
+function endpoint(slug: { name: string }, branch: string): string {
+  const repo = slug.name
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+  const ref = branch
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+  return `repos/${repo}/git/ref/heads/${ref}`;
+}
+
+/** gh reports a missing API resource as "HTTP 404" on stderr (and exits non-zero). */
+function isNotFound(result: ExecResult): boolean {
+  return /\b404\b/.test(result.stderr) || /\b404\b/.test(result.stdout);
 }
 
 const SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
@@ -279,7 +337,8 @@ function ghFailed(what: string, result: ExecResult): CodeHostError {
 }
 
 function assertRepo(repo: string): void {
-  if (repo.length === 0 || repo.length > 512 || /[\0\r\n\t ]/.test(repo)) {
+  // A leading `-` would be parsed as a flag (`--repo=--web` is safe, `--repo --web` is not).
+  if (repo.length === 0 || repo.length > 512 || repo.startsWith("-") || /[\0\r\n\t ]/.test(repo)) {
     throw new CodeHostError("repo must be a nonempty name or URL without whitespace");
   }
 }
@@ -288,6 +347,7 @@ function assertRefName(name: string, what: string): void {
   if (
     name.length === 0 ||
     name.length > 255 ||
+    name.startsWith("-") ||
     name.startsWith("/") ||
     name.endsWith("/") ||
     name.includes("..") ||

@@ -168,10 +168,6 @@ function forged(): Scenario {
 }
 
 /**
- * D14/D15: a failed top-of-stack verification escalates with reason `verification_failed`; the
- * human resumes, the owner re-verifies, the human merges, and the task is done.
- */
-/**
  * D20: three plan rejections push `review_rounds` over the budget and escalate; the human's
  * `resume_with_plan` returns the task to `executing` with the counter still over budget (D12).
  * The legal-but-surprising state the SK-304 review pinned, frozen as a golden fixture.
@@ -197,6 +193,10 @@ function reviewResume(): Scenario {
   );
 }
 
+/**
+ * D14/D15: a failed top-of-stack verification escalates with reason `verification_failed`; the
+ * human resumes, the owner re-verifies, the human merges, and the task is done.
+ */
 function verifyFailResume(): Scenario {
   const log = new Script("verify-fail-resume");
   log.register(VPS);

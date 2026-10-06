@@ -150,7 +150,7 @@ describe("FakeCodeHost", () => {
     await expect(host.remoteBranchSha("has space", "main")).rejects.toBeInstanceOf(CodeHostError);
   });
 
-  it("keeps registries per repo and allows a new PR after the old one closes", async () => {
+  it("refuses a second PR for a head in any state and lists every PR", async () => {
     const { dir, host } = await bareRepo();
     const work = join(dir, "..", "work");
     const head = "feature";
@@ -158,11 +158,46 @@ describe("FakeCodeHost", () => {
     await commitFile(git, work, "a.txt", "a\n");
     await git.run(["push", "--all", "origin"], { cwd: work });
     const first = await host.createPr(REPO, { head, base: "main", title: "one", body: "one" });
+
     await host.closePr(REPO, first.number, "closed");
-    const second = await host.createPr(REPO, { head, base: "main", title: "two", body: "two" });
-    expect(second.number).not.toBe(first.number);
-    expect(await host.findPr(REPO, head)).toEqual(second);
+    // Invariant 5 (§13.2) counts every state: closing the PR does not free the head.
+    await expect(
+      host.createPr(REPO, { head, base: "main", title: "two", body: "two" }),
+    ).rejects.toThrow(/already has pull request #1 \(closed\)/);
+    // A closed PR is not reusable through findPr, which only sees open PRs (§11.4).
+    expect(await host.findPr(REPO, head)).toBeNull();
+
+    const merged = "feature-merged";
+    await git.run(["checkout", "-b", merged], { cwd: work });
+    await commitFile(git, work, "b.txt", "b\n");
+    await git.run(["push", "--all", "origin"], { cwd: work });
+    const second = await host.createPr(REPO, {
+      head: merged,
+      base: "main",
+      title: "two",
+      body: "two",
+    });
+    await host.merge(second.number);
+    await expect(
+      host.createPr(REPO, { head: merged, base: "main", title: "again", body: "again" }),
+    ).rejects.toThrow(/\(merged\)/);
+
+    expect(host.pullRequests()).toEqual([
+      { repo: REPO, head, number: 1, state: "closed" },
+      { repo: REPO, head: merged, number: 2, state: "merged" },
+    ]);
+    expect(host.list(REPO).map((pr) => pr.number)).toEqual([1, 2]);
     await expect(host.findPr("example/other", head)).rejects.toThrow(/serves/);
+  });
+
+  it("rejects a leading dash in repo and ref names", async () => {
+    const { host } = await bareRepo();
+    await expect(host.remoteBranchSha("--repo", "main")).rejects.toBeInstanceOf(CodeHostError);
+    await expect(host.remoteBranchSha(REPO, "--delete")).rejects.toBeInstanceOf(CodeHostError);
+    await expect(
+      host.createPr(REPO, { head: "-h", base: "main", title: "t", body: "b" }),
+    ).rejects.toBeInstanceOf(CodeHostError);
+    expect(host.pullRequests()).toEqual([]);
   });
 
   async function stacked(): Promise<{
