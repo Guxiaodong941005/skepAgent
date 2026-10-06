@@ -49,7 +49,7 @@
 | SK-204 | Reducer views + `statusView` | SK-101 | pi | `src/core/reducer/views.ts` (+ tests) | `claimableItems`, `leasesHeldBy`, `isOwner`, `pendingReviews`, `barrierStatus`, `statusView` (stable JSON, sorted keys) with unit tests over builder logs. **D16:** `claimableItems` uses `activeLeaseCount` from `handlers/lease.ts` (never its own count); `leasesHeldBy` marks parked leases (item `interrupted`) separately from active ones. **D14:** `statusView` shows `escalation.reason` (incl. `verification_failed`) and `verified` | todo |
 | SK-205 | exec/fs utilities + run journal | SK-001 | pi | `src/util/{exec,fs}.ts`, `src/exec/journal.ts` (+ tests) | See task brief. `execFileChecked` (shell:false, timeout, maxBuffer, env passthrough), `atomicWrite`, `appendFsync`, `safeJoin` (rejects `..`/absolute/symlink escape); journal append/read/`unfinishedAttempts()` with fsync; torn last line tolerated | done |
 | SK-206 | Config loaders: device.toml, AGENT.md, checks.toml parsing | SK-104 | pi | `src/config/{device,agent-md,errors}.ts`, `src/exec/checks-file.ts` (+ tests, fixtures under `test/fixtures/config/`) | See task brief. Parse + validate with the scaffold schemas; helpful error messages with file/line; AGENT.md body extracted; repo allowlist lookup by name/url | done |
-| SK-207 | Adapter spike: pinned Codex CLI | SK-001 | codex | `docs/spikes/adapter-codex.md`, `src/adapter/codex.ts` (+ opt-in test `test/integration/adapter-codex.test.ts`) | Report: exact flags for non-interactive run, output schema, last-message file, JSON events, interrupt behaviour (SIGINT), approval policy, usage fields, version string; `CodexAdapter` implements `AgentAdapter`; decision Codex vs Claude fallback recorded | todo |
+| SK-207 | Adapter spike: pinned Codex CLI | SK-001 | codex | `docs/spikes/adapter-codex.md`, `src/adapter/codex.ts` (+ opt-in test `test/integration/adapter-codex.test.ts`) | Report: exact flags for non-interactive run, output schema, last-message file, JSON events, interrupt behaviour (SIGINT), approval policy, usage fields, version string; `CodexAdapter` implements `AgentAdapter`; decision Codex vs Claude fallback recorded; **D19:** documents how the CLI authenticates from the agent user's local config with no credentials passed by the daemon. See the Wave 2b brief | todo |
 | SK-208 | Reducer: plan-mode routing (D13) | SK-101 | codex | `src/core/reducer/handlers/plan.ts`, `src/core/reducer/handlers/plan.test.ts` | ARCHITECTURE §5.5 "Plan mode decides routing": reviewers, post-proposal status and `plan.locked` gating use the current **plan's** mode; team task + solo plan ⇒ `invalid_plan`; solo plan with ≠ 1 item ⇒ `invalid_plan`; `activatePlan` sets `task.mode = plan.mode`. Tests: solo task + 2-item team plan ⇒ `reviewing` ⇒ lock ⇒ approve ⇒ `executing` with `task.mode` team; rejected/unapproved team plan leaves `task.mode` solo; after the switch a solo plan is rejected; existing solo/team lifecycles unchanged. **D15:** branch from `main` at or after the SK-209 commit and keep the status derivation at the end of `activatePlan` (D15 tests in `handlers/merge.test.ts` stay green). `npx vitest run src/core/reducer` green | todo |
 | SK-209 | Reducer: close SK-201 protocol gaps D14–D16 | SK-201 | architect | `src/core/reducer/handlers/{merge,plan,lease}.ts` (+ `merge.test.ts`, `lease.test.ts`) | ARCHITECTURE D14–D16: `task.verified{passed:false}` ⇒ `escalated` (`verification_failed`); `activatePlan` ⇒ `done`/`delivered`/`executing` from the rebuilt items; `max_parallel` counts only `leased` items (`activeLeaseCount`). See "Protocol gap closure" below | done (architect) |
 
@@ -58,13 +58,13 @@
 | ID | Title | Depends on | Assignee | Files/area | Acceptance criteria | Status |
 |---|---|---|---|---|---|---|
 | SK-301 | Blackboard clone + publisher write loop + genesis bootstrap | SK-101, SK-102, SK-203, SK-103 | codex | `src/blackboard/{clone,publisher,genesis}.ts`, `src/core/intents.ts` (types + draft helper) (+ integration tests) | fetch→reset→recompute→push, never rebase; stable event_id; ambiguous push resolved via `seen_event_ids`; dropped intents; 8 concurrent publishers on one bare remote all land exactly once with linear history; genesis created human-signed | todo |
-| SK-302 | Sync poller + state cache | SK-101, SK-203, SK-308 | codex | `src/blackboard/sync.ts` (+ tests) | Fetch main + hb/*; incremental replay from cached tip == full replay; `observeNow()`; jittered adaptive interval via Clock; freshness metadata. **D18:** takes a `HintChannel` (default `NullHintChannel`); a `tip` hint triggers an early cycle at most once per 2 s (FakeClock test: 100 hints in 1 s ⇒ ≤ 1 extra fetch); a forged hint for an unknown sha changes nothing; `ls-remote` short-circuit skips the fetch when `main` and `hb/*` are unchanged | todo |
+| SK-302 | Sync poller + state cache | SK-101, SK-203, SK-301, SK-308 | codex | `src/blackboard/sync.ts` (+ tests) | Fetch main + hb/*; incremental replay from cached tip == full replay; `observeNow()`; jittered adaptive interval via Clock; freshness metadata. **D18:** takes a `HintChannel` (default `NullHintChannel`); a `tip` hint triggers an early cycle at most once per 2 s (FakeClock test: 100 hints in 1 s ⇒ ≤ 1 extra fetch); a forged hint for an unknown sha changes nothing; `ls-remote` short-circuit skips the fetch when `main` and `hb/*` are unchanged | todo |
 | SK-303 | Heartbeat writer/reader + liveness tracker | SK-102, SK-103 | codex | `src/blackboard/{heartbeat,liveness}.ts` (+ tests) | Orphan signed commit per beat, `--force-with-lease`; reader verifies principal matches agent device; `main` untouched; liveness live/stale/lost/unknown on observer monotonic clock; suspend reset; duplicate boot_id alarm | todo |
-| SK-304 | Reducer invariants + property tests | SK-201, SK-202, SK-209 | pi | `src/core/reducer/invariants.ts`, `src/core/reducer/replay.property.test.ts`, `test/helpers/random-log.ts` | Seeded random log generator (valid + forged entries, incl. `task.verified{passed:false}`, `human.decided` after it, and replans that carry over every item); 1,000 logs: full == incremental, invariants 2–4, 6, **8 (status agrees with items, D14/D15) and 9 (`max_parallel` via `activeLeaseCount`, D16)** hold, forged entries are no-ops | todo |
-| SK-305 | Golden replay fixtures | SK-201, SK-202, SK-209 | pi | `test/fixtures/golden/*.json`, `test/integration/golden.test.ts`, `scripts/golden-update.ts` | ≥ 6 golden logs (solo, team, replan, escalate, forged, **verify-fail ⇒ escalate ⇒ resume ⇒ delivered ⇒ done**, D14/D15) with expected state hashes; update script documented | todo |
+| SK-304 | Reducer invariants + property tests | SK-201, SK-202, SK-208, SK-209 | pi | `src/core/reducer/invariants.ts`, `src/core/reducer/replay.property.test.ts`, `test/helpers/random-log.ts` | Seeded random log generator (valid + forged entries, incl. `task.verified{passed:false}`, `human.decided` after it, and replans that carry over every item); 1,000 logs: full == incremental, invariants 2–4, 6, **8 (status agrees with items, D14/D15) and 9 (`max_parallel` via `activeLeaseCount`, D16)** hold, forged entries are no-ops | todo |
+| SK-305 | Golden replay fixtures | SK-201, SK-202, SK-208, SK-209, SK-304 | pi | `test/fixtures/golden/*.json`, `test/integration/golden.test.ts`, `test/helpers/golden.ts` | ≥ 6 golden logs (solo, team, replan, escalate, forged, **verify-fail ⇒ escalate ⇒ resume ⇒ delivered ⇒ done**, D14/D15) with expected state hashes; update via `SKEP_UPDATE_GOLDEN=1` documented | todo |
 | SK-306 | Native runtime backend + interrupt ladder | SK-205 | codex | `src/runtime/native.ts`, `src/exec/interrupt.ts` (+ tests) | Detached spawn, pgid, start token (Linux /proc, macOS ps), group signals, `isAlive` guards PID reuse; ladder SIGINT→grace→SIGTERM→SIGKILL with injected Clock; tests kill a child tree | todo |
 | SK-307 | Structured output runner, prompts, fake adapter | SK-001 | codex | `src/adapter/{structured,prompts,fake}.ts` (+ tests) | JSON extraction (fenced/unfenced), Zod validation, exactly one repair; prompt builders for plan/review/work/fixup; fake adapter scripts (success, invalidJson, wrongEvidence, hang, slow, permissionPrompt, replanRequest, crash) | todo |
-| SK-308 | Transport interface: wake-up hints (D18) | SK-001 | codex | `src/transport/{types,null-hint}.ts` (+ tests) | ARCHITECTURE §17.3: `Hint` Zod schema (strict, ≤ 1 KiB, only `tip`/`wake`, unknown kinds and extra keys rejected); `HintChannel` interface; `NullHintChannel` (start/publish/stop are no-ops, `health()` disconnected); a test-only `FakeHintChannel` in the test file for SK-302; no mailbox or payload channel (dropped with D17, §17.2); no secrets in any hint field (D19) | todo |
+| SK-308 | Transport interface: wake-up hints (D18) | SK-001 | codex | `src/transport/{types,null-hint,fake-hint}.ts` (+ tests) | ARCHITECTURE §17.3: `Hint` Zod schema (strict, ≤ 1 KiB, only `tip`/`wake`, unknown kinds and extra keys rejected); `HintChannel` interface; `NullHintChannel` (start/publish/stop are no-ops, `health()` disconnected); `FakeHintChannel` in `fake-hint.ts` for SK-302 tests; no mailbox or payload channel (dropped with D17, §17.2); no secrets in any hint field (D19) | todo |
 
 ## Wave 4 — simulation harness and lease safety
 
@@ -110,6 +110,64 @@ relay). Provider-config sync (former D17 tasks) was withdrawn and must not be re
 | SK-701 | Hint relay (V1): worker + client | SK-308, SK-302 | codex | `relay/` (worker source + its own deploy config, outside the npm workspace), `src/transport/relay.ts` (+ tests against an in-process fake relay) | §17.3/§17.4: topic derivation; optional bearer token; hint fan-out within a topic only; frames that are not valid `Hint`s are dropped; no storage and no payload logging in the relay; client reconnect with `util/backoff` and injected Clock; a relay that forges, drops, floods or replays hints never changes reducer state and causes ≤ 1 extra fetch per 2 s (test) | todo |
 | SK-702 | Enrollment and trust bundles (replaces Tailscale SSH provisioning) | SK-102, SK-607 | pi | `src/cli/commands/{enroll,trust}.ts`, `src/config/enroll.ts` (+ tests), `docs/RUNBOOK.md` (provisioning section) | §17.6: `skep enroll export\|import`, `skep trust import`; `skep.enroll/v1` and `skep.trust_bundle/v1` contain public data only (schema rejects private-key blocks and unknown keys; test) and are signed by the human key; import requires typing the human key's short fingerprint on first trust; later trust bundles verified against the installed human key and applied atomically; tampered or wrong-signer bundles rejected; no network access in tests | todo |
 | SK-703 | `skep logs` without SSH | SK-604, SK-506 | pi | `src/cli/commands/logs.ts` (+ tests) | Local agents: tail the journal/log via `logs.tail`, redacted; remote agents: print the last heartbeat (state, task, item, epoch, observed age) and the journal path on that device, exit 0; no log transport between devices (§17.2) | todo |
+
+---
+
+## Wave 2b / Wave 3 parallel schedule
+
+Baseline: `main` at `e906dd1` (SK-101..SK-104, SK-201, SK-203, SK-205, SK-206, SK-209 merged).
+The Wave 2 remainder (SK-202, SK-204, SK-207, SK-208) runs **in parallel** with every Wave 3 task
+that neither depends on it nor shares files with it. One git worktree + branch + agent pane per
+task; **cap 6 concurrent panes** (5 codex + 1 pi in Batch A). Merge order inside a batch does not
+matter unless a gate below names it. Every task branches from the latest `main` when it starts.
+
+### Dependency / conflict analysis
+
+| Task | Unfinished prerequisites (W2 remainder or W3) | File / function overlap with a concurrent task | Verdict |
+|---|---|---|---|
+| SK-202 (W2) | none (SK-201, SK-209 merged) | `handlers/replan.ts` only; reads `barrier.ts`, `lease.ts` (`activeLeaseCount`), `plan.ts` `activatePlan` (SK-208 edits it; SK-202 must not). Also the stub list in `replay.test.ts` (owned by SK-202 in this batch). | **A** |
+| SK-208 (W2) | none | `handlers/plan.ts`, `plan.test.ts`; keeps the D15 tail of `activatePlan`. Disjoint from SK-202 (no shared file); semantic overlap only through full replan cycles, avoided by SK-202 using mode-consistent plans | **A** |
+| SK-204 (W2, pi) | none | new `views.ts`; reads `activeLeaseCount`/`isSettled`; owns the one-line export in `reducer/index.ts` for this batch. Barrier states are constructed in tests (SK-202 runs concurrently) | **A** |
+| SK-207 (W2) | none hard; the real adapter needs a runtime backend and the interrupt ladder (SK-306) | `src/adapter/codex.ts` only; SK-307 owns the other adapter files. Decoupled by constructor injection of `RuntimeBackend` + an `InterruptLadder` function type declared in `codex.ts` (SK-306 implements a structurally identical function) | **A** (Day-1 risk spike, PRD §16.4) |
+| SK-301 (W3) | none (SK-102, SK-103, SK-203 merged) | `src/blackboard/{clone,publisher,genesis}.ts`, new `src/core/intents.ts` (types + draft helper only; builders are SK-403). Publisher needs a state source: SK-301 defines `StateSource` + a simple full-replay implementation, SK-302 later provides the incremental one | **A** (critical path) |
+| SK-308 (W3) | none | new `src/transport/*` | **A** (tiny; gates SK-302) |
+| SK-302 (W3) | **SK-308** (`HintChannel` type), **SK-301** (`BlackboardClone`, `StateSource`) | `src/blackboard/sync.ts` only; must not edit `clone.ts`/`publisher.ts` | **B**, gated on SK-301 + SK-308 merged |
+| SK-303 (W3) | none | `src/blackboard/{heartbeat,liveness}.ts`; works on a repo dir parameter, does not use or edit `clone.ts` | **B** (pane cap only); first free codex pane |
+| SK-306 (W3) | none | `src/runtime/native.ts`, `src/exec/interrupt.ts`; must export `runInterruptLadder` matching SK-207's `InterruptLadder` | **B** (pane cap only) |
+| SK-307 (W3) | none | `src/adapter/{structured,prompts,fake}.ts`; disjoint from SK-207's `codex.ts`; neither edits `adapter/types.ts` | **B** (pane cap only) |
+| SK-304 (W3, pi) | **SK-202** (replan events in random logs), **SK-208** (plan-mode rules decide which generated plans are valid) | new `invariants.ts`, `replay.property.test.ts`, `test/helpers/random-log.ts` (owned by SK-304) | **B**, gated on SK-202 + SK-208 merged; takes the pi pane after SK-204 |
+| SK-305 (W3, pi) | **SK-202**, **SK-208**, **SK-304** (property tests may still change reducer behaviour, which would churn golden hashes) | `test/fixtures/golden/*`, `test/integration/golden.test.ts`, `test/helpers/golden.ts`; imports (never edits) `random-log.ts` | **C**, gated on SK-304 merged |
+
+Wave 2 remainder against each other: SK-202 vs SK-208 — disjoint files; SK-202 must not touch
+`plan.ts`, SK-208 must not touch `replan.ts` or `replay.test.ts`. SK-204 vs both — read-only use of
+handler exports; views must not reimplement reducer rules (D16 count via `activeLeaseCount`).
+Shared frozen files nobody in Batches A–C may edit: `src/core/schemas/**`, `src/core/reducer/{state,apply,types,preconditions,authz,structural,genesis,replay}.ts`, `handlers/{barrier,lease,merge,work,task,types}.ts`, `src/adapter/types.ts`, `src/runtime/types.ts`, `src/git/**`, `test/helpers/{log-builder,git-fixture}.ts`, `package.json`, configs. Extend helpers only inside your own test files.
+
+### Schedule
+
+| Batch | Task | Assignee | Starts when / blocked by | Files owned |
+|---|---|---|---|---|
+| A | SK-202 | codex | now | `src/core/reducer/handlers/replan.ts`, `handlers/replan.test.ts`, stub assertions in `src/core/reducer/replay.test.ts` |
+| A | SK-208 | codex | now | `src/core/reducer/handlers/plan.ts`, `handlers/plan.test.ts` |
+| A | SK-301 | codex | now | `src/blackboard/{clone,publisher,genesis}.ts` (+ tests), `src/core/intents.ts` (+ test), `test/integration/publisher-race.test.ts` |
+| A | SK-308 | codex | now | `src/transport/{types,null-hint,fake-hint}.ts` (+ tests) |
+| A | SK-207 | codex | now | `docs/spikes/adapter-codex.md`, `src/adapter/codex.ts` (+ test), `test/fixtures/codex/*`, `test/integration/adapter-codex.test.ts` |
+| A | SK-204 | pi | now | `src/core/reducer/views.ts` (+ test), export line in `src/core/reducer/index.ts` |
+| B | SK-302 | codex | SK-301 **and** SK-308 merged | `src/blackboard/sync.ts` (+ test) |
+| B | SK-303 | codex | first free codex pane (no gate) | `src/blackboard/{heartbeat,liveness}.ts` (+ tests) |
+| B | SK-306 | codex | next free codex pane (no gate) | `src/runtime/native.ts`, `src/exec/interrupt.ts` (+ tests) |
+| B | SK-307 | codex | next free codex pane (no gate) | `src/adapter/{structured,prompts,fake}.ts` (+ tests) |
+| B | SK-304 | pi | SK-202 **and** SK-208 merged (pi pane free after SK-204) | `src/core/reducer/invariants.ts`, `src/core/reducer/replay.property.test.ts`, `test/helpers/random-log.ts` |
+| C | SK-305 | pi | SK-304 merged | `test/fixtures/golden/*.json`, `test/integration/golden.test.ts`, `test/helpers/golden.ts` |
+
+Batch B fill order when a codex pane frees: SK-302 (as soon as its gates merge; critical path) →
+SK-303 (feeds SK-401) → SK-306 (gives SK-207 its real runtime) → SK-307. Never more than 6 panes.
+Held-back reasons: SK-302 needs SK-308's `HintChannel` and SK-301's clone/state-source contracts;
+SK-304 generates replan and plan-mode logs whose semantics SK-202/SK-208 are still defining;
+SK-305 freezes state hashes, so it runs after the reducer stops moving (SK-304's property tests);
+SK-303, SK-306 and SK-307 have no blocker and wait only for a free pane (they are off the
+SK-202→SK-304→SK-401 and SK-301/302→SK-401 critical paths, or have slack because SK-401 also waits
+for SK-304).
 
 ---
 
@@ -481,6 +539,252 @@ Read first: PRD §7.1–§7.3, §11.5, `src/core/schemas/config.ts` (normative),
 6. No test reads the real `~/.skep`; files come from fixtures or temp dirs.
 
 **Test command:** `npx vitest run src/config src/exec && npm run lint && npm test`
+
+---
+
+## Wave 2b / Wave 3 task briefs
+
+All tasks: branch `task/<ID>-<slug>` from the latest `main`, run `npm ci` first, own **only** the
+files listed in the schedule above (plus colocated tests), never edit the frozen files listed under
+the analysis table, and finish with the task's test command green. Normative: ARCHITECTURE
+§4–§9, §11, D12–D16, D18, D19. Generic example values only. No credentials anywhere (D19).
+
+### SK-202 — Reducer: replan, barrier, checkpoint handlers (codex, Batch A)
+
+Read first: ARCHITECTURE §5.2, §5.5 (rows replan.requested, checkpoint.recorded, barrier.closed;
+budgets; D6, D12, D16), §6.1 "Which leases count", PRD §9.7; `handlers/barrier.ts`, `lease.ts`,
+`work.ts` (style), `state.ts` (`Barrier`, `CheckpointRecord`).
+
+**Modify:** `handlers/replan.ts` (replace the three stubs, keep the exported names), new
+`handlers/replan.test.ts`, and in `replay.test.ts` **only** remove the three SK-202 types from the
+"later-wave stub" assertions. Do not edit `plan.ts` (SK-208 runs concurrently), `barrier.ts`,
+`lease.ts`, `apply.ts`, `state.ts`.
+
+Rules (check order = rejection precedence):
+
+* `replan.requested` — `executing`: if the signer principal is not `human`, `evidence.length ≥ 1`
+  (`missing_evidence`); `payload.item` non-null ⇒ must exist (`unknown_item`). Effect:
+  `replan_count += 1`; `barrier = { id: "B<seq>", opened_seq: seq, closed_seq: null, requests:
+  [{seq, event_id, actor, summary, evidence_count}], awaiting: items in status `leased` in
+  `stack_order`, checkpointed: [], escalate: replan_count > budgets.replans }`; every awaited
+  lease gets `interrupt = barrier.id`; status `interrupting`; then `settleBarrier(task, seq)` (an
+  empty `awaiting` closes it at once ⇒ `replanning`, or `escalated` with reason `replans`).
+  `interrupting`/`replanning`: same evidence check, then append to `barrier.requests` only
+  (coalesce; `replan_count` unchanged). Other statuses ⇒ `bad_task_state`.
+* `checkpoint.recorded` — statuses `executing`, `interrupting`, `replanning`, `escalated`
+  (`bad_task_state`); fenced (`lease !== null ∧ holder == actor ∧ epoch == payload.epoch`, else
+  `fenced`); `snapshot.item/epoch == payload.item/epoch` (`bad_snapshot`); `barrier_id === null`
+  or `== task.barrier?.id` (`no_barrier`). Effect: `last_checkpoint = { epoch, seq, barrier_id,
+  head_sha: snapshot.head_sha, invocation_state: snapshot.invocation_state }`. If `barrier_id` is
+  set: item `interrupted`, add to `checkpointed` (no duplicates), **keep the lease** (parked, D16),
+  then `settleBarrier`. A voluntary checkpoint (`barrier_id: null`) changes nothing else.
+* `barrier.closed` — `interrupting`; `barrier_id == task.barrier.id ∧ closed_seq === null`
+  (`no_barrier`); sorted `missing` == sorted(awaiting − settled) (`pre_mismatch`). Effect: each
+  missing item: lease `null`, status `unknown`; then `settleBarrier` (⇒ `replanning`/`escalated`).
+
+**Acceptance criteria**
+
+1. Every row of the DEV-PLAN SK-202 entry, each rejection reason above with no state change but
+   the outcome.
+2. Full cycle via `LogBuilder` (use **solo** plans in solo tasks or **team** plans in team tasks so
+   the log is valid both before and after SK-208): claim W1 ⇒ `replan.requested` ⇒ checkpoint ⇒
+   `replanning` ⇒ `plan.proposed` v2 ⇒ approve ⇒ `executing`, barrier cleared, epochs kept, W1
+   re-claimable at epoch+1; a stale `work.delivered` from epoch 1 ⇒ `fenced` or `interrupted`.
+3. Budget: with `replans: 2` the third barrier escalates only after settlement (reason `replans`);
+   coalesced requests do not count; `human.decided{replan}` afterwards clears the barrier (D12).
+4. D16: holder with `max_parallel_items: 1` checkpoints in task A ⇒ claim in task B accepted;
+   before the checkpoint (flagged, still `leased`) ⇒ `max_parallel`.
+5. Late checkpoint in `replanning`/`escalated` for the parked lease is accepted and changes no
+   status; deep-freeze + prefix-replay determinism test as in `merge.test.ts`.
+
+**Test command:** `npx vitest run src/core/reducer && npm run lint && npm test`
+
+### SK-208 — Reducer: plan-mode routing (D13) (codex, Batch A)
+
+The DEV-PLAN row is the spec (ARCHITECTURE §5.5 "Plan mode decides routing", D13, D15). **Modify
+only** `handlers/plan.ts` and `handlers/plan.test.ts`; keep the D15 status derivation at the end
+of `activatePlan` and add `task.mode = record.plan.mode` there. Do not touch `replan.ts` or
+`replay.test.ts` (SK-202). If a test in another file encodes the old `plan.mode == task.mode`
+rule, change only that assertion and say so in the commit body.
+
+**Acceptance criteria:** as in the row; additionally `npx vitest run src/core/reducer` shows the
+D14/D15 tests in `merge.test.ts` and the D16 tests in `lease.test.ts` unchanged and green.
+
+**Test command:** `npx vitest run src/core/reducer && npm run lint && npm test`
+
+### SK-204 — Reducer views + `statusView` (pi, Batch A)
+
+Read first: ARCHITECTURE §5.6, §6.1 (D16), §16 (D19), `state.ts`, `handlers/{lease,barrier}.ts`.
+
+**Create** `src/core/reducer/views.ts` (pure) + `views.test.ts`; add `export * from "./views.js";`
+to `src/core/reducer/index.ts` (the only edit outside your files).
+
+| Export | Contract |
+|---|---|
+| `claimableItems(s: State, agent: AgentId): ClaimCandidate[]` | `{ task_id, item, expected_epoch, plan_version, plan_hash, branch }` (branch = `workBranch(task, item, epoch + 1)`); task `executing` ∧ barrier null ∧ item `ready` ∧ assignee == agent ∧ `attempts_this_plan ≤ budgets.item_retries`; returns `[]` for an unregistered agent or when `activeLeaseCount(s, agent) ≥ max_parallel_items`; sorted by task_id, then `stack_order` |
+| `leasesHeldBy(s, agent): HeldLease[]` | `{ task_id, item, epoch, branch, interrupt, parked }`, `parked` = item status `interrupted` (D16) |
+| `isOwner(s, taskId, agent): boolean` | |
+| `pendingReviews(s, agent): { task_id, plan_version, plan_hash }[]` | task `reviewing`, agent ∈ current plan reviewers, no review by agent yet |
+| `barrierStatus(s, taskId): BarrierStatus \| null` | `{ id, open, awaiting, settled, missing, escalate, request_count }` using `isSettled` |
+| `statusView(s): StatusView` | stable, JSON-only: `seq`, `tip`, agents (id, device, agent_cli, cli_version, max_parallel_items), tasks (status, mode, owner, owner_gen, current/active plan version, items with status/assignee/epoch/holder/parked, barrier status, `escalation` incl. `verification_failed`, `verified`, replan_count/review_rounds with budgets); arrays sorted; **no provider information** (D19) |
+
+**Acceptance criteria:** each function tested over `LogBuilder` logs; barrier and parked-lease
+cases use constructed states (SK-202 runs concurrently); `claimableItems` never offers an item the
+reducer would reject for `max_parallel`/`retry_budget`/`barrier_open` (cross-check by applying the
+claim it returns); `canonicalJson(statusView(s))` equals `JSON.stringify` of a re-parse and is
+identical for two replays; inputs not mutated (deep-freeze).
+
+**Test command:** `npx vitest run src/core/reducer && npm run lint && npm test`
+
+### SK-207 — Adapter spike: pinned Codex CLI (codex, Batch A)
+
+Read first: ARCHITECTURE §9.1–§9.3, §10.1, §16 (D19), `src/adapter/types.ts`,
+`src/runtime/types.ts`, PRD §13.1.
+
+**Create:** `docs/spikes/adapter-codex.md`; `src/adapter/codex.ts` + `codex.test.ts`;
+`test/fixtures/codex/*.jsonl` (recorded or hand-made event streams with generic content);
+`test/integration/adapter-codex.test.ts` (opt-in, `SKEP_REAL_CODEX=1`).
+
+* `export type InterruptLadder = (h: ProcessHandle, clock: Clock) => Promise<"completed" |
+  "interrupted" | "killed">` — SK-306's `runInterruptLadder` is structurally identical; do not
+  import from `src/exec/interrupt.ts` (not merged yet).
+* `class CodexAdapter implements AgentAdapter` — constructor `{ runtime: RuntimeBackend;
+  interrupt: InterruptLadder; clock: Clock; codexPath?: string }`; `probe()` (version string);
+  `invoke(inv)` builds argv (no shell), writes the schema to `inv.scratchDir`, passes the prompt on
+  stdin, parses JSONL events (usage, approval request ⇒ `permission_prompt`), reads the
+  last-message file, enforces `timeoutMs` and `signal` through `interrupt`.
+* The opt-in real test uses a minimal inline `RuntimeBackend` in the test file, not `native.ts`.
+
+**Report must cover:** exact flags (non-interactive, approval policy, sandbox, output schema,
+last-message file, JSON events), version string, usage fields, SIGINT behaviour, permission-prompt
+detection, and **D19:** how the CLI authenticates from the agent user's own local configuration
+when the daemon passes only the sanitized environment (no credentials), and what the human must
+configure on each device; plus the Codex-vs-fallback decision.
+
+**Acceptance criteria:** unit tests with a fake `RuntimeBackend` replaying fixtures cover success,
+invalid final message, approval request ⇒ `permission_prompt`, timeout ⇒ ladder called ⇒
+`timeout`, abort ⇒ `interrupted`/`killed`, missing usage ⇒ `null`; argv never contains the
+prompt or any credential; `adapter/types.ts` unchanged (contract problems go into the commit
+body).
+
+**Test command:** `npx vitest run src/adapter && npm run lint && npm test` (plus, on a device with
+the pinned CLI configured: `SKEP_REAL_CODEX=1 npx vitest run test/integration/adapter-codex.test.ts`)
+
+### SK-301 — Blackboard clone, publisher write loop, genesis (codex, Batch A)
+
+Read first: ARCHITECTURE §7.1–§7.4, §4.5, §5.3, PRD §10.2; `src/git/{runner,commit,signer}.ts`,
+`src/git/log-reader.ts`, `src/util/backoff.ts`, `test/helpers/git-fixture.ts`.
+
+| File | Exports |
+|---|---|
+| `src/core/intents.ts` (pure) | `interface EventDraft<T extends EventType = EventType> { type: T; task_id: TaskId \| null; actor: string; pre: Pre; payload: PayloadOf<T> }`; `type Intent = (s: State) => EventDraft \| null`; `draft(type, taskId, actor, payload, pre)`; `finalizeEvent(d, { event_id, observed_tip, created_at }): SkepEvent` (runs `parseEvent`, throws a typed error). No intent builders (SK-403). |
+| `src/blackboard/clone.ts` | `class BlackboardClone { constructor({ git, dir, remoteUrl }); init(): Promise<void> /* non-bare, mode 0700, refspecs §7.1 */; fetch(): Promise<void> /* main + hb/* */; resetToRemoteMain(): Promise<Sha>; }` |
+| `src/blackboard/publisher.ts` | `interface StateSource { replayTo(tip: Sha): Promise<State> }`; `fullReplaySource(git, dir, trustPath): StateSource` (readLog + replay, no cache); `interface PublishResult`; `class Publisher { constructor({ git, clone, signer, clock, rng, state: StateSource, ident, maxAttempts? }); publish(intent, opts?: { signer?: Signer }): Promise<PublishResult> }` — §7.2 steps 1–9, serialized FIFO, backoff via `util/backoff` + `rng`, sleeps via `clock` |
+| `src/blackboard/genesis.ts` | `createGenesis({ git, clone, signer /* human */, genesis, allowedSignersText, ident }): Promise<Sha>` — refuses if remote `main` exists |
+
+**Acceptance criteria:** the DEV-PLAN row; plus (recording `GitRunner` wrapper defined in the test
+file) no `rebase`/`merge`/`pull`/`--force` ever on `main`; lost-ack (push performed, error
+reported) resolves through `seen_event_ids` to exactly one commit; an intent returning `null` ⇒
+`dropped`; a rejected event ⇒ `rejected` with the reducer reason; `MAX_ATTEMPTS` exhaustion ⇒
+`failed`; the `opts.signer` path signs with the human test key and the reducer accepts the human
+event. Hint publishing is **not** part of this task (SK-601 wires it, D18).
+
+**Test command:** `npx vitest run src/blackboard src/core/intents.test.ts test/integration/publisher-race.test.ts && npm run lint && npm test`
+
+### SK-308 — Transport interface: wake-up hints (codex, Batch A)
+
+The DEV-PLAN row is the spec (ARCHITECTURE §17.3). **Create** `src/transport/types.ts`
+(`HintSchema` (Zod), `type Hint`, `interface HintChannel`) and `src/transport/null-hint.ts`
+(`class NullHintChannel implements HintChannel`), with tests. Export a `FakeHintChannel` only
+from a test helper inside `src/transport/` named `fake-hint.ts` so SK-302 can import it (SK-308
+owns it; SK-302 must not edit it).
+
+**Test command:** `npx vitest run src/transport && npm run lint && npm test`
+
+### SK-302 — Sync poller + state cache (codex, Batch B; after SK-301 + SK-308)
+
+Read first: ARCHITECTURE §5.1 (incremental == full), §11.1 step 2, §17.3; `clone.ts` and
+`publisher.ts` (`StateSource`) from SK-301; `src/transport/*` from SK-308. **Create**
+`src/blackboard/sync.ts` + test; do not edit SK-301/SK-308 files.
+
+`class Sync implements StateSource { constructor({ git, clone, trustPath, clock, rng, hints?:
+HintChannel, intervals?: { activeMs: 20_000, idleMs: 90_000, jitter: 0.25, minHintGapMs: 2_000 }
+}); replayTo(tip); observeNow(): Promise<State>; start(); stop(); current(): { state, tip, seq,
+fetchedAtMonoMs, invalidCount }; onState(cb); onAlarm(cb) }` — incremental from the cached
+`{sha, seq}` via `readLog({ from })`; `LogReadError` ⇒ alarm + full replay.
+
+**Acceptance criteria:** the DEV-PLAN row (hint rate limit, forged hint, `ls-remote`
+short-circuit, incremental == full over a real temp repo, adaptive interval with `FakeClock`).
+
+**Test command:** `npx vitest run src/blackboard/sync.test.ts && npm run lint && npm test`
+
+### SK-303 — Heartbeats + liveness (codex, Batch B)
+
+Read first: ARCHITECTURE §8, PRD §10.4–§10.5, `src/core/schemas/heartbeat.ts`,
+`src/git/{commit,verify}.ts`. **Create** `src/blackboard/{heartbeat,liveness}.ts` + tests; take a
+`repoDir` parameter, do not use or edit `clone.ts`.
+
+`class HeartbeatWriter { constructor({ git, repoDir, agent, signer, clock, bootId, onAlarm });
+beat(hb: Omit<Heartbeat, "schema" | "agent" | "boot_id" | "n" | "sent_at">): Promise<void> }`;
+`readHeartbeats(git, repoDir, trustPath, devices: Record<AgentId, string>): Promise<Record<AgentId,
+{ oid: string; hb: Heartbeat | null; problem: string | null }>>`; `class LivenessTracker` exactly as
+§8.2.
+
+**Acceptance criteria:** the DEV-PLAN row; a beat signed by another device's key ⇒ `problem`; a
+ref with a parent commit ⇒ `problem`; `main` sha unchanged by 10 beats.
+
+**Test command:** `npx vitest run src/blackboard && npm run lint && npm test`
+
+### SK-306 — Native runtime + interrupt ladder (codex, Batch B)
+
+Read first: ARCHITECTURE §10.1, §9.2 (ladder), PRD §9.7, §10.6; `src/runtime/types.ts`.
+**Create** `src/runtime/native.ts` (`class NativeRuntime implements RuntimeBackend`,
+`readStartToken(pid)`) and `src/exec/interrupt.ts` (`runInterruptLadder(h: ProcessHandle, clock:
+Clock, opts?: { graceMs?: number /*120_000*/; termMs?: number /*30_000*/ }): Promise<"completed" |
+"interrupted" | "killed">` — must stay assignable to SK-207's `InterruptLadder`).
+
+**Acceptance criteria:** the DEV-PLAN row; ladder steps driven by `FakeClock` (no real 120 s
+waits); a child that traps SIGINT is escalated to SIGTERM/SIGKILL; grandchildren die with the
+group; `isAlive` false after reuse simulation (wrong start token); uid/gid tests skipped unless
+running as root.
+
+**Test command:** `npx vitest run src/runtime src/exec/interrupt.test.ts && npm run lint && npm test`
+
+### SK-307 — Structured output, prompts, fake adapter (codex, Batch B)
+
+Read first: ARCHITECTURE §9.3–§9.5, §13.4, §16 (D19); model-facing schemas in
+`src/core/schemas/{plan,review,work-report}.ts`. **Create** `src/adapter/{structured,prompts,fake}.ts`
++ tests; do not edit `types.ts` or `codex.ts` (SK-207).
+
+Exports: `extractJson(text): unknown | null` (last JSON object, fenced or bare); `runStructured`
+per §9.3 (exactly one `repair` invocation); `buildPlanPrompt`, `buildReviewPrompt`,
+`buildWorkPrompt`, `buildFixupPrompt`, `buildRepairPrompt` (English, inputs passed explicitly —
+never read env or files; D19); `class FakeAdapter implements AgentAdapter` scripted per §13.4.
+
+**Acceptance criteria:** the DEV-PLAN row; a prompt-builder test asserts the output is a pure
+function of its arguments (same inputs ⇒ same string; no `process.env` access).
+
+**Test command:** `npx vitest run src/adapter && npm run lint && npm test`
+
+### SK-304 — Reducer invariants + property tests (pi, Batch B; after SK-202 + SK-208)
+
+The DEV-PLAN row is the spec (ARCHITECTURE §13.2 invariants 1–4, 6, 8, 9). **Create**
+`src/core/reducer/invariants.ts` (pure predicates `(entries, state) ⇒ Violation[]`),
+`src/core/reducer/replay.property.test.ts`, `test/helpers/random-log.ts` (`randomLog(seed, opts)`
+using `src/sim/rng.ts`; owned by SK-304, SK-305 may only import it). Use `activeLeaseCount` for
+invariant 9; never reimplement handler rules.
+
+**Test command:** `npx vitest run src/core/reducer && npm run lint && npm test`
+
+### SK-305 — Golden replay fixtures (pi, Batch C; after SK-304)
+
+The DEV-PLAN row is the spec. **Create** `test/fixtures/golden/*.json` (entries + expected
+`contentHash(state)`), `test/helpers/golden.ts` (serialize/load + hash), and
+`test/integration/golden.test.ts`. Updating hashes: `SKEP_UPDATE_GOLDEN=1 npx vitest run
+test/integration/golden.test.ts` rewrites the fixtures (documented in the test file header) —
+no `scripts/` dir and no `package.json` change.
+
+**Test command:** `npx vitest run test/integration/golden.test.ts && npm run lint && npm test`
 
 ---
 
