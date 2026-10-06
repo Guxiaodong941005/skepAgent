@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { FakeCodeHost } from "../../codehost/fake.js";
 import { canonicalJson, contentHash } from "../../core/canonical.js";
 import { claimIntent, deliverIntent, draft, type Intent } from "../../core/intents.js";
 import type { State } from "../../core/reducer/state.js";
@@ -7,7 +8,6 @@ import { PlanSchema } from "../../core/schemas/plan.js";
 import { writeSignedCommit } from "../../git/commit.js";
 import { SshKeySigner } from "../../git/signer.js";
 import { reverify } from "../../lease/reverify.js";
-import type { SimCodeHost } from "../invariants.js";
 import { type SimDuties, type SimNode, type SimWorld, SimWorldError } from "../world.js";
 import type { Scenario } from "./index.js";
 
@@ -62,9 +62,9 @@ export async function publishHuman(world: SimWorld, intent: Intent): Promise<voi
   );
 }
 
-export interface ScriptedCode extends SimCodeHost {
+export interface ScenarioCode {
   base: string;
-  prs: { repo: string; head: string }[];
+  host: FakeCodeHost;
 }
 
 async function codeCommit(
@@ -105,7 +105,7 @@ async function codeCommit(
 
 export async function pushCode(
   world: SimWorld,
-  code: ScriptedCode,
+  code: ScenarioCode,
   node: SimNode,
   branch: string,
 ): Promise<string> {
@@ -119,7 +119,7 @@ export async function pushCode(
 
 export async function approvePlan(
   world: SimWorld,
-  code: ScriptedCode,
+  code: ScenarioCode,
   assignee: string,
 ): Promise<void> {
   const owner = world.node("mac").state.tasks[TASK]?.owner;
@@ -186,7 +186,7 @@ export async function prepareTask(
   world: SimWorld,
   assignee = "mac.coding",
   owner = "mac.coding",
-): Promise<ScriptedCode> {
+): Promise<ScenarioCode> {
   // Only the assignee and owner need registry entries; extra race nodes are independent writers.
   for (const agent of new Set([assignee, owner])) {
     await publish(world, world.node(agent), () =>
@@ -211,22 +211,15 @@ export async function prepareTask(
   await world.git.run(["push", world.codeRemote, `${base}:refs/heads/main`], {
     cwd: node.clone.dir,
   });
-  const code: ScriptedCode = {
+  const host = new FakeCodeHost({ git: world.git, repo: REPO, repoDir: world.codeRemote });
+  const code: ScenarioCode = {
     base,
-    prs: [],
-    async remoteBranchSha(repo, branch) {
-      requireScenario(world, repo === REPO, "Unexpected code repository");
-      const result = await world.git.run(["rev-parse", "--verify", `refs/heads/${branch}`], {
-        cwd: world.codeRemote,
-        allowFailure: true,
-      });
-      return result.code === 0 ? ShaSchema.parse(result.stdout.trim()) : null;
-    },
-    pullRequests() {
-      return [...code.prs];
-    },
+    host,
   };
-  world.codeHost = code;
+  world.codeHost = {
+    remoteBranchSha: host.remoteBranchSha.bind(host),
+    pullRequests: () => host.list().map((pr) => ({ repo: REPO, head: pr.head })),
+  };
   await publishHuman(world, () =>
     draft(
       "task.created",
@@ -250,7 +243,7 @@ export async function prepareTask(
   return code;
 }
 
-export function deliveryDuties(world: SimWorld, code: ScriptedCode, actor: string): SimDuties {
+export function deliveryDuties(world: SimWorld, code: ScenarioCode, actor: string): SimDuties {
   return async (node, state) => {
     const item = state.tasks[TASK]?.items[ITEM];
     if (item?.status === "ready")
@@ -265,12 +258,20 @@ export function deliveryDuties(world: SimWorld, code: ScriptedCode, actor: strin
     );
     // ARCHITECTURE §7.5/§6.3: code first, then a freshly authorized PR and delivery record.
     const head = await pushCode(world, code, node, lease.branch);
+    const found = await code.host.findPr(REPO, lease.branch);
     requireScenario(
       world,
       (await reverify(node.sync, identity)) === "ok",
       "Holder became stale before opening a PR",
     );
-    code.prs.push({ repo: REPO, head: lease.branch });
+    const pr =
+      found ??
+      (await code.host.createPr(REPO, {
+        head: lease.branch,
+        base: "main",
+        title: "Example change",
+        body: "Publish the example change after re-verifying its lease.",
+      }));
     requireScenario(
       world,
       (await reverify(node.sync, identity)) === "ok",
@@ -283,8 +284,8 @@ export function deliveryDuties(world: SimWorld, code: ScriptedCode, actor: strin
         item: ITEM,
         epoch: lease.epoch,
         head_sha: head,
-        pr_url: "https://example.invalid/pull/1",
-        pr_number: 1,
+        pr_url: pr.url,
+        pr_number: pr.number,
         check_runs: [],
       }),
     ];
@@ -314,7 +315,7 @@ export async function requireDelivery(
   requireScenario(
     world,
     (await world.codeHost?.pullRequests())?.length === 1,
-    "Expected one scripted PR",
+    "Expected one fake code-host PR",
   );
 }
 

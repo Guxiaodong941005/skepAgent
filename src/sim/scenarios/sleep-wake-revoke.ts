@@ -134,15 +134,17 @@ export const sleepWakeRevoke: Scenario = {
         await oldHolder.tick();
         requireScenario(
           world,
-          oldHolder.publications.at(-1)?.status === "dropped" && code.prs.length === 0,
+          oldHolder.publications.at(-1)?.status === "dropped" && code.host.list().length === 0,
           "Stale holder published a delivery or opened a PR",
         );
         await newHolder.tick();
         await requireDelivery(world, 2, newHolder.agent);
         requireScenario(
           world,
-          (await code.remoteBranchSha("https://example.invalid/code.git", branchForEpochOne())) !==
-            null,
+          (await code.host.remoteBranchSha(
+            "https://example.invalid/code.git",
+            branchForEpochOne(),
+          )) !== null,
           "Keep the stale epoch branch for forensics",
         );
       },
