@@ -24,6 +24,8 @@ Contents
 13. [Simulation harness](#13-simulation-harness)
 14. [Testing strategy](#14-testing-strategy)
 15. [Decisions and deviations log](#15-decisions-and-deviations-log)
+16. [Provider config sync (D17)](#16-provider-config-sync-d17)
+17. [Transport and discovery without a mesh VPN (D18)](#17-transport-and-discovery-without-a-mesh-vpn-d18)
 
 ---
 
@@ -174,6 +176,17 @@ skep/
 │   │   └── agent-md.ts          parse AGENT.md (front-matter + body)
 │   ├── notify/
 │   │   └── ntfy.ts              human notifications
+│   ├── transport/               D18 (§17): hint channels + mailboxes; never authoritative
+│   │   ├── types.ts             Hint (Zod), HintChannel, Mailbox
+│   │   ├── null-hint.ts         default no-op hint channel
+│   │   ├── git-mailbox.ts       refs/heads/mbx/<agent> mailbox on the blackboard remote
+│   │   └── relay.ts             V1: outbound WebSocket relay client (hints + mailbox)
+│   ├── secrets/                 D17 (§16): provider config sync
+│   │   ├── redact.ts            Redactor (journal, logs, IPC, notifications)
+│   │   ├── device-key.ts        per-device age X25519 identity, rotation
+│   │   ├── bundle.ts            skep.secret_bundle/v1 seal / verify / open
+│   │   ├── ccswitch.ts          read-only import of one provider entry (controller)
+│   │   └── store.ts             at-rest ciphertext store + per-invocation env hand-off
 │   └── sim/
 │       ├── rng.ts               seeded PRNG (+ RandomSource adapter)
 │       ├── fake-clock.ts        per-daemon virtual clock (skew, suspend)
@@ -186,6 +199,7 @@ skep/
     ├── helpers/                 log-builder (pure log fixtures) [scaffold], git tmp repos, keys
     ├── fixtures/                test-only SSH keys, golden logs
     └── integration/             cross-module tests (git + publisher + reducer, sim scenarios)
+relay/                           V1 (D18): serverless WebSocket relay (worker + per-topic object), own deploy config
 ```
 
 `[scaffold]` = present in the initial commit. Unit tests are colocated (`foo.ts` ↔ `foo.test.ts`);
@@ -224,6 +238,10 @@ human ──►  skep CLI ──unix socket──►  skepd  (one per device, la
   clone (`$SKEP_HOME/cli-blackboard`). Correctness never depends on single-writer-ness — the
   write loop handles races — it only reduces contention.
 * `SKEP_HOME` defaults to `~/.skep`; tests and the simulator point it at temp dirs.
+* **Outbound-only networking (D18, §17).** Devices never connect to each other. Each `skepd` talks
+  only to the git remotes, the code host, provider APIs and, optionally, one relay WebSocket for
+  hints. No mesh VPN, inbound port or fixed IP is required (this replaces the PRD §6.1 Tailscale
+  edge between devices).
 
 ---
 
@@ -238,7 +256,7 @@ Source of truth: `src/core/schemas/events.ts` (+ the files it imports).
 | `schema` | `"skep.event/v1"` | literal |
 | `event_id` | `evt_<uuid v4>` | generated once per intent; stable across write-loop retries |
 | `type` | one of §4.3 | discriminator |
-| `task_id` | `T-yyyymmdd-xxxx` \| `null` | `null` iff `type == agent.registered` |
+| `task_id` | `T-yyyymmdd-xxxx` \| `null` | `null` iff `type == agent.registered` (D17 extends this to the registry events `device.key_published`, `provider.*`, §16.6) |
 | `actor` | `"human"` \| agent ID | must be bound to the commit's signer (§5.4) |
 | `observed_tip` | git sha | must equal the commit's parent |
 | `pre` | object | preconditions (§4.2) |
@@ -290,6 +308,9 @@ against buggy or forged-but-signed writers.
 | `item.merged` | any daemon \| human | task_rev, item | item, pr_number, merge_sha |
 | `task.verified` | owner | task_rev, owner_gen, plan_hash | top_of_stack_sha, check_runs[], passed (`false` ⇒ escalate, D14) |
 | `human.decided` | human | task_rev | decision, note?, new_owner? |
+| `device.key_published` *(planned, D17)* | agent on the device | – | device, key_id, alg, recipient, retires |
+| `provider.bound` / `provider.revoked` *(planned, D17)* | human | – | agent, version, bundle_id, recipient_key_id, ciphertext_sha256, provider_name, transport / agent, version, reason |
+| `provider.applied` *(planned, D17)* | target agent | – | version, bundle_id, ciphertext_sha256 |
 
 `work.failed.class` ∈ `invalid_output | checks_failed | timeout | permission_prompt | crash |
 preflight | secret_detected | budget_exceeded`.
@@ -421,6 +442,8 @@ genesis is fatal (`GenesisError`): the daemon refuses to run against that blackb
 | replan.requested | ✅ | actor == task.owner or actor holds a lease in the task |
 | agent.registered | ❌ | ✅ |
 | item.merged | ✅ | ✅ |
+| provider.bound, provider.revoked *(planned, D17)* | ✅ | ❌ |
+| device.key_published, provider.applied *(planned, D17)* | ❌ | actor on `<d>`; payload device == `<d>`; `provider.applied` only for the actor itself |
 
 3. State-dependent checks (owner, reviewer, holder) are evaluated only if the task exists; if it
    does not, authz passes and the handler rejects with `unknown_task`.
@@ -679,6 +702,8 @@ ref equals the local sha before recording anything (**code first, then record**)
 * `git push --force-with-lease=refs/heads/hb/<agent>:<last_oid> origin <new>:refs/heads/hb/<agent>`.
   Lease failure ⇒ someone else wrote our ref ⇒ `duplicate-daemon` alarm (also raised when two
   `boot_id`s are seen for one agent).
+* After each beat the daemon may publish a `tip` hint for `hb/<agent>` (D18, §17.3); observers still
+  judge liveness only from fetched refs.
 * Interval 60 s while holding a lease, 300 s idle. `n` increments per boot. Never touches `main`
   (invariant: zero heartbeat commits on main).
 
@@ -705,7 +730,9 @@ liveness column + revoke suggestion.
 ### 9.1 Adapter interface
 
 See `src/adapter/types.ts` (`AgentAdapter`, `AdapterInvocation`, `AdapterResult`). An adapter
-only runs the CLI and returns the raw final message; it knows nothing about events.
+only runs the CLI and returns the raw final message; it knows nothing about events. Provider
+credentials reach the CLI only through `AdapterInvocation.env` (sanitized base ∪ the slot's
+allowlisted provider env, D17 §16.9); each adapter declares that allowlist.
 
 ### 9.2 MVP adapter: Codex (`adapter/codex.ts`)
 
@@ -809,6 +836,7 @@ and a stub that reports "unavailable".
 every tick (20 s ±25 % with an active local task, 90 s idle; immediately after a local publish):
   1. suspend check (§6.3)
   2. sync: fetch main + hb/* → incremental replay → State; liveness.observe(...)
+     (a relay `tip` hint starts this step early, ≤ 1 per 2 s; `ls-remote` may skip an idle fetch, D18)
   3. alarms: new invalid commits, duplicate boot_ids, reducer version mismatch
   4. for each slot: duties(state) → intents / attempt actions
        owner:    planning|replanning → plan invocation → validate → plan.proposed
@@ -821,7 +849,8 @@ every tick (20 s ±25 % with an active local task, 90 s idle; immediately after 
        holder:   barrier on my lease → interrupt → snapshot → checkpoint.recorded
        any:      PR merged (gh) → item.merged; retarget next PR
   5. heartbeat if due
-  6. publisher drains its queue (serialized)
+  6. publisher drains its queue (serialized); after an accepted publish ⇒ hints.publish(tip)
+  7. mailbox (D17): pending provider.bound for a local slot ⇒ fetch → verify → apply → provider.applied
 ```
 
 All waits use the injected `Clock`; `Daemon.tick()` is callable directly by the simulator.
@@ -888,6 +917,10 @@ head branch".
 * `status.result` = `statusView(state)` + liveness + fetch freshness (`#seq`, tip, fetched N s
   ago, reducer version, invalid commit count). The same JSON is printed by `--machine`.
 * Version negotiation: `v` mismatch ⇒ `error.code = "protocol_version"`.
+* `logs.tail` serves **local** agents only. There is no device-to-device socket and no SSH hop
+  (D18): for a remote agent the CLI shows its last heartbeat; remote log streaming is V1 over the
+  relay mailbox, redacted and encrypted (§17.6). All socket responses pass through the redactor
+  (§16.10).
 
 ---
 
@@ -990,3 +1023,373 @@ before a task is done.
 | D14 | A failed top-of-stack verification is recorded as `task.verified{passed: false}` by the owner and moves the task `delivered → escalated` (reason `verification_failed`). Items, deliveries and epochs are unchanged; no budget is consumed and there is no automatic retry. The human resumes (re-verify, via D15), replans (fix item on top of the carried-over stack) or cancels; merging every PR anyway still completes the task | PRD §9.8 says "`work.failed` on the top item", but in `delivered` no item holds a lease, so a fenced event (PRD §9.5) cannot be accepted, and reopening the lease of a delivered item would undo a fenced, accepted delivery. `task.verified` is already owner-only and `owner_gen`/`plan_hash`-fenced (PRD §11.3), and `passed` exists (D11), so no schema change is needed. Escalation matches PRD §8.6 (a failure with no budget left ⇒ `escalated`) and §9.9 (escalation decisions are a human gate); integration failures span items, so retrying a single item is not a meaningful default. Found in the SK-201 review (note 1). |
 | D15 | Plan activation derives the status from the rebuilt items: all `merged` ⇒ `done`; all `delivered`/`merged` ⇒ `delivered`; otherwise `executing` | With D7 carry-over a replan (or `resume_with_plan`) can keep every item finished. Claims and deliveries are the only way out of `executing` (PRD §8.6), so the task would be stuck forever. The rule reuses the existing `work.delivered`/`item.merged` completion conditions, so it is deterministic, and it clears `verified` so a carried-over stack is verified again under the new plan (PRD §9.8). Found in the SK-201 review (note 3). |
 | D16 | Only items in status `leased` count toward `max_parallel_items`. A lease flagged by a barrier counts until its item checkpoints; after that it is parked (record kept until the next activation, never reactivated, ends on activation, revoke or cancel) and does not count | PRD §9.5 limits *held* leases ("claimant holds < `max_parallel_items`"). A checkpointed lease is fenced (`interrupt` set ⇒ no delivery, §6.3), and its process has stopped (PRD §9.7 ladder), so counting it would block the agent in every other task for as long as the human takes to decide an escalation. Counting a flagged but not yet checkpointed lease stays conservative while the process may still run. Found in the SK-201 review (note 4). |
+| D17 | Provider config sync: the controller sends one cc-switch provider entry to exactly one `(device, agent)` as `skep.secret_bundle/v1` = age (X25519) encryption to a per-device key published on `main` by the device's daemon (`device.key_published`), signed by the human key (SSH signature, namespace `skep-secret-bundle@v1`), bound to blackboard/device/agent/version. `main` carries only metadata (`provider.bound`/`applied`/`revoked`) and is the anchor for replay/rollback protection; the ciphertext travels through a transient mailbox. Target stores ciphertext 0600 under the daemon user, decrypts per invocation and hands values to the agent CLI only via its process env (adapter allowlist); a redactor + exact-match scan guard every output. Design in §16 | PRD §3.2 excludes secret distribution through the blackboard and §18 defers `skep provider copy`; this is a deviation, kept narrow: no plaintext or plaintext hash ever on the blackboard, never on `main`, one entry per push. age over libsodium/SSH-derived keys: reviewed format with CLI recovery tooling, key separation from signing keys (§16.2). Anchoring versions on the signed log reuses the existing trust root (PRD §11.2) instead of trusting a transport. |
+| D18 | No mesh VPN or fixed IP: the hosted git remote is the only rendezvous and authority (adaptive polling, `ls-remote` short-circuit); an optional outbound-only WebSocket relay carries only rate-limited wake-up hints and opaque encrypted mailbox blobs (V1); direct P2P rejected. Tailscale-dependent features move to signed enrollment/trust bundles, local `skep logs` + heartbeat summary (remote logs over the relay in V1), and relay hints. Design in §17 | Deviates from PRD §1, §5, §6.1, §11.2, §15.2 and §18, which assume a tailnet. Devices behind NAT, laptops and phones cannot rely on inbound reachability; correctness already comes from signed git (PRD §10), so a transport needs only availability. Polling latency (~10 s active) is small next to work-item durations, so the relay is an optimisation, not a dependency; P2P would need the relay for signalling anyway plus TURN. |
+
+---
+
+## 16. Provider config sync (D17)
+
+> Status: design, not implemented. Tasks: SK-309 (protocol), SK-506 (redaction), SK-701..SK-704, SK-708.
+> **PRD deviation:** PRD §3.2 lists "no secret storage or secret distribution through the
+> blackboard" as a non-goal, and §16.1/§18 defer `skep provider copy` to V2. D17 brings a narrow,
+> end-to-end encrypted point-to-point copy forward as an MVP+ feature (Wave 7, after the core MVP
+> path). It keeps the spirit of the non-goal: **plaintext never touches the blackboard**, `main`
+> carries only non-secret metadata, and ciphertext lives only in a transient mailbox (§17.3), never
+> on `main`.
+
+### 16.1 Goal and scope
+
+The human's controller device (the Mac) selects **one** provider entry from its local
+provider-switcher database (e.g. cc-switch) and sends it to **exactly one** `(device, agent)` slot.
+A "provider config" is the set of environment values the agent CLI needs: API key(s), base URL,
+model id, and a few CLI-specific options. Nothing else is in scope (no account management, no
+installation of CLIs, PRD §3.2).
+
+Threats addressed (on top of PRD §11.1): a passive or active attacker on the transport (git host,
+relay, network), replay of an old bundle (rollback to a revoked key), cut-and-paste of a bundle to
+another device or agent, leakage through logs, journals, prompts, events, notifications or the
+agent's git output. Not addressed: a compromised target daemon user/host, or a compromised
+controller (PRD §11.1 out of scope). The agent necessarily sees its own key (it calls the provider),
+so a misbehaving agent can exfiltrate **that** key; the mitigations are scoping (one entry per
+slot), per-device provider keys with provider-side limits, and fast rotation (§16.8).
+
+### 16.2 Cryptography choice
+
+| Option | Verdict |
+|---|---|
+| **age, X25519 recipients** (`age-encryption.org/v1`, `age-encryption` npm package, pinned) | **Chosen.** Well-specified, small, widely reviewed format (X25519 + HKDF-SHA-256 + ChaCha20-Poly1305, fresh ephemeral key per file). Interoperable with the `age`/`rage` CLIs, so a human can inspect or recover a bundle by hand. Pure TypeScript implementation, no native build. One new dependency, authorised by SK-702. |
+| libsodium sealed boxes (`crypto_box_seal`) | Equivalent security (X25519 + XSalsa20-Poly1305, anonymous sender), but needs a WASM/native libsodium dependency that is larger than age, and offers no file format, armor or CLI tooling for recovery. |
+| SSH-key-derived (ed25519 → X25519, or age `ssh-ed25519` recipients) | Rejected. It reuses the daemon's **signing** key for encryption (no key separation), so rotating one forces rotating the other, and a signing-key compromise also exposes every secret ever sent. A separate encryption key costs one extra file. |
+| Hand-written HPKE (RFC 9180) on `node:crypto` | Fallback only if the dependency is vetoed: no new dependency, but it is our own crypto composition and must be checked against the RFC 9180 test vectors. |
+
+Sender authentication is **not** age's job (age is anonymous-sender). Bundles are signed with the
+existing human SSH key through the existing `Signer` (§7.3) in a dedicated namespace,
+`skep-secret-bundle@v1`, so a bundle signature can never be confused with a commit signature
+(namespace `git`). Verification uses only the local trust root (principal `human`).
+
+### 16.3 Device encryption keys
+
+* Each device generates an X25519 age identity at `skep init` (`$SKEP_HOME/keys/device.age`, mode
+  0600, owned by the daemon user; the agent user cannot read `$SKEP_HOME`, PRD §11.4).
+  `key_id = "dk_" + first 16 hex of sha256(recipient string)`.
+* The daemon publishes the public recipient on `main` with a **`device.key_published`** event
+  signed by its own daemon key (§16.6). Because the daemon principal is already in every device's
+  trust root, the controller learns the recipient key with the same authenticity as any other
+  event; there is no separate TOFU step.
+* The controller encrypts **only** to the latest non-retired `key_id` of the target device on its
+  replayed state.
+* V1: identity kept in the macOS Keychain / Linux Secret Service where the daemon user can access
+  it non-interactively; MVP: 0600 file (the same protection as the daemon's signing key).
+
+### 16.4 Bundle format `skep.secret_bundle/v1`
+
+Outer document (transported; contains no plaintext; strict Zod schema; ≤ 32 KiB):
+
+```jsonc
+{
+  "schema": "skep.secret_bundle/v1",
+  "bundle_id": "sb_<uuid v4>",
+  "blackboard_id": "<from skep.json>",
+  "device": "vps",                       // target device
+  "agent": "vps.coding",                 // target slot; must live on `device`
+  "version": 3,                          // per (blackboard, agent), strictly increasing
+  "recipient_key_id": "dk_0123456789abcdef",
+  "alg": "age-x25519",
+  "ciphertext": "-----BEGIN AGE ENCRYPTED FILE-----\n…",
+  "ciphertext_sha256": "sha256:…",
+  "created_at": "2026-01-01T00:00:00Z",  // display only
+  "signature": "-----BEGIN SSH SIGNATURE-----\n…"   // human key, namespace skep-secret-bundle@v1,
+                                                    // over canonicalJson(outer minus signature)
+}
+```
+
+Inner plaintext (only ever in memory on the controller and the target; strict schema
+`skep.provider_config/v1`):
+
+```jsonc
+{
+  "schema": "skep.provider_config/v1",
+  "bundle_id": "sb_…", "blackboard_id": "…", "device": "vps", "agent": "vps.coding", "version": 3,
+  "agent_cli": "codex",                          // must equal the slot's AGENT.md agent_cli
+  "provider": { "name": "example-provider", "model": "example-model-1" },  // non-secret labels
+  "env": { "EXAMPLE_API_KEY": "…", "EXAMPLE_BASE_URL": "https://api.example.invalid/v1" },
+  "secret_env": ["EXAMPLE_API_KEY"],             // values the redactor must never let through
+  "source": { "tool": "cc-switch", "entry_id": "…" }
+}
+```
+
+* The binding fields (`bundle_id`, `blackboard_id`, `device`, `agent`, `version`) appear in both
+  layers and must be equal. The signature covers the outer binding fields and the ciphertext hash;
+  the inner copy defends against a bug that would decrypt one bundle under another's header.
+* `env` keys must be in the adapter's **provider env allowlist** (`AgentAdapter.providerEnv`, SK-704;
+  e.g. the API-key, base-URL and model variables that CLI documents). Anything else is rejected,
+  so a bundle cannot inject `PATH`, `NODE_OPTIONS`, `LD_PRELOAD`, `GIT_*`, etc.
+* Scoping: the controller exports exactly one provider entry for one agent; the format has no
+  list of entries, so "send everything" is not representable.
+
+### 16.5 Flow
+
+```text
+controller (human, Mac)                       untrusted transport            target skepd (device d, slot a)
+1. replay main → recipient key of d (§16.3), last version v of a
+2. read ONE cc-switch entry (read-only, in memory)
+3. inner → age-encrypt to recipient → outer → sign (human key, touch)
+4. publish provider.bound {a, v+1, bundle_id, ciphertext_sha256, key_id} on main   (metadata only)
+5. Mailbox.put(a, outer)  ─────────────────────►  (git ref or relay, §17.3)
+                                                                    6. hint / poll → Mailbox.fetch(a)
+                                                                    7. verify (§16.7) → decrypt → store
+                                                                    8. publish provider.applied {a, v+1, sha}
+                                                                    9. Mailbox.ack (delete) 
+```
+
+`main` is authoritative for **which** version is current; the mailbox only carries the bytes.
+The target applies a bundle only if it matches the latest accepted `provider.bound` for its agent
+(same `bundle_id`, `version`, `ciphertext_sha256`, `recipient_key_id`). This anchors replay and
+rollback protection in the signed, linear log instead of in the transport.
+
+### 16.6 Events (planned; SK-309)
+
+All are `_skep` events (`task_id: null`; the §4.1 rule "null iff `agent.registered`" becomes "null
+iff the type is a registry event": `agent.registered`, `device.key_published`, `provider.*`).
+
+| Type | Actor / signer | Payload | Reducer effect |
+|---|---|---|---|
+| `device.key_published` | agent on device `d` / `daemon:d` | device, key_id, alg `age-x25519`, recipient, retires: key_id \| null | `devices[d].enc_keys[key_id] = {recipient, seq}`; `retires` marks the old key retired |
+| `provider.bound` | human | agent, version, bundle_id, recipient_key_id, ciphertext_sha256, provider_name, transport (`git_ref` \| `relay`) | rejects unless agent registered, version == previous + 1 (`pre_mismatch`), key_id current for the agent's device (new reason `unknown_key_id`); sets `agents[a].provider = {…, status: "pending"}` |
+| `provider.applied` | the target agent / `daemon:d` | version, bundle_id, ciphertext_sha256 | must match the pending binding; status `applied` |
+| `provider.revoked` | human | agent, version, reason | status `revoked`; the target deletes its stored bundle and stops starting invocations for that slot until a newer `provider.bound` is applied |
+
+No event carries a secret, a hash of plaintext (low-entropy fields such as a base URL could be
+brute-forced), or the ciphertext. `skep status` shows per slot: provider name, version, pending /
+applied / revoked, and whether a newer version is pending (freeze attack visible). PRD §13.3 step 3
+("records only provider name + config hash") becomes provider name + bound version +
+`ciphertext_sha256`.
+
+### 16.7 Verification on the target (order = rejection precedence)
+
+1. Outer schema; size; `blackboard_id`, `device`, `agent` are mine (else drop: not for me).
+2. Human signature valid in namespace `skep-secret-bundle@v1` against the **local** trust root.
+3. `sha256(ciphertext) == ciphertext_sha256`.
+4. Matches the latest accepted `provider.bound` for the agent on my replayed `main`, and `version`
+   > my stored version (replay/rollback protection; an older or unannounced bundle is dropped and
+   alarmed).
+5. `recipient_key_id` is one of my non-destroyed identities.
+6. Decrypt; inner schema; binding fields equal; `agent_cli` equals the slot; `env` keys within the
+   adapter allowlist.
+7. Atomically store (16.9), destroy the previous version, publish `provider.applied`, ack the
+   mailbox.
+
+Any failure ⇒ no state change, a local alarm (`skep status`, ntfy) naming the step, never the
+content; the bundle bytes are not logged.
+
+### 16.8 Rotation and revocation
+
+* **Provider secret rotation:** rotate at the provider, update cc-switch, `skep provider push`
+  again (version + 1). Applied at the next invocation boundary; a running invocation keeps its
+  environment. `skep provider status` lists slots still on an older version.
+* **Device key rotation:** `skep device rotate-key` (target side) generates a new identity,
+  re-encrypts its stored bundle locally to the new key, publishes `device.key_published{retires:
+  old}`, then destroys the old identity. Controllers encrypt only to the new key; a bundle in flight
+  to the retired key fails at step 5 and is re-pushed. Recommended every 90 days and whenever the
+  device is re-imaged.
+* **Device compromise / decommission:** human removes `daemon:<d>` from every trust root (PRD §11.2),
+  publishes `provider.revoked` for each slot on `d`, and **rotates every provider secret that was
+  ever sent to `d`** (the controller keeps a local, non-secret inventory: agent, version,
+  provider_name, entry id, date). Revocation on the log stops an honest daemon; only provider-side
+  rotation defeats a thief.
+* **Forward secrecy limit (explicit):** age uses an ephemeral sender key but a static recipient key,
+  so whoever captured old ciphertext and later steals a device identity can decrypt it. Mitigations:
+  transient mailboxes (deleted on ack; relay mailboxes never persist past ack), key rotation that
+  destroys old identities, and secret rotation after any device compromise.
+
+### 16.9 At rest on the target and hand-off to the agent CLI
+
+* Stored as the **age ciphertext** (re-encrypted to the device key) at
+  `$SKEP_HOME/providers/<agent>.age`, 0600, daemon user; `$SKEP_HOME` is 0700 and not readable by
+  the agent user. Decrypted into memory only when an invocation starts.
+* Hand-off = **environment variables of the agent process only**: `AdapterInvocation.env` =
+  sanitized base env (§9, PRD §11.4) ∪ the bundle's allowlisted `env`. Never in `skepd`'s own
+  `process.env`, never passed to trusted checks (§9.6), the secret scan, git, `gh`, hooks or
+  notifications. On Linux `/proc/<pid>/environ` is readable only by the same uid (the agent user,
+  which needs the value anyway) and root.
+* CLIs that only read a config file: the adapter writes it into an invocation-scoped directory
+  (0700, owned by the agent user, under the scratch dir, pointed to by the CLI's documented home
+  variable), deleted when the invocation ends and by restart reconciliation (§11.4).
+* Prompts never contain provider values; plan/review/work prompts are built from the log and the
+  worktree only.
+
+### 16.10 Redaction and scanning
+
+* `Redactor` (SK-506): built from every `secret_env` value currently loaded (plus derived forms:
+  base64, URL-encoded); replaces matches with `[REDACTED:<NAME>]`. Applied to journal records, the
+  adapter's captured stdout/stderr and JSONL logs, check logs, IPC responses (`logs.tail`, status),
+  notifications and error messages, **before** they are written or sent.
+* Before any publication (event, PR body, commit, snapshot, work-report-derived text) the daemon
+  runs gitleaks (existing) **and** an exact-match scan against the loaded secrets; a hit fails the
+  attempt with `work.failed{secret_detected}` and nothing is published (PRD §9.6 step 7).
+* The controller never writes plaintext to disk: the cc-switch entry is read into memory,
+  encrypted, and the buffer is overwritten after use (best effort in JS).
+* Telemetry: none in the MVP; any future telemetry goes through the same redactor.
+
+### 16.11 Failure modes
+
+| Failure | Behaviour |
+|---|---|
+| Target offline | Mailbox keeps the bundle; `provider.bound` shows `pending`; target applies when it returns. |
+| Mailbox lost / tampered / replayed | Steps 2–4 reject; status stays `pending`; human re-pushes (new version). |
+| Target key rotated in flight | Step 5 fails; alarm "re-push needed"; controller re-encrypts to the new key. |
+| Newer version announced but bytes never arrive | Keep using the applied version (no outage) and show "pending v+1" in status; `provider.revoked` is the explicit stop. |
+| Revoked while an invocation runs | The running invocation finishes (cannot be fenced, PRD §9.5 limitation); no new invocation starts. |
+| Decryption or inner validation fails | Alarm; bundle discarded; nothing stored. |
+| Leak detected in output | `secret_detected`; rotate the secret (history is immutable, PRD §11.5). |
+
+### 16.12 MVP vs later
+
+* **MVP+ (Wave 7):** device key + `device.key_published`; `skep.secret_bundle/v1`; `provider.bound`
+  / `applied` / `revoked`; git-ref mailbox (§17.3); cc-switch read-only import of one entry; env
+  hand-off; redactor + exact-match scan; `skep provider push|status|revoke`, `skep device
+  rotate-key`. Protocol events land in Wave 3 (SK-309) so they are part of the frozen protocol
+  before the first live blackboard (§4.4).
+* **Later:** OS keychain storage (V1); relay mailbox (V1, with D18 relay); scheduled key rotation
+  reminders; multiple controllers; phones as targets; writing back into the target's cc-switch.
+
+### 16.13 Open questions
+
+1. cc-switch storage format and stability across versions (spike in SK-703); whether to read its
+   database directly or use an export command if one exists.
+2. Exact provider env variable names and config-file needs per pinned CLI version (Codex, Claude
+   Code, pi) — determined by the adapter spikes (SK-207) and encoded in each adapter's allowlist.
+3. Provider terms for using one account's key on several devices or unattended (PRD R11).
+4. Whether the launchd daemon user can use the macOS Keychain without a GUI session (V1).
+5. Git hosts may keep unreachable objects (deleted mailbox refs) for some time; acceptable only
+   because content is ciphertext — prefer the relay mailbox once it exists.
+
+---
+
+## 17. Transport and discovery without a mesh VPN (D18)
+
+> Status: design. Tasks: SK-308, SK-302 (changed), SK-705..SK-707, SK-607/SK-608 (changed).
+> **PRD deviation:** PRD §1, §5 (principle 10), §6.1 ("Networking honesty" and the diagram's
+> Tailscale edge), §11.2 (trust root "installed over Tailscale SSH"), §15.2 (`skep logs` "over
+> Tailscale SSH") and §18 (notification hint "over Tailscale") assume a tailnet between devices.
+> D18 removes that assumption: **no Skep feature requires device-to-device reachability, a mesh
+> VPN or a fixed IP.** Every device only makes outbound connections (git over SSH/HTTPS, provider
+> APIs, optionally one outbound WebSocket). Tailscale or plain SSH remain usable conveniences for
+> the human, never dependencies.
+
+### 17.1 Options evaluated
+
+| Option | Latency (event visible on another device) | Cost / ops | Verdict |
+|---|---|---|---|
+| **A. Hosted git remote as sole rendezvous + adaptive polling** (current §7, §11.1) | mean ≈ half the poll interval + one fetch: ~10–12 s while a task is active (20 s ±25 %), ~45 s idle (90 s); immediate after a local publish | none beyond the git host; works behind any NAT that allows outbound SSH/HTTPS | **Default and authority.** Already required; the only component every device must reach. |
+| **B. Outbound-only relay** (e.g. a serverless WebSocket relay: one small worker + one stateful object per blackboard topic) forwarding wake-up hints and opaque encrypted mailbox blobs | ~1–3 s (hint push < 1 s, then a normal fetch) | one small deployment on a serverless platform (free or entry tier for a few devices; verify current pricing); one config value per device | **Recommended accelerator (V1, optional).** Never an authority; system is fully correct when it is down. |
+| C. Git host webhooks → relay → hints | ~2–10 s (webhook delivery) | needs B plus a webhook secret | Optional add-on to B; useful when some publishers do not run the relay client. |
+| D. NAT traversal / direct P2P (ICE/STUN/TURN, hole punching) | sub-second when it works | needs signalling (i.e. B anyway) and a TURN fallback for symmetric NAT and mobile networks; large attack surface; complex to test deterministically | **Rejected for MVP and V1.** Buys latency we do not need (work items take minutes). |
+| E. Mesh VPN (Tailscale etc.) | sub-second | third-party dependency, account, per-device agent | No longer required (this decision). Allowed as a human convenience. |
+
+Ordered fallbacks: **relay hints (if configured) → adaptive polling of the git remote (always on) →
+offline queueing** (publications queued in the journal, fail closed, §7.2 step 9; resumed with
+lease re-verification, PRD §10.6).
+
+### 17.2 Authority vs hints
+
+* **Authoritative:** only the git remote — `main` (signed linear log) and `hb/*` (signed heartbeat
+  refs). All protocol decisions come from replaying `main` (§5). The relay and the git host are
+  untrusted for integrity (everything is signed and verified against the local trust root) and for
+  confidentiality of secrets (D17 payloads are end-to-end encrypted); they are trusted **only for
+  availability**. Non-secret blackboard content (task text, plans) is visible to the git host, as
+  today (private repo, PRD §8.2).
+* **Hint-only:** a hint can only make a daemon fetch **earlier**. It never changes state, never
+  skips verification, and its contents are not trusted: a forged hint costs at most one extra
+  fetch (rate-limited); a dropped hint costs at most one poll interval.
+* **Mailbox:** store-and-forward of opaque, self-authenticating blobs (D17 bundles; V1 log
+  snippets). The mailbox may lose, delay, duplicate, reorder or replay; the payload's own signature,
+  encryption and the anchoring event on `main` handle that (§16.7).
+
+### 17.3 Transport interfaces (`src/transport/types.ts`, SK-308)
+
+```ts
+export type Hint =                                   // Zod-validated, ≤ 1 KiB, strict
+  | { v: 1; kind: "tip"; topic: string; ref: "main" | `hb/${string}`; sha: Sha }
+  | { v: 1; kind: "mailbox"; topic: string; to: AgentId }
+  | { v: 1; kind: "wake"; topic: string; device: string };
+
+/** Best-effort, never authoritative. Implementations: NullHintChannel (default), RelayHintChannel (V1). */
+export interface HintChannel {
+  readonly name: string;
+  start(onHint: (h: Hint) => void): Promise<void>;
+  publish(h: Hint): Promise<void>;                   // never throws to callers; failures only logged
+  stop(): Promise<void>;
+  health(): { connected: boolean; lastMessageMonoMs: number | null };
+}
+
+/** Store-and-forward of opaque blobs; one slot per recipient (put replaces). */
+export interface Mailbox {
+  readonly name: string;                             // "git_ref" (MVP+) | "relay" (V1)
+  put(to: AgentId, id: string, blob: Uint8Array): Promise<void>;
+  fetch(me: AgentId): Promise<{ id: string; blob: Uint8Array } | null>;
+  ack(me: AgentId, id: string): Promise<void>;       // delete if `id` is still the stored one
+}
+```
+
+* `topic = base32(sha256("skep-relay/v1\0" + blackboard_id + "\0" + relay_secret))[0..26]`: the
+  relay cannot link a topic to a repository; `relay_secret` comes from `device.toml` / the
+  enrollment bundle (§17.6).
+* **Sync integration (SK-302):** the poller keeps its adaptive interval (Clock-driven). A `tip`
+  hint for `main` or `hb/*` triggers an early cycle, at most one per 2 s per daemon; before a full
+  fetch the cycle may run `git ls-remote` for `main` and `hb/*` and skip the fetch if nothing
+  moved. After every accepted local publish the publisher calls `hints.publish({kind: "tip"})`.
+* **`GitRefMailbox` (SK-308):** `refs/heads/mbx/<agent>` on the blackboard remote, a single orphan
+  commit with `blob.bin` (like `hb/*`, §8.1), written with `--force-with-lease`, deleted on ack.
+  Never on `main`. Signed by the writer (human for D17), verified like heartbeats.
+* **`RelayHintChannel` / `RelayMailbox` (SK-705, V1):** one outbound WebSocket per daemon to
+  `wss://relay.example.invalid/v1/<topic>`, bearer `relay_token` (abuse control only, not trust),
+  exponential reconnect via `util/backoff`; relay mailbox entries have a TTL (default 7 days), are
+  ≤ 64 KiB and are deleted on ack. The relay stores nothing else and logs no payloads.
+
+### 17.4 Security model
+
+1. Every authoritative record is signed and verified locally (unchanged, §7.3); transports add no
+   trust. 2. Secret payloads are end-to-end encrypted to the target device (D17); transports see
+   ciphertext only. 3. The relay sees topics, connection timing and blob sizes (metadata) — accepted.
+4. Denial of service by the git host or relay = no progress (fail closed), never wrong progress.
+5. Hints are rate-limited and size-capped, so a hostile relay cannot amplify load beyond one fetch
+   per 2 s per daemon. 6. Webhook ingestion (option C) verifies the host's HMAC signature, but even
+   an unverified webhook could only produce a hint.
+
+### 17.5 Offline and eventual consistency
+
+Unchanged protocol rules make offline operation safe: no time-based lease expiry on `main` (§6.2);
+re-verification before every externally visible delivery step (§6.3); publications queued and
+retried through the write loop; observer-relative liveness (§8.2) shows a silent device as
+`stale`/`lost` and the human may revoke. A laptop that sleeps or loses network simply falls behind
+and catches up by replaying; hints missed while offline are irrelevant because the first poll after
+waking observes the current tip. Phones do not run `skepd` (MVP and V1): they are notification
+targets (ntfy) and, at most, read-only viewers; the human key stays on the controller.
+
+### 17.6 Features that assumed Tailscale
+
+| Feature | Without a mesh VPN |
+|---|---|
+| Installing / updating `allowed_signers` (PRD §11.2) | **Enrollment bundle** `skep.enroll/v1` (SK-706): `skep enroll export --device <d>` on the controller produces a file with blackboard URL, `blackboard_id`, genesis sha, the trust root lines, relay config (optional) and is signed by the human key. The human moves it by any channel (copy/paste in a provider web console, scp, QR code). `skep enroll import <file>` on the new device shows the human key fingerprint and requires the human to type its short fingerprint (out-of-band comparison; first trust is never taken from the transport). Later trust-root updates are `skep.trust_bundle/v1` files signed by the already-trusted human key, so they may travel over any untrusted channel, including the mailbox; they are still applied locally by `skep trust import` (PRD "changing trust requires a local edit" is preserved as an explicit local command). |
+| Provisioning a device (daemon key, `device.toml`) | `skep init` on the device itself (console or any shell); prints the daemon public key line for the controller's trust root; the controller adds it and re-issues trust bundles. No inbound connection to the device. |
+| `skep logs <agent>` for a remote device (PRD §15.2) | MVP: local agents only; for a remote agent the CLI prints the agent's last heartbeat (state, task, item, epoch) and the journal path to inspect on that device. V1 (SK-707 + relay): `logs.request` over the relay; the remote daemon returns redacted (§16.10) log chunks encrypted to the controller's age key and signed by the daemon key. |
+| Notification hint channel (PRD §18) | The relay hint channel (§17.3) replaces it. |
+| Human-layer bridge / herdr main manager reaching other devices | Out of MVP scope; any future bridge uses the same mailbox (signed + encrypted), not inbound SSH. |
+
+### 17.7 MVP vs later
+
+* **MVP:** option A only (already designed); `HintChannel`/`Mailbox` interfaces with the null hint
+  channel and the git-ref mailbox; `ls-remote` short-circuit in sync; enrollment and trust bundles
+  replace Tailscale SSH provisioning; `skep logs` local + heartbeat summary for remote agents.
+* **V1:** relay (hints + mailbox), webhook ingestion, remote `skep logs` over the relay, D17 relay
+  mailbox. **Not planned:** direct P2P, mesh VPN dependency.
+
+### 17.8 Open questions
+
+1. Git host behaviour under many devices polling (fetch throttling, per-ref push limits for
+   `mbx/*`), to be measured in SK-609.
+2. Choice of relay platform and who operates it (the user's own account); self-hosting story for a
+   plain VPS.
+3. Whether phones should get a signed read-only status feed via the relay (V2).
