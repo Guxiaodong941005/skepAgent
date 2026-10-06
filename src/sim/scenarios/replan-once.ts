@@ -5,6 +5,7 @@ import { canonicalJson, sha256Hex } from "../../core/canonical.js";
 import { checkpointIntent, claimIntent } from "../../core/intents.js";
 import type { CommandRunEvidence } from "../../core/schemas/evidence.js";
 import { SnapshotSchema } from "../../core/schemas/snapshot.js";
+import { attemptReplanHandler } from "../../daemon/duties.js";
 import { createReplanDuty, publishReplanRequest } from "../../daemon/replan.js";
 import { SlotRegistry } from "../../daemon/slots.js";
 import { AttemptRunner } from "../../exec/attempt.js";
@@ -35,6 +36,7 @@ export async function replanScenario(
   world: SimWorld,
   rounds: number,
   missing = false,
+  agentOriginated = false,
 ): Promise<void> {
   const code = await prepareTask(world, "vps.coding", "mac.coding");
   const owner = world.node("mac");
@@ -146,6 +148,34 @@ export async function replanScenario(
           outputReady();
           return result;
         }
+        if (agentOriginated) {
+          const text = await codeGit.run(["show", `${code.base}:example.txt`], {
+            cwd: await mirror.mirrorPath(REPO),
+          });
+          const excerpt = text.stdout.split("\n")[0] ?? "";
+          invocationReady();
+          return {
+            ...result,
+            finalMessage: JSON.stringify({
+              ...JSON.parse(result.finalMessage ?? "null"),
+              replan_request: {
+                summary: "Revise the plan using the pinned example file.",
+                evidence: [
+                  {
+                    id: "ev_agent_file",
+                    type: "file_span",
+                    repo: REPO,
+                    commit: code.base,
+                    path: "example.txt",
+                    lines: [1, 1],
+                    sha256: sha256Hex(excerpt),
+                    excerpt,
+                  },
+                ],
+              },
+            }),
+          };
+        }
         const handle = await backend.spawn({
           argv: ["example-agent"],
           cwd: inv.cwd,
@@ -234,18 +264,35 @@ export async function replanScenario(
       const task = holder.state.tasks[TASK];
       const lease = task?.items[ITEM]?.lease;
       const plan = task?.plans[String(task.active_plan_version)]?.plan;
-      requireScenario(world, lease && plan, "Replan attempt has no approved lease");
-      const result = await attempt.run({
-        lease: { task_id: TASK, item: ITEM, epoch: lease.epoch, holder: holder.agent },
-        attemptId: lease.attempt_id,
-        plan,
-        baseSha: code.base,
-        prBase: "main",
-        agentInstructions: holderSlot.policy.body,
-        repoContext: "",
-        timeoutMs: 30 * 60_000,
-        cliVersion: "0.0.0-test",
-      });
+      requireScenario(world, task && lease && plan, "Replan attempt has no approved lease");
+      const result = await attempt.run(
+        {
+          lease: { task_id: TASK, item: ITEM, epoch: lease.epoch, holder: holder.agent },
+          attemptId: lease.attempt_id,
+          plan,
+          baseSha: code.base,
+          prBase: "main",
+          agentInstructions: holderSlot.policy.body,
+          repoContext: "",
+          timeoutMs: 30 * 60_000,
+          cliVersion: "0.0.0-test",
+        },
+        undefined,
+        agentOriginated
+          ? attemptReplanHandler(
+              {
+                publisher: holder.publisher,
+                current: () => holder.state,
+                clock: holder.clock,
+                attempt: () => attempt,
+                wake: () => {},
+              },
+              holderSlot,
+              task,
+              ITEM,
+            )
+          : undefined,
+      );
       requireScenario(world, result.status === "checkpointed", "Interrupt did not checkpoint");
       requireScenario(
         world,
@@ -265,6 +312,7 @@ export async function replanScenario(
     });
     world.scheduler.schedule(at + 1, `verified-replan-${index + 1}`, async () => {
       if (!missing) await launched;
+      if (agentOriginated) return;
       const state = await owner.sync.observeNow();
       const task = state.tasks[TASK];
       requireScenario(world, task, "Missing replan task");
@@ -308,6 +356,7 @@ export async function replanScenario(
           task,
           actor: owner.agent,
           item: null,
+          evidenceKey: { task: TASK, item: ITEM, epoch: index + 1 },
           report: JSON.parse(report.finalMessage ?? "null"),
         },
         { verifier, publisher: owner.publisher },
@@ -451,4 +500,12 @@ export const replanOnce: Scenario = {
   devices: ["mac", "vps"],
   steps: 22,
   setup: (world) => replanScenario(world, 1),
+};
+
+/** S3 variant: the running agent's report opens the barrier through the production callback. */
+export const agentReplanOnce: Scenario = {
+  name: "agent-replan-once",
+  devices: ["mac", "vps"],
+  steps: 22,
+  setup: (world) => replanScenario(world, 1, false, true),
 };

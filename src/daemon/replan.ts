@@ -1,3 +1,4 @@
+import type { Publisher, PublishResult } from "../blackboard/publisher.js";
 import { checkpointIntent, draft, type Intent } from "../core/intents.js";
 import { isSettled } from "../core/reducer/handlers/barrier.js";
 import type { State, TaskState } from "../core/reducer/state.js";
@@ -6,7 +7,7 @@ import { SnapshotSchema } from "../core/schemas/snapshot.js";
 import { WorkReportSchema } from "../core/schemas/work-report.js";
 import type { AttemptRunner } from "../exec/attempt.js";
 import type { EvidenceVerifier } from "../exec/evidence.js";
-import type { Journal } from "../exec/journal.js";
+import type { AttemptKey, Journal } from "../exec/journal.js";
 import { findSecrets, Redactor } from "../exec/redact.js";
 import type { Clock } from "../util/clock.js";
 import type { Slot } from "./slots.js";
@@ -157,54 +158,71 @@ export function createReplanDuty(deps: ReplanDutyDependencies): ReplanDuty {
 }
 
 /** Structured-output consumers use this before delivery; the reducer cannot verify evidence (§9.5). */
+export type ReplanRequestResult =
+  | PublishResult
+  | { status: "dropped"; reason: "no_request" | "no_verified_evidence" | "stale" };
+
 export async function publishReplanRequest(
-  input: { task: TaskState; actor: string; item: string | null; report: unknown },
+  input: {
+    task: TaskState;
+    actor: string;
+    item: string | null;
+    report: unknown;
+    evidenceKey: AttemptKey;
+    eventId?: string;
+  },
   deps: {
     verifier: Pick<EvidenceVerifier, "verifyAll">;
-    publisher: ReplanDutyContext["publisher"];
+    publisher: Pick<Publisher, "publish">;
   },
-): Promise<unknown> {
+): Promise<ReplanRequestResult> {
   const report = WorkReportSchema.parse(input.report);
   const request = report.replan_request;
-  if (!request) return null;
+  if (!request) return { status: "dropped", reason: "no_request" };
   const { task, actor, item } = input;
   const lease = item === null ? null : task.items[item]?.lease;
   const plan = task.plans[String(task.active_plan_version)];
+  // The payload item may be null for an owner. Evidence still belongs to the invocation's
+  // journal, never a guessed first item or the task's latest epoch (ARCHITECTURE §9.5).
+  if (
+    input.evidenceKey.task !== task.task_id ||
+    (item !== null && (input.evidenceKey.item !== item || input.evidenceKey.epoch !== lease?.epoch))
+  )
+    return { status: "dropped", reason: "stale" };
   if (
     !plan ||
     !["executing", "interrupting", "replanning"].includes(task.status) ||
     (item !== null && !task.items[item]) ||
     (actor !== task.owner && lease?.holder !== actor)
   )
-    return null;
-  const evidence = await deps.verifier.verifyAll(request.evidence, {
-    task: task.task_id,
-    item: item ?? "W1",
-    epoch: lease?.epoch ?? task.epochs[item ?? "W1"] ?? 1,
-  });
+    return { status: "dropped", reason: "stale" };
+  const evidence = await deps.verifier.verifyAll(request.evidence, input.evidenceKey);
   // Redacting proof would change the fact being asserted. Unsafe evidence is dropped instead.
   const safe = evidence.filter((entry) => findSecrets(JSON.stringify(entry)).length === 0);
-  if (safe.length === 0) return null;
+  if (safe.length === 0) return { status: "dropped", reason: "no_verified_evidence" };
   const payload = EVENT_SCHEMAS["replan.requested"].shape.payload.parse({
     item,
     summary: new Redactor().redact(request.summary),
     evidence: safe,
   });
-  return deps.publisher.publish((latest) => {
-    const current = latest.tasks[task.task_id];
-    const active = current?.plans[String(current.active_plan_version)];
-    const held = item === null ? null : current?.items[item]?.lease;
-    if (
-      !current ||
-      !["executing", "interrupting", "replanning"].includes(current.status) ||
-      active?.plan_hash !== plan.plan_hash ||
-      (actor === task.owner
-        ? current.owner !== actor || current.owner_gen !== task.owner_gen
-        : held?.holder !== actor ||
-          held.epoch !== lease?.epoch ||
-          held.attempt_id !== lease?.attempt_id)
-    )
-      return null;
-    return draft("replan.requested", task.task_id, actor, payload, { task_rev: current.rev });
-  });
+  return deps.publisher.publish(
+    (latest) => {
+      const current = latest.tasks[task.task_id];
+      const active = current?.plans[String(current.active_plan_version)];
+      const held = item === null ? null : current?.items[item]?.lease;
+      if (
+        !current ||
+        !["executing", "interrupting", "replanning"].includes(current.status) ||
+        active?.plan_hash !== plan.plan_hash ||
+        (item !== null &&
+          (held?.holder !== actor ||
+            held.epoch !== lease?.epoch ||
+            held.attempt_id !== lease?.attempt_id)) ||
+        (actor === task.owner && (current.owner !== actor || current.owner_gen !== task.owner_gen))
+      )
+        return null;
+      return draft("replan.requested", task.task_id, actor, payload, { task_rev: current.rev });
+    },
+    input.eventId ? { eventId: input.eventId } : undefined,
+  );
 }

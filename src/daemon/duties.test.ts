@@ -12,6 +12,8 @@ import {
 import { contentHash } from "../core/canonical.js";
 import { draft, finalizeEvent, type Intent } from "../core/intents.js";
 import { replay } from "../core/reducer/replay.js";
+import type { WorkReport } from "../core/schemas/work-report.js";
+import type { AttemptRunner } from "../exec/attempt.js";
 import { FakeClock, VirtualTime } from "../sim/fake-clock.js";
 import { Duties } from "./duties.js";
 import { SlotRegistry } from "./slots.js";
@@ -101,7 +103,7 @@ async function fixture(device = "vps", team = false, approval: "human" | "owner"
     suggestions: [],
   }));
   const attempt = {
-    run: vi.fn(async (_input: import("../exec/attempt.js").AttemptInput) => ({
+    run: vi.fn<AttemptRunner["run"]>(async () => ({
       status: "stale" as const,
     })),
     interrupt: vi.fn(async () => true),
@@ -171,6 +173,57 @@ async function fixture(device = "vps", team = false, approval: "human" | "owner"
   };
 }
 describe("daemon duties", () => {
+  it("passes work reports to verification and immediately runs the barrier duty", async () => {
+    const f = await fixture();
+    const reportRun = vi.fn<AttemptRunner["runWithReplan"]>(async () => ({ status: "stale" }));
+    Object.assign(f.attempt, { runWithReplan: reportRun });
+    f.duties.tick(f.state());
+    await f.duties.settle();
+    await f.approve();
+    f.duties.tick(f.state());
+    await f.duties.settle();
+    const invocation = reportRun.mock.calls[0];
+    const handler = invocation?.[1];
+    if (!handler || !invocation) throw new Error("Missing attempt report handler");
+    const report: WorkReport = {
+      schema: "skep.work_report/v1",
+      summary: "Revise the plan",
+      files_intended: [],
+      concerns: [],
+      replan_request: {
+        summary: "Missing example file",
+        evidence: [
+          {
+            id: "ev_example",
+            type: "command_run",
+            run_id: "run_example",
+            sha: "a".repeat(40),
+            argv_sha256: "b".repeat(64),
+            exit: 1,
+            log_sha256: "c".repeat(64),
+          },
+        ],
+      },
+    };
+    const evidenceKey = {
+      task: T1,
+      item: invocation[0].lease.item,
+      epoch: invocation[0].lease.epoch,
+    };
+    const verifier = { verifyAll: vi.fn(async () => report.replan_request?.evidence ?? []) };
+    expect(
+      await handler({ report, evidenceKey, eventId: fakeEventId(611), verifier }),
+    ).toMatchObject({ status: "accepted" });
+    expect(verifier.verifyAll).toHaveBeenCalledWith(report.replan_request?.evidence, evidenceKey);
+    expect(f.replan).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        task: expect.objectContaining({ status: "interrupting" }),
+        attempt: f.attempt,
+      }),
+    );
+    expect(f.error).not.toHaveBeenCalled();
+  });
+
   it("activates a normal solo plan under owner approval but leaves high risk for the human", async () => {
     const normal = await fixture("vps", false, "owner");
     normal.duties.tick(normal.state());

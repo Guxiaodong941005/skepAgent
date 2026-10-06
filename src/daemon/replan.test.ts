@@ -42,6 +42,7 @@ const evidence: CommandRunEvidence = {
   exit: 1,
   log_sha256: "c".repeat(64),
 };
+const evidenceKey = { task: T1, item: "W1", epoch: 1 };
 const report: WorkReport = {
   schema: "skep.work_report/v1",
   summary: "An example assumption failed.",
@@ -83,7 +84,7 @@ async function fixture(device = "vps") {
   const publish = vi.fn(async (intent: Intent) => {
     const value = intent(state);
     const eventId = fakeEventId(sequence++);
-    if (!value) return { status: "dropped", eventId };
+    if (!value) return { status: "dropped" as const, eventId };
     log.appendRaw(
       finalizeEvent(value, {
         event_id: eventId,
@@ -93,7 +94,7 @@ async function fixture(device = "vps") {
     );
     state = replay(log.entries);
     expect(state.outcomes.at(-1)?.outcome).toBe("accepted");
-    return { status: "accepted", eventId };
+    return { status: "accepted" as const, eventId };
   });
   const slots = new SlotRegistry({
     device,
@@ -425,15 +426,105 @@ describe("coarse replan duty", () => {
 });
 
 describe("verified daemon replan requests", () => {
+  it("verifies an owner request against the explicit W2 epoch-7 invocation journal", async () => {
+    const f = await fixture("mac");
+    const invocationKey = { task: T1, item: "W2", epoch: 7 };
+    const { id: _id, type: _type, ...facts } = evidence;
+    f.read.mockImplementation(async (key) =>
+      key.item === "W2" && key.epoch === 7
+        ? [{ step: "command_run", ts_mono: 0, ts_wall: "2026-10-05T00:00:00Z", ...facts }]
+        : [],
+    );
+    const verifier = new EvidenceVerifier({
+      git: { run: vi.fn() },
+      mirror: { mirrorPath: vi.fn() },
+      journal: f.journal,
+    });
+    expect(
+      await publishReplanRequest(
+        {
+          task: f.context().task,
+          actor: MAC,
+          item: null,
+          report,
+          evidenceKey: invocationKey,
+        },
+        { verifier, publisher: { publish: f.publish } },
+      ),
+    ).toMatchObject({ status: "accepted" });
+    expect(f.read).toHaveBeenCalledWith(invocationKey);
+    expect(f.read).toHaveBeenCalledTimes(1);
+  });
+
+  it("drops mismatched invocation keys before verifying or publishing", async () => {
+    const f = await fixture();
+    const verifier = { verifyAll: vi.fn(async () => [evidence]) };
+    for (const key of [
+      { ...evidenceKey, item: "W2" },
+      { ...evidenceKey, epoch: 2 },
+      { ...evidenceKey, task: "T-20261005-ffff" },
+    ]) {
+      expect(
+        await publishReplanRequest(
+          {
+            task: f.context().task,
+            actor: VPS,
+            item: "W1",
+            report,
+            evidenceKey: key,
+          },
+          { verifier, publisher: { publish: f.publish } },
+        ),
+      ).toMatchObject({ status: "dropped", reason: "stale" });
+    }
+    expect(verifier.verifyAll).not.toHaveBeenCalled();
+    expect(f.state().tasks[T1]?.barrier).toBeNull();
+  });
+
+  it("fences a revoked holder even when that holder is also the owner", async () => {
+    const f = await fixture();
+    await f.publish((state) =>
+      draft(
+        "owner.transferred",
+        T1,
+        "human",
+        { new_owner: VPS },
+        { task_rev: state.tasks[T1]?.rev, owner_gen: 1 },
+      ),
+    );
+    const task = f.context().task;
+    const verifier = {
+      verifyAll: async () => {
+        await f.publish((state) =>
+          draft(
+            "lease.revoked",
+            T1,
+            "human",
+            { item: "W1", epoch: 1, reason: "Move example work", observed_hb: null },
+            { task_rev: state.tasks[T1]?.rev, item: "W1" },
+          ),
+        );
+        return [evidence];
+      },
+    };
+    expect(
+      await publishReplanRequest(
+        { task, actor: VPS, item: "W1", report, evidenceKey },
+        { verifier, publisher: { publish: f.publish } },
+      ),
+    ).toMatchObject({ status: "dropped" });
+    expect(f.state().tasks[T1]?.barrier).toBeNull();
+  });
+
   it("drops fabricated evidence and publishes only locally verified facts", async () => {
     const f = await fixture();
     const git = { run: vi.fn() };
     const mirror = { mirrorPath: vi.fn() };
     const verifier = new EvidenceVerifier({ git, mirror, journal: f.journal });
-    const input = { task: f.context().task, actor: VPS, item: "W1", report };
+    const input = { task: f.context().task, actor: VPS, item: "W1", report, evidenceKey };
     expect(
       await publishReplanRequest(input, { verifier, publisher: { publish: f.publish } }),
-    ).toBeNull();
+    ).toMatchObject({ status: "dropped", reason: "no_verified_evidence" });
     const { id: _id, type: _type, ...facts } = evidence;
     f.read.mockResolvedValue([
       { step: "command_run", ts_mono: 0, ts_wall: "2026-10-05T00:00:00Z", ...facts },
@@ -460,7 +551,7 @@ describe("verified daemon replan requests", () => {
 
   it("drops a request if the holder is fenced while evidence is being verified", async () => {
     const f = await fixture();
-    const input = { task: f.context().task, actor: VPS, item: "W1", report };
+    const input = { task: f.context().task, actor: VPS, item: "W1", report, evidenceKey };
     const verifier = {
       verifyAll: async () => {
         await f.publish((latest) =>
@@ -493,7 +584,13 @@ describe("verified daemon replan requests", () => {
     const verifier = { verifyAll: vi.fn(async () => [evidence]) };
     await expect(
       publishReplanRequest(
-        { task: f.context().task, actor: VPS, item: "W1", report: { ...report, extra: true } },
+        {
+          task: f.context().task,
+          actor: VPS,
+          item: "W1",
+          evidenceKey,
+          report: { ...report, extra: true },
+        },
         { verifier, publisher: { publish: f.publish } },
       ),
     ).rejects.toThrow();
@@ -510,6 +607,7 @@ describe("verified daemon replan requests", () => {
         task: f.context().task,
         actor: VPS,
         item: "W1",
+        evidenceKey,
         report: {
           ...report,
           replan_request: {
@@ -546,7 +644,7 @@ describe("verified daemon replan requests", () => {
     };
     expect(
       await publishReplanRequest(
-        { task, actor: MAC, item: null, report },
+        { task, actor: MAC, item: null, report, evidenceKey },
         { verifier, publisher: { publish: f.publish } },
       ),
     ).toMatchObject({ status: "dropped" });
