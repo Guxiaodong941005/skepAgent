@@ -125,7 +125,7 @@
         }
       ],
       "added": {
-        "events/T-20261005-0000/evt_8261002a-1b71-47ae-8f91-2b40a54ae5d2.json": "{\n  \"schema\": \"skep.event/v1\",\n  \"event_id\": \"evt_8261002a-1b71-47ae-8f91-2b40a54ae5d2\",\n  \"type\": \"work.delivered\",\n  \"task_id\": \"T-20261005-0000\",\n  \"actor\": \"vps.coding\",\n  \"observed_tip\": \"8316cf9a54d262125bf855f95243f70972b98486\",\n  \"pre\": {\n    \"task_rev\": 4,\n    \"item\": \"W1\"\n  },\n  \"created_at\": \"2026-10-05T09:00:00Z\",\n  \"lang\": \"en\",\n  \"payload\": {\n    \"item\": \"W1\",\n    \"epoch\": 1,\n    \"branch\": \"skep/T-20261005-0000/W1/e1\",\n    \"head_sha\": \"3ec09f8bb6b29b19ac9055016584916c0d29b598\",\n    \"pr_url\": \"https://example.com/example/app/pull/1\",\n    \"pr_number\": 1,\n    \"check_runs\": [\n      {\n        \"run_id\": \"run-1\",\n        \"check\": \"unit\",\n        \"sha\": \"3ec09f8bb6b29b19ac9055016584916c0d29b598\",\n        \"exit\": 0,\n        \"duration_ms\": 10,\n        \"passed\": 1,\n        \"failed\": 0,\n        \"log_sha256\": \"be583b51fcadca731112c718931e5729ef966305000000000000000000000000\"\n      }\n    ]\n  }\n}\n"
+        "events/T-20261005-0000/evt_8261002a-1b71-47ae-8f91-2b40a54ae5d2.json": "{\n  \"schema\": \"skep.event/v1\",\n  \"event_id\": \"evt_8261002a-1b71-47ae-8f91-2b40a54ae5d2\",\n  \"type\": \"work.delivered\",\n  \"task_id\": \"T-20261005-0000\",\n  \"actor\": \"vps.coding\",\n  \"observed_tip\": \"8316cf9a54d262125bf855f95243f70972b98486\",\n  \"pre\": {\n    \"task_rev\": 4,\n    \"item\": \"W1\"\n  },\n  \"created_at\": \"2026-10-05T09:00:00Z\",\n  \"lang\": \"en\",\n  \"payload\": {\n    \"item\": \"W1\",\n    \"epoch\": 1,\n    \"branch\": \"skep/T-20261005-0000/W1/e1\",\n    \"head_sha\": \"3ec09f8bb6b29b19ac9055016584916c0d29b598\",\n    \"pr_url\": \"https://example.invalid/example/app/pull/1\",\n    \"pr_number\": 1,\n    \"check_runs\": [\n      {\n        \"run_id\": \"run-1\",\n        \"check\": \"unit\",\n        \"sha\": \"3ec09f8bb6b29b19ac9055016584916c0d29b598\",\n        \"exit\": 0,\n        \"duration_ms\": 10,\n        \"passed\": 1,\n        \"failed\": 0,\n        \"log_sha256\": \"be583b51fcadca731112c718931e5729ef966305000000000000000000000000\"\n      }\n    ]\n  }\n}\n"
       }
     },
     {
@@ -201,5 +201,5 @@
       }
     }
   ],
-  "state_hash": "sha256:17da2b0d037e447fcaf41f821c89a9d053ed7478f052d51ca2b9542ba9e9701b"
+  "state_hash": "sha256:84f2fe9b0fe35c5d06f785a283918228e60a0bcf2cb9d956d5b5e8cd1ff7731d"
 }

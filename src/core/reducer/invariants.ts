@@ -29,6 +29,12 @@ export interface Violation {
   detail: string;
 }
 
+/**
+ * `state` must be `replay(entries)`. Invariant 6 is the only predicate that reads the caller's
+ * state instead of the replayed one, and only for the last step (SK-304 review note 1): a test
+ * can hand in a state whose final transition broke the budget rule. `skep doctor` and the sim
+ * checker pass the replayed state, so there the two agree.
+ */
 export function checkInvariants(entries: readonly LogEntry[], state: State): Violation[] {
   // One incremental replay serves every invariant that needs state at a seq. Replaying per
   // invariant dominates `skep doctor` and the property tests on long logs.

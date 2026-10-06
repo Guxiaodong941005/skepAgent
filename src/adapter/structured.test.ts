@@ -4,6 +4,7 @@ import { PlanSchema } from "../core/schemas/plan.js";
 import { ReviewSchema } from "../core/schemas/review.js";
 import { WorkReportSchema } from "../core/schemas/work-report.js";
 import { FakeClock, VirtualTime } from "../sim/fake-clock.js";
+import { toCodexOutputSchema } from "./codex.js";
 import { FakeAdapter } from "./fake.js";
 import { extractJson, normalizeOptionalNulls, runStructured } from "./structured.js";
 import type { AdapterInvocation, AdapterResult, AgentAdapter, InvocationOutcome } from "./types.js";
@@ -69,6 +70,16 @@ describe("extractJson", () => {
     ['{"complete":true}\n{"truncated":', { complete: true }],
   ])("extracts the last complete object from %s", (text, expected) => {
     expect(extractJson(text)).toEqual(expected);
+  });
+
+  it("recovers the object that follows a stray unmatched brace in prose", () => {
+    // The forward scan never returns to an empty stack here, so only the fallback finds it.
+    const text = 'Using {x as a placeholder, then {"summary": "Example", "n": 1}';
+    expect(extractJson(text)).toEqual({ summary: "Example", n: 1 });
+    // The last object still wins when the prose has more than one.
+    expect(extractJson('note {a then {"first": 1} and {"last": 2}')).toEqual({ last: 2 });
+    // A brace quoted inside the object is not a candidate start.
+    expect(extractJson('prose { then {"text": "a { brace"}')).toEqual({ text: "a { brace" });
   });
 
   it.each([
@@ -285,6 +296,143 @@ describe("normalizeOptionalNulls", () => {
     expect(normalized).toEqual(value);
     expect(schema.safeParse(normalized).success).toBe(false);
     expect(normalizeOptionalNulls(null, z.toJSONSchema(schema))).toBeNull();
+  });
+});
+
+describe("provider schema round trip", () => {
+  type JsonSchema = Record<string, unknown>;
+
+  function isSchemaObject(value: unknown): value is JsonSchema {
+    return value !== null && typeof value === "object" && !Array.isArray(value);
+  }
+
+  /**
+   * What the provider is forced to emit (SK-207 B1): every property present, the ones the original
+   * schema left optional filled with null. Union branches are chosen by the value's `type`
+   * literal, which is how the provider's schema distinguishes them.
+   */
+  function providerShaped(value: unknown, schema: JsonSchema): unknown {
+    const branches = schema.anyOf ?? schema.oneOf;
+    if (Array.isArray(branches)) {
+      const match = branches.find(
+        (branch) => isSchemaObject(branch) && branchMatches(value, branch),
+      );
+      return providerShaped(value, isSchemaObject(match) ? match : {});
+    }
+    if (Array.isArray(value)) {
+      const item = isSchemaObject(schema.items) ? schema.items : {};
+      return value.map((entry) => providerShaped(entry, item));
+    }
+    if (value === null || typeof value !== "object") return value;
+    const record = value as Record<string, unknown>;
+    const properties = isSchemaObject(schema.properties) ? schema.properties : null;
+    if (properties === null) return value;
+    const shaped: Record<string, unknown> = {};
+    for (const [key, property] of Object.entries(properties)) {
+      const child = isSchemaObject(property) ? property : {};
+      shaped[key] = Object.hasOwn(record, key) ? providerShaped(record[key], child) : null;
+    }
+    return shaped;
+  }
+
+  /** A union branch matches when its `type` const/enum agrees with the value's, if it has one. */
+  function branchMatches(value: unknown, branch: JsonSchema): boolean {
+    if (!isSchemaObject(value) || !isSchemaObject(branch.properties)) return false;
+    const type = isSchemaObject(branch.properties.type) ? branch.properties.type : {};
+    if (typeof type.const === "string") return value.type === type.const;
+    return true;
+  }
+
+  function roundTrip<T>(schema: z.ZodType<T>, value: T): unknown {
+    const original = z.toJSONSchema(schema) as JsonSchema;
+    const transformed = toCodexOutputSchema(original);
+    // The transform is what the provider sees; the value below is what it would send back.
+    expect(transformed).not.toBe(original);
+    const provided = providerShaped(value, original);
+    return schema.parse(normalizeOptionalNulls(provided, original));
+  }
+
+  it("round-trips a Plan through the provider schema and back to Zod", () => {
+    const plan = PlanSchema.parse({
+      schema: "skep.plan/v1",
+      task_id: "T-20261005-0001",
+      version: 1,
+      parent_version: null,
+      base: { repo: "git@example.invalid:example/app.git", branch: "main", commit: "a".repeat(40) },
+      mode: "solo",
+      summary: "Ship the example change.",
+      items: [
+        {
+          id: "W1",
+          title: "Implement W1",
+          details: "Touch only the example path.",
+          role: "coding",
+          assignee: "vps.coding",
+          depends_on: [],
+          touches: ["src/w1/"],
+          risk: "normal",
+          acceptance: [{ kind: "check", name: "unit" }],
+        },
+      ],
+      stack_order: ["W1"],
+      changes_from_parent: null,
+    });
+    expect(roundTrip(PlanSchema, plan)).toEqual(plan);
+  });
+
+  it("round-trips a Review, keeping a required null and dropping optional ones", () => {
+    const review = ReviewSchema.parse({
+      schema: "skep.review/v1",
+      plan_version: 1,
+      plan_hash: `sha256:${"0".repeat(64)}`,
+      verdict: "block",
+      blockers: [
+        {
+          id: "B1",
+          claim: "The check does not cover the changed path.",
+          evidence: [
+            {
+              id: "ev_1",
+              type: "file_span",
+              repo: "git@example.invalid:example/app.git",
+              commit: "b".repeat(40),
+              path: "src/w1/index.ts",
+              lines: [1, 4],
+              sha256: "c".repeat(64),
+              excerpt: "const example = 1;",
+            },
+          ],
+        },
+      ],
+      suggestions: [],
+    });
+    expect(roundTrip(ReviewSchema, review)).toEqual(review);
+  });
+
+  it("round-trips a WorkReport through the provider schema and back to Zod", () => {
+    const report = WorkReportSchema.parse({
+      schema: "skep.work_report/v1",
+      summary: "Implemented the example item.",
+      files_intended: ["src/w1/index.ts"],
+      concerns: [],
+      replan_request: null,
+    });
+    expect(roundTrip(WorkReportSchema, report)).toEqual(report);
+  });
+
+  it("still rejects a required null and an unknown key after normalization", () => {
+    const schema = z.strictObject({ required: z.string(), optional: z.string().optional() });
+    const original = z.toJSONSchema(schema) as JsonSchema;
+    const normalized = normalizeOptionalNulls(
+      { required: null, optional: null, unknown: null },
+      original,
+    );
+    expect(schema.safeParse(normalized).success).toBe(false);
+    // The transform really does demand the optional key, which is what produced the null.
+    const transformed = toCodexOutputSchema(original);
+    const properties = transformed.properties as Record<string, unknown>;
+    expect(transformed.required).toEqual(expect.arrayContaining(["required", "optional"]));
+    expect(JSON.stringify(properties.optional)).toContain('"type":"null"');
   });
 });
 
