@@ -3,7 +3,13 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { FakeClock, VirtualTime } from "../sim/fake-clock.js";
-import { type AttemptKey, Journal, JournalError, TERMINAL_STEPS } from "./journal.js";
+import {
+  type AttemptKey,
+  Journal,
+  JournalError,
+  TERMINAL_STEPS,
+  verificationKey,
+} from "./journal.js";
 import { findSecrets, Redactor } from "./redact.js";
 
 const TASK_A = "T-20261005-aa01";
@@ -121,6 +127,38 @@ describe("Journal", () => {
 
     expect(await journal.unfinishedAttempts()).toEqual([]);
   });
+
+  it("isolates verification by task activation and keeps completed item attempts terminal", async () => {
+    const dir = await roleDir();
+    const clock = clockAt(0, Date.UTC(2026, 0, 1));
+    const journal = new Journal({ roleDir: dir, clock });
+    const attempt = { task: TASK_A, item: "W2", epoch: 1 };
+    const first = verificationKey(TASK_A, "owner-1:plan-1:activation-1");
+    const resumed = verificationKey(TASK_A, "owner-1:plan-1:activation-2");
+    await journal.append(attempt, { step: "delivered_published" });
+    const delivered = await readFile(journal.path(attempt), "utf8");
+    await journal.append(first, { step: "check_started" });
+    expect(await journal.unfinishedAttempts()).toEqual([first]);
+    await journal.append(first, { step: "checks", run_ids: ["run_unit"] });
+    await journal.append(resumed, { step: "check_started" });
+    expect(first).toEqual(verificationKey(TASK_A, "owner-1:plan-1:activation-1"));
+    expect(journal.path(first)).not.toBe(journal.path(resumed));
+    expect(journal.path(first)).not.toBe(
+      journal.path(verificationKey(TASK_B, "owner-1:plan-1:activation-1")),
+    );
+    expect(await journal.read(first)).toHaveLength(2);
+    const restarted = new Journal({ roleDir: dir, clock });
+    expect(await restarted.unfinishedAttempts()).toEqual([resumed]);
+    expect(await readFile(journal.path(attempt), "utf8")).toBe(delivered);
+  });
+
+  it.each(["verification-../W1", "verification-example", `verification-${"a".repeat(65)}`])(
+    "rejects an invalid verification key %s",
+    async (item) => {
+      const journal = new Journal({ roleDir: await roleDir(), clock: clockAt(0, 0) });
+      expect(() => journal.path({ task: TASK_A, item, epoch: 1 })).toThrow(JournalError);
+    },
+  );
 
   it("reports an attempt whose only line is torn, so reconciliation cannot miss it", async () => {
     const dir = await roleDir();

@@ -6,6 +6,7 @@ import type { State, TaskState } from "../core/reducer/state.js";
 import { CheckRunSchema, ShaSchema } from "../core/schemas/common.js";
 import { type PayloadOf, TaskVerifiedPayload } from "../core/schemas/events.js";
 import type { ChecksRunner } from "../exec/checks.js";
+import { verificationKey } from "../exec/journal.js";
 import { findSecrets } from "../exec/redact.js";
 import type { CodeMirror } from "../exec/worktree.js";
 import type { GitRunner } from "../git/runner.js";
@@ -70,12 +71,41 @@ function samePlan(current: TaskState | undefined, task: TaskState): current is T
   );
 }
 
+function epochKey(task: TaskState, item: string, epoch: number): string {
+  return `${task.task_id}:${item}:${epoch}`;
+}
+
+function preservedBranches(task: TaskState, id: string): string[] {
+  if (task.status === "cancelled") return [];
+  const item = task.items[id];
+  return [...new Set([item?.lease?.branch, item?.delivered?.branch])]
+    .filter((branch): branch is string => branch !== undefined)
+    .sort();
+}
+
+function staleEpochsKey(task: TaskState): string {
+  // Cancellation, lease release and removal can make an epoch stale without incrementing its
+  // counter. Include authority over its branches, but ignore unrelated task revisions (D7).
+  return JSON.stringify(
+    Object.keys(task.epochs)
+      .sort()
+      .map((id) => [id, task.epochs[id], preservedBranches(task, id)]),
+  );
+}
+
 export function createDeliveryDuty(deps: DeliveryDutyDependencies): DeliveryDuty {
   const verifications = new Map<
     string,
     { key: string; result: Promise<PayloadOf<"task.verified">>; published: boolean }
   >();
   const notified = new Set<string>();
+  const terminalPrs = new Map<
+    string,
+    { number: number; observed: z.infer<typeof PrStateSchema> }
+  >();
+  const retargeted = new Set<string>();
+  const settledEpochs = new Set<string>();
+  const staleScans = new Map<string, string>();
   let checkout = 0;
 
   const notifyFailure = async (task: TaskState, seq: number) => {
@@ -129,7 +159,7 @@ export function createDeliveryDuty(deps: DeliveryDutyDependencies): DeliveryDuty
                 baseCommit: record.base_commit,
                 worktree: worktree.path,
                 checks,
-                attempt: { task: task.task_id, item: top, epoch: delivery.epoch },
+                attempt: verificationKey(task.task_id, key),
               }),
             );
             if (
@@ -206,10 +236,19 @@ export function createDeliveryDuty(deps: DeliveryDutyDependencies): DeliveryDuty
       const item = task.items[id];
       const delivery = item?.delivered;
       if (item?.status !== "delivered" || !delivery) continue;
-      const observed = PrStateSchema.parse(await host.prState(task.repo, delivery.pr_number));
+      const key = epochKey(task, id, delivery.epoch);
+      const cached = terminalPrs.get(key);
+      const observed =
+        cached?.number === delivery.pr_number
+          ? cached.observed
+          : PrStateSchema.parse(await host.prState(task.repo, delivery.pr_number));
+      // Retain terminal evidence even when publication fails; the fenced intent still retries.
+      if (observed.state === "closed")
+        terminalPrs.set(key, { number: delivery.pr_number, observed });
       if (observed.state === "merged") {
         if (!observed.mergeSha)
           throw new DeliveryError(`Merged PR #${delivery.pr_number} lacks a merge SHA`);
+        terminalPrs.set(key, { number: delivery.pr_number, observed });
         const mergeSha = observed.mergeSha;
         const result = AcceptedSchema.safeParse(
           await publisher.publish((latest) => {
@@ -250,24 +289,28 @@ export function createDeliveryDuty(deps: DeliveryDutyDependencies): DeliveryDuty
         merged.has(record.plan.stack_order[index - 1] ?? "")
       ) {
         // Reconcile already-recorded merges too: a crash may happen after item.merged (§11.4).
-        const pr = await host.findPr(task.repo, delivery.branch);
-        if (pr && pr.base !== record.plan.base.branch)
-          await host.retargetPr(task.repo, delivery.pr_number, record.plan.base.branch);
+        const retargetKey = `${key}:${delivery.pr_number}:${record.plan.base.branch}`;
+        if (!retargeted.has(retargetKey)) {
+          const pr = await host.findPr(task.repo, delivery.branch);
+          if (pr) {
+            if (pr.base !== record.plan.base.branch)
+              await host.retargetPr(task.repo, delivery.pr_number, record.plan.base.branch);
+            retargeted.add(retargetKey);
+          }
+        }
       }
     }
   };
 
   const closeStale = async (task: TaskState, host: CodeHost) => {
     for (const id of Object.keys(task.epochs).sort()) {
-      const item = task.items[id];
+      const preserved = preservedBranches(task, id);
       for (let epoch = 1; epoch <= (task.epochs[id] ?? 0); epoch++) {
         const branch = workBranch(task.task_id, id, epoch);
         // D7 carry-over may preserve a delivery from an older epoch; it is still authoritative.
-        if (
-          task.status !== "cancelled" &&
-          (branch === item?.lease?.branch || branch === item?.delivered?.branch)
-        )
-          continue;
+        if (preserved.includes(branch)) continue;
+        const key = epochKey(task, id, epoch);
+        if (settledEpochs.has(key) || terminalPrs.has(key)) continue;
         const pr = await host.findPr(task.repo, branch);
         if (pr)
           await host.closePr(
@@ -275,6 +318,7 @@ export function createDeliveryDuty(deps: DeliveryDutyDependencies): DeliveryDuty
             pr.number,
             `Stale attempt ${id} epoch ${epoch}; consult the current signed task state before merging.`,
           );
+        settledEpochs.add(key);
       }
     }
   };
@@ -298,7 +342,11 @@ export function createDeliveryDuty(deps: DeliveryDutyDependencies): DeliveryDuty
       await verify(context);
       const host = deps.codeHost(slot);
       await observeMerges(context, host);
-      await closeStale(task, host);
+      const staleKey = staleEpochsKey(task);
+      if (staleScans.get(task.task_id) !== staleKey) {
+        await closeStale(task, host);
+        staleScans.set(task.task_id, staleKey);
+      }
       if (["done", "cancelled"].includes(task.status)) verifications.delete(task.task_id);
     } catch (cause) {
       throw new DeliveryError(

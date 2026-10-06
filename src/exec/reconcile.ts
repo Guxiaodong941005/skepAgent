@@ -1,3 +1,7 @@
+import { execFile } from "node:child_process";
+import { readFile } from "node:fs/promises";
+import { platform } from "node:os";
+import { promisify } from "node:util";
 import { z } from "zod";
 import type { PublishResult } from "../blackboard/publisher.js";
 import type { PrInfo } from "../codehost/types.js";
@@ -46,6 +50,7 @@ const ProcessSchema = z.object({
   pid: z.number().int().positive().max(2_147_483_647),
   pgid: z.number().int().positive().max(2_147_483_647),
   start_token: z.string(),
+  boot_id: z.string().min(1).optional(),
 });
 const PrSchema = z.strictObject({
   number: z.number().int().positive(),
@@ -64,11 +69,33 @@ const PrStateSchema = z.strictObject({
 /** Separate I/O port because RuntimeBackend cannot signal a group from an earlier daemon. */
 export interface ReconcileProcesses {
   startToken(pid: number): Promise<string | null>;
+  /** OS boot identity, shared across daemon restarts; never the heartbeat's daemon boot_id. */
+  bootId?(): Promise<string | null>;
   killGroup(pgid: number): Promise<void>;
 }
 
 export const nativeReconcileProcesses: ReconcileProcesses = {
   startToken: readStartToken,
+  async bootId() {
+    try {
+      if (platform() === "linux") {
+        return z.uuid().parse((await readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim());
+      }
+      if (platform() === "darwin") {
+        const { stdout } = await promisify(execFile)(
+          "/usr/sbin/sysctl",
+          ["-n", "kern.bootsessionuuid"],
+          { shell: false, encoding: "utf8" },
+        );
+        return z.uuid().parse(stdout.trim());
+      }
+      return null;
+    } catch (cause) {
+      throw new ReconcileError("Cannot read the OS boot identity; inspect process supervision", {
+        cause,
+      });
+    }
+  },
   async killGroup(pgid) {
     if (!ProcessSchema.shape.pgid.safeParse(pgid).success) {
       throw new ReconcileError("Cannot signal an invalid recorded process group");
@@ -168,16 +195,26 @@ export class AttemptReconciler {
     if (interrupted && !["interrupting", "replanning", "escalated"].includes(task.status)) {
       return this.stale(key);
     }
-    if (!pending && (interrupted || !claimed || unknownOutcome(records))) {
-      const publication = this.unknownPublication(input, lease.interrupt);
-      await this.deps.journal.append(key, { step: "publish_pending", publication });
-    } else if (pending?.type === "work.delivered" && interrupted) {
-      // Preserve a pending event id. Its fenced intent drops rather than becoming a new event.
-      return this.stale(key);
+    let replacement: AttemptPublication | null = null;
+    if (
+      (!pending && (interrupted || !claimed || unknownOutcome(records))) ||
+      (pending?.type === "work.delivered" && interrupted)
+    ) {
+      replacement = this.unknownPublication(input, lease.interrupt);
+    } else if (!interrupted && (!pending || pending.type === "work.delivered")) {
+      const prState = await this.checkPr(input, records, pending);
+      if (prState !== "open") {
+        replacement = this.unknownPublication(
+          input,
+          null,
+          `PR was ${prState} before work.delivered; inspect the PR before retrying`,
+        );
+      }
     }
-
-    if (!interrupted && (!pending || pending.type === "work.delivered")) {
-      if (!(await this.checkPr(input, records, pending))) return this.stale(key);
+    if (replacement) {
+      // Retain the old delivery id for acknowledgement, but journal a distinct fenced outcome
+      // before publishing it (F17, §11.4). A retry resumes this new id after an outage.
+      await this.deps.journal.append(key, { step: "publish_pending", publication: replacement });
     }
     // SK-504 resolves remote push/PR lost acknowledgements and scans before every publication.
     return new AttemptRunner(this.deps).run(input);
@@ -229,15 +266,30 @@ export class AttemptReconciler {
       if (!parsed.success) {
         throw new ReconcileError("Invalid journaled process identity; repair the journal");
       }
-      const { pid, pgid, start_token: token } = parsed.data;
-      const identity = `${pgid}/${token}`;
+      const { pid, pgid, start_token: token, boot_id: bootId } = parsed.data;
+      const identity = JSON.stringify([pgid, token, bootId]);
       if (stopped.has(identity)) continue;
-      const actual = token === "" ? null : await processes.startToken(pid);
+      if (token === "") {
+        // PRD §10.6: an empty token alone cannot distinguish orphans from a reused group
+        // after reboot. Older journals lack this evidence, so leave those groups untouched.
+        const currentBoot = bootId ? await processes.bootId?.() : null;
+        if (!bootId || !currentBoot || currentBoot !== bootId) {
+          await this.deps.journal.append(key, {
+            step: "process_unverified",
+            pgid,
+            reason:
+              currentBoot && currentBoot !== bootId ? "boot_changed" : "missing_boot_identity",
+          });
+          stopped.add(identity);
+          continue;
+        }
+      }
+      const actual = await processes.startToken(token === "" ? pgid : pid);
       // A nonempty different token proves PID reuse. Never signal that unrelated new group.
-      if (token !== "" && actual !== null && actual !== token) {
+      if (actual !== null && actual !== token) {
         await this.deps.journal.append(key, { step: "process_reused", pgid });
       } else {
-        // Empty/missing leader metadata cannot rule out orphan children: kill anyway (F19).
+        // A missing leader can leave orphan children within the proven boot (F19).
         await processes.killGroup(pgid);
         await this.deps.journal.append(key, { step: "process_terminated", pgid });
       }
@@ -249,12 +301,12 @@ export class AttemptReconciler {
     input: AttemptInput,
     records: JournalRecord[],
     pending: AttemptPublication | null,
-  ): Promise<boolean> {
+  ): Promise<"open" | "closed" | "merged"> {
     const saved = records.findLast((record) => record.step === "pr");
     const pr: PrInfo | null = saved ? PrSchema.parse(saved.pr) : null;
     const number =
       pr?.number ?? (pending?.type === "work.delivered" ? pending.payload.pr_number : null);
-    if (number === null) return true;
+    if (number === null) return "open";
     if (pr && pr.head !== workBranch(input.lease.task_id, input.lease.item, input.lease.epoch)) {
       throw new ReconcileError("Journaled PR head differs from the attempt branch");
     }
@@ -262,10 +314,14 @@ export class AttemptReconciler {
     const current = PrStateSchema.parse(
       await this.deps.codeHost.prState(input.plan.base.repo, number),
     );
-    return current.state === "open";
+    return current.state;
   }
 
-  private unknownPublication(input: AttemptInput, barrierId: string | null): AttemptPublication {
+  private unknownPublication(
+    input: AttemptInput,
+    barrierId: string | null,
+    detail = "Outcome is unknown after restart; do not rerun the invocation",
+  ): AttemptPublication {
     const { item, epoch } = input.lease;
     const event_id = newEventId(this.deps.random ?? cryptoRandom);
     return AttemptPublicationSchema.parse(
@@ -277,7 +333,7 @@ export class AttemptReconciler {
               item,
               epoch,
               class: "crash",
-              detail: "Outcome is unknown after restart; do not rerun the invocation",
+              detail,
             },
           }
         : {
