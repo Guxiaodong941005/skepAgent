@@ -35,6 +35,7 @@ export const IPC_METHODS = [
   "logs.tail",
   "doctor",
   "ping",
+  "pull",
 ] as const;
 
 export type IpcMethod = (typeof IPC_METHODS)[number];
@@ -130,6 +131,7 @@ const PARAMS_BY_METHOD = {
   "logs.tail": LogsTailParams,
   doctor: DoctorParams,
   ping: PingParams,
+  pull: PingParams,
 } as const;
 
 export type ParamsOf<M extends IpcMethod> = z.infer<(typeof PARAMS_BY_METHOD)[M]>;

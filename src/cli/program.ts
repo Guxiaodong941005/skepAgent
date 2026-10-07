@@ -16,6 +16,7 @@ import { register as registerLease } from "./commands/lease.js";
 import { register as registerLog } from "./commands/log.js";
 import { register as registerLogs } from "./commands/logs.js";
 import { register as registerPlan } from "./commands/plan.js";
+import { register as registerPull } from "./commands/pull.js";
 import { register as registerReplan } from "./commands/replan.js";
 import { register as registerSim } from "./commands/sim.js";
 import { register as registerStatus } from "./commands/status.js";
@@ -62,6 +63,7 @@ export function buildProgram(ctx: CliContext): Command {
   registerAgent(program, ctx);
   registerTask(program, ctx);
   registerPlan(program, ctx);
+  registerPull(program, ctx);
   registerReplan(program, ctx);
   registerLease(program, ctx);
   registerDecide(program, ctx);

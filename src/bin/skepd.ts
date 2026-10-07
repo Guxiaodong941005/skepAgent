@@ -26,6 +26,7 @@ import { GhCodeHost } from "../codehost/gh.js";
 import type { CodeHost } from "../codehost/types.js";
 import { findRepo, loadDeviceConfig } from "../config/device.js";
 import { skepHome, skepPaths } from "../config/paths.js";
+import { workersOf } from "../controller/pull-notify.js";
 import { intentFromSpec } from "../core/intent-spec.js";
 import { draft, type Intent } from "../core/intents.js";
 import type { TaskState } from "../core/reducer/state.js";
@@ -572,6 +573,7 @@ export async function createDeviceDaemon(options: DaemonBootstrapOptions): Promi
       random,
       hints,
       redactor,
+      workers: workersOf(config),
       notify: config.notify
         ? async (alarm) => {
             const response = await (options.request ?? fetch)(config.notify?.ntfy_topic_url ?? "", {

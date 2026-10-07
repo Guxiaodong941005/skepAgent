@@ -103,6 +103,7 @@ describe("write commands through the daemon", () => {
         logsTail: async () => ({}),
         doctor: async () => ({}),
         ping: async () => ({ pong: true }),
+        pull: async () => ({ fetched: true }),
       },
     });
     await server.start();
@@ -242,6 +243,7 @@ describe("write commands through the daemon", () => {
         logsTail: async () => ({}),
         doctor: async () => ({}),
         ping: async () => ({}),
+        pull: async () => ({ fetched: true }),
       },
     });
     await server.start();

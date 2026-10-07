@@ -48,6 +48,7 @@ describe("IPC socket permissions (D22)", () => {
           logsTail: vi.fn(),
           doctor: vi.fn(),
           ping: async () => ({ pong: true }),
+          pull: async () => ({ fetched: true }),
         },
       },
       { exec },

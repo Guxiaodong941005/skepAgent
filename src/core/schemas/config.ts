@@ -42,6 +42,31 @@ export const DeviceConfigSchema = z.strictObject({
     })
     .default({ active_sec: 20, idle_sec: 90 }),
   notify: z.strictObject({ ntfy_topic_url: z.url() }).optional(),
+  /**
+   * Controller only (D26). Workers the controller tells to fetch after it publishes.
+   * The message is a wake-up, never state: each worker still verifies signed git.
+   */
+  workers: z
+    .array(
+      z.strictObject({
+        /** Device name, for logs only. */
+        device: z.string().regex(DEVICE_RE),
+        /** `user@host` or an SSH config alias. No shell metacharacters. */
+        ssh: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._@:-]{0,200}$/),
+        /** Absolute path of that device's skep checkout or install root. Optional. */
+        skep_bin: z
+          .string()
+          .regex(/^\/[A-Za-z0-9._/-]{0,240}$/)
+          .optional(),
+        /** That device's SKEP_HOME, if not the default. Optional. */
+        home: z
+          .string()
+          .regex(/^\/[A-Za-z0-9._/-]{0,240}$/)
+          .optional(),
+      }),
+    )
+    .max(16)
+    .optional(),
 });
 export type DeviceConfig = z.infer<typeof DeviceConfigSchema>;
 

@@ -3,6 +3,7 @@ import type { HeartbeatWriter } from "../blackboard/heartbeat.js";
 import type { LivenessTracker } from "../blackboard/liveness.js";
 import type { Publisher, PublishResult } from "../blackboard/publisher.js";
 import type { Sync, SyncAlarm } from "../blackboard/sync.js";
+import { notifyWorkers, type WorkerTarget } from "../controller/pull-notify.js";
 import type { Intent } from "../core/intents.js";
 import { GenesisError } from "../core/reducer/genesis.js";
 import { REDUCER_VERSION, type State } from "../core/reducer/state.js";
@@ -52,6 +53,9 @@ export interface DaemonDependencies {
   idleMs?: number;
   /** Injected local log reader; remote log access is deliberately unavailable (D18). */
   logsTail?: (agent: string, params: unknown) => Promise<{ text: string }>;
+  /** Controller only (D26). Workers to tell "fetch now" after an accepted publish. */
+  workers?: readonly WorkerTarget[];
+  notifyPull?: typeof notifyWorkers;
 }
 interface PendingPublication {
   intent: Intent;
@@ -264,6 +268,18 @@ export class Daemon {
       } catch (error) {
         this.alarm(error, "hint_failed");
       }
+      const workers = this.deps.workers ?? [];
+      if (workers.length > 0) {
+        try {
+          const notified = await (this.deps.notifyPull ?? notifyWorkers)(workers);
+          for (const item of notified) {
+            if (!item.ok)
+              this.alarm(new DaemonError(`${item.device}: ${item.detail}`), "pull_notify_failed");
+          }
+        } catch (error) {
+          this.alarm(error, "pull_notify_failed");
+        }
+      }
       this.wake();
     } else if (result.status === "failed")
       this.alarm(new DaemonError(result.reason ?? "Publication failed"), "publish_failed");
@@ -427,6 +443,11 @@ export class Daemon {
         alarms: this.status().extras.alarms,
       }),
       ping: async (_params: Record<string, never> = {}) => ({ reducer_version: REDUCER_VERSION }),
+      pull: async (_params: Record<string, never> = {}) => {
+        const state = await this.deps.sync.observeNow();
+        this.wake();
+        return { fetched: true, tip: state.tip, seq: state.seq };
+      },
     } satisfies IpcHandlers;
   }
   status() {

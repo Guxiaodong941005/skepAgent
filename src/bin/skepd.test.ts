@@ -107,6 +107,7 @@ describe("daemon entrypoint", () => {
         logsTail: vi.fn(),
         doctor: vi.fn(),
         ping: vi.fn(),
+        pull: vi.fn(),
       };
       const server = options.ipcFactory({
         socketPath: join(options.home, "skepd.sock"),
@@ -149,6 +150,7 @@ describe("daemon entrypoint", () => {
           logsTail: vi.fn(),
           doctor: vi.fn(),
           ping: vi.fn(),
+          pull: vi.fn(),
         },
       });
       return {

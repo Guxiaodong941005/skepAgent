@@ -370,6 +370,36 @@ Notifications are optional. Set `notify.ntfy_topic_url` in `device.toml` to an `
 host you run (an example shape is `https://ntfy.example.invalid/skep-example`). The topic URL is
 not a credential; message bodies are redacted before they are sent.
 
+
+### 1.4 Controller and workers (D26)
+
+One device is the controller. It is the only device that reaches the others. The others do not
+connect to each other and do not accept protocol commands: the controller tells them to fetch,
+and they verify the signed blackboard themselves.
+
+On the controller's daemon `device.toml`, add the workers. This list is local. It is never
+written to the blackboard.
+
+```toml
+[[workers]]
+device = "mac"
+ssh = "agent@mac"                  # an ssh config alias or user@host, no shell characters
+skep_bin = "/usr/local/bin/skep"   # optional; default is `skep` on the worker's PATH
+home = "/var/lib/skep"             # optional; the worker's SKEP_HOME
+```
+
+After every accepted publish, the controller runs, for each worker:
+
+```text
+ssh -o BatchMode=yes <ssh> <skep_bin> pull --home <home>
+```
+
+`skep pull` fetches. It does not apply a payload from the controller. If the worker is offline,
+the publish still stands and the worker catches up on its next poll.
+
+The controller's SSH key is a management credential of that device, not a provider credential
+(D19). Do not put it in the blackboard, a plan, or an agent prompt.
+
 ## 2. Trust root and fingerprint comparison
 
 The trust root is local on every device. Changing it is a local edit (PRD §11.2); nothing in the

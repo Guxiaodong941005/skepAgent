@@ -68,6 +68,8 @@ export interface IpcHandlers {
   doctor(params: Record<string, never>): Promise<unknown>;
   /** `ping`: liveness of the socket itself. */
   ping(params: Record<string, never>): Promise<unknown>;
+  /** `pull`: fetch the blackboard now. The caller is not trusted for state (D26). */
+  pull(params: Record<string, never>): Promise<unknown>;
 }
 
 /**
@@ -348,6 +350,8 @@ class Connection {
         return { done: false, result: await handlers.doctor({}) };
       case "ping":
         return { done: false, result: await handlers.ping({}) };
+      case "pull":
+        return { done: false, result: await handlers.pull({}) };
       default:
         return assertNever(request);
     }

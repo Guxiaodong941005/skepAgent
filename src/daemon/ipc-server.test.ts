@@ -40,6 +40,7 @@ function handlers(overrides: Partial<IpcHandlers> = {}): IpcHandlers {
     },
     doctor: async () => ({ ok: true }),
     ping: async () => ({ pong: true }),
+    pull: async () => ({ fetched: true }),
     ...overrides,
   };
 }

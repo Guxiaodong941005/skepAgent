@@ -55,6 +55,7 @@ describe("connectIpc", () => {
         logsTail: async () => ({}),
         doctor: async () => ({}),
         ping: async () => ({ pong: true }),
+        pull: async () => ({ fetched: true }),
       },
     });
     await server.start();
@@ -97,6 +98,7 @@ describe("connectIpc", () => {
         logsTail: async () => ({}),
         doctor: async () => ({}),
         ping: async () => ({}),
+        pull: async () => ({ fetched: true }),
       },
     });
     await server.start();
@@ -135,6 +137,7 @@ describe("connectIpc", () => {
         logsTail: async () => ({}),
         doctor: async () => ({}),
         ping: async () => ({}),
+        pull: async () => ({ fetched: true }),
       },
     });
     await server.start();
@@ -189,6 +192,7 @@ describe("connectIpc", () => {
         logsTail: async () => ({}),
         doctor: async () => ({}),
         ping: async () => ({ pong: true }),
+        pull: async () => ({ fetched: true }),
       },
     });
     await server.start();
