@@ -7,8 +7,9 @@ import {
   taskCreated,
   VPS,
 } from "../../test/helpers/log-builder.js";
-import { INTENT_KINDS, IntentSpecSchema } from "../ipc/protocol.js";
+import { IntentSpecSchema } from "../ipc/protocol.js";
 import { intentFromSpec } from "./intent-spec.js";
+import { submitIntent } from "./intents.js";
 import { replay } from "./reducer/replay.js";
 import type { State } from "./reducer/state.js";
 
@@ -33,8 +34,10 @@ describe("intentFromSpec", () => {
         body: "Add a dark mode toggle.",
         repo: "app",
         mode: "team",
+        submit: "device",
         owner: VPS,
       },
+      { kind: "work.submit", task: T1, item: "W1", method: "none", skip: false },
       { kind: "task.cancel", task: T1, reason: "no longer needed" },
       { kind: "plan.approve", task: T1, note: "ship it" },
       { kind: "plan.reject", task: T1 },
@@ -49,7 +52,9 @@ describe("intentFromSpec", () => {
       expect(intentFromSpec(spec, ctx)).not.toBeNull();
       seen.add(spec.kind);
     }
-    expect([...seen].sort()).toEqual([...INTENT_KINDS].sort());
+    expect([...seen].sort()).toEqual(
+      IntentSpecSchema.options.map((option) => option.shape.kind.value).sort(),
+    );
   });
 
   it("mints one task id from the supplied clock and randomness", () => {
@@ -81,5 +86,63 @@ describe("intentFromSpec", () => {
     expect(
       intentFromSpec({ kind: "task.cancel", task: T1, reason: "stop", extra: true }, ctx),
     ).toBeNull();
+  });
+});
+
+describe("submission spec mapping", () => {
+  it.each([
+    { method: "none", state: "local" },
+    { method: "push", state: "pushed" },
+    { method: "pr", state: "opened", pr_url: "https://example.invalid/pull/1", pr_number: 1 },
+    { method: "mr", state: "opened", pr_url: "https://example.invalid/merge/1", pr_number: 1 },
+    { method: "none", state: "skipped" },
+  ] as const)("maps $method / $state using the current delivery", (submission) => {
+    const current = state();
+    const task = current.tasks[T1];
+    if (!task) throw new Error("Missing task");
+    task.status = "delivered";
+    task.items.W1 = {
+      id: "W1",
+      title: "Example",
+      assignee: VPS,
+      depends_on: [],
+      requires: [],
+      status: "delivered",
+      lease: null,
+      delivered: {
+        epoch: 3,
+        branch: "example",
+        head_sha: "a".repeat(40),
+        submit: { method: "ask", state: "pending" },
+        check_runs: [],
+        seq: 9,
+      },
+      merged: null,
+      failure: null,
+      last_checkpoint: null,
+      attempts_this_plan: 1,
+    };
+    const { state: submissionState, ...fields } = submission;
+    const spec = {
+      kind: "work.submit",
+      task: T1,
+      item: "W1",
+      ...fields,
+      skip: submissionState === "skipped",
+    };
+    const intent = intentFromSpec(spec, ctx);
+    expect(intent?.(current)).toEqual(
+      submitIntent({ task_id: T1, item: "W1", actor: "human", ...submission })(current),
+    );
+    expect(intent?.(current)).toMatchObject({ payload: { epoch: 3, head_sha: "a".repeat(40) } });
+    task.items.W1.submission = {
+      item: "W1",
+      epoch: 3,
+      head_sha: "a".repeat(40),
+      method: "none",
+      state: "local",
+      seq: 10,
+    };
+    expect(intent?.(current)).toBeNull();
   });
 });

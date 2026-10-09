@@ -233,6 +233,7 @@ export async function prepareTask(
         mode: "solo",
         owner,
         budgets: { ...DEFAULT_BUDGETS },
+        submit: "device",
         plan_approval: "human",
       },
       {},
@@ -284,8 +285,12 @@ export function deliveryDuties(world: SimWorld, code: ScenarioCode, actor: strin
         item: ITEM,
         epoch: lease.epoch,
         head_sha: head,
-        pr_url: pr.url,
-        pr_number: pr.number,
+        submit: {
+          method: "pr",
+          state: "opened",
+          pr_url: pr.url,
+          pr_number: pr.number,
+        },
         check_runs: [],
       }),
     ];

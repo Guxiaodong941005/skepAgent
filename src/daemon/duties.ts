@@ -3,6 +3,7 @@ import { contentHash } from "../core/canonical.js";
 import { claimIntent, draft, releaseIntent } from "../core/intents.js";
 import type { State, TaskState } from "../core/reducer/state.js";
 import { pendingReviews } from "../core/reducer/views.js";
+import { type DeviceConfig, DeviceSubmitSchema } from "../core/schemas/config.js";
 import { type Plan, PlanSchema } from "../core/schemas/plan.js";
 import { type Review, ReviewSchema } from "../core/schemas/review.js";
 import type { AttemptInput, AttemptReplanHandler, AttemptRunner } from "../exec/attempt.js";
@@ -17,6 +18,7 @@ import { claimCandidates, type Slot, type SlotRegistry } from "./slots.js";
 
 export interface DutiesDependencies {
   slots: SlotRegistry;
+  device?: Pick<DeviceConfig, "submit">;
   clock: Clock;
   random: RandomSource;
   publisher: Pick<Publisher, "publish">;
@@ -354,10 +356,16 @@ export class Duties {
       }
       const plan = PlanSchema.parse(task.plans[String(task.active_plan_version)]?.plan);
       const predecessor = item.depends_on[0] ? task.items[item.depends_on[0]] : null;
+      const deviceSubmit = DeviceSubmitSchema.parse(this.deps.device?.submit);
+      const requested = task.submit && task.submit !== "device" ? task.submit : deviceSubmit.method;
       const input: AttemptInput = {
         lease: { task_id: taskId, item: itemId, epoch: lease.epoch, holder: slot.agent },
         attemptId,
         plan,
+        submit: {
+          method: deviceSubmit.host === "git" ? "push" : requested,
+          host: deviceSubmit.host,
+        },
         baseSha: predecessor?.delivered?.head_sha ?? plan.base.commit,
         prBase:
           predecessor?.status === "merged"

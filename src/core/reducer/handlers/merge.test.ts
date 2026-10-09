@@ -101,8 +101,12 @@ function deliver(builder: LogBuilder, state: State, id: string): State {
           epoch,
           branch: workBranch(T1, id, epoch),
           head_sha: fakeSha(id),
-          pr_url: `https://example.invalid/pull/${id === "W1" ? 1 : 2}`,
-          pr_number: id === "W1" ? 1 : 2,
+          submit: {
+            method: "pr",
+            state: "opened",
+            pr_url: `https://example.invalid/pull/${id === "W1" ? 1 : 2}`,
+            pr_number: id === "W1" ? 1 : 2,
+          },
           check_runs: [],
         },
         pre: { task_rev: task(state).rev, item: id },
@@ -154,6 +158,22 @@ function freeze<T>(value: T): T {
 }
 
 describe("stack integration and completion", () => {
+  it.each(["push", "none", "ask"] as const)(
+    "rejects merge by PR number for %s delivery",
+    (method) => {
+      const f = fixture(1);
+      const delivery = task(f.state).items.W1?.delivered;
+      if (!delivery) throw new Error("Missing delivery");
+      delivery.submit = {
+        method,
+        state: method === "push" ? "pushed" : method === "none" ? "local" : "pending",
+      };
+      const next = append(f.builder, f.state, "item.merged", merge("W1"), "human");
+      expect(next.outcomes.at(-1)?.reason).toBe("bad_task_state");
+      expect(next.tasks).toEqual(f.state.tasks);
+    },
+  );
+
   it("verifies only W2's head and completes after W1 and W2 are merged", () => {
     const { builder, state: delivered } = fixture(2);
     expect(task(delivered).status).toBe("delivered");

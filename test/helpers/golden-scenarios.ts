@@ -281,6 +281,7 @@ class Script {
           mode,
           owner,
           budgets: { ...DEFAULT_BUDGETS, ...budgets },
+          submit: "device",
           plan_approval: "human",
         },
       }),
@@ -439,8 +440,12 @@ class Script {
           epoch: lease.epoch,
           branch: lease.branch,
           head_sha: head,
-          pr_url: `https://example.invalid/example/app/pull/${pr}`,
-          pr_number: pr,
+          submit: {
+            method: "pr",
+            state: "opened",
+            pr_url: `https://example.invalid/example/app/pull/${pr}`,
+            pr_number: pr,
+          },
           check_runs: [checkRun(head)],
         },
       }),
@@ -465,7 +470,8 @@ class Script {
 
   merge(id: string): void {
     const delivered = this.item(id).delivered;
-    if (!delivered) throw new Error(`${this.name}: ${id} was never delivered`);
+    if (!delivered || delivered.submit.pr_number === undefined)
+      throw new Error(`${this.name}: ${id} has no delivered PR`);
     this.step(
       built("item.merged", {
         task_id: this.task().task_id,
@@ -473,7 +479,7 @@ class Script {
         pre: { task_rev: this.task().rev, item: id },
         payload: {
           item: id,
-          pr_number: delivered.pr_number,
+          pr_number: delivered.submit.pr_number,
           merge_sha: sha(`${this.name}:merge:${id}`),
         },
       }),
@@ -637,8 +643,8 @@ class Script {
     let max = 0;
     for (const task of Object.values(this.state.tasks)) {
       for (const itemState of Object.values(task.items)) {
-        if (itemState.delivered && itemState.delivered.pr_number > max) {
-          max = itemState.delivered.pr_number;
+        if (itemState.delivered && (itemState.delivered.submit.pr_number ?? 0) > max) {
+          max = itemState.delivered.submit.pr_number ?? 0;
         }
       }
     }

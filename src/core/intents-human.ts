@@ -15,6 +15,7 @@ import type { AgentId, TaskId } from "./ids.js";
 import { draft, type Intent } from "./intents.js";
 import type { State, TaskState } from "./reducer/state.js";
 import { DEFAULT_BUDGETS } from "./schemas/common.js";
+import type { PayloadOf } from "./schemas/events.js";
 import type { Evidence } from "./schemas/evidence.js";
 
 const HUMAN = "human";
@@ -37,6 +38,7 @@ export interface TaskCreateInput {
   /** Branch the plan is cut from. Defaults to `main` when the human did not name one. */
   baseBranch?: string;
   mode: "solo" | "team";
+  submit?: PayloadOf<"task.created">["submit"];
   /** Owning agent. When omitted, the single registered agent is used. */
   owner?: AgentId;
   /** Verbatim non-English source, kept for audit only (PRD §14). */
@@ -71,6 +73,7 @@ export function taskCreateIntent(input: TaskCreateInput, taskId: TaskId): Intent
         repo: input.repo,
         base_branch: input.baseBranch ?? "main",
         mode: input.mode,
+        submit: input.submit ?? "device",
         owner,
         budgets: { ...DEFAULT_BUDGETS },
         plan_approval: "human",

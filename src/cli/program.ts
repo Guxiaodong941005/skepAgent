@@ -21,6 +21,7 @@ import { register as registerReplan } from "./commands/replan.js";
 import { expandStartWithMaster, register as registerSession } from "./commands/session.js";
 import { register as registerSim } from "./commands/sim.js";
 import { register as registerStatus } from "./commands/status.js";
+import { register as registerSubmit } from "./commands/submit.js";
 import { register as registerTask } from "./commands/task.js";
 import { type CliContext, connectDaemon } from "./context.js";
 import { CliError, createOutput, EXIT, type Output } from "./output.js";
@@ -63,6 +64,7 @@ export function buildProgram(ctx: CliContext): Command {
   registerInit(program, ctx);
   registerAgent(program, ctx);
   registerTask(program, ctx);
+  registerSubmit(program, ctx);
   registerPlan(program, ctx);
   registerPull(program, ctx);
   registerReplan(program, ctx);

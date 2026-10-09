@@ -343,6 +343,7 @@ export async function daemonHappyScenario(world: SimWorld, team: boolean): Promi
         mode: team ? "team" : "solo",
         owner: "mac.coding",
         budgets: { ...DEFAULT_BUDGETS },
+        submit: "device",
         plan_approval: "human",
       },
       {},
@@ -394,8 +395,10 @@ export async function daemonHappyScenario(world: SimWorld, team: boolean): Promi
       for (const id of plan.stack_order) {
         const delivery = owner.state.tasks[TASK]?.items[id]?.delivered;
         if (!delivery) throw new SimWorldError("Missing delivered item before human merge");
-        if (id !== "W1") await host.retargetPr(REPO, delivery.pr_number, "main");
-        await host.merge(delivery.pr_number);
+        const prNumber = delivery.submit.pr_number;
+        if (prNumber === undefined) throw new Error("Scenario delivery has no PR number");
+        if (id !== "W1") await host.retargetPr(REPO, prNumber, "main");
+        await host.merge(prNumber);
         await owner.publisher.publish((state) => {
           const current = state.tasks[TASK];
           return current
@@ -403,7 +406,7 @@ export async function daemonHappyScenario(world: SimWorld, team: boolean): Promi
                 "item.merged",
                 TASK,
                 owner.agent,
-                { item: id, pr_number: delivery.pr_number, merge_sha: delivery.head_sha },
+                { item: id, pr_number: prNumber, merge_sha: delivery.head_sha },
                 {
                   task_rev: current.rev,
                   item: id,

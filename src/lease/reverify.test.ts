@@ -120,8 +120,12 @@ describe("fresh lease re-verification", () => {
       epoch: 1,
       actor: VPS,
       head_sha: state.tip,
-      pr_url: "https://example.invalid/pull/1",
-      pr_number: 1,
+      submit: {
+        method: "pr",
+        state: "opened",
+        pr_url: "https://example.invalid/pull/1",
+        pr_number: 1,
+      },
       check_runs: [],
     });
     expect(deliver(state)).not.toBeNull();

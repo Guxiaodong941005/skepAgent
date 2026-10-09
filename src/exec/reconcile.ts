@@ -8,20 +8,13 @@ import type { PrInfo } from "../codehost/types.js";
 import { contentHash } from "../core/canonical.js";
 import { workBranch } from "../core/ids.js";
 import type { State } from "../core/reducer/state.js";
-import {
-  AgentIdSchema,
-  AttemptIdSchema,
-  EpochSchema,
-  ItemIdSchema,
-  ShaSchema,
-  TaskIdSchema,
-} from "../core/schemas/common.js";
-import { PlanSchema } from "../core/schemas/plan.js";
+import { ShaSchema } from "../core/schemas/common.js";
 import { SnapshotSchema } from "../core/schemas/snapshot.js";
 import { readStartToken } from "../runtime/native.js";
 import { cryptoRandom, newEventId } from "../util/random.js";
 import {
   type AttemptInput,
+  AttemptInputSchema,
   type AttemptPublication,
   AttemptPublicationSchema,
   type AttemptResult,
@@ -30,22 +23,6 @@ import {
 } from "./attempt.js";
 import { type AttemptKey, type Journal, type JournalRecord, TERMINAL_STEPS } from "./journal.js";
 
-const InputSchema = z.strictObject({
-  lease: z.strictObject({
-    task_id: TaskIdSchema,
-    item: ItemIdSchema,
-    epoch: EpochSchema,
-    holder: AgentIdSchema,
-  }),
-  attemptId: AttemptIdSchema,
-  plan: PlanSchema,
-  baseSha: ShaSchema,
-  prBase: z.string().min(1).max(255),
-  agentInstructions: z.string(),
-  repoContext: z.string(),
-  timeoutMs: z.number().finite().positive(),
-  cliVersion: z.string().min(1).optional(),
-});
 const ProcessSchema = z.object({
   pid: z.number().int().positive().max(2_147_483_647),
   pgid: z.number().int().positive().max(2_147_483_647),
@@ -201,7 +178,17 @@ export class AttemptReconciler {
       (pending?.type === "work.delivered" && interrupted)
     ) {
       replacement = this.unknownPublication(input, lease.interrupt);
-    } else if (!interrupted && (!pending || pending.type === "work.delivered")) {
+    } else if (
+      !interrupted &&
+      (!pending || pending.type === "work.delivered") &&
+      ["pr", "mr"].includes(
+        pending?.type === "work.delivered"
+          ? pending.payload.submit.method
+          : input.submit.host === "git"
+            ? "push"
+            : input.submit.method,
+      )
+    ) {
       const prState = await this.checkPr(input, records, pending);
       if (prState !== "open") {
         replacement = this.unknownPublication(
@@ -221,7 +208,7 @@ export class AttemptReconciler {
   }
 
   private input(key: AttemptKey, value: unknown): AttemptInput {
-    const parsed = InputSchema.safeParse(value);
+    const parsed = AttemptInputSchema.safeParse(value);
     if (
       !parsed.success ||
       parsed.data.lease.task_id !== key.task ||
@@ -305,7 +292,8 @@ export class AttemptReconciler {
     const saved = records.findLast((record) => record.step === "pr");
     const pr: PrInfo | null = saved ? PrSchema.parse(saved.pr) : null;
     const number =
-      pr?.number ?? (pending?.type === "work.delivered" ? pending.payload.pr_number : null);
+      pr?.number ??
+      (pending?.type === "work.delivered" ? (pending.payload.submit.pr_number ?? null) : null);
     if (number === null) return "open";
     if (pr && pr.head !== workBranch(input.lease.task_id, input.lease.item, input.lease.epoch)) {
       throw new ReconcileError("Journaled PR head differs from the attempt branch");

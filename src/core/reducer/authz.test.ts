@@ -59,6 +59,7 @@ describe("authorization matrix (ARCHITECTURE §5.4)", () => {
     ["replan.requested", true, true, false],
     ["barrier.closed", true, true, false],
     ["item.merged", true, true, true],
+    ["work.submitted", true, true, true],
     ["task.verified", false, true, false],
   ];
   it.each(matrix)(

@@ -18,8 +18,7 @@ export const handleWorkDelivered: Handler<"work.delivered"> = (draft, event, ctx
     epoch: payload.epoch,
     branch: payload.branch,
     head_sha: payload.head_sha,
-    pr_url: payload.pr_url,
-    pr_number: payload.pr_number,
+    submit: structuredClone(payload.submit),
     check_runs: structuredClone(payload.check_runs),
     seq: ctx.seq,
   };
@@ -33,6 +32,23 @@ export const handleWorkDelivered: Handler<"work.delivered"> = (draft, event, ctx
       dependent.status = "ready";
   }
   if (Object.keys(task.items).every(completed)) task.status = "delivered";
+  return { ok: true };
+};
+
+export const handleWorkSubmitted: Handler<"work.submitted"> = (draft, event, ctx) => {
+  const task = draft.tasks[event.task_id];
+  if (!task) return { ok: false, reason: "unknown_task" };
+  if (!["executing", "delivered", "escalated"].includes(task.status))
+    return { ok: false, reason: "bad_task_state" };
+  const payload = event.payload;
+  const item = task.items[payload.item];
+  if (!item) return { ok: false, reason: "unknown_item" };
+  if (item.status !== "delivered" || item.delivered?.submit.state !== "pending" || item.submission)
+    return { ok: false, reason: "bad_task_state" };
+  if (item.delivered.epoch !== payload.epoch) return { ok: false, reason: "epoch_mismatch" };
+  if (item.delivered.head_sha !== payload.head_sha) return { ok: false, reason: "bad_task_state" };
+  // Delivery already cleared the lease; the recorded SHA fences this later human decision.
+  item.submission = { ...structuredClone(payload), seq: ctx.seq };
   return { ok: true };
 };
 

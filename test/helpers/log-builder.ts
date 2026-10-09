@@ -164,6 +164,7 @@ export function taskCreated(
     mode: "solo",
     owner: VPS,
     budgets: { ...DEFAULT_BUDGETS },
+    submit: "device",
     plan_approval: "human",
     ...overrides,
   };

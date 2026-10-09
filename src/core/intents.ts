@@ -10,6 +10,7 @@ import {
   type Pre,
   parseEvent,
   type SkepEvent,
+  WorkSubmittedPayload,
 } from "./schemas/events.js";
 
 // Indexing a concrete map preserves PayloadOf<T> while avoiding Extract's inferred invariance:
@@ -73,6 +74,13 @@ export type RevokeIntentOptions = { task_id: TaskId } & Omit<
   "observed_hb"
 >;
 export type DeliverIntentOptions = AgentAction & Omit<PayloadOf<"work.delivered">, "branch">;
+export type SubmitIntentOptions = {
+  task_id: TaskId;
+  actor: string;
+  item: string;
+  epoch?: number;
+  head_sha?: Sha;
+} & Pick<PayloadOf<"work.submitted">, "method" | "state" | "pr_url" | "pr_number">;
 export type FailIntentOptions = AgentAction & PayloadOf<"work.failed">;
 export type CheckpointIntentOptions = AgentAction & PayloadOf<"checkpoint.recorded">;
 
@@ -194,12 +202,45 @@ export function deliverIntent(options: DeliverIntentOptions): Intent {
         epoch: action.epoch,
         branch: lease.branch,
         head_sha: action.head_sha,
-        pr_url: action.pr_url,
-        pr_number: action.pr_number,
+        submit: structuredClone(action.submit),
         check_runs: structuredClone(action.check_runs),
       },
       { task_rev: task.rev, item: action.item },
     );
+  };
+}
+
+export function submitIntent(options: SubmitIntentOptions): Intent {
+  const action = structuredClone(options);
+  return (state) => {
+    const task = state.tasks[action.task_id];
+    const item = task?.items[action.item];
+    const delivery = item?.delivered;
+    if (
+      !task ||
+      !["executing", "delivered", "escalated"].includes(task.status) ||
+      item?.status !== "delivered" ||
+      !delivery ||
+      delivery.submit.state !== "pending" ||
+      item.submission ||
+      (action.epoch !== undefined && action.epoch !== delivery.epoch) ||
+      (action.head_sha !== undefined && action.head_sha !== delivery.head_sha)
+    )
+      return null;
+    const payload = WorkSubmittedPayload.safeParse({
+      item: action.item,
+      epoch: delivery.epoch,
+      head_sha: delivery.head_sha,
+      method: action.method,
+      state: action.state,
+      ...(action.pr_url === undefined ? {} : { pr_url: action.pr_url }),
+      ...(action.pr_number === undefined ? {} : { pr_number: action.pr_number }),
+    });
+    if (!payload.success) return null;
+    return draft("work.submitted", action.task_id, action.actor, payload.data, {
+      task_rev: task.rev,
+      item: action.item,
+    });
   };
 }
 
