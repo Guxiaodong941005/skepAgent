@@ -9,7 +9,8 @@
  * in the agent's own view, which `a` opens (PTY: this terminal; herdr: its pane).
  */
 
-import type { JoinView, JoinViewModel } from "./commands/session.js";
+import { type Clock, systemClock } from "../util/clock.js";
+import type { JoinView, JoinViewModel, PeerPhase } from "./commands/session.js";
 
 const ESC = "\x1b[";
 const ALT_SCREEN_ON = `${ESC}?1049h`;
@@ -25,6 +26,38 @@ const RESET = `${ESC}0m`;
 export const MIN_ROWS = 24;
 /** At most this many list rows; the rest of the screen belongs to the tail. */
 const MAX_LIST_ROWS = 6;
+
+export type Glyphs = "unicode" | "ascii";
+export const TICK_MS = 250;
+
+export function beeLane(phase: PeerPhase, beat: number, glyphs: Glyphs): string {
+  const bee = glyphs === "unicode" ? "🐝" : "~b";
+  if (phase === "working") {
+    const offset = [0, 1, 2, 1][beat % 4] ?? 0;
+    return `${" ".repeat(offset)}${bee}${" ".repeat(2 - offset)}`;
+  }
+  if (phase === "blocked") {
+    return glyphs === "unicode" ? (beat % 4 < 2 ? "🐝! " : "🐝  ") : beat % 4 < 2 ? "b!  " : "b   ";
+  }
+  if (phase === "done") return glyphs === "unicode" ? "✓   " : "ok  ";
+  return glyphs === "unicode" ? "·   " : ".   ";
+}
+
+export function progressBar(percent: number, glyphs: Glyphs): string {
+  const bounded = Math.max(0, Math.min(100, percent));
+  const filled = bounded === 100 ? 8 : Math.min(7, Math.round(bounded / 12.5));
+  const full = glyphs === "unicode" ? "█" : "#";
+  const empty = glyphs === "unicode" ? "░" : ".";
+  return full.repeat(filled) + empty.repeat(8 - filled);
+}
+
+export function charWidth(cp: number): number {
+  return cp >= 0x1f300 && cp <= 0x1faff ? 2 : 1;
+}
+
+function displayWidth(text: string): number {
+  return [...text].reduce((width, char) => width + charWidth(char.codePointAt(0) ?? 0), 0);
+}
 
 // ---------------------------------------------------------------------------------------------
 // Terminal I/O.
@@ -107,12 +140,20 @@ function printable(text: string): string {
   return out;
 }
 
-/** Cuts `text` to `width` code points, marking the cut with an ellipsis. */
+/** Cuts `text` to `width` display columns, marking the cut with an ellipsis. */
 export function truncate(text: string, width: number): string {
-  const chars = [...printable(text)];
-  if (chars.length <= width) return chars.join("");
+  const clean = printable(text);
+  if (displayWidth(clean) <= width) return clean;
   if (width <= 0) return "";
-  return `${chars.slice(0, width - 1).join("")}…`;
+  let used = 0;
+  let out = "";
+  for (const char of clean) {
+    const columns = charWidth(char.codePointAt(0) ?? 0);
+    if (used + columns > width - 1) break;
+    out += char;
+    used += columns;
+  }
+  return `${out}…`;
 }
 
 export type Line = string | { text: string; style: "inverse" | "bold" };
@@ -189,7 +230,7 @@ export class Screen {
       const body = lines.slice(0, rows).map((line) => {
         if (typeof line === "string") return truncate(line, columns);
         const text = truncate(line.text, columns);
-        const pad = line.style === "inverse" ? " ".repeat(columns - [...text].length) : "";
+        const pad = line.style === "inverse" ? " ".repeat(columns - displayWidth(text)) : "";
         return `${line.style === "inverse" ? INVERSE : BOLD}${text}${pad}${RESET}`;
       });
       this.io.stdout.write(`${HOME_CLEAR}${body.join("\r\n")}`);
@@ -266,6 +307,7 @@ export interface TuiPeer {
   device: string;
   role: string;
   state: string;
+  progress?: JoinViewModel["peers"][number]["progress"];
 }
 
 /** One item, and its agent when this device runs it. A master sees items without agents. */
@@ -307,6 +349,14 @@ export class TuiModel {
   pendingAttach: string | null = null;
   host: CodeHostKind = "github";
   message = "";
+  beat = 0;
+  glyphs: Glyphs = "unicode";
+
+  animating(): boolean {
+    return this.snapshot.peers.some(
+      (peer) => peer.progress?.phase === "working" || peer.progress?.phase === "blocked",
+    );
+  }
 
   set(snapshot: TuiSnapshot): void {
     this.snapshot = snapshot;
@@ -401,7 +451,18 @@ export class TuiModel {
     for (const peer of peers) {
       const own = entries.filter((e) => e.peerId === peer.peerId);
       const who = `${peer.device}  ${peer.role}`;
-      if (own.length === 0) out.push({ text: `${who}  ${peer.state}`, entry: null });
+      const progress = peer.progress;
+      if (progress !== undefined) {
+        const label =
+          progress.phase === "done" && progress.failed > 0
+            ? `done (${progress.failed} failed)`
+            : progress.phase;
+        const summary = printable(progress.summary);
+        out.push({
+          text: `${who}  ${beeLane(progress.phase, this.beat, this.glyphs)}  [${progressBar(progress.percent, this.glyphs)}] ${String(progress.percent).padStart(3)}%  ${progress.done}/${progress.total}  ${label}${summary === "" ? "" : `  ${summary}`}`,
+          entry: null,
+        });
+      } else if (own.length === 0) out.push({ text: `${who}  ${peer.state}`, entry: null });
       for (const entry of own) out.push({ text: `${who}  ${entryLine(entry)}`, entry: entry.key });
     }
     for (const entry of entries.filter((e) => !known.has(e.peerId))) {
@@ -459,6 +520,9 @@ export interface TuiOptions {
   /** The human pressed `q`/Ctrl-C or a signal arrived; the terminal is already restored. */
   onQuit?(reason: "key" | "signal"): void;
   session?: string;
+  clock?: Clock;
+  animate?: boolean;
+  glyphs?: Glyphs;
 }
 
 /** Shared screen + model + key handling for both the join view and `skep ui`. */
@@ -467,10 +531,12 @@ export class Tui {
   readonly screen: Screen;
   private readonly submitWaiters = new Map<string, (choice: SubmitChoice) => void>();
   private attachWaiter: (() => void) | null = null;
+  private ticker: AbortController | null = null;
   /** Settles once the code host is known (or could not be read; then `pr` is offered). */
   readonly hostReady: Promise<void>;
 
   constructor(private readonly opts: TuiOptions) {
+    this.model.glyphs = opts.glyphs ?? "unicode";
     this.screen = new Screen(
       opts.io,
       {
@@ -504,6 +570,7 @@ export class Tui {
   render(): void {
     const { columns, rows } = this.screen.size();
     this.screen.draw(this.model.frame(columns, rows));
+    this.maybeTick();
   }
 
   /** Runs `fn`; on a throw the terminal is restored before the error propagates. */
@@ -545,6 +612,7 @@ export class Tui {
   }
 
   close(): void {
+    this.ticker?.abort();
     this.screen.close();
     for (const [key, resolve] of this.submitWaiters) {
       this.model.pendingSubmit.delete(key);
@@ -554,6 +622,40 @@ export class Tui {
     // The terminal is free now; a waiting PTY run may take it (the join aborts it when closing).
     this.attachWaiter?.();
     this.attachWaiter = null;
+  }
+
+  private maybeTick(): void {
+    if (
+      this.opts.animate === false ||
+      !this.model.animating() ||
+      this.screen.isClosed ||
+      this.ticker !== null
+    )
+      return;
+    const controller = new AbortController();
+    this.ticker = controller;
+    const tick = async (): Promise<void> => {
+      try {
+        for (;;) {
+          try {
+            await (this.opts.clock ?? systemClock).sleep(TICK_MS, controller.signal);
+          } catch (error) {
+            if (controller.signal.aborted) return;
+            throw error;
+          }
+          if (!this.model.animating() || this.screen.isClosed) return;
+          this.model.beat += 1;
+          if (this.screen.isActive) this.guard(() => this.render());
+        }
+      } finally {
+        this.ticker = null;
+      }
+    };
+    void tick().catch((error: unknown) =>
+      this.guard(() => {
+        throw error;
+      }),
+    );
   }
 
   private quit(reason: "key" | "signal"): void {
