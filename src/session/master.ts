@@ -30,6 +30,7 @@ import {
   TokenSchema,
 } from "./messages.js";
 import type { PeerPath } from "./path.js";
+import { deriveProgress } from "./progress.js";
 import { applyClaim, applyResult, buildPlan, matchSub, type SubCandidate } from "./state.js";
 
 export class ListenAddressError extends Error {
@@ -190,6 +191,11 @@ class SessionMaster implements MasterHandle {
         repo: peer.repo,
         head: peer.head,
         role: peer.role,
+        progress: deriveProgress(
+          this.intents.flatMap((intent) => intent.items),
+          peer.peerId,
+          null,
+        ),
       })),
       intents: this.intents.map(({ intentId, text, state, items }) => ({
         intentId,

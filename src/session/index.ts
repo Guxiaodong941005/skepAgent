@@ -11,6 +11,10 @@ import type {
   SubResult,
 } from "./messages.js";
 import type { PeerPath } from "./path.js";
+import type { PeerPhase, PeerProgress } from "./progress.js";
+
+/** Agent lifecycle states a join reports for its own items (`SubHandle.reportAgent`). */
+export type AgentProgressState = "starting" | "running" | "blocked" | "done" | "failed";
 
 export interface MasterOptions {
   listen?: { host: string; port: number };
@@ -30,6 +34,8 @@ export interface MasterOptions {
   heartbeatMs?: number;
   joinCodeTtlMs?: number;
   datalistTimeoutMs?: number;
+  /** Peer progress coalescing window per subject (default 500 ms; 0 disables coalescing). */
+  progressIntervalMs?: number;
 }
 
 export interface MasterHandle {
@@ -55,6 +61,15 @@ export interface SubOptions {
   clock?: Clock;
   random?: RandomSource;
   heartbeatMs?: number;
+  /**
+   * Own (`self: true`, uncoalesced) and relayed (`self: false`) peer progress. It may fire
+   * before `connectSub` resolves. A relay with `phase: "left"` means: drop that peer's row.
+   */
+  onProgress?(p: PeerProgress & { self: boolean }): void;
+  /** Opt in to peer progress (default true). `false` behaves like a ≤ 0.1.2 sub. */
+  progress?: boolean;
+  /** Own progress coalescing window (default 500 ms; 0 disables coalescing). */
+  progressIntervalMs?: number;
 }
 
 export interface SubHandle {
@@ -63,6 +78,12 @@ export interface SubHandle {
   readonly fingerprint: string;
   close(): Promise<void>;
   readonly closed: Promise<{ reason: string }>;
+  /**
+   * Feed an assigned item's agent state into this peer's progress. A no-op after close; an
+   * unknown item throws `ChannelError`. Optional only so hand-written test doubles still type;
+   * `connectSub` always provides it.
+   */
+  reportAgent?(itemId: string, state: AgentProgressState): void;
 }
 
 export { JoinRejectedError, normalizeJoinCode } from "./handshake.js";
@@ -73,6 +94,8 @@ export { connectSub } from "./sub.js";
 export type {
   DatalistEntry,
   PeerPath,
+  PeerPhase,
+  PeerProgress,
   PlanItem,
   SessionStatus,
   SubmitMethod,

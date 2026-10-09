@@ -46,6 +46,7 @@ const status = {
       repo: null,
       head: null,
       role: null,
+      progress: { phase: "working", done: 0, total: 1, failed: 0, percent: 0, summary: "Work" },
     },
   ],
   intents: [

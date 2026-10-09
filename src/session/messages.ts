@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { RepoRefSchema, ShaSchema } from "../core/schemas/common.js";
+import { PEER_PHASES, percentOf, SUMMARY_MAX } from "./progress.js";
 
 export const DATALIST_CAP = 32_768;
 export const DeviceSchema = z.string().regex(/^[a-z0-9][a-z0-9-]{0,62}$/);
@@ -163,6 +164,43 @@ export const DescriptionSchema = z.strictObject({
   head: ShaSchema,
   role: RoleSchema,
 });
+export const PeerPhaseSchema = z.enum(PEER_PHASES);
+const SummarySchema = z.string().max(SUMMARY_MAX);
+const CountSchema = z.number().int().nonnegative().max(10_000);
+const progressFields = {
+  done: CountSchema,
+  total: CountSchema,
+  failed: CountSchema,
+  percent: z.number().int().min(0).max(100),
+  summary: SummarySchema, // "" allowed
+  itemId: ItemIdSchema.optional(),
+};
+type ProgressCounts = { done: number; total: number; failed: number; percent: number };
+function progressRules<T extends z.ZodType<ProgressCounts>>(schema: T): T {
+  return schema
+    .refine((m) => m.done <= m.total && m.failed <= m.done, "done ≤ total and failed ≤ done")
+    .refine(
+      (m) => m.percent === percentOf(m.done, m.total),
+      "percent must equal floor(100*done/total)",
+    );
+}
+/**
+ * One member serves both directions; `receive` enforces the direction rules (plan §2.2): a sub
+ * never names a peer or sends "left", and a master relay always names another peer.
+ */
+export const ProgressMsgSchema = progressRules(
+  z.strictObject({
+    type: z.literal("progress"),
+    // Master-filled identity. MUST be absent sub→master, MUST be present master→sub.
+    peerId: IdSchema.optional(),
+    device: DeviceSchema.optional(),
+    role: RoleSchema.nullable().optional(),
+    phase: z.enum([...PEER_PHASES, "left"]), // "left": master→sub only
+    ...progressFields,
+  }),
+);
+export type ProgressMsg = z.infer<typeof ProgressMsgSchema>;
+
 export const SessionMsgSchema = z.discriminatedUnion("type", [
   z.strictObject({ type: z.literal("welcome"), sessionId: IdSchema, peerId: IdSchema }),
   z.strictObject({ type: z.literal("heartbeat"), seq: z.number().int().nonnegative() }),
@@ -197,6 +235,7 @@ export const SessionMsgSchema = z.discriminatedUnion("type", [
     itemId: ItemIdSchema,
     reason: ResultRejectReasonSchema,
   }),
+  ProgressMsgSchema,
   z.strictObject({ type: z.literal("bye"), reason: z.string().min(1).max(500) }),
 ]);
 export type SessionMsg = z.infer<typeof SessionMsgSchema>;
@@ -226,6 +265,7 @@ export const SessionStatusSchema = z.strictObject({
       repo: RepoRefSchema.nullable(),
       head: ShaSchema.nullable(),
       role: RoleSchema.nullable(),
+      progress: progressRules(z.strictObject({ phase: PeerPhaseSchema, ...progressFields })),
     }),
   ),
   intents: z.array(

@@ -262,6 +262,7 @@ export async function connectSub(o: SubOptions): Promise<SubHandle> {
               await closed;
             },
             closed,
+            reportAgent: () => {},
           };
           wire.startHeartbeat(heartbeatMs);
           resolveReady(handle);
