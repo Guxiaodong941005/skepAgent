@@ -9,7 +9,7 @@ import {
 } from "./common.js";
 
 /**
- * Local, trusted configuration. None of these are ever read from the blackboard or from an agent
+ * Local, trusted configuration. None of these are ever read from an agent
  * worktree.
  */
 
@@ -25,11 +25,13 @@ export const DeviceConfigSchema = z.strictObject({
   schema: z.literal("skep.device/v1"),
   device: z.string().regex(DEVICE_RE),
   submit: DeviceSubmitSchema,
-  blackboard: z.strictObject({
-    url: z.string().min(1),
-    /** Local private clone owned by skepd. Default: `~/.skep/blackboard`. */
-    clone_path: z.string().optional(),
-  }),
+  /** @deprecated Removed with skepd; ignored if present in old device.toml files. */
+  blackboard: z
+    .strictObject({
+      url: z.string().min(1),
+      clone_path: z.string().optional(),
+    })
+    .optional(),
   /** Repo allowlist; tasks referencing other repos are refused (PRD §11.5). */
   repos: z
     .array(
@@ -39,8 +41,8 @@ export const DeviceConfigSchema = z.strictObject({
       }),
     )
     .max(64),
-  /** Path to the daemon's SSH signing key (private). */
-  signing_key: z.string().min(1),
+  /** @deprecated Removed with skepd. */
+  signing_key: z.string().min(1).optional(),
   /** Optional path to the human key / ssh-agent identity (Mac only). */
   human_signing_key: z.string().min(1).optional(),
   poll: z

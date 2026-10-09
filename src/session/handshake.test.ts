@@ -1,6 +1,5 @@
 import { createHash, createHmac, hkdfSync } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
-import { Rng } from "../sim/rng.js";
 import {
   confirmation,
   createEphemeral,
@@ -11,6 +10,21 @@ import {
   normalizeJoinCode,
 } from "./handshake.js";
 
+
+function seededBytes(seed: number): { bytes(n: number): Uint8Array } {
+  let x = seed >>> 0 || 1;
+  return {
+    bytes(n: number) {
+      const out = new Uint8Array(n);
+      for (let i = 0; i < n; i++) {
+        x = (Math.imul(x, 1664525) + 1013904223) >>> 0;
+        out[i] = x & 0xff;
+      }
+      return out;
+    },
+  };
+}
+
 describe("join codes", () => {
   it("rejection-samples five bytes and formats twelve decimal digits", () => {
     const bytes = vi
@@ -19,7 +33,7 @@ describe("join codes", () => {
       .mockReturnValueOnce(Buffer.from([0, 0, 0, 0, 42]));
     expect(generateJoinCode({ bytes })).toBe("0000-0000-0042");
     expect(bytes.mock.calls).toEqual([[5], [5]]);
-    expect(generateJoinCode(new Rng(1))).toMatch(/^\d{4}-\d{4}-\d{4}$/);
+    expect(generateJoinCode(seededBytes(1))).toMatch(/^\d{4}-\d{4}-\d{4}$/);
   });
 
   it("normalizes spaces and hyphens and rejects other input", () => {
@@ -39,7 +53,7 @@ describe("join codes", () => {
 
 describe("temporary HKDF handshake", () => {
   it("derives identical directional keys and fingerprint, but a different MAC key for a wrong code", () => {
-    const rng = new Rng("handshake");
+    const rng = seededBytes(0x68616e64);
     const sub = createEphemeral(rng);
     const master = createEphemeral(rng);
     const common = {

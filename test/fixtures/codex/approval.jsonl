@@ -1,2 +1,0 @@
-{"type":"thread.started","thread_id":"example-thread"}
-{"type":"exec_approval_request","call_id":"example-call","command":["echo","example"],"reason":"Approval required"}

@@ -1,2 +1,0 @@
-{"type":"error","message":"Invalid schema for response_format 'codex_output_schema': In context=('properties', 'replan_request', 'anyOf', '0', 'properties', 'evidence', 'items'), 'oneOf' is not permitted.","code":"invalid_json_schema"}
-{"type":"turn.failed","error":{"code":"invalid_json_schema","message":"Schema configuration rejected"}}

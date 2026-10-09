@@ -1,7 +1,0 @@
-{
-  "error": {
-    "code": "agent_prompt_stalled",
-    "message": "agent prompt produced no observed working or blocked state within 5000 ms; current status is idle"
-  },
-  "id": "cli:agent:prompt"
-}

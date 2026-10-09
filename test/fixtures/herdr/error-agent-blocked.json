@@ -1,7 +1,0 @@
-{
-  "id": "cli:agent:wait",
-  "error": {
-    "code": "agent_blocked",
-    "message": "Example agent is blocked"
-  }
-}

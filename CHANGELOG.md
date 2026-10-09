@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.2
+
+### Removed
+- Signed git blackboard protocol, `skepd` daemon, and related CLI (`init`, `task`, `plan`, `pull`, `replan`, `lease`, `decide`, `status`, `log`, `logs`, `doctor`, `sim`, role-slot `agent`, …).
+- Deploy units (`skepd.service`, launchd plist).
+
+### Kept
+- Session mode: `skep session start|join|…`, `skep ui`, bare `skep` → local agent TUI.
+- Join-code multi-device (and same-machine multi-directory) collaboration.
+
+
+# Changelog
+
 All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),

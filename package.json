@@ -1,15 +1,14 @@
 {
   "name": "@skepagent/skep",
-  "version": "0.1.1",
-  "description": "Cross-device, decentralized collaboration for AI coding agents over a signed git blackboard.",
+  "version": "0.1.2",
+  "description": "Cross-device collaboration for AI coding agents via live join-code sessions.",
   "license": "MIT",
   "type": "module",
   "engines": {
     "node": ">=22.12.0"
   },
   "bin": {
-    "skep": "dist/bin/skep.js",
-    "skepd": "dist/bin/skepd.js"
+    "skep": "dist/bin/skep.js"
   },
   "files": [
     "dist",
@@ -27,15 +26,12 @@
   },
   "keywords": [
     "skep",
-    "skepd",
     "agents",
     "ai-agents",
-    "git",
-    "blackboard",
+    "session",
     "collaboration",
-    "daemon",
-    "ssh-signing",
-    "codex"
+    "codex",
+    "claude"
   ],
   "publishConfig": {
     "access": "public"
@@ -50,8 +46,7 @@
     "test:watch": "vitest",
     "check": "npm run lint && npm test",
     "prepublishOnly": "npm run check && npm run build",
-    "skep": "tsx src/bin/skep.ts",
-    "skepd": "tsx src/bin/skepd.ts"
+    "skep": "tsx src/bin/skep.ts"
   },
   "dependencies": {
     "commander": "^15.0.0",

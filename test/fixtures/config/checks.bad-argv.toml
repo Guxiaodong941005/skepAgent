@@ -1,5 +1,0 @@
-schema = "skep.checks/v1"
-
-[checks.unit]
-argv = "npm test"
-timeout_sec = 600
