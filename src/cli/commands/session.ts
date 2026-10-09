@@ -19,15 +19,22 @@ import type { Readable } from "node:stream";
 import { type Command, Option } from "commander";
 import { z } from "zod";
 import { RepoRefSchema, ShaSchema } from "../../core/schemas/common.js";
+import {
+  connectSub,
+  type DatalistEntry,
+  type MasterHandle,
+  type MasterOptions,
+  type PlanItem,
+  type SubHandle,
+  type SubOptions,
+  startMaster,
+} from "../../session/index.js";
 import { type Clock, isoUtc, systemClock } from "../../util/clock.js";
 import { execFileChecked } from "../../util/exec.js";
 import { atomicWrite } from "../../util/fs.js";
-import { cryptoRandom, type RandomSource } from "../../util/random.js";
+import { cryptoRandom } from "../../util/random.js";
 import type { CliContext } from "../context.js";
 import { CliError, EXIT } from "../output.js";
-
-/** Non-literal on purpose: tsc must not resolve it while `src/session/` does not exist yet. */
-export const SESSION_MODULE: string = "../../session/index.js";
 
 export const DEFAULT_PORT = 7419;
 const SESSION_FILE = "session.json";
@@ -45,107 +52,17 @@ const TOKEN_RE = /^[0-9a-f]{32}$/;
 /** Interfaces that are never what a peer on the LAN should dial. */
 const SKIPPED_IFACE_RE = /^(lo|docker|br-|veth|tun|tap|utun|tailscale|wg|virbr)/;
 
-// ---------------------------------------------------------------------------------------------
-// Contract with src/session (Task A's exports must satisfy these signatures).
-
 export interface HostPort {
   host: string;
   port: number;
-}
-
-export interface JoinRequest {
-  device: string;
-  /** Remote address of the joining socket. */
-  address: string;
-  /** `xxxx-xxxx-xxxx-xxxx`, shown on both sides for the human to compare. */
-  fingerprint: string;
-}
-
-export interface MasterOptions {
-  /** Omit to use the default LAN address and port chosen by the CLI. */
-  listen?: HostPort;
-  repo: string;
-  device: string;
-  /** 32 hex chars; control frames must carry it. */
-  controlToken: string;
-  clock?: Clock;
-  random?: RandomSource;
-  /**
-   * Called for the initial code and on every rotation (use, MAC failure, 600 s TTL). May fire
-   * before `startMaster` resolves. `code` is `NNNN-NNNN-NNNN`; `expiresAtMs` is wall-clock.
-   */
-  onJoinCode(info: { code: string; expiresAtMs: number }): void;
-  acceptJoin(request: JoinRequest): Promise<boolean>;
-}
-
-export interface MasterHandle {
-  /** Bound address. Null when the master was attached to streams instead of a port. */
-  readonly address: { host: string; port: number } | null;
-  readonly sessionId: string;
-  /** Resolves when the master has shut down. */
-  readonly closed: Promise<void>;
-  close(): Promise<void>;
-}
-
-export interface Capability {
-  repo: string;
-  head: string;
-  role: string;
-}
-
-export interface DatalistEntry {
-  kind: "path" | "schema" | "signature";
-  path: string;
-  detail?: string;
-}
-
-export interface PlanItem {
-  itemId: string;
-  repo: string;
-  assignee: string;
-  epoch: number;
-  title: string;
-  datalistEntries: number;
-}
-
-export interface ItemResult {
-  itemId: string;
-  epoch: number;
-  repo: string;
-  baseSha: string;
-  headSha: string;
-  checks: { name: string; status: "pass" | "fail" | "skip" }[];
-  summary: string;
-}
-
-export interface SubOptions {
-  target: HostPort;
-  /** 12 digits, or the displayed `NNNN-NNNN-NNNN` form. The session module normalizes it. */
-  code: string;
-  device: string;
-  clock?: Clock;
-  random?: RandomSource;
-  /** Optional early notice of the handshake fingerprint, before the master decides. */
-  onFingerprint?(fingerprint: string): void;
-  describe(): Promise<Capability>;
-  /** Repo the master asked about. The CLI lists paths in that checkout. */
-  collectDatalist(repo: string): Promise<DatalistEntry[]>;
-  /** A plan item assigned to this sub. `null` means the item was shown but not executed. */
-  onItem(item: PlanItem): Promise<ItemResult | null>;
-}
-
-export interface SubHandle {
-  sessionId: string;
-  peerId: string;
-  fingerprint: string;
-  closed: Promise<void>;
-  close(): Promise<void>;
 }
 
 export interface SessionApi {
   startMaster(options: MasterOptions): Promise<MasterHandle>;
   connectSub(options: SubOptions): Promise<SubHandle>;
 }
+
+export type { DatalistEntry, MasterHandle, MasterOptions, PlanItem, SubHandle, SubOptions };
 
 export type SessionCliContext = CliContext & {
   sessionApi?: SessionApi;
@@ -454,19 +371,7 @@ async function readSessionFile(file: string): Promise<SessionFile | null> {
 
 async function loadSessionApi(ctx: SessionCliContext): Promise<SessionApi> {
   if (ctx.sessionApi !== undefined) return ctx.sessionApi;
-  let mod: Partial<SessionApi>;
-  try {
-    mod = (await import(SESSION_MODULE)) as Partial<SessionApi>;
-  } catch (error) {
-    throw new CliError(
-      "session_unavailable",
-      `session mode is not available in this build: ${errorMessage(error)}`,
-    );
-  }
-  if (typeof mod.startMaster !== "function" || typeof mod.connectSub !== "function") {
-    throw new CliError("session_unavailable", "session module lacks startMaster/connectSub");
-  }
-  return mod as SessionApi;
+  return { startMaster, connectSub };
 }
 
 /** Git with only the variables it needs: `execFileChecked` never inherits the environment. */
@@ -684,7 +589,7 @@ async function startCommand(ctx: SessionCliContext, opts: StartOptions): Promise
 
   let reader: LineReader | undefined;
   let prompts: Promise<unknown> = Promise.resolve();
-  const acceptJoin = (request: JoinRequest): Promise<boolean> => {
+  const acceptJoin = (request: Parameters<MasterOptions["acceptJoin"]>[0]): Promise<boolean> => {
     if (opts.yes === true) return Promise.resolve(true);
     // One prompt at a time: concurrent joins must not interleave questions and answers.
     const answer = prompts.then(async () => {

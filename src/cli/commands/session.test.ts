@@ -78,6 +78,15 @@ function fakeApi(listen = "192.168.1.20:7419") {
       return {
         address: parsed,
         sessionId: "S-1",
+        status: () => {
+          throw new Error("fake master has no status");
+        },
+        submitIntent: async () => {
+          throw new Error("fake master has no intent");
+        },
+        attach: () => {
+          throw new Error("fake master has no attach");
+        },
         closed: closed.promise,
         close: async () => closed.resolve(),
       };
@@ -88,7 +97,7 @@ function fakeApi(listen = "192.168.1.20:7419") {
         sessionId: "S-1",
         peerId: "P-1",
         fingerprint: "abcd-ef01-2345-6789",
-        closed: Promise.resolve(),
+        closed: Promise.resolve({ reason: "test" }),
         close: async () => {},
       };
     },
@@ -205,9 +214,14 @@ describe("help and --startwithmaster", () => {
     const options = fake.calls.master[0];
     expect(options?.listen).toEqual({ host: "192.168.1.20", port: 7419 });
     expect(options?.controlToken).toMatch(/^[0-9a-f]{32}$/);
-    expect(await options?.acceptJoin({ device: "pc", address: "1.2.3.4", fingerprint: "x" })).toBe(
-      true,
-    );
+    expect(
+      await options?.acceptJoin({
+        device: "pc",
+        address: "1.2.3.4",
+        family: "IPv4",
+        fingerprint: "x",
+      }),
+    ).toBe(true);
     fake.closed.resolve();
     expect(await run).toBe(0);
   });
@@ -279,6 +293,7 @@ describe("session start", () => {
     const answer = fake.calls.master[0]?.acceptJoin({
       device: "laptop",
       address: "192.168.1.30",
+      family: "IPv4",
       fingerprint: "abcd-ef01-2345-6789",
     });
     stdin.write("y\n");
@@ -287,6 +302,7 @@ describe("session start", () => {
     const declined = fake.calls.master[0]?.acceptJoin({
       device: "x",
       address: "1.1.1.1",
+      family: "IPv4",
       fingerprint: "f",
     });
     stdin.write("n\n");
