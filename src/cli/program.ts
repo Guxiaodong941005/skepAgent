@@ -9,6 +9,7 @@
 import { Command, CommanderError } from "commander";
 import { skepHome, skepPaths } from "../config/paths.js";
 import { register as registerAgent } from "./commands/agent.js";
+import { launchAgent, register as registerAgentTui } from "./commands/agent-tui.js";
 import { register as registerDecide } from "./commands/decide.js";
 import { register as registerDoctor } from "./commands/doctor.js";
 import { register as registerInit } from "./commands/init.js";
@@ -18,9 +19,12 @@ import { register as registerLogs } from "./commands/logs.js";
 import { register as registerPlan } from "./commands/plan.js";
 import { register as registerPull } from "./commands/pull.js";
 import { register as registerReplan } from "./commands/replan.js";
+import { expandStartWithMaster, register as registerSession } from "./commands/session.js";
 import { register as registerSim } from "./commands/sim.js";
 import { register as registerStatus } from "./commands/status.js";
+import { register as registerSubmit } from "./commands/submit.js";
 import { register as registerTask } from "./commands/task.js";
+import { register as registerUi } from "./commands/ui.js";
 import { type CliContext, connectDaemon } from "./context.js";
 import { CliError, createOutput, EXIT, type Output } from "./output.js";
 
@@ -62,6 +66,7 @@ export function buildProgram(ctx: CliContext): Command {
   registerInit(program, ctx);
   registerAgent(program, ctx);
   registerTask(program, ctx);
+  registerSubmit(program, ctx);
   registerPlan(program, ctx);
   registerPull(program, ctx);
   registerReplan(program, ctx);
@@ -72,6 +77,16 @@ export function buildProgram(ctx: CliContext): Command {
   registerLogs(program, ctx);
   registerDoctor(program, ctx);
   registerSim(program, ctx);
+  registerUi(program, ctx);
+  registerSession(program, ctx);
+  registerAgentTui(program, ctx);
+
+  // No subcommand means "open the agent". Anything that looks like a command still errors.
+  program
+    .argument("[prompt...]", "ask the agent; no subcommand opens it")
+    .action(async (words: string[]) => {
+      await launchAgent(ctx, words.join(" "), undefined);
+    });
 
   return program;
 }
@@ -83,6 +98,7 @@ export function buildProgram(ctx: CliContext): Command {
 export async function runCli(argv: string[], ctx: CliContext): Promise<number> {
   // A reused context must not keep a previous action's failure (sim violations set this).
   ctx.exitCode = undefined;
+  argv = expandStartWithMaster(argv);
   // The daemon socket is the CLI's way to publish and query (ARCHITECTURE §12). An action or a
   // test may supply its own factory; otherwise talk to the socket under the resolved home.
   ctx.connectDaemon ??= () => connectDaemon(ctx);

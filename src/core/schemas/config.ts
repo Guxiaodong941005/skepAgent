@@ -14,9 +14,17 @@ import {
  */
 
 /** `~/.skep/device.toml` (PRD §7.2, §11.5). */
+export const DeviceSubmitSchema = z
+  .strictObject({
+    method: z.enum(["pr", "mr", "push", "none", "ask"]).default("pr"),
+    host: z.enum(["github", "gitlab", "git"]).default("github"),
+  })
+  .default({ method: "pr", host: "github" });
+
 export const DeviceConfigSchema = z.strictObject({
   schema: z.literal("skep.device/v1"),
   device: z.string().regex(DEVICE_RE),
+  submit: DeviceSubmitSchema,
   blackboard: z.strictObject({
     url: z.string().min(1),
     /** Local private clone owned by skepd. Default: `~/.skep/blackboard`. */

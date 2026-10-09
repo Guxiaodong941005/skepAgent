@@ -46,8 +46,12 @@ export const sleepWakeRevoke: Scenario = {
         item: ITEM,
         epoch: 1,
         head_sha: head,
-        pr_url: "https://example.invalid/pull/1",
-        pr_number: 1,
+        submit: {
+          method: "pr",
+          state: "opened",
+          pr_url: "https://example.invalid/pull/1",
+          pr_number: 1,
+        },
         check_runs: [],
       });
       requireScenario(

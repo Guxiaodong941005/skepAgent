@@ -20,6 +20,7 @@ import {
   ShaSchema,
   TaskIdSchema,
 } from "../core/schemas/common.js";
+import { DeviceSubmitSchema } from "../core/schemas/config.js";
 import { EVENT_SCHEMAS, type PayloadOf, WorkFailureClassSchema } from "../core/schemas/events.js";
 import { type Plan, PlanSchema } from "../core/schemas/plan.js";
 import { type InvocationState, type Snapshot, SnapshotSchema } from "../core/schemas/snapshot.js";
@@ -56,6 +57,7 @@ export const ATTEMPT_STEPS = [
   "checks",
   "fixup",
   "secret_scan_ok",
+  "submit",
   "pushed",
   "reverified",
   "pr",
@@ -68,7 +70,7 @@ export const ATTEMPT_STEPS = [
 
 const SECRET_FAILURE_DETAIL = "Secret scan blocked publication; see the local journal";
 
-const InputSchema = z.strictObject({
+export const AttemptInputSchema = z.strictObject({
   lease: z.strictObject({
     task_id: TaskIdSchema,
     item: ItemIdSchema,
@@ -79,12 +81,13 @@ const InputSchema = z.strictObject({
   plan: PlanSchema,
   baseSha: ShaSchema,
   prBase: z.string().min(1).max(255),
+  submit: DeviceSubmitSchema,
   agentInstructions: z.string(),
   repoContext: z.string(),
   timeoutMs: z.number().finite().positive(),
   cliVersion: z.string().min(1).optional(),
 });
-export type AttemptInput = z.infer<typeof InputSchema>;
+export type AttemptInput = z.infer<typeof AttemptInputSchema>;
 export type FailureClass = z.infer<typeof WorkFailureClassSchema>;
 
 export const AttemptPublicationSchema = z.discriminatedUnion("type", [
@@ -236,7 +239,7 @@ export class AttemptRunner {
     signal?: AbortSignal,
     onReplan?: AttemptReplanHandler,
   ): Promise<AttemptResult> {
-    const parsed = InputSchema.safeParse(input);
+    const parsed = AttemptInputSchema.safeParse(input);
     if (!parsed.success) throw new AttemptError("Attempt requires a valid lease and approved plan");
     const lease = parsed.data.lease;
     const name = keyName({ task: lease.task_id, item: lease.item, epoch: lease.epoch });
@@ -285,7 +288,11 @@ export class AttemptRunner {
       context.abort.abort();
     }
     const claimed = last(context, "claimed");
-    if (claimed && JSON.stringify(claimed.input) !== JSON.stringify(this.scrub(frozen))) {
+    if (
+      claimed &&
+      JSON.stringify(this.scrub(AttemptInputSchema.parse(claimed.input))) !==
+        JSON.stringify(this.scrub(frozen))
+    ) {
       throw new AttemptError("Recovery input differs from the journaled attempt");
     }
     const terminal = context.records.at(-1);
@@ -392,42 +399,60 @@ export class AttemptRunner {
       const body = `${report.summary}\n\nTrusted checks: ${runs.map((run) => `${run.check} (${run.exit})`).join(", ")}`;
       if (!(await this.scan(context, head, [title, body])))
         return await this.secretFailure(context);
-      await this.push(context, head);
-      let pr: PrInfo;
-      const savedPr = last(context, "pr");
-      if (savedPr) pr = PrSchema.parse(savedPr.pr);
-      else {
-        const found = await this.deps.codeHost.findPr(frozen.plan.base.repo, branchOf(context));
-        // A fresh observation is the last await before each visible delivery operation (§6.3).
-        if (!(await this.reverify(context, "pr"))) return await this.stale(context);
-        if (found) {
-          pr = PrSchema.parse(found);
-          if (pr.head !== branchOf(context) || pr.state !== "open") {
-            throw new AttemptError("Existing attempt PR has the wrong head or is no longer open");
+      const method = frozen.submit.host === "git" ? "push" : frozen.submit.method;
+      if (!last(context, "submit"))
+        await this.record(context, {
+          step: "submit",
+          method,
+          host: frozen.submit.host,
+          ...(frozen.submit.host === "git" ? { reason: "git_only_host_forces_push" } : {}),
+        });
+      if (method === "pr" || method === "mr" || method === "push") {
+        if (!(await this.push(context, head, true))) return await this.stale(context);
+      }
+      let submit: PayloadOf<"work.delivered">["submit"];
+      if (method === "pr" || method === "mr") {
+        let pr: PrInfo;
+        const savedPr = last(context, "pr");
+        if (savedPr) pr = PrSchema.parse(savedPr.pr);
+        else {
+          const found = await this.deps.codeHost.findPr(frozen.plan.base.repo, branchOf(context));
+          // A fresh observation is the last await before each visible delivery operation (§6.3).
+          if (!(await this.reverify(context, "pr"))) return await this.stale(context);
+          if (found) {
+            pr = PrSchema.parse(found);
+            if (pr.head !== branchOf(context) || pr.state !== "open") {
+              throw new AttemptError("Existing attempt PR has the wrong head or is no longer open");
+            }
+            if (pr.base !== frozen.prBase) {
+              await this.deps.codeHost.retargetPr(frozen.plan.base.repo, pr.number, frozen.prBase);
+              pr = { ...pr, base: frozen.prBase };
+            }
+          } else {
+            pr = PrSchema.parse(
+              await this.deps.codeHost.createPr(frozen.plan.base.repo, {
+                head: branchOf(context),
+                base: frozen.prBase,
+                title: this.deps.redactor.redact(title),
+                body: this.deps.redactor.redact(body),
+              }),
+            );
           }
-          if (pr.base !== frozen.prBase) {
-            await this.deps.codeHost.retargetPr(frozen.plan.base.repo, pr.number, frozen.prBase);
-            pr = { ...pr, base: frozen.prBase };
-          }
-        } else {
-          pr = PrSchema.parse(
-            await this.deps.codeHost.createPr(frozen.plan.base.repo, {
-              head: branchOf(context),
-              base: frozen.prBase,
-              title: this.deps.redactor.redact(title),
-              body: this.deps.redactor.redact(body),
-            }),
-          );
+          await this.record(context, { step: "pr", pr, action: found ? "found" : "created" });
         }
-        await this.record(context, { step: "pr", pr, action: found ? "found" : "created" });
+        submit = { method, state: "opened", pr_number: pr.number, pr_url: pr.url };
+      } else {
+        submit = {
+          method,
+          state: method === "push" ? "pushed" : method === "none" ? "local" : "pending",
+        };
       }
       return await this.preparePublication(context, "work.delivered", {
         item: key.item,
         epoch: key.epoch,
         branch: branchOf(context),
         head_sha: head,
-        pr_number: pr.number,
-        pr_url: pr.url,
+        submit,
         check_runs: runs,
       });
     } finally {
@@ -913,17 +938,34 @@ export class AttemptRunner {
     return true;
   }
 
-  private async push(c: RunningAttempt, head: string): Promise<void> {
+  private async remoteSha(c: RunningAttempt): Promise<string | null> {
+    // Bare Git remains usable without a PR host or host credentials (D19).
+    const ref = `refs/heads/${branchOf(c)}`;
+    const result = await this.git().run(["ls-remote", "--refs", "origin", ref], {
+      cwd: requiredWorktree(c).mirrorDir,
+    });
+    const lines = result.stdout.trim().split("\n").filter(Boolean);
+    if (lines.length === 0) return null;
+    if (lines.length !== 1 || lines[0]?.split("\t")[1] !== ref)
+      throw new AttemptError("Git returned an unexpected epoch branch ref");
+    const sha = ShaSchema.safeParse(lines[0].split("\t")[0]);
+    if (!sha.success) throw new AttemptError("Git returned an invalid epoch branch SHA");
+    return sha.data;
+  }
+
+  private async push(c: RunningAttempt, head: string, verify = false): Promise<boolean> {
     // A lost acknowledgement is resolved by observing the ref; never force an epoch branch.
-    if ((await this.deps.codeHost.remoteBranchSha(c.input.plan.base.repo, branchOf(c))) !== head) {
+    if ((await this.remoteSha(c)) !== head) {
+      if (verify && !(await this.reverify(c, "push"))) return false;
       await this.git().run(["push", "origin", `${head}:refs/heads/${branchOf(c)}`], {
         cwd: requiredWorktree(c).mirrorDir,
       });
     }
-    if ((await this.deps.codeHost.remoteBranchSha(c.input.plan.base.repo, branchOf(c))) !== head) {
+    if ((await this.remoteSha(c)) !== head) {
       throw new AttemptError("Code remote did not confirm the committed attempt SHA");
     }
     if (last(c, "pushed")?.sha !== head) await this.record(c, { step: "pushed", sha: head });
+    return true;
   }
 
   private async reverify(c: RunningAttempt, before: string) {
@@ -967,7 +1009,8 @@ export class AttemptRunner {
     );
     if (head !== null) {
       if (!(await this.scan(c, head))) return this.secretFailure(c);
-      await this.push(c, head);
+      if (["pr", "mr", "push"].includes(c.input.submit.method) || c.input.submit.host === "git")
+        await this.push(c, head);
     }
     const snapshot = await buildSnapshot(
       {
@@ -982,7 +1025,15 @@ export class AttemptRunner {
         invocationState: state,
         checkRuns: runs,
       },
-      { git: this.git(), codeHost: this.deps.codeHost },
+      {
+        git: this.git(),
+        codeHost: {
+          remoteBranchSha: async () =>
+            ["none", "ask"].includes(c.input.submit.method) && c.input.submit.host !== "git"
+              ? null
+              : this.remoteSha(c),
+        },
+      },
     );
     return this.preparePublication(c, "checkpoint.recorded", {
       item: c.key.item,
@@ -1029,7 +1080,8 @@ export class AttemptRunner {
     const action = { task_id: c.key.task, actor: c.input.lease.holder };
     if (publication.type === "work.delivered") {
       if (
-        (await this.deps.codeHost.remoteBranchSha(c.input.plan.base.repo, branchOf(c))) !== head
+        ["pr", "mr", "push"].includes(publication.payload.submit.method) &&
+        (await this.remoteSha(c)) !== head
       ) {
         throw new AttemptError("Cannot deliver code whose remote SHA no longer matches");
       }

@@ -113,8 +113,12 @@ function delivery(id = "W1", epoch = 1): PayloadOf<"work.delivered"> {
     epoch,
     branch: workBranch(T1, id, epoch),
     head_sha: head,
-    pr_url: `https://example.invalid/pull/${id === "W1" ? 1 : 2}`,
-    pr_number: id === "W1" ? 1 : 2,
+    submit: {
+      method: "pr",
+      state: "opened",
+      pr_url: `https://example.invalid/pull/${id === "W1" ? 1 : 2}`,
+      pr_number: id === "W1" ? 1 : 2,
+    },
     check_runs: [
       {
         run_id: "run_unit",
@@ -394,5 +398,120 @@ describe("work.failed", () => {
       escalation: null,
       barrier: { closed_seq: after.seq },
     });
+  });
+});
+
+describe("work.submitted", () => {
+  function pending() {
+    const f = executing();
+    const state = work(f.builder, claim(f.builder, f.state), "work.delivered", {
+      ...delivery(),
+      submit: { method: "ask", state: "pending" },
+    });
+    return { ...f, state };
+  }
+  function submit(
+    f: ReturnType<typeof pending>,
+    actor = "human",
+    overrides: Partial<PayloadOf<"work.submitted">> = {},
+  ) {
+    return applyEntry(
+      f.state,
+      f.builder.appendRaw(
+        f.builder.event({
+          type: "work.submitted",
+          actor,
+          pre: { task_rev: task(f.state).rev, item: "W1" },
+          payload: {
+            item: "W1",
+            epoch: 1,
+            method: "none",
+            state: "local",
+            head_sha: delivery().head_sha,
+            ...overrides,
+          },
+        }),
+      ),
+    );
+  }
+  it.each(["human", MAC, VPS])("allows %s without the original lease", (actor) => {
+    const f = pending();
+    const next = submit(f, actor);
+    expect(next.outcomes.at(-1)?.outcome).toBe("accepted");
+    expect(task(next).items.W1).toMatchObject({
+      status: "delivered",
+      lease: null,
+      delivered: { submit: { method: "ask", state: "pending" } },
+      submission: { method: "none", state: "local", seq: next.seq },
+    });
+  });
+  it.each(["pr", "mr", "push", "none", "skip"] as const)("records %s exactly once", (method) => {
+    const f = pending();
+    const payload: Partial<PayloadOf<"work.submitted">> =
+      method === "pr" || method === "mr"
+        ? { method, state: "opened", pr_url: "https://example.invalid/pull/1", pr_number: 1 }
+        : {
+            method: method === "skip" ? "none" : method,
+            state: method === "push" ? "pushed" : method === "skip" ? "skipped" : "local",
+          };
+    const next = submit(f, "human", payload);
+    expect(next.outcomes.at(-1)?.outcome).toBe("accepted");
+    const repeated = submit({ ...f, state: next }, "human", payload);
+    expect(repeated.outcomes.at(-1)?.reason).toBe("bad_task_state");
+    expect(repeated.tasks).toEqual(next.tasks);
+  });
+  it.each([
+    "executing",
+    "delivered",
+    "escalated",
+    "planning",
+    "interrupting",
+    "cancelled",
+    "done",
+  ] as const)("checks task status %s", (status) => {
+    const f = pending();
+    task(f.state).status = status;
+    const next = submit(f);
+    expect(next.outcomes.at(-1)?.outcome).toBe(
+      ["executing", "delivered", "escalated"].includes(status) ? "accepted" : "rejected",
+    );
+  });
+  it("keeps an accepted submission when the human resumes carried-over work", () => {
+    const f = pending();
+    const submitted = submit(f);
+    task(submitted).status = "escalated";
+    const state = applyEntry(
+      submitted,
+      f.builder.appendRaw(
+        f.builder.event({
+          type: "human.decided",
+          actor: "human",
+          payload: { decision: "resume_with_plan" },
+          pre: { task_rev: task(submitted).rev },
+        }),
+      ),
+    );
+    expect(state.outcomes.at(-1)?.outcome).toBe("accepted");
+    expect(task(state).items.W1?.submission).toEqual(task(submitted).items.W1?.submission);
+    expect(submit({ ...f, state }).outcomes.at(-1)?.reason).toBe("bad_task_state");
+  });
+
+  it.each(["epoch", "head", "item", "delivery", "pending"])("rejects changed %s", (change) => {
+    const f = pending();
+    const item = task(f.state).items.W1;
+    if (!item?.delivered) throw new Error("Missing delivery");
+    if (change === "item") item.status = "merged";
+    if (change === "delivery") item.delivered = null;
+    if (change === "pending" && item.delivered)
+      item.delivered.submit = { method: "push", state: "pushed" };
+    const next = submit(
+      f,
+      "human",
+      change === "epoch" ? { epoch: 2 } : change === "head" ? { head_sha: fakeSha("other") } : {},
+    );
+    expect(next.outcomes.at(-1)?.reason).toBe(
+      change === "epoch" ? "epoch_mismatch" : "bad_task_state",
+    );
+    expect(next.tasks).toEqual(f.state.tasks);
   });
 });

@@ -18,7 +18,7 @@
 
 import { z } from "zod";
 import { newTaskId, type RandomSource } from "../util/random.js";
-import type { Intent } from "./intents.js";
+import { type Intent, submitIntent } from "./intents.js";
 import {
   humanDecideIntent,
   leaseRevokeIntent,
@@ -33,6 +33,7 @@ import {
   AgentIdSchema,
   EpochSchema,
   ItemIdSchema,
+  PositiveIntSchema,
   RepoRefSchema,
   Sha256TaggedSchema,
   ShortTextSchema,
@@ -48,6 +49,7 @@ const TaskCreateSpec = z.strictObject({
   repo: RepoRefSchema,
   base_branch: z.string().min(1).max(255).optional(),
   mode: z.enum(["solo", "team"]),
+  submit: z.enum(["device", "pr", "mr", "push", "none", "ask"]).optional(),
   owner: AgentIdSchema.optional(),
   original_text: z.string().max(16_000).optional(),
   original_lang: z.string().min(2).max(16).optional(),
@@ -110,6 +112,17 @@ const ReplanSpec = z.strictObject({
   item: ItemIdSchema.nullable().optional(),
 });
 
+const SubmitSpec = z.strictObject({
+  kind: z.literal("work.submit"),
+  task: TaskIdSchema,
+  item: ItemIdSchema,
+  epoch: EpochSchema.optional(),
+  method: z.enum(["pr", "mr", "push", "none"]),
+  pr_url: z.url().max(512).optional(),
+  pr_number: PositiveIntSchema.optional(),
+  skip: z.boolean().default(false),
+});
+
 /**
  * Every CLI write kind (ARCHITECTURE §12). Re-exported by `ipc/protocol.ts` so the socket frames
  * validate with exactly this schema.
@@ -122,6 +135,7 @@ export const IntentSpecSchema = z.discriminatedUnion("kind", [
   LeaseRevokeSpec,
   DecideSpec,
   ReplanSpec,
+  SubmitSpec,
 ]);
 
 export type IntentSpec = z.infer<typeof IntentSpecSchema>;
@@ -151,6 +165,23 @@ function intentFor(spec: IntentSpec, ctx: IntentSpecContext): Intent {
       return taskCreateIntent(taskCreateInput(spec), newTaskId(ctx.rng, ctx.nowMs));
     case "task.cancel":
       return taskCancelIntent(spec.task, spec.reason);
+    case "work.submit":
+      return submitIntent({
+        task_id: spec.task,
+        item: spec.item,
+        actor: "human",
+        epoch: spec.epoch,
+        method: spec.skip ? "none" : spec.method,
+        state: spec.skip
+          ? "skipped"
+          : spec.method === "none"
+            ? "local"
+            : spec.method === "push"
+              ? "pushed"
+              : "opened",
+        ...(spec.pr_url === undefined ? {} : { pr_url: spec.pr_url }),
+        ...(spec.pr_number === undefined ? {} : { pr_number: spec.pr_number }),
+      });
     case "plan.approve":
       return planApproveIntent(spec.task, { planHash: spec.plan_hash, note: spec.note });
     case "plan.reject":
@@ -178,6 +209,7 @@ function taskCreateInput(spec: Extract<IntentSpec, { kind: "task.create" }>): Ta
     repo: spec.repo,
     baseBranch: spec.base_branch,
     mode: spec.mode,
+    submit: spec.submit,
     owner: spec.owner,
     originalText: spec.original_text,
     originalLang: spec.original_lang,

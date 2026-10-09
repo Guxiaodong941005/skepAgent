@@ -716,8 +716,12 @@ describe("activatePlan carry-over (D7)", () => {
       epoch: 3,
       branch: "branch",
       head_sha: fakeSha("head"),
-      pr_url: "https://example.com/pr/1",
-      pr_number: 1,
+      submit: {
+        method: "pr",
+        state: "opened",
+        pr_url: "https://example.invalid/pr/1",
+        pr_number: 1,
+      },
       check_runs: [],
       seq: 8,
     };

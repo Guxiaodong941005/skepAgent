@@ -53,7 +53,7 @@
         }
       ],
       "added": {
-        "events/T-20261005-0000/evt_39ba3a4f-f236-4d4b-849d-df81db8867ae.json": "{\n  \"schema\": \"skep.event/v1\",\n  \"event_id\": \"evt_39ba3a4f-f236-4d4b-849d-df81db8867ae\",\n  \"type\": \"task.created\",\n  \"task_id\": \"T-20261005-0000\",\n  \"actor\": \"human\",\n  \"observed_tip\": \"5ed5923be11dc0158273595511fe447884c65a2a\",\n  \"pre\": {},\n  \"created_at\": \"2026-10-05T09:00:00Z\",\n  \"lang\": \"en\",\n  \"payload\": {\n    \"title\": \"Ship the requested change\",\n    \"body\": \"Implement the change described by the human and cover it with the unit check.\",\n    \"repo\": \"git@example.invalid:example/app.git\",\n    \"base_branch\": \"main\",\n    \"mode\": \"solo\",\n    \"owner\": \"vps.coding\",\n    \"budgets\": {\n      \"max_invocations\": 12,\n      \"max_wall_hours\": 6,\n      \"replans\": 2,\n      \"review_rounds\": 2,\n      \"item_retries\": 1\n    },\n    \"plan_approval\": \"human\"\n  }\n}\n"
+        "events/T-20261005-0000/evt_39ba3a4f-f236-4d4b-849d-df81db8867ae.json": "{\n  \"schema\": \"skep.event/v1\",\n  \"event_id\": \"evt_39ba3a4f-f236-4d4b-849d-df81db8867ae\",\n  \"type\": \"task.created\",\n  \"task_id\": \"T-20261005-0000\",\n  \"actor\": \"human\",\n  \"observed_tip\": \"5ed5923be11dc0158273595511fe447884c65a2a\",\n  \"pre\": {},\n  \"created_at\": \"2026-10-05T09:00:00Z\",\n  \"lang\": \"en\",\n  \"payload\": {\n    \"title\": \"Ship the requested change\",\n    \"body\": \"Implement the change described by the human and cover it with the unit check.\",\n    \"repo\": \"git@example.invalid:example/app.git\",\n    \"base_branch\": \"main\",\n    \"mode\": \"solo\",\n    \"owner\": \"vps.coding\",\n    \"budgets\": {\n      \"max_invocations\": 12,\n      \"max_wall_hours\": 6,\n      \"replans\": 2,\n      \"review_rounds\": 2,\n      \"item_retries\": 1\n    },\n    \"submit\": \"device\",\n    \"plan_approval\": \"human\"\n  }\n}\n"
       }
     },
     {
@@ -125,7 +125,7 @@
         }
       ],
       "added": {
-        "events/T-20261005-0000/evt_68860825-cc83-48b7-80fd-0ff3d59fb64d.json": "{\n  \"schema\": \"skep.event/v1\",\n  \"event_id\": \"evt_68860825-cc83-48b7-80fd-0ff3d59fb64d\",\n  \"type\": \"work.delivered\",\n  \"task_id\": \"T-20261005-0000\",\n  \"actor\": \"vps.coding\",\n  \"observed_tip\": \"32ec0972b9d382278815ca55ad17fa57d0b66f66\",\n  \"pre\": {\n    \"task_rev\": 4,\n    \"item\": \"W1\"\n  },\n  \"created_at\": \"2026-10-05T09:00:00Z\",\n  \"lang\": \"en\",\n  \"payload\": {\n    \"item\": \"W1\",\n    \"epoch\": 1,\n    \"branch\": \"skep/T-20261005-0000/W1/e1\",\n    \"head_sha\": \"eb23eae3b7876ff674bf4c847875f98b6030df35\",\n    \"pr_url\": \"https://example.invalid/example/app/pull/1\",\n    \"pr_number\": 1,\n    \"check_runs\": [\n      {\n        \"run_id\": \"run-1\",\n        \"check\": \"unit\",\n        \"sha\": \"eb23eae3b7876ff674bf4c847875f98b6030df35\",\n        \"exit\": 0,\n        \"duration_ms\": 10,\n        \"passed\": 1,\n        \"failed\": 0,\n        \"log_sha256\": \"0555d12435ef76beefd0747dbafde29f90dee3d7000000000000000000000000\"\n      }\n    ]\n  }\n}\n"
+        "events/T-20261005-0000/evt_68860825-cc83-48b7-80fd-0ff3d59fb64d.json": "{\n  \"schema\": \"skep.event/v1\",\n  \"event_id\": \"evt_68860825-cc83-48b7-80fd-0ff3d59fb64d\",\n  \"type\": \"work.delivered\",\n  \"task_id\": \"T-20261005-0000\",\n  \"actor\": \"vps.coding\",\n  \"observed_tip\": \"32ec0972b9d382278815ca55ad17fa57d0b66f66\",\n  \"pre\": {\n    \"task_rev\": 4,\n    \"item\": \"W1\"\n  },\n  \"created_at\": \"2026-10-05T09:00:00Z\",\n  \"lang\": \"en\",\n  \"payload\": {\n    \"item\": \"W1\",\n    \"epoch\": 1,\n    \"branch\": \"skep/T-20261005-0000/W1/e1\",\n    \"head_sha\": \"eb23eae3b7876ff674bf4c847875f98b6030df35\",\n    \"submit\": {\n      \"method\": \"pr\",\n      \"state\": \"opened\",\n      \"pr_url\": \"https://example.invalid/example/app/pull/1\",\n      \"pr_number\": 1\n    },\n    \"check_runs\": [\n      {\n        \"run_id\": \"run-1\",\n        \"check\": \"unit\",\n        \"sha\": \"eb23eae3b7876ff674bf4c847875f98b6030df35\",\n        \"exit\": 0,\n        \"duration_ms\": 10,\n        \"passed\": 1,\n        \"failed\": 0,\n        \"log_sha256\": \"0555d12435ef76beefd0747dbafde29f90dee3d7000000000000000000000000\"\n      }\n    ]\n  }\n}\n"
       }
     },
     {
@@ -218,5 +218,5 @@
       }
     }
   ],
-  "state_hash": "sha256:1c04f535777946e9387b4883a2d9ca339637b3a4d60233596a4eaf4ab4eca198"
+  "state_hash": "sha256:7acc2c846f93e9259d1d13fc66279515d455041c77398fecd6c9c3462bb756ae"
 }

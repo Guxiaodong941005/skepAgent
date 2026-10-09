@@ -235,20 +235,20 @@ export function createDeliveryDuty(deps: DeliveryDutyDependencies): DeliveryDuty
     for (const [index, id] of record.plan.stack_order.entries()) {
       const item = task.items[id];
       const delivery = item?.delivered;
-      if (item?.status !== "delivered" || !delivery) continue;
+      if (item?.status !== "delivered" || !delivery || delivery.submit.pr_number === undefined)
+        continue;
+      const prNumber = delivery.submit.pr_number;
       const key = epochKey(task, id, delivery.epoch);
       const cached = terminalPrs.get(key);
       const observed =
-        cached?.number === delivery.pr_number
+        cached?.number === prNumber
           ? cached.observed
-          : PrStateSchema.parse(await host.prState(task.repo, delivery.pr_number));
+          : PrStateSchema.parse(await host.prState(task.repo, prNumber));
       // Retain terminal evidence even when publication fails; the fenced intent still retries.
-      if (observed.state === "closed")
-        terminalPrs.set(key, { number: delivery.pr_number, observed });
+      if (observed.state === "closed") terminalPrs.set(key, { number: prNumber, observed });
       if (observed.state === "merged") {
-        if (!observed.mergeSha)
-          throw new DeliveryError(`Merged PR #${delivery.pr_number} lacks a merge SHA`);
-        terminalPrs.set(key, { number: delivery.pr_number, observed });
+        if (!observed.mergeSha) throw new DeliveryError(`Merged PR #${prNumber} lacks a merge SHA`);
+        terminalPrs.set(key, { number: prNumber, observed });
         const mergeSha = observed.mergeSha;
         const result = AcceptedSchema.safeParse(
           await publisher.publish((latest) => {
@@ -258,7 +258,7 @@ export function createDeliveryDuty(deps: DeliveryDutyDependencies): DeliveryDuty
               !samePlan(current, task) ||
               !["executing", "delivered", "escalated"].includes(current.status) ||
               latestItem?.status !== "delivered" ||
-              latestItem.delivered?.pr_number !== delivery.pr_number ||
+              latestItem.delivered?.submit.pr_number !== prNumber ||
               latestItem.delivered.epoch !== delivery.epoch ||
               latestItem.delivered.branch !== delivery.branch ||
               latestItem.delivered.head_sha !== delivery.head_sha
@@ -270,7 +270,7 @@ export function createDeliveryDuty(deps: DeliveryDutyDependencies): DeliveryDuty
               slot.agent,
               {
                 item: id,
-                pr_number: delivery.pr_number,
+                pr_number: prNumber,
                 merge_sha: mergeSha,
               },
               {
@@ -289,12 +289,12 @@ export function createDeliveryDuty(deps: DeliveryDutyDependencies): DeliveryDuty
         merged.has(record.plan.stack_order[index - 1] ?? "")
       ) {
         // Reconcile already-recorded merges too: a crash may happen after item.merged (§11.4).
-        const retargetKey = `${key}:${delivery.pr_number}:${record.plan.base.branch}`;
+        const retargetKey = `${key}:${prNumber}:${record.plan.base.branch}`;
         if (!retargeted.has(retargetKey)) {
           const pr = await host.findPr(task.repo, delivery.branch);
           if (pr) {
             if (pr.base !== record.plan.base.branch)
-              await host.retargetPr(task.repo, delivery.pr_number, record.plan.base.branch);
+              await host.retargetPr(task.repo, prNumber, record.plan.base.branch);
             retargeted.add(retargetKey);
           }
         }
@@ -304,6 +304,8 @@ export function createDeliveryDuty(deps: DeliveryDutyDependencies): DeliveryDuty
 
   const closeStale = async (task: TaskState, host: CodeHost) => {
     for (const id of Object.keys(task.epochs).sort()) {
+      const delivery = task.items[id]?.delivered;
+      if (!delivery || delivery.submit.pr_number === undefined) continue;
       const preserved = preservedBranches(task, id);
       for (let epoch = 1; epoch <= (task.epochs[id] ?? 0); epoch++) {
         const branch = workBranch(task.task_id, id, epoch);
@@ -340,12 +342,16 @@ export function createDeliveryDuty(deps: DeliveryDutyDependencies): DeliveryDuty
       )
         await notifyFailure(task, task.verified.seq);
       await verify(context);
-      const host = deps.codeHost(slot);
-      await observeMerges(context, host);
-      const staleKey = staleEpochsKey(task);
-      if (staleScans.get(task.task_id) !== staleKey) {
-        await closeStale(task, host);
-        staleScans.set(task.task_id, staleKey);
+      if (
+        Object.values(task.items).some((item) => item.delivered?.submit.pr_number !== undefined)
+      ) {
+        const host = deps.codeHost(slot);
+        await observeMerges(context, host);
+        const staleKey = staleEpochsKey(task);
+        if (staleScans.get(task.task_id) !== staleKey) {
+          await closeStale(task, host);
+          staleScans.set(task.task_id, staleKey);
+        }
       }
       if (["done", "cancelled"].includes(task.status)) verifications.delete(task.task_id);
     } catch (cause) {

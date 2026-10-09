@@ -12,20 +12,33 @@ import {
 import { contentHash } from "../core/canonical.js";
 import { draft, finalizeEvent, type Intent } from "../core/intents.js";
 import { replay } from "../core/reducer/replay.js";
+import type { DeviceConfig } from "../core/schemas/config.js";
+import type { PayloadOf } from "../core/schemas/events.js";
 import type { WorkReport } from "../core/schemas/work-report.js";
 import type { AttemptRunner } from "../exec/attempt.js";
 import { FakeClock, VirtualTime } from "../sim/fake-clock.js";
 import { Duties } from "./duties.js";
 import { SlotRegistry } from "./slots.js";
 
-async function fixture(device = "vps", team = false, approval: "human" | "owner" = "human") {
+async function fixture(
+  device = "vps",
+  team = false,
+  approval: "human" | "owner" = "human",
+  policy?: DeviceConfig["submit"],
+  submit: PayloadOf<"task.created">["submit"] = "device",
+) {
   const log = new LogBuilder();
   for (const actor of [MAC, VPS])
     log.append({ type: "agent.registered", actor, payload: agentRegistered() });
   log.append({
     type: "task.created",
     actor: "human",
-    payload: taskCreated({ owner: VPS, mode: team ? "team" : "solo", plan_approval: approval }),
+    payload: taskCreated({
+      owner: VPS,
+      mode: team ? "team" : "solo",
+      plan_approval: approval,
+      submit,
+    }),
   });
   let state = replay(log.entries);
   const time = new VirtualTime();
@@ -113,6 +126,7 @@ async function fixture(device = "vps", team = false, approval: "human" | "owner"
   const stale = vi.fn(async () => {});
   const error = vi.fn();
   const duties = new Duties({
+    device: policy ? { submit: policy } : undefined,
     slots,
     clock,
     random: { bytes: (n) => new Uint8Array(n) },
@@ -173,6 +187,32 @@ async function fixture(device = "vps", team = false, approval: "human" | "owner"
   };
 }
 describe("daemon duties", () => {
+  it.each([
+    [undefined, "device", "pr", "github"],
+    [{ method: "none", host: "github" }, "device", "none", "github"],
+    [{ method: "ask", host: "github" }, "device", "ask", "github"],
+    [{ method: "mr", host: "gitlab" }, "device", "mr", "gitlab"],
+    [{ method: "pr", host: "github" }, "push", "push", "github"],
+    [{ method: "none", host: "gitlab" }, "pr", "pr", "gitlab"],
+    [{ method: "pr", host: "github" }, "ask", "ask", "github"],
+    [{ method: "push", host: "github" }, "none", "none", "github"],
+    [{ method: "pr", host: "git" }, "mr", "push", "git"],
+    [{ method: "pr", host: "git" }, "pr", "push", "git"],
+  ] as const)(
+    "resolves device %j and task %s to %s on %s",
+    async (policy, requested, method, host) => {
+      const f = await fixture("vps", false, "human", policy, requested);
+      expect(f.state().tasks[T1]?.submit).toBe(requested);
+      f.duties.tick(f.state());
+      await f.duties.settle();
+      await f.approve();
+      f.duties.tick(f.state());
+      await f.duties.settle();
+      expect(f.attempt.run.mock.calls[0]?.[0].submit).toEqual({ method, host });
+      expect(f.error).not.toHaveBeenCalled();
+    },
+  );
+
   it("passes work reports to verification and immediately runs the barrier duty", async () => {
     const f = await fixture();
     const reportRun = vi.fn<AttemptRunner["runWithReplan"]>(async () => ({ status: "stale" }));

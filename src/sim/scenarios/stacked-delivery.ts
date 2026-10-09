@@ -293,6 +293,7 @@ argv = ["node", "-e", "const fs = require('node:fs'); process.exit(fs.existsSync
         mode: "team",
         owner: owner.agent,
         budgets: { ...DEFAULT_BUDGETS },
+        submit: "device",
         plan_approval: "human",
       },
       {},
@@ -407,14 +408,16 @@ argv = ["node", "-e", "const fs = require('node:fs'); process.exit(fs.existsSync
     owner.state.tasks[STACKED_TASK]?.verified?.passed,
     "Resumed verification must pass",
   );
-  outcome.mergeShas.push(await host.merge(first.pr_number));
+  if (first.submit.pr_number === undefined) throw new Error("First delivery has no PR number");
+  outcome.mergeShas.push(await host.merge(first.submit.pr_number));
   await tick(0);
   requireScenario(
     world,
     (await host.findPr(REPO, second.branch))?.base === "main",
     "The daemon must retarget the next PR after observing the lower merge",
   );
-  outcome.mergeShas.push(await host.merge(second.pr_number));
+  if (second.submit.pr_number === undefined) throw new Error("Second delivery has no PR number");
+  outcome.mergeShas.push(await host.merge(second.submit.pr_number));
   await tick(0);
   const done = (await converge(world)).tasks[STACKED_TASK];
   requireScenario(world, done?.status === "done", "Human merges must complete the task");

@@ -453,6 +453,7 @@ export async function createDeviceDaemon(options: DaemonBootstrapOptions): Promi
       }
     };
     const duties = new Duties({
+      device: config,
       slots,
       clock,
       random,

@@ -72,6 +72,7 @@ export const TaskCreatedPayload = z.strictObject({
   repo: RepoRefSchema,
   base_branch: z.string().min(1).max(255),
   mode: z.enum(["solo", "team"]),
+  submit: z.enum(["device", "pr", "mr", "push", "none", "ask"]).default("device"),
   owner: AgentIdSchema,
   budgets: BudgetsSchema,
   plan_approval: z.enum(["human", "owner"]),
@@ -147,15 +148,57 @@ export const CheckpointRecordedPayload = z.strictObject({
   snapshot: SnapshotSchema,
 });
 
+const submissionFields = {
+  method: z.enum(["pr", "mr", "push", "none", "ask"]),
+  state: z.enum(["opened", "pushed", "local", "pending"]),
+  pr_url: z.url().max(512).optional(),
+  pr_number: PositiveIntSchema.optional(),
+};
+
+function validSubmission(p: {
+  method: string;
+  state: string;
+  pr_url?: string;
+  pr_number?: number;
+}): boolean {
+  const opened = p.state === "opened";
+  if (opened !== (p.pr_url !== undefined) || opened !== (p.pr_number !== undefined)) return false;
+  if (p.state === "skipped") return p.method === "none";
+  const states: Record<string, string> = {
+    pr: "opened",
+    mr: "opened",
+    push: "pushed",
+    none: "local",
+    ask: "pending",
+  };
+  return states[p.method] === p.state;
+}
+
+export const DeliverySubmitSchema = z.strictObject(submissionFields).refine(validSubmission, {
+  message: "submit method and state must agree; PR URL and number are required iff opened",
+});
+
 export const WorkDeliveredPayload = z.strictObject({
   item: ItemIdSchema,
   epoch: EpochSchema,
   branch: z.string().min(1).max(255),
   head_sha: ShaSchema,
-  pr_url: z.url().max(512),
-  pr_number: PositiveIntSchema,
+  submit: DeliverySubmitSchema,
   check_runs: z.array(CheckRunSchema).max(32),
 });
+
+export const WorkSubmittedPayload = z
+  .strictObject({
+    ...submissionFields,
+    item: ItemIdSchema,
+    epoch: EpochSchema,
+    method: z.enum(["pr", "mr", "push", "none"]),
+    state: z.enum(["opened", "pushed", "local", "skipped"]),
+    head_sha: ShaSchema,
+  })
+  .refine(validSubmission, {
+    message: "submission method and state must agree; PR URL and number are required iff opened",
+  });
 
 export const WorkFailureClassSchema = z.enum([
   "invalid_output",
@@ -251,6 +294,7 @@ export const EVENT_SCHEMAS = {
   "lease.revoked": taskEvent("lease.revoked", LeaseRevokedPayload),
   "checkpoint.recorded": taskEvent("checkpoint.recorded", CheckpointRecordedPayload),
   "work.delivered": taskEvent("work.delivered", WorkDeliveredPayload),
+  "work.submitted": taskEvent("work.submitted", WorkSubmittedPayload),
   "work.failed": taskEvent("work.failed", WorkFailedPayload),
   "replan.requested": taskEvent("replan.requested", ReplanRequestedPayload),
   "barrier.closed": taskEvent("barrier.closed", BarrierClosedPayload),
@@ -277,6 +321,7 @@ export const EventSchema = z.discriminatedUnion("type", [
   EVENT_SCHEMAS["lease.revoked"],
   EVENT_SCHEMAS["checkpoint.recorded"],
   EVENT_SCHEMAS["work.delivered"],
+  EVENT_SCHEMAS["work.submitted"],
   EVENT_SCHEMAS["work.failed"],
   EVENT_SCHEMAS["replan.requested"],
   EVENT_SCHEMAS["barrier.closed"],
@@ -305,6 +350,7 @@ export const REQUIRED_PRE: Record<EventType, readonly (keyof Pre)[]> = {
   "lease.revoked": ["task_rev", "item"],
   "checkpoint.recorded": ["task_rev", "item"],
   "work.delivered": ["task_rev", "item"],
+  "work.submitted": ["task_rev", "item"],
   "work.failed": ["task_rev", "item"],
   "replan.requested": ["task_rev"],
   "barrier.closed": ["task_rev"],

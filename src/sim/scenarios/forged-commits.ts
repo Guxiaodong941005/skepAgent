@@ -50,6 +50,7 @@ async function forge(world: SimWorld, attack: Attack): Promise<void> {
             mode: "solo",
             owner: node.agent,
             budgets: { ...DEFAULT_BUDGETS },
+            submit: "device",
             plan_approval: "human",
           },
           {},

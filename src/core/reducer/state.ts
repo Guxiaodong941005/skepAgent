@@ -64,8 +64,7 @@ export interface Delivery {
   epoch: number;
   branch: string;
   head_sha: Sha;
-  pr_url: string;
-  pr_number: number;
+  submit: PayloadOf<"work.delivered">["submit"];
   check_runs: CheckRun[];
   seq: number;
 }
@@ -88,6 +87,7 @@ export interface ItemState {
   /** Active (or last interrupted) lease; null when never leased or after release/revoke. */
   lease: Lease | null;
   delivered: Delivery | null;
+  submission?: PayloadOf<"work.submitted"> & { seq: number };
   merged: { pr_number: number; merge_sha: Sha; seq: number } | null;
   failure: { epoch: number; class: string; detail: string; seq: number } | null;
   last_checkpoint: CheckpointRecord | null;
@@ -155,6 +155,7 @@ export interface TaskState {
   repo: string;
   base_branch: string;
   mode: "solo" | "team";
+  submit?: PayloadOf<"task.created">["submit"];
   plan_approval: "human" | "owner";
   budgets: Budgets;
 

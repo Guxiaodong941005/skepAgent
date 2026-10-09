@@ -7,7 +7,16 @@ import {
   samplePlan,
   taskCreated,
 } from "../../../test/helpers/log-builder.js";
-import { EVENT_TYPES, parseEvent, parseEventFile, REQUIRED_PRE, serializeEvent } from "./events.js";
+import {
+  DeliverySubmitSchema,
+  EVENT_TYPES,
+  parseEvent,
+  parseEventFile,
+  REQUIRED_PRE,
+  serializeEvent,
+  TaskCreatedPayload,
+  WorkSubmittedPayload,
+} from "./events.js";
 import { PlanSchema } from "./plan.js";
 
 describe("event schemas", () => {
@@ -84,5 +93,76 @@ describe("plan schema", () => {
     expect(PlanSchema.safeParse(bad).success).toBe(false);
     const badPath = samplePlan({ items: [{ ...w1, touches: ["../etc/passwd"] }] });
     expect(PlanSchema.safeParse(badPath).success).toBe(false);
+  });
+});
+
+describe("submission payloads", () => {
+  const methods = ["pr", "mr", "push", "none", "ask"] as const;
+  const states = ["opened", "pushed", "local", "pending"] as const;
+  const expected = { pr: "opened", mr: "opened", push: "pushed", none: "local", ask: "pending" };
+  for (const method of methods) {
+    it.each(states)(`${method} accepts only its matching state %s`, (state) => {
+      const submit = {
+        method,
+        state,
+        ...(state === "opened" ? { pr_url: "https://example.invalid/pull/1", pr_number: 1 } : {}),
+      };
+      expect(DeliverySubmitSchema.safeParse(submit).success).toBe(expected[method] === state);
+    });
+  }
+  it.each([
+    { method: "pr", state: "opened" },
+    { method: "pr", state: "opened", pr_url: "https://example.invalid/pull/1" },
+    { method: "mr", state: "opened", pr_number: 1 },
+    { method: "pr", state: "opened", pr_url: "bad", pr_number: 1 },
+    { method: "pr", state: "opened", pr_url: "https://example.invalid/pull/1", pr_number: 0 },
+    { method: "push", state: "pushed", pr_number: 1 },
+    { method: "none", state: "local", pr_url: "https://example.invalid/pull/1" },
+    { method: "ask", state: "pending", pr_url: "https://example.invalid/pull/1", pr_number: 1 },
+    { method: "skip", state: "skipped" },
+    { method: "none", state: "local", extra: true },
+  ])("rejects invalid PR data or unknown fields %j", (submit) => {
+    expect(DeliverySubmitSchema.safeParse(submit).success).toBe(false);
+  });
+  it("defaults older task creation events to device policy", () => {
+    const { submit: _submit, ...legacy } = taskCreated();
+    expect(TaskCreatedPayload.parse(legacy).submit).toBe("device");
+    expect(TaskCreatedPayload.safeParse({ ...legacy, submit: "skip" }).success).toBe(false);
+  });
+  it.each([
+    { method: "pr", state: "opened", pr_url: "https://example.invalid/pull/1", pr_number: 1 },
+    { method: "mr", state: "opened", pr_url: "https://example.invalid/merge/1", pr_number: 1 },
+    { method: "push", state: "pushed" },
+    { method: "none", state: "local" },
+    { method: "none", state: "skipped" },
+  ])("accepts strict later submission %j without a lease precondition", (submission) => {
+    const payload = { item: "W1", epoch: 1, head_sha: "a".repeat(40), ...submission };
+    expect(WorkSubmittedPayload.safeParse(payload).success).toBe(true);
+    const log = new LogBuilder();
+    const event = log.event({
+      type: "work.submitted",
+      actor: "human",
+      payload: WorkSubmittedPayload.parse(payload),
+      pre: { task_rev: 1, item: "W1" },
+    });
+    expect(parseEvent(event).ok).toBe(true);
+    expect(parseEvent({ ...event, pre: { task_rev: 1 } }).ok).toBe(false);
+    expect(WorkSubmittedPayload.safeParse({ ...payload, extra: true }).success).toBe(false);
+  });
+  it.each([
+    { method: "ask", state: "pending" },
+    { method: "pr", state: "local" },
+    { method: "pr", state: "opened", pr_url: "https://example.invalid/pull/1" },
+    { method: "push", state: "pushed", pr_number: 1 },
+    { method: "none", state: "skipped", pr_url: "https://example.invalid/pull/1" },
+  ])("rejects inconsistent later submission %j", (submission) => {
+    expect(
+      WorkSubmittedPayload.safeParse({
+        item: "W1",
+        epoch: 1,
+        head_sha: "a".repeat(40),
+        ...submission,
+      }).success,
+    ).toBe(false);
   });
 });

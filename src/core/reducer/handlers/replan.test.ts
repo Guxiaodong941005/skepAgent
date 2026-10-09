@@ -260,8 +260,12 @@ function delivery(epoch = 1): PayloadOf<"work.delivered"> {
     epoch,
     branch: workBranch(T1, "W1", epoch),
     head_sha: fakeSha("delivery"),
-    pr_url: "https://example.invalid/pull/1",
-    pr_number: 1,
+    submit: {
+      method: "pr",
+      state: "opened",
+      pr_url: "https://example.invalid/pull/1",
+      pr_number: 1,
+    },
     check_runs: [],
   };
 }
