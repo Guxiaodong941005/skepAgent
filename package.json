@@ -1,7 +1,6 @@
 {
-  "name": "skep",
-  "version": "0.0.1",
-  "private": true,
+  "name": "@skepagent/skep",
+  "version": "0.1.0",
   "description": "Cross-device, decentralized collaboration for AI coding agents over a signed git blackboard.",
   "license": "MIT",
   "type": "module",
@@ -12,6 +11,35 @@
     "skep": "dist/bin/skep.js",
     "skepd": "dist/bin/skepd.js"
   },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Guxiaodong941005/skepAgent.git"
+  },
+  "homepage": "https://github.com/Guxiaodong941005/skepAgent",
+  "bugs": {
+    "url": "https://github.com/Guxiaodong941005/skepAgent/issues"
+  },
+  "keywords": [
+    "skep",
+    "skepd",
+    "agents",
+    "ai-agents",
+    "git",
+    "blackboard",
+    "collaboration",
+    "daemon",
+    "ssh-signing",
+    "codex"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
@@ -21,6 +49,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "check": "npm run lint && npm test",
+    "prepublishOnly": "npm run check && npm run build",
     "skep": "tsx src/bin/skep.ts",
     "skepd": "tsx src/bin/skepd.ts"
   },

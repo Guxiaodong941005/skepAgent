@@ -12,11 +12,74 @@ approve plans, resolve escalations and merge. There is no central server; any gi
 
 Website: [skepagent.com](https://skepagent.com)
 
-> [!WARNING]
-> **Project status: early MVP, under active development.** Nothing is usable end-to-end yet. The
-> protocol schemas and the reducer core are in place; the git write path, daemon, execution
-> pipeline and most CLI commands are still being built. Progress is tracked in
-> [`docs/DEV-PLAN.md`](docs/DEV-PLAN.md). Expect breaking changes.
+> [!NOTE]
+> **Project status: first public tag v0.1.0 (MVP), still early.** The signed blackboard,
+> reducer, daemon, CLI, Codex adapter and stacked delivery are in this tag. The real two-device
+> acceptance run (**SK-609**) has **not** been done — the user waived it for v0.1.0. Expect
+> breaking changes while 0.x. See [`docs/RELEASE.md`](docs/RELEASE.md) and
+> [`docs/DEV-PLAN.md`](docs/DEV-PLAN.md).
+
+## What Skep never does
+
+> **Hard rule (D19):** **Skep never transports, stores, syncs or brokers provider credentials,
+> API keys or provider configurations between devices, in any form: not as plaintext, not as
+> ciphertext, not as a hash, and not as a label.** Each device's agent CLIs are configured
+> locally by the human on that device; Skep neither reads nor records that configuration.
+>
+> **No inbound connectivity (D18):** no Skep feature requires device-to-device reachability, a
+> mesh VPN or a fixed IP. Devices never connect to each other. Each `skepd` makes outbound
+> connections to the hosted git remote (the only rendezvous and authority) and, optionally, one
+> wake-up hint channel. Tailscale or SSH are human conveniences, never dependencies.
+>
+> Skep also never auto-merges. The human holds plan approval, lease revocation, escalation
+> decisions and merges.
+
+## Install
+
+npm registry publish of `@skepagent/skep` is **deferred** (org `skepagent` may not exist yet).
+Until then, install from the git tag or clone and build.
+
+```bash
+# from the v0.1.0 tag (bins: skep, skepd)
+npm install -g github:Guxiaodong941005/skepAgent#v0.1.0
+```
+
+```bash
+git clone https://github.com/Guxiaodong941005/skepAgent.git
+cd skepAgent
+git checkout v0.1.0
+npm ci
+npm run build
+# put dist/bin/skep.js and dist/bin/skepd.js on PATH, or npm link
+```
+
+## Quickstart
+
+Prerequisites on **each** device:
+
+* Node.js **≥ 22.12** and npm
+* `git` ≥ 2.34 (SSH signing)
+* OpenSSH `ssh-keygen` ≥ 8.9 (`-Y sign/verify`)
+* `gh`, `gitleaks`
+* the pinned agent CLI (Codex in this MVP), **installed and logged in locally** on that device
+  (D19 — Skep will not copy the login)
+
+Then, following [`docs/RUNBOOK.md`](docs/RUNBOOK.md):
+
+1. Create an empty **private** blackboard git repo (no README; genesis must be the root commit).
+2. On each device, run `skep init` (generates the daemon key and prints an `allowed_signers`
+   line). Compare fingerprints out of band and install the local trust root.
+3. On the controller, `skep init --genesis` to write the signed genesis commit.
+4. Run `skepd` as a service (`deploy/skepd.service` or `deploy/com.skepagent.skepd.plist`).
+5. `skep doctor` on each device, then:
+
+   ```bash
+   skep task new "…" --repo <allowlist-name> --owner <agent>
+   skep plan approve <task>
+   skep status
+   ```
+
+The runbook covers trust setup, revoke, re-genesis, Mac vs Linux homes, and `--socket-group`.
 
 ## Why
 
@@ -70,8 +133,10 @@ Skep takes a different approach:
 
 * [`docs/PRD-v0.4.md`](docs/PRD-v0.4.md): product requirements (normative).
 * [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): module layout, event schema, reducer, leases,
-  git write path, adapters, simulation harness, decisions log.
+  git write path, adapters, simulation harness, decisions log (including D18 and D19).
 * [`docs/DEV-PLAN.md`](docs/DEV-PLAN.md): MVP task breakdown in parallelizable waves, with status.
+* [`docs/RUNBOOK.md`](docs/RUNBOOK.md): install, trust, revoke, re-genesis, service units.
+* [`docs/RELEASE.md`](docs/RELEASE.md): v0.1.0 name decision, checklist, tag instructions.
 
 ## Developer quickstart
 
@@ -81,8 +146,8 @@ Requirements:
 * `git` ≥ 2.34 and OpenSSH `ssh-keygen` (used by the SSH signing tests)
 
 ```bash
-git clone https://github.com/<org>/skep.git
-cd skep
+git clone https://github.com/Guxiaodong941005/skepAgent.git
+cd skepAgent
 npm ci                   # install exact dependencies
 npm test                 # unit + integration tests (Vitest)
 npm run lint             # Biome + tsc --noEmit
@@ -92,6 +157,9 @@ npm run skep -- --help   # run the CLI from source
 
 `npm run fix` applies Biome formatting and import ordering. Tests never touch `~/.skep` or the
 network; they use temp directories, local bare repositories and fake adapters.
+
+`skep sim run` needs the fixture keys under `test/fixtures/keys/` (a git checkout). Those files
+are not in the npm pack.
 
 ## Repository layout
 
@@ -115,11 +183,10 @@ src/
 test/
   helpers/     log builder, git fixtures
   integration/ cross-module tests
-docs/          PRD, architecture, dev plan, reviews
+docs/          PRD, architecture, dev plan, runbook, release notes, reviews
 ```
 
-Some directories are created by tasks that have not landed yet. See
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §2 for the full planned tree.
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §2 for the full tree.
 
 ## Contributing
 
