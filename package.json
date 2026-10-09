@@ -13,7 +13,7 @@
     "skepd": "dist/bin/skepd.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json && mkdir -p dist/cli/agent-guide && cp src/cli/agent-guide/SKILL.md dist/cli/agent-guide/SKILL.md",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "biome check . && tsc -p tsconfig.json --noEmit",
     "format": "biome format --write .",

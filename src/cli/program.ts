@@ -9,6 +9,7 @@
 import { Command, CommanderError } from "commander";
 import { skepHome, skepPaths } from "../config/paths.js";
 import { register as registerAgent } from "./commands/agent.js";
+import { launchAgent, register as registerAgentTui } from "./commands/agent-tui.js";
 import { register as registerDecide } from "./commands/decide.js";
 import { register as registerDoctor } from "./commands/doctor.js";
 import { register as registerInit } from "./commands/init.js";
@@ -78,6 +79,14 @@ export function buildProgram(ctx: CliContext): Command {
   registerSim(program, ctx);
   registerUi(program, ctx);
   registerSession(program, ctx);
+  registerAgentTui(program, ctx);
+
+  // No subcommand means "open the agent". Anything that looks like a command still errors.
+  program
+    .argument("[prompt...]", "ask the agent; no subcommand opens it")
+    .action(async (words: string[]) => {
+      await launchAgent(ctx, words.join(" "), undefined);
+    });
 
   return program;
 }
