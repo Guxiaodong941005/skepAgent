@@ -1,0 +1,29 @@
+{
+  "id": "cli:agent:wait",
+  "result": {
+    "agent": {
+      "agent": "codex",
+      "agent_session": {
+        "agent": "codex",
+        "kind": "id",
+        "source": "herdr:codex",
+        "value": "<session-id>"
+      },
+      "agent_status": "done",
+      "completion_seq": 177,
+      "cwd": "<worktree>",
+      "focused": false,
+      "foreground_cwd": "<worktree>",
+      "name": "skep-example",
+      "pane_id": "workspace:pane",
+      "revision": 70,
+      "state_change_seq": 177,
+      "tab_id": "workspace:tab",
+      "terminal_id": "terminal",
+      "terminal_title": "Example task",
+      "terminal_title_stripped": "Example task",
+      "workspace_id": "workspace"
+    },
+    "type": "agent_info"
+  }
+}

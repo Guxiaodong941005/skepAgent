@@ -1,0 +1,7 @@
+{
+  "id": "cli:agent:wait",
+  "error": {
+    "code": "timeout",
+    "message": "Example wait timed out"
+  }
+}
