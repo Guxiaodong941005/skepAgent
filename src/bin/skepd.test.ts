@@ -193,6 +193,7 @@ describe("daemon code host repository binding", () => {
       repos: [{ name: "app", url }],
       signing_key: "daemon.key",
       poll: { active_sec: 20, idle_sec: 90 },
+      submit: { method: "pr", host: "github" },
     };
   }
   it.each([

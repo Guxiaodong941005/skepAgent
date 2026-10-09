@@ -70,6 +70,7 @@ describe("restart reconciliation", () => {
       plan,
       baseSha: base,
       prBase: "main",
+      submit: { method: "pr", host: "github" },
       agentInstructions: "Implement the example change.",
       repoContext: "Example repository.",
       timeoutMs: 10_000,
@@ -199,6 +200,47 @@ describe("restart reconciliation", () => {
     };
     await expect(new AttemptRunner({ ...deps, journal: saved }).run(input)).rejects.toThrow(Crash);
   }
+  it.each(
+    ["push", "none", "ask"].flatMap((method) =>
+      ["submit", "publish_pending"].map((step) => ({
+        method: method as "push" | "none" | "ask",
+        step,
+      })),
+    ),
+  )("recovers $method at $step without PR checks or code-host access", async ({ method, step }) => {
+    input.submit = { method, host: "github" };
+    await stopAt(step);
+    await journal.append(key, {
+      step: "pr",
+      pr: {
+        number: 99,
+        url: "https://example.invalid/pull/99",
+        head: branch,
+        base: "main",
+        title: "Unrelated stale record",
+        state: "open",
+        mergeSha: null,
+      },
+    });
+    for (const port of [
+      "remoteBranchSha",
+      "findPr",
+      "createPr",
+      "prState",
+      "retargetPr",
+      "closePr",
+    ] as const)
+      vi.spyOn(host, port).mockRejectedValue(new Error("No code host for this method"));
+    const gitRun = vi.spyOn(git, "run");
+    expect(await new AttemptReconciler(deps).reconcile()).toMatchObject([
+      { result: { status: "delivered" } },
+    ]);
+    expect(adapter.invoke).toHaveBeenCalledOnce();
+    expect(gitRun.mock.calls.filter(([argv]) => argv.includes("push"))).toHaveLength(
+      method === "push" && step === "submit" ? 1 : 0,
+    );
+  });
+
   const recover = () => new AttemptReconciler(deps).reconcile();
   async function processRecord(token: string, bootId?: string) {
     await journal.append(key, {

@@ -28,6 +28,7 @@ import {
   type Intent,
   releaseIntent,
   revokeIntent,
+  submitIntent,
 } from "./intents.js";
 import { activeLeaseCount } from "./reducer/handlers/lease.js";
 import { applyEntry, replay } from "./reducer/replay.js";
@@ -215,8 +216,12 @@ function delivery(): Intent {
   return deliverIntent({
     ...heldAction,
     head_sha: fakeSha("delivery"),
-    pr_url: "https://example.invalid/pull/1",
-    pr_number: 1,
+    submit: {
+      method: "pr",
+      state: "opened",
+      pr_url: "https://example.invalid/pull/1",
+      pr_number: 1,
+    },
     check_runs: [],
   });
 }
@@ -596,5 +601,110 @@ describe("claim capacity and fresh state", () => {
     expect(claimCandidates(state, VPS)).toEqual([]);
     expect(claim(T2)(state)).toBeNull();
     expect(claimCandidates(state, "vps.coding.2")).toEqual([]);
+  });
+});
+
+describe("submitIntent", () => {
+  function pending() {
+    const { builder, state } = holding();
+    return {
+      builder,
+      state: publish(
+        builder,
+        state,
+        deliverIntent({
+          ...heldAction,
+          head_sha: fakeSha("pending"),
+          submit: { method: "ask", state: "pending" },
+          check_runs: [],
+        }),
+      ),
+    };
+  }
+  const action = {
+    task_id: T1,
+    actor: "human",
+    item: "W1",
+    method: "none",
+    state: "local",
+  } as const;
+
+  it.each(["executing", "delivered", "escalated"] as const)(
+    "accepts a lease-free submission while %s",
+    (status) => {
+      const { builder, state } = pending();
+      task(state).status = status;
+      const intent = submitIntent(action);
+      const next = publish(builder, state, intent);
+      expect(next.outcomes.at(-1)?.outcome).toBe("accepted");
+      expect(task(next).items.W1?.submission).toMatchObject({
+        epoch: 1,
+        head_sha: fakeSha("pending"),
+        method: "none",
+        state: "local",
+      });
+      expect(task(next).items.W1?.status).toBe("delivered");
+      expect(intent(next)).toBeNull();
+    },
+  );
+
+  it.each(["task", "item", "status", "pending", "epoch", "head", "submission"])(
+    "rechecks %s before publishing",
+    (change) => {
+      const { state } = pending();
+      const intent = submitIntent({ ...action, epoch: 1, head_sha: fakeSha("pending") });
+      expect(intent(state)).not.toBeNull();
+      const item = task(state).items.W1;
+      if (!item?.delivered) throw new Error("Missing delivery");
+      if (change === "task") delete state.tasks[T1];
+      if (change === "item") delete task(state).items.W1;
+      if (change === "status") task(state).status = "interrupting";
+      if (change === "pending") item.delivered.submit = { method: "none", state: "local" };
+      if (change === "epoch") item.delivered.epoch++;
+      if (change === "head") item.delivered.head_sha = fakeSha("changed");
+      if (change === "submission")
+        item.submission = {
+          item: "W1",
+          epoch: 1,
+          method: "none",
+          state: "skipped",
+          head_sha: fakeSha("pending"),
+          seq: state.seq,
+        };
+      expect(intent(state)).toBeNull();
+    },
+  );
+
+  it("derives epoch, SHA and revision from fresh delivery state", () => {
+    const { state } = pending();
+    const intent = submitIntent(action);
+    const item = task(state).items.W1;
+    if (!item?.delivered) throw new Error("Missing delivery");
+    item.delivered.epoch = 2;
+    item.delivered.head_sha = fakeSha("new");
+    task(state).rev++;
+    expect(intent(state)).toMatchObject({
+      payload: { epoch: 2, head_sha: fakeSha("new") },
+      pre: { task_rev: task(state).rev, item: "W1" },
+    });
+  });
+
+  it("isolates PR data and drops incomplete or inconsistent submissions", () => {
+    const { state } = pending();
+    const options = {
+      ...action,
+      method: "pr",
+      state: "opened",
+      pr_url: "https://example.invalid/pull/1",
+      pr_number: 1,
+    } as const;
+    const intent = submitIntent(options);
+    const first = intent(state);
+    if (!first) throw new Error("Missing draft");
+    const expected = structuredClone(first);
+    (first.payload as { pr_number: number }).pr_number = 99;
+    expect(intent(state)).toEqual(expected);
+    expect(submitIntent({ ...options, pr_number: undefined })(state)).toBeNull();
+    expect(submitIntent({ ...options, state: "pushed" })(state)).toBeNull();
   });
 });

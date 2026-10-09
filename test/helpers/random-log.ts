@@ -220,6 +220,7 @@ function taskCreated(rng: Rng, state: State, agents: readonly AgentSpec[]): Skep
       mode: rng.chance(0.5) ? "team" : "solo",
       owner: owner.id,
       budgets,
+      submit: "device",
       plan_approval: rng.chance(0.7) ? "human" : "owner",
     },
   });
@@ -433,8 +434,12 @@ function workDelivered(state: State, task: TaskState, item: ItemState): SkepEven
       epoch: lease.epoch,
       branch: lease.branch,
       head_sha: head,
-      pr_url: `https://example.com/example/app/pull/${pr}`,
-      pr_number: pr,
+      submit: {
+        method: "pr",
+        state: "opened",
+        pr_url: `https://example.invalid/example/app/pull/${pr}`,
+        pr_number: pr,
+      },
       check_runs: [checkRun(head)],
     },
   });
@@ -544,16 +549,17 @@ function taskVerified(task: TaskState, passed: boolean): SkepEvent | null {
 
 function itemMerged(task: TaskState): SkepEvent | null {
   const item = Object.values(task.items).find(
-    (candidate) => candidate.status === "delivered" && candidate.delivered,
+    (candidate) =>
+      candidate.status === "delivered" && candidate.delivered?.submit.pr_number !== undefined,
   );
-  if (!item?.delivered) return null;
+  if (!item?.delivered || item.delivered.submit.pr_number === undefined) return null;
   return event("item.merged", {
     task_id: task.task_id,
     actor: "human",
     pre: { task_rev: task.rev, item: item.id },
     payload: {
       item: item.id,
-      pr_number: item.delivered.pr_number,
+      pr_number: item.delivered.submit.pr_number,
       merge_sha: sha(`merge-${task.task_id}-${item.id}`),
     },
   });
@@ -781,7 +787,8 @@ function nextPr(state: State): number {
   let max = 0;
   for (const task of Object.values(state.tasks)) {
     for (const item of Object.values(task.items)) {
-      if (item.delivered && item.delivered.pr_number > max) max = item.delivered.pr_number;
+      if (item.delivered && (item.delivered.submit.pr_number ?? 0) > max)
+        max = item.delivered.submit.pr_number ?? 0;
     }
   }
   return max + 1;

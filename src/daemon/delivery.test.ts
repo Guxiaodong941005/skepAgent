@@ -172,8 +172,12 @@ async function fixture(delivered = true, maximumChecks = false) {
         actor,
         epoch: 1,
         head_sha: head,
-        pr_url: `https://example.invalid/pull/${number}`,
-        pr_number: number,
+        submit: {
+          method: "pr",
+          state: "opened",
+          pr_url: `https://example.invalid/pull/${number}`,
+          pr_number: number,
+        },
         check_runs: [],
       }),
     );
@@ -318,6 +322,29 @@ async function fixture(delivered = true, maximumChecks = false) {
 }
 
 describe("stacked delivery duty", () => {
+  it.each(["push", "none", "ask"] as const)(
+    "verifies %s deliveries without code-host calls or stale closure",
+    async (method) => {
+      const f = await fixture();
+      const task = required(f.state().tasks[T1]);
+      for (const item of Object.values(task.items)) {
+        const delivery = required(item.delivered);
+        delivery.submit = {
+          method,
+          state: method === "push" ? "pushed" : method === "none" ? "local" : "pending",
+        };
+        task.epochs[item.id] = 3;
+      }
+      task.epochs.W3 = 2;
+      await f.duty(f.context());
+      expect(f.checks.run).toHaveBeenCalledOnce();
+      expect(f.host.prState).not.toHaveBeenCalled();
+      expect(f.host.findPr).not.toHaveBeenCalled();
+      expect(f.host.retargetPr).not.toHaveBeenCalled();
+      expect(f.host.closePr).not.toHaveBeenCalled();
+    },
+  );
+
   it("runs every named acceptance check once at the top SHA using the trusted plan base", async () => {
     const f = await fixture();
     const original = f.context();
@@ -677,7 +704,12 @@ describe("stacked delivery duty", () => {
     Object.assign(required(required(task.items.W1).delivered), {
       epoch: 2,
       branch: workBranch(T1, "W1", 2),
-      pr_number: 3,
+      submit: {
+        method: "pr",
+        state: "opened",
+        pr_url: "https://example.invalid/pull/3",
+        pr_number: 3,
+      },
     });
     f.statuses.set(3, { state: "open", mergeSha: null });
     await f.duty(f.context());
@@ -705,7 +737,7 @@ describe("stacked delivery duty", () => {
     expect(f.checks.run).toHaveBeenCalledOnce();
   });
 
-  it("closes stale epochs and removed items while preserving carried-over deliveries and live leases", async () => {
+  it("closes known PR stale epochs while ignoring removed items and preserving deliveries and leases", async () => {
     const f = await fixture(false);
     await f.publish(claimIntent({ task_id: T1, item: "W2", actor: VPS, attempt_id: "att_active" }));
     const task = required(f.state().tasks[T1]);
@@ -721,36 +753,33 @@ describe("stacked delivery duty", () => {
       mergeSha: null,
     }));
     await f.duty(f.context());
-    expect(f.host.closePr).toHaveBeenCalledTimes(2);
-    expect(f.host.findPr.mock.calls.map((call) => call[1])).toEqual([
-      workBranch(T1, "W1", 2),
-      workBranch(T1, "W3", 1),
-    ]);
+    expect(f.host.closePr).toHaveBeenCalledTimes(1);
+    expect(f.host.findPr.mock.calls.map((call) => call[1])).toEqual([workBranch(T1, "W1", 2)]);
     expect(f.checks.run).not.toHaveBeenCalled();
     await f.duty(f.context());
-    expect(f.host.closePr).toHaveBeenCalledTimes(2);
-    expect(f.host.findPr).toHaveBeenCalledTimes(2);
-    task.epochs.W3 = 2;
+    expect(f.host.closePr).toHaveBeenCalledTimes(1);
+    expect(f.host.findPr).toHaveBeenCalledTimes(1);
+    task.epochs.W1 = 3;
     await f.duty(f.context());
-    expect(f.host.closePr).toHaveBeenCalledTimes(3);
-    expect(f.host.findPr).toHaveBeenLastCalledWith(REPO, workBranch(T1, "W3", 2));
+    expect(f.host.closePr).toHaveBeenCalledTimes(2);
+    expect(f.host.findPr).toHaveBeenLastCalledWith(REPO, workBranch(T1, "W1", 3));
   });
 
   it("caches absent stale PRs across ticks and scans only new epochs", async () => {
     const f = await fixture(false);
     const task = required(f.state().tasks[T1]);
-    task.epochs.W3 = 1;
+    task.epochs.W1 = 2;
     await f.duty(f.context());
     await f.duty(f.context());
     task.rev++;
     await f.duty(f.context());
-    expect(f.host.findPr).toHaveBeenCalledExactlyOnceWith(REPO, workBranch(T1, "W3", 1));
-    task.epochs.W3 = 2;
+    expect(f.host.findPr).toHaveBeenCalledExactlyOnceWith(REPO, workBranch(T1, "W1", 2));
+    task.epochs.W1 = 3;
     await f.duty(f.context());
     await f.duty(f.context());
     expect(f.host.findPr.mock.calls.map((call) => call[1])).toEqual([
-      workBranch(T1, "W3", 1),
-      workBranch(T1, "W3", 2),
+      workBranch(T1, "W1", 2),
+      workBranch(T1, "W1", 3),
     ]);
     expect(f.host.closePr).not.toHaveBeenCalled();
   });
@@ -759,18 +788,16 @@ describe("stacked delivery duty", () => {
     "retries a failed stale PR %s without poisoning the cache",
     async (operation) => {
       const f = await fixture(false);
-      await f.publish(
-        claimIntent({ task_id: T1, item: "W2", actor: VPS, attempt_id: "att_active" }),
-      );
-      await f.publish(
-        releaseIntent({
-          task_id: T1,
-          item: "W2",
-          actor: VPS,
-          epoch: 1,
-          reason: "End the example lease.",
-        }),
-      );
+      required(f.state().tasks[T1]).epochs.W1 = 2;
+      f.host.findPr.mockResolvedValue({
+        number: 3,
+        url: "https://example.invalid/pull/3",
+        head: workBranch(T1, "W1", 2),
+        base: "main",
+        title: "Stale",
+        state: "open",
+        mergeSha: null,
+      });
       if (operation === "lookup") f.host.findPr.mockRejectedValueOnce(new Error("Example outage"));
       else f.host.closePr.mockRejectedValueOnce(new Error("Example outage"));
       await expect(f.duty(f.context())).rejects.toBeInstanceOf(DeliveryError);
@@ -782,7 +809,7 @@ describe("stacked delivery duty", () => {
   );
 
   it.each(["cancel", "release"])(
-    "rescans when %s makes a preserved epoch stale",
+    "rescans known PRs after %s without probing undelivered epochs",
     async (change) => {
       const f = await fixture(false);
       await f.publish(
@@ -815,7 +842,7 @@ describe("stacked delivery duty", () => {
       expect(f.state().tasks[T1]?.epochs).toEqual(epochs);
       await f.duty(f.context());
       await f.duty(f.context());
-      expect(f.host.closePr).toHaveBeenCalledTimes(change === "cancel" ? 2 : 1);
+      expect(f.host.closePr).toHaveBeenCalledTimes(change === "cancel" ? 1 : 0);
     },
   );
 

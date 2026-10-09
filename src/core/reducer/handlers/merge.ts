@@ -11,7 +11,8 @@ export const handleItemMerged: Handler<"item.merged"> = (draft, event, ctx) => {
   if (
     item.status !== "delivered" ||
     !item.delivered ||
-    payload.pr_number !== item.delivered.pr_number
+    item.delivered.submit.pr_number === undefined ||
+    payload.pr_number !== item.delivered.submit.pr_number
   )
     return { ok: false, reason: "bad_task_state" };
   item.merged = { pr_number: payload.pr_number, merge_sha: payload.merge_sha, seq: ctx.seq };

@@ -1,4 +1,4 @@
-import type { Command } from "commander";
+import { type Command, Option } from "commander";
 import type { IntentSpec } from "../../core/intent-spec.js";
 import { titleFromBody } from "../../core/intents-human.js";
 import type { CliContext } from "../context.js";
@@ -25,6 +25,11 @@ export function register(program: Command, ctx: CliContext): void {
     .requiredOption("--repo <name>", "allowlisted code repo name")
     .option("--owner <agentId>", "owning agent", parseAgentId)
     .option("--team", "team mode (default is the solo fast path)")
+    .addOption(
+      new Option("--submit <method>", "submission policy")
+        .choices(["device", "pr", "mr", "push", "none", "ask"])
+        .default("device"),
+    )
     .option("--allow-non-english", "allow a predominantly non-Latin task body")
     .action(async (text: string, opts: NewOptions) => {
       if (!opts.allowNonEnglish && isPredominantlyNonLatin(text)) {
@@ -52,6 +57,7 @@ export function register(program: Command, ctx: CliContext): void {
 
 interface NewOptions {
   repo: string;
+  submit: "device" | "pr" | "mr" | "push" | "none" | "ask";
   owner?: string;
   team?: boolean;
   allowNonEnglish?: boolean;
@@ -70,6 +76,7 @@ function taskCreateSpec(text: string, opts: NewOptions): IntentSpec {
     body: nonEnglish ? "See original_text; an English body was not provided." : text,
     repo: opts.repo,
     mode: opts.team ? "team" : "solo",
+    submit: opts.submit,
     ...(opts.owner === undefined ? {} : { owner: opts.owner }),
     ...(nonEnglish ? { original_text: text, original_lang: "und" } : {}),
   };

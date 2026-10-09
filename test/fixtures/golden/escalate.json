@@ -53,7 +53,7 @@
         }
       ],
       "added": {
-        "events/T-20261005-0000/evt_087d54eb-650c-4769-8efa-3879748e26a5.json": "{\n  \"schema\": \"skep.event/v1\",\n  \"event_id\": \"evt_087d54eb-650c-4769-8efa-3879748e26a5\",\n  \"type\": \"task.created\",\n  \"task_id\": \"T-20261005-0000\",\n  \"actor\": \"human\",\n  \"observed_tip\": \"beb3cbe2df31505fe720515c9030e080ff6af0e9\",\n  \"pre\": {},\n  \"created_at\": \"2026-10-05T09:00:00Z\",\n  \"lang\": \"en\",\n  \"payload\": {\n    \"title\": \"Ship the requested change\",\n    \"body\": \"Implement the change described by the human and cover it with the unit check.\",\n    \"repo\": \"git@example.invalid:example/app.git\",\n    \"base_branch\": \"main\",\n    \"mode\": \"solo\",\n    \"owner\": \"vps.coding\",\n    \"budgets\": {\n      \"max_invocations\": 12,\n      \"max_wall_hours\": 6,\n      \"replans\": 1,\n      \"review_rounds\": 2,\n      \"item_retries\": 1\n    },\n    \"plan_approval\": \"human\"\n  }\n}\n"
+        "events/T-20261005-0000/evt_087d54eb-650c-4769-8efa-3879748e26a5.json": "{\n  \"schema\": \"skep.event/v1\",\n  \"event_id\": \"evt_087d54eb-650c-4769-8efa-3879748e26a5\",\n  \"type\": \"task.created\",\n  \"task_id\": \"T-20261005-0000\",\n  \"actor\": \"human\",\n  \"observed_tip\": \"beb3cbe2df31505fe720515c9030e080ff6af0e9\",\n  \"pre\": {},\n  \"created_at\": \"2026-10-05T09:00:00Z\",\n  \"lang\": \"en\",\n  \"payload\": {\n    \"title\": \"Ship the requested change\",\n    \"body\": \"Implement the change described by the human and cover it with the unit check.\",\n    \"repo\": \"git@example.invalid:example/app.git\",\n    \"base_branch\": \"main\",\n    \"mode\": \"solo\",\n    \"owner\": \"vps.coding\",\n    \"budgets\": {\n      \"max_invocations\": 12,\n      \"max_wall_hours\": 6,\n      \"replans\": 1,\n      \"review_rounds\": 2,\n      \"item_retries\": 1\n    },\n    \"submit\": \"device\",\n    \"plan_approval\": \"human\"\n  }\n}\n"
       }
     },
     {
@@ -237,5 +237,5 @@
       }
     }
   ],
-  "state_hash": "sha256:721d401515bce3536fbdc4c6f9ca88e8400dcbbe74b578921ebddeeae7a1c318"
+  "state_hash": "sha256:6cb1bc180c791e39073311d3a9e9c7e535e6ee984c914a3b3ccb9182bf58f0b0"
 }

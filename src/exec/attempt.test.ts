@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { commitFile, initRepo, tempDir } from "../../test/helpers/git-fixture.js";
 import {
   agentRegistered,
+  fakeEventId,
   LogBuilder,
   planProposed,
   samplePlan,
@@ -91,6 +92,7 @@ describe("journaled attempt pipeline", () => {
       plan,
       baseSha: base,
       prBase: "main",
+      submit: { method: "pr", host: "github" },
       agentInstructions: "Implement the example item.",
       repoContext: "Example repository.",
       timeoutMs: 10000,
@@ -168,8 +170,9 @@ describe("journaled attempt pipeline", () => {
           ).toMatchObject({ event_id: eventId });
         }
         if (event.type === "work.delivered") {
-          const payload = event.payload as { head_sha: string };
-          expect(await host.remoteBranchSha("app", branch)).toBe(payload.head_sha);
+          const payload = event.payload as { head_sha: string; submit: { method: string } };
+          if (["pr", "mr"].includes(payload.submit.method))
+            expect(await host.remoteBranchSha("app", branch)).toBe(payload.head_sha);
         }
         log.append({
           type: event.type,
@@ -260,6 +263,7 @@ describe("journaled attempt pipeline", () => {
 
   afterEach(async () => {
     vi.unstubAllEnvs();
+    vi.restoreAllMocks();
     await rm(root, { recursive: true, force: true });
   });
 
@@ -407,6 +411,110 @@ describe("journaled attempt pipeline", () => {
     expect(log.events.some((event) => event?.type === "work.delivered")).toBe(false);
   });
 
+  it.each([
+    ["pr", "opened", true, true],
+    ["mr", "opened", true, true],
+    ["push", "pushed", true, false],
+    ["none", "local", false, false],
+    ["ask", "pending", false, false],
+  ] as const)(
+    "delivers %s with the correct Git and code-host operations",
+    async (method, state, pushed, opened) => {
+      input.submit = { method, host: method === "mr" ? "gitlab" : "github" };
+      const ports = [
+        "remoteBranchSha",
+        "findPr",
+        "createPr",
+        "prState",
+        "retargetPr",
+        "closePr",
+      ] as const;
+      const spies = ports.map((port) => vi.spyOn(host, port));
+      const gitRun = vi.spyOn(git, "run");
+      expect(await run()).toMatchObject({ status: "delivered" });
+      const delivery = log.events.findLast((event) => event?.type === "work.delivered");
+      expect(delivery).toMatchObject({ payload: { submit: { method, state } } });
+      const pushes = gitRun.mock.calls.filter(([argv]) => argv.includes("push"));
+      expect(pushes).toHaveLength(pushed ? 1 : 0);
+      if (pushed) expect(pushes[0]?.[0].at(-1)).toMatch(new RegExp(`:refs/heads/${branch}$`));
+      if (!opened) for (const spy of spies) expect(spy).not.toHaveBeenCalled();
+      else expect(spies[2]).toHaveBeenCalledOnce();
+      expect((await journal.read(key)).some((record) => record.step === "pr")).toBe(opened);
+    },
+  );
+
+  it.each(["none", "ask"] as const)(
+    "replays pending %s delivery without pushing or touching the code host",
+    async (method) => {
+      input.submit = { method, host: "github" };
+      for (const port of [
+        "remoteBranchSha",
+        "findPr",
+        "createPr",
+        "prState",
+        "retargetPr",
+        "closePr",
+      ] as const)
+        vi.spyOn(host, port).mockRejectedValue(new Error("Code host must stay unused"));
+      const gitRun = vi.spyOn(git, "run");
+      publish.mockResolvedValueOnce({
+        status: "failed",
+        eventId: fakeEventId(999),
+        reason: "outage",
+      });
+      expect(await run()).toMatchObject({ status: "pending" });
+      expect(await run()).toMatchObject({ status: "delivered" });
+      expect(gitRun.mock.calls.some(([argv]) => argv.includes("push"))).toBe(false);
+      expect(adapter.invocations).toHaveLength(1);
+      expect(
+        (await journal.read(key)).filter((record) => record.step === "publish_pending"),
+      ).toHaveLength(1);
+    },
+  );
+
+  it.each(["pr", "mr"] as const)(
+    "uses a Git-only host as push for requested %s",
+    async (method) => {
+      input.submit = { method, host: "git" };
+      const create = vi.spyOn(host, "createPr");
+      expect(await run()).toMatchObject({ status: "delivered" });
+      expect(create).not.toHaveBeenCalled();
+      expect(log.events.at(-1)).toMatchObject({
+        payload: { submit: { method: "push", state: "pushed" } },
+      });
+      expect((await journal.read(key)).find((record) => record.step === "submit")).toMatchObject({
+        reason: "git_only_host_forces_push",
+      });
+    },
+  );
+
+  it("rejects malformed Git ref observations before push-only submission", async () => {
+    input.submit = { method: "push", host: "git" };
+    const original = git.run.bind(git);
+    const gitRun = vi.spyOn(git, "run").mockImplementation(async (argv, options) => {
+      if (argv.includes("ls-remote"))
+        return { code: 0, stdout: `invalid\trefs/heads/${branch}\n`, stderr: "" };
+      return original(argv, options);
+    });
+    await expect(run()).rejects.toThrow("invalid epoch branch SHA");
+    expect(gitRun.mock.calls.some(([argv]) => argv.includes("push"))).toBe(false);
+    expect(publish).not.toHaveBeenCalled();
+  });
+
+  it.each(["push", "pr", "none", "ask"] as const)(
+    "fences %s before its first visible operation",
+    async (method) => {
+      input.submit = { method, host: "github" };
+      deps.reverify = vi.fn(async () => "stale" as const);
+      const gitRun = vi.spyOn(git, "run");
+      const create = vi.spyOn(host, "createPr");
+      expect(await run()).toEqual({ status: "stale" });
+      expect(gitRun.mock.calls.some(([argv]) => argv.includes("push"))).toBe(false);
+      expect(create).not.toHaveBeenCalled();
+      expect(publish).not.toHaveBeenCalled();
+    },
+  );
+
   it("journals the ordered happy path, signs as the daemon and publishes code first", async () => {
     expect(await run()).toMatchObject({ status: "delivered" });
     const records = await journal.read(key);
@@ -421,8 +529,9 @@ describe("journaled attempt pipeline", () => {
       "committed",
       "checks",
       "secret_scan_ok",
-      "pushed",
+      "submit",
       "reverified",
+      "pushed",
       "pr",
       "publish_pending",
       "delivered_published",
@@ -433,7 +542,7 @@ describe("journaled attempt pipeline", () => {
     }
     expect(
       records.filter((entry) => entry.step === "reverified").map((entry) => entry.before),
-    ).toEqual(["pr", "work.delivered"]);
+    ).toEqual(["push", "pr", "work.delivered"]);
     const head = await host.remoteBranchSha("app", branch);
     expect((await git.run(["cat-file", "-p", required(head)], { cwd: remote })).stdout).toContain(
       "gpgsig -----BEGIN SSH SIGNATURE-----",
@@ -683,6 +792,7 @@ describe("journaled attempt pipeline", () => {
     async (stage) => {
       deps.reverify = vi
         .fn()
+        .mockResolvedValueOnce("ok")
         .mockResolvedValueOnce(stage === "before PR" ? "stale" : "ok")
         .mockResolvedValue("stale");
       expect(await run()).toEqual({ status: "stale" });
@@ -805,6 +915,46 @@ describe("journaled attempt pipeline", () => {
     expect(await run()).toMatchObject({ status: "failed", class: "crash" });
     expect(adapter.invocations).toHaveLength(0);
   });
+
+  it.each(["none", "ask"] as const)(
+    "checkpoints interrupted %s work locally without code-host access",
+    async (method) => {
+      input.submit = { method, host: "github" };
+      deps.adapter = {
+        cli: "codex",
+        probe: adapter.probe.bind(adapter),
+        invoke: async (inv) => {
+          await writeFile(join(inv.cwd, "result.txt"), "partial\n");
+          return {
+            outcome: "interrupted",
+            exitCode: 130,
+            finalMessage: null,
+            usage: null,
+            durationMs: 1,
+            pid: null,
+          };
+        },
+      };
+      for (const port of [
+        "remoteBranchSha",
+        "findPr",
+        "createPr",
+        "prState",
+        "retargetPr",
+        "closePr",
+      ] as const)
+        vi.spyOn(host, port).mockRejectedValue(
+          new Error("Local checkpoint must not use the code host"),
+        );
+      const gitRun = vi.spyOn(git, "run");
+      expect(await run()).toMatchObject({
+        status: "checkpointed",
+        snapshot: { pushed: false, head_sha: expect.any(String) },
+      });
+      expect(gitRun.mock.calls.some(([argv]) => argv.includes("push"))).toBe(false);
+      expect(log.events.at(-1)?.type).toBe("checkpoint.recorded");
+    },
+  );
 
   it("checkpoints interrupted edits with a signed WIP commit pushed before the event", async () => {
     deps.adapter = {

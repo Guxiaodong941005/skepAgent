@@ -48,6 +48,7 @@ export function authorize(principal: Principal, event: SkepEvent, state: State):
     case "work.failed":
       return !human;
     case "item.merged":
+    case "work.submitted":
       return true;
   }
 }
