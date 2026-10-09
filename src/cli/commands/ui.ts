@@ -23,6 +23,7 @@ import {
   type TuiEntry,
   TuiJoinView,
   type TuiSnapshot,
+  detectGlyphs,
 } from "../tui.js";
 import {
   ControlConnectionError,
@@ -76,7 +77,7 @@ export function joinViewFactory(ctx: CliContext): JoinViewFactory {
     const deviceToml = ctx.paths?.deviceToml;
     return new TuiJoinView({
       io: { stdin: io.stdin, stdout: io.stdout },
-      glyphs: ctx.env.SKEP_TUI_ASCII === "1" ? "ascii" : "unicode",
+      glyphs: detectGlyphs(ctx.env),
       host:
         deviceToml === undefined
           ? "github"
@@ -119,7 +120,7 @@ async function uiCommand(ctx: UiCliContext): Promise<void> {
   const tui = new Tui({
     io,
     clock,
-    glyphs: ctx.env.SKEP_TUI_ASCII === "1" ? "ascii" : "unicode",
+    glyphs: detectGlyphs(ctx.env),
     ...(ctx.uiHooks === undefined ? {} : { hooks: ctx.uiHooks }),
     onQuit: () => stop.abort(),
   });

@@ -5,6 +5,7 @@ import type { Clock } from "../util/clock.js";
 import type { JoinAgentState, JoinViewModel } from "./commands/session.js";
 import {
   beeLane,
+  detectGlyphs,
   charWidth,
   decodeKeys,
   type Glyphs,
@@ -149,21 +150,38 @@ function tickClock() {
   return { clock, sleep, tick: () => wake(), signal: () => signal };
 }
 
+describe("detectGlyphs", () => {
+  it("honors SKEP_TUI_ASCII and SKEP_TUI_GLYPHS", () => {
+    expect(detectGlyphs({ SKEP_TUI_ASCII: "1" }, () => true)).toBe("ascii");
+    expect(detectGlyphs({ SKEP_TUI_GLYPHS: "ascii" }, () => true)).toBe("ascii");
+    expect(detectGlyphs({ SKEP_TUI_GLYPHS: "nerd" }, () => false)).toBe("nerd");
+    expect(detectGlyphs({ SKEP_TUI_GLYPHS: "unicode" }, () => false)).toBe("nerd");
+  });
+
+  it("falls back to ascii when no Nerd Font covers nf-md-bee", () => {
+    expect(detectGlyphs({}, () => false)).toBe("ascii");
+    expect(detectGlyphs({}, () => true)).toBe("nerd");
+  });
+});
+
 describe("peer progress glyphs", () => {
-  it.each(["unicode", "ascii"] as const)(
+  it.each(["nerd", "ascii"] as const)(
     "renders every phase and beat with %s glyphs",
     (glyphs) => {
+      const bee = "\u{F0FA1}";
+      const beeFlower = "\u{F0FA2}";
+      const hive = "\u{F10CE}";
       const expected =
-        glyphs === "unicode"
+        glyphs === "nerd"
           ? {
-              working: [">*  ", " >* ", "  >*", " >* "],
-              blocked: ["*!  ", "*!  ", "*   ", "*   "],
-              done: ["[x] ", "[x] ", "[x] ", "[x] "],
+              working: [`${bee}  `, ` ${beeFlower} `, `  ${bee}`, ` ${beeFlower} `],
+              blocked: [`${bee}! `, `${bee}! `, `${bee}  `, `${bee}  `],
+              done: [`${hive}  `, `${hive}  `, `${hive}  `, `${hive}  `],
               idle: [".   ", ".   ", ".   ", ".   "],
             }
           : {
-              working: ["~b  ", " ~b ", "  ~b", " ~b "],
-              blocked: ["b!  ", "b!  ", "b   ", "b   "],
+              working: ["~b> ", " ~b>", " >~b", " ~b>"],
+              blocked: ["b!> ", "b!> ", "b>  ", "b>  "],
               done: ["ok  ", "ok  ", "ok  ", "ok  "],
               idle: [".   ", ".   ", ".   ", ".   "],
             };
@@ -186,17 +204,20 @@ describe("peer progress glyphs", () => {
     [99, "███████░", "#######."],
     [100, "████████", "########"],
   ] as const)("renders an eight-cell bar at %s%%", (percent, unicode, ascii) => {
-    expect(progressBar(percent, "unicode")).toBe(unicode);
+    expect(progressBar(percent, "nerd")).toBe(unicode);
     expect(progressBar(percent, "ascii")).toBe(ascii);
   });
 
-  it("counts the specified emoji range as two display columns", () => {
+  it("counts emoji and Nerd Font MD PUA as two display columns", () => {
     expect(charWidth(0x1f300)).toBe(2);
     expect(charWidth(0x1f41d)).toBe(2);
     expect(charWidth(0x1faff)).toBe(2);
     expect(charWidth(0x1f2ff)).toBe(1);
     expect(charWidth(0x1fb00)).toBe(1);
     expect(charWidth(0x61)).toBe(1);
+    expect(charWidth(0xf0fa1)).toBe(2);
+    expect(charWidth(0xf10ce)).toBe(2);
+    expect(charWidth(0xf0000)).toBe(2);
   });
 });
 
@@ -314,10 +335,10 @@ describe("truncate", () => {
 
 describe("peer progress strips", () => {
   it.each([
-    ["working", ">*", "working"],
-    ["blocked", "*!", "blocked"],
+    ["working", "\u{F0FA1}", "working"],
+    ["blocked", "!", "blocked"],
     ["idle", ".", "idle"],
-    ["done", "[x]", "done"],
+    ["done", "\u{F10CE}", "done"],
   ] as const)("draws a remote %s peer without an entry", (phase, glyph, label) => {
     const term = fakeTerminal();
     const view = open(term, { animate: false });
@@ -347,7 +368,7 @@ describe("peer progress strips", () => {
         progress: { ...progress, phase: "done", done: 8, failed: 1, percent: 100, summary: "" },
       };
       view.update(snapshot);
-      expect(term.frame()[2]).toContain("[x] ");
+      expect(term.frame()[2]).toContain("\u{F10CE}");
       expect(term.frame()[2]).toContain("[████████] 100%  8/8  done (1 failed)");
       expect(term.frame()[3]).toBe("> laptop  coding  I-1 e1  codex/pty  running");
     } finally {
@@ -355,7 +376,7 @@ describe("peer progress strips", () => {
     }
   });
 
-  it.each(["unicode", "ascii"] as Glyphs[])(
+  it.each(["nerd", "ascii"] as Glyphs[])(
     "uses model.beat for %s frames and strips summary controls",
     (glyphs) => {
       const term = fakeTerminal();
@@ -367,9 +388,9 @@ describe("peer progress strips", () => {
         progress.summary = "safe\n\r\ttext";
         view.tui.model.beat = 2;
         view.update(snapshot);
-        expect(term.frame()[3]).toContain(`backend    ${glyphs === "unicode" ? ">*" : "~b"}  [`);
+        expect(term.frame()[3]).toMatch(glyphs === "nerd" ? /backend\s+.*[\u{F0FA1}\u{F0FA2}]/u : /backend\s+.*~b/);
         expect(term.frame()[3]).toContain("safe text");
-        expect(term.frame()[3]).toContain(glyphs === "unicode" ? "███░░░░░" : "###.....");
+        expect(term.frame()[3]).toContain(glyphs === "nerd" ? "███░░░░░" : "###.....");
       } finally {
         view.close();
       }

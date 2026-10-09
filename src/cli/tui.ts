@@ -9,6 +9,7 @@
  * in the agent's own view, which `a` opens (PTY: this terminal; herdr: its pane).
  */
 
+import { execFileSync } from "node:child_process";
 import { type Clock, systemClock } from "../util/clock.js";
 import type { JoinView, JoinViewModel, PeerPhase } from "./commands/session.js";
 
@@ -27,42 +28,80 @@ export const MIN_ROWS = 24;
 /** At most this many list rows; the rest of the screen belongs to the tail. */
 const MAX_LIST_ROWS = 6;
 
-export type Glyphs = "unicode" | "ascii";
+export type Glyphs = "nerd" | "ascii";
 export const TICK_MS = 250;
 
+/** nf-md-bee (Nerd Fonts Material Design). */
+export const NF_MD_BEE = "\u{F0FA1}";
+/** nf-md-bee-flower — alternate pose for flight. */
+export const NF_MD_BEE_FLOWER = "\u{F0FA2}";
+/** nf-md-beehive-outline — done marker. */
+export const NF_MD_BEEHIVE = "\u{F10CE}";
+
+/**
+ * Prefer Nerd Font bee icons when available; otherwise ASCII. Forced by
+ * `SKEP_TUI_GLYPHS=nerd|ascii` or legacy `SKEP_TUI_ASCII=1`.
+ */
+export function detectGlyphs(
+  env: NodeJS.ProcessEnv = process.env,
+  hasNerdBee: () => boolean = nerdBeeFontInstalled,
+): Glyphs {
+  const forced = env.SKEP_TUI_GLYPHS?.toLowerCase();
+  if (forced === "ascii" || env.SKEP_TUI_ASCII === "1") return "ascii";
+  if (forced === "nerd" || forced === "unicode") return "nerd";
+  return hasNerdBee() ? "nerd" : "ascii";
+}
+
+/** True when fontconfig can resolve a face covering nf-md-bee (U+F0FA1). */
+export function nerdBeeFontInstalled(): boolean {
+  try {
+    const out = execFileSync("fc-list", [":charset=0xf0fa1"], {
+      encoding: "utf8",
+      timeout: 800,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return out.trim().length > 0;
+  } catch {
+    return false;
+  }
+}
+
 export function beeLane(phase: PeerPhase, beat: number, glyphs: Glyphs): string {
-  // Portable BMP glyphs only — no emoji (many fonts render 🐝 as tofu).
-  // unicode: ">*" bee dart; ascii: "~b". Both are 4 display columns.
+  if (glyphs === "nerd") {
+    const bee = NF_MD_BEE;
+    const beeAlt = beat % 2 === 0 ? NF_MD_BEE : NF_MD_BEE_FLOWER;
+    if (phase === "working") {
+      // Ping-pong flight; beeAlt flips nf-md-bee / nf-md-bee-flower each beat (wing flap).
+      const frames = [`${beeAlt}  `, ` ${beeAlt} `, `  ${beeAlt}`, ` ${beeAlt} `] as const;
+      return frames[beat % 4] ?? frames[0];
+    }
+    if (phase === "blocked") return beat % 4 < 2 ? `${bee}! ` : `${bee}  `;
+    if (phase === "done") return `${NF_MD_BEEHIVE}  `;
+    return ".   ";
+  }
+  // Colored-ASCII fallback (no ANSI — printable() strips controls): dart + letters.
   if (phase === "working") {
-    const frames =
-      glyphs === "ascii"
-        ? (["~b  ", " ~b ", "  ~b", " ~b "] as const)
-        : ([">*  ", " >* ", "  >*", " >* "] as const);
+    const frames = ["~b> ", " ~b>", " >~b", " ~b>"] as const;
     return frames[beat % 4] ?? frames[0];
   }
-  if (phase === "blocked") {
-    return glyphs === "ascii"
-      ? beat % 4 < 2
-        ? "b!  "
-        : "b   "
-      : beat % 4 < 2
-        ? "*!  "
-        : "*   ";
-  }
-  if (phase === "done") return glyphs === "ascii" ? "ok  " : "[x] ";
+  if (phase === "blocked") return beat % 4 < 2 ? "b!> " : "b>  ";
+  if (phase === "done") return "ok  ";
   return ".   ";
 }
 
 export function progressBar(percent: number, glyphs: Glyphs): string {
   const bounded = Math.max(0, Math.min(100, percent));
   const filled = bounded === 100 ? 8 : Math.min(7, Math.round(bounded / 12.5));
-  const full = glyphs === "unicode" ? "█" : "#";
-  const empty = glyphs === "unicode" ? "░" : ".";
+  const full = glyphs === "nerd" ? "█" : "#";
+  const empty = glyphs === "nerd" ? "░" : ".";
   return full.repeat(filled) + empty.repeat(8 - filled);
 }
 
 export function charWidth(cp: number): number {
-  return cp >= 0x1f300 && cp <= 0x1faff ? 2 : 1;
+  // Emoji + Nerd Fonts Material Design PUA (often double-width in terminals).
+  if (cp >= 0x1f300 && cp <= 0x1faff) return 2;
+  if (cp >= 0xf0000 && cp <= 0xf1af0) return 2;
+  return 1;
 }
 
 function displayWidth(text: string): number {
@@ -360,7 +399,7 @@ export class TuiModel {
   host: CodeHostKind = "github";
   message = "";
   beat = 0;
-  glyphs: Glyphs = "unicode";
+  glyphs: Glyphs = "nerd";
 
   animating(): boolean {
     return this.snapshot.peers.some(
@@ -546,7 +585,7 @@ export class Tui {
   readonly hostReady: Promise<void>;
 
   constructor(private readonly opts: TuiOptions) {
-    this.model.glyphs = opts.glyphs ?? "unicode";
+    this.model.glyphs = opts.glyphs ?? "nerd";
     this.screen = new Screen(
       opts.io,
       {
