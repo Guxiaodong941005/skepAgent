@@ -38,10 +38,10 @@ import {
   type PeerProgress,
   type PlanItem,
   type SubHandle,
-  type SubOptions,
   type SubmitMethod,
   type SubmitOutcome,
   SubmitOutcomeSchema,
+  type SubOptions,
   type SubResult,
   startMaster,
 } from "../../session/index.js";

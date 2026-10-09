@@ -1,0 +1,109 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`TuiModel colors > matches the golden ascii frame with none color 1`] = `
+" ⎋[1mskep⎋[0m   ⎋[2msession ⎋[0ms-1⎋[2m | ⎋[0m⎋[2mdevice ⎋[0mlaptop⎋[2m | ⎋[0m⎋[2mrole ⎋[0mcoding                        ⎋[2mv0.1.5⎋[0m
+⎋[2m-- ⎋[0m⎋[1;2mPEERS⎋[0m⎋[2m -------------------------------------⎋[0m⎋[2m 3 peers | 1 working | 1 blocked ⎋[0m⎋[2m-⎋[0m
+  laptop  ⎋[2mcoding    ⎋[0m⎋[1m~b> ⎋[0m  ⎋[2m[⎋[0m⎋[1m####⎋[0m⎋[2m....⎋[0m⎋[2m]⎋[0m ⎋[1m 50%⎋[0m⎋[2m  4/8⎋[0m  ⎋[1mworking⎋[0m  add a health check
+⎋[7m> laptop  coding    I-3 e1  claude/pty  running                                 ⎋[0m
+  laptop  ⎋[2mcoding    ⎋[0mI-4 e2  codex/herdr  ⎋[1mblocked⎋[0m
+  vps     ⎋[2mbackend   ⎋[0m⎋[1mb!> ⎋[0m  ⎋[2m[⎋[0m⎋[1m######⎋[0m⎋[2m..⎋[0m⎋[2m]⎋[0m ⎋[1m 75%⎋[0m⎋[2m  6/8⎋[0m  ⎋[1mblocked⎋[0m  migrate users
+  mac     ⎋[2mfrontend  ⎋[0mok    ⎋[2m[⎋[0m⎋[1m########⎋[0m⎋[2m]⎋[0m ⎋[1m100%⎋[0m⎋[2m  8/8⎋[0m  done⎋[1m (1 failed)⎋[0m
+⎋[2m-- ⎋[0m⎋[1;2mITEM⎋[0m⎋[2m --------------------------------------------------------⎋[0m⎋[2m I-3 | epoch 1 ⎋[0m⎋[2m-⎋[0m
+⎋[2m  Item    ⎋[0mI-3 (web)  add a health check
+⎋[2m  Agent   ⎋[0mclaude⎋[2m | ⎋[0m⎋[2mview ⎋[0mpty⎋[2m | ⎋[0m⎋[1mrunning⎋[0m
+⎋[2m  Submit  ⎋[0m⎋[1mp pr / u push / n none / s skip?⎋[0m
+⎋[2m-- ⎋[0m⎋[1;2mOUTPUT⎋[0m⎋[2m ------------------------------------------------------⎋[0m⎋[2m last 11 of 30 ⎋[0m⎋[2m-⎋[0m
+    tail line 20
+    tail line 21
+    tail line 22
+    tail line 23
+    tail line 24
+    tail line 25
+    tail line 26
+    tail line 27
+    tail line 28
+    tail line 29
+    tail line 30
+ ⎋[1m↑↓⎋[0m⎋[2m select⎋[0m⎋[2m | ⎋[0m⎋[1mp⎋[0m⎋[2m pr⎋[0m⎋[2m | ⎋[0m⎋[1mu⎋[0m⎋[2m push⎋[0m⎋[2m | ⎋[0m⎋[1mn⎋[0m⎋[2m none⎋[0m⎋[2m | ⎋[0m⎋[1ms⎋[0m⎋[2m skip⎋[0m⎋[2m | ⎋[0m⎋[1mq⎋[0m⎋[2m quit⎋[0m                       ⎋[2m1/2⎋[0m "
+`;
+
+exports[`TuiModel colors > matches the golden ascii frame with truecolor color 1`] = `
+" ⎋[38;2;255;196;48;1mskep⎋[0m   ⎋[38;2;168;173;179msession ⎋[0ms-1⎋[38;2;128;134;139m | ⎋[0m⎋[38;2;168;173;179mdevice ⎋[0mlaptop⎋[38;2;128;134;139m | ⎋[0m⎋[38;2;168;173;179mrole ⎋[0mcoding                        ⎋[38;2;128;134;139mv0.1.5⎋[0m
+⎋[38;2;128;134;139m-- ⎋[0m⎋[38;2;168;173;179;1mPEERS⎋[0m⎋[38;2;128;134;139m -------------------------------------⎋[0m⎋[38;2;168;173;179m 3 peers | 1 working | 1 blocked ⎋[0m⎋[38;2;128;134;139m-⎋[0m
+  laptop  ⎋[38;2;168;173;179mcoding    ⎋[0m⎋[38;2;255;196;48m~b> ⎋[0m  ⎋[38;2;128;134;139m[⎋[0m⎋[38;2;255;196;48m####⎋[0m⎋[38;2;128;134;139m....⎋[0m⎋[38;2;128;134;139m]⎋[0m ⎋[1m 50%⎋[0m⎋[38;2;168;173;179m  4/8⎋[0m  ⎋[38;2;255;196;48mworking⎋[0m  add a health check
+⎋[7m> laptop  coding    I-3 e1  claude/pty  running                                 ⎋[0m
+  laptop  ⎋[38;2;168;173;179mcoding    ⎋[0mI-4 e2  ⎋[38;2;215;166;232mcodex/herdr⎋[0m  ⎋[38;2;255;158;87mblocked⎋[0m
+  vps     ⎋[38;2;168;173;179mbackend   ⎋[0m⎋[38;2;255;158;87mb!> ⎋[0m  ⎋[38;2;128;134;139m[⎋[0m⎋[38;2;255;196;48m######⎋[0m⎋[38;2;128;134;139m..⎋[0m⎋[38;2;128;134;139m]⎋[0m ⎋[1m 75%⎋[0m⎋[38;2;168;173;179m  6/8⎋[0m  ⎋[38;2;255;158;87mblocked⎋[0m  migrate users
+  mac     ⎋[38;2;168;173;179mfrontend  ⎋[0m⎋[38;2;139;212;158mok  ⎋[0m  ⎋[38;2;128;134;139m[⎋[0m⎋[38;2;255;138;128m########⎋[0m⎋[38;2;128;134;139m]⎋[0m ⎋[1m100%⎋[0m⎋[38;2;168;173;179m  8/8⎋[0m  ⎋[38;2;139;212;158mdone⎋[0m⎋[38;2;255;138;128m (1 failed)⎋[0m
+⎋[38;2;128;134;139m-- ⎋[0m⎋[38;2;168;173;179;1mITEM⎋[0m⎋[38;2;128;134;139m --------------------------------------------------------⎋[0m⎋[38;2;168;173;179m I-3 | epoch 1 ⎋[0m⎋[38;2;128;134;139m-⎋[0m
+⎋[38;2;168;173;179m  Item    ⎋[0mI-3 (web)  add a health check
+⎋[38;2;168;173;179m  Agent   ⎋[0m⎋[38;2;215;166;232mclaude⎋[0m⎋[38;2;128;134;139m | ⎋[0m⎋[38;2;168;173;179mview ⎋[0mpty⎋[38;2;128;134;139m | ⎋[0m⎋[38;2;255;196;48mrunning⎋[0m
+⎋[38;2;168;173;179m  Submit  ⎋[0m⎋[38;2;255;158;87mp pr / u push / n none / s skip?⎋[0m
+⎋[38;2;128;134;139m-- ⎋[0m⎋[38;2;168;173;179;1mOUTPUT⎋[0m⎋[38;2;128;134;139m ------------------------------------------------------⎋[0m⎋[38;2;168;173;179m last 11 of 30 ⎋[0m⎋[38;2;128;134;139m-⎋[0m
+    tail line 20
+    tail line 21
+    tail line 22
+    tail line 23
+    tail line 24
+    tail line 25
+    tail line 26
+    tail line 27
+    tail line 28
+    tail line 29
+    tail line 30
+ ⎋[38;2;255;196;48;1m↑↓⎋[0m⎋[38;2;168;173;179m select⎋[0m⎋[38;2;128;134;139m | ⎋[0m⎋[38;2;255;158;87;1mp⎋[0m⎋[38;2;168;173;179m pr⎋[0m⎋[38;2;128;134;139m | ⎋[0m⎋[38;2;255;158;87;1mu⎋[0m⎋[38;2;168;173;179m push⎋[0m⎋[38;2;128;134;139m | ⎋[0m⎋[38;2;255;158;87;1mn⎋[0m⎋[38;2;168;173;179m none⎋[0m⎋[38;2;128;134;139m | ⎋[0m⎋[38;2;255;158;87;1ms⎋[0m⎋[38;2;168;173;179m skip⎋[0m⎋[38;2;128;134;139m | ⎋[0m⎋[38;2;255;196;48;1mq⎋[0m⎋[38;2;168;173;179m quit⎋[0m                       ⎋[38;2;168;173;179m1/2⎋[0m "
+`;
+
+exports[`TuiModel colors > matches the golden nerd frame with none color 1`] = `
+" ⎋[1m󱃎 ⎋[0m⎋[1mskep⎋[0m   ⎋[2msession ⎋[0ms-1⎋[2m · ⎋[0m⎋[2mdevice ⎋[0mlaptop⎋[2m · ⎋[0m⎋[2mrole ⎋[0mcoding                     ⎋[2mv0.1.5⎋[0m
+⎋[2m── ⎋[0m⎋[1;2mPEERS⎋[0m⎋[2m ─────────────────────────────────────⎋[0m⎋[2m 3 peers · 1 working · 1 blocked ⎋[0m⎋[2m─⎋[0m
+  laptop  ⎋[2mcoding    ⎋[0m⎋[1m󰾡  ⎋[0m  ⎋[2m[⎋[0m⎋[1m████⎋[0m⎋[2m░░░░⎋[0m⎋[2m]⎋[0m ⎋[1m 50%⎋[0m⎋[2m  4/8⎋[0m  ⎋[1mworking⎋[0m  add a health check
+⎋[7m> laptop  coding    I-3 e1  claude/pty  running                                 ⎋[0m
+  laptop  ⎋[2mcoding    ⎋[0mI-4 e2  codex/herdr  ⎋[1mblocked⎋[0m
+  vps     ⎋[2mbackend   ⎋[0m⎋[1m󰾡! ⎋[0m  ⎋[2m[⎋[0m⎋[1m██████⎋[0m⎋[2m░░⎋[0m⎋[2m]⎋[0m ⎋[1m 75%⎋[0m⎋[2m  6/8⎋[0m  ⎋[1mblocked⎋[0m  migrate users
+  mac     ⎋[2mfrontend  ⎋[0m󱃎    ⎋[2m[⎋[0m⎋[1m████████⎋[0m⎋[2m]⎋[0m ⎋[1m100%⎋[0m⎋[2m  8/8⎋[0m  done⎋[1m (1 failed)⎋[0m
+⎋[2m── ⎋[0m⎋[1;2mITEM⎋[0m⎋[2m ────────────────────────────────────────────────────────⎋[0m⎋[2m I-3 · epoch 1 ⎋[0m⎋[2m─⎋[0m
+⎋[2m  Item    ⎋[0mI-3 (web)  add a health check
+⎋[2m  Agent   ⎋[0mclaude⎋[2m · ⎋[0m⎋[2mview ⎋[0mpty⎋[2m · ⎋[0m⎋[1mrunning⎋[0m
+⎋[2m  Submit  ⎋[0m⎋[1mp pr / u push / n none / s skip?⎋[0m
+⎋[2m── ⎋[0m⎋[1;2mOUTPUT⎋[0m⎋[2m ──────────────────────────────────────────────────────⎋[0m⎋[2m last 11 of 30 ⎋[0m⎋[2m─⎋[0m
+    tail line 20
+    tail line 21
+    tail line 22
+    tail line 23
+    tail line 24
+    tail line 25
+    tail line 26
+    tail line 27
+    tail line 28
+    tail line 29
+    tail line 30
+ ⎋[1m↑↓⎋[0m⎋[2m select⎋[0m⎋[2m · ⎋[0m⎋[1mp⎋[0m⎋[2m pr⎋[0m⎋[2m · ⎋[0m⎋[1mu⎋[0m⎋[2m push⎋[0m⎋[2m · ⎋[0m⎋[1mn⎋[0m⎋[2m none⎋[0m⎋[2m · ⎋[0m⎋[1ms⎋[0m⎋[2m skip⎋[0m⎋[2m · ⎋[0m⎋[1mq⎋[0m⎋[2m quit⎋[0m                       ⎋[2m1/2⎋[0m "
+`;
+
+exports[`TuiModel colors > matches the golden nerd frame with truecolor color 1`] = `
+" ⎋[38;2;255;196;48m󱃎 ⎋[0m⎋[38;2;255;196;48;1mskep⎋[0m   ⎋[38;2;168;173;179msession ⎋[0ms-1⎋[38;2;128;134;139m · ⎋[0m⎋[38;2;168;173;179mdevice ⎋[0mlaptop⎋[38;2;128;134;139m · ⎋[0m⎋[38;2;168;173;179mrole ⎋[0mcoding                     ⎋[38;2;128;134;139mv0.1.5⎋[0m
+⎋[38;2;128;134;139m── ⎋[0m⎋[38;2;168;173;179;1mPEERS⎋[0m⎋[38;2;128;134;139m ─────────────────────────────────────⎋[0m⎋[38;2;168;173;179m 3 peers · 1 working · 1 blocked ⎋[0m⎋[38;2;128;134;139m─⎋[0m
+  laptop  ⎋[38;2;168;173;179mcoding    ⎋[0m⎋[38;2;255;196;48m󰾡  ⎋[0m  ⎋[38;2;128;134;139m[⎋[0m⎋[38;2;255;196;48m████⎋[0m⎋[38;2;128;134;139m░░░░⎋[0m⎋[38;2;128;134;139m]⎋[0m ⎋[1m 50%⎋[0m⎋[38;2;168;173;179m  4/8⎋[0m  ⎋[38;2;255;196;48mworking⎋[0m  add a health check
+⎋[7m> laptop  coding    I-3 e1  claude/pty  running                                 ⎋[0m
+  laptop  ⎋[38;2;168;173;179mcoding    ⎋[0mI-4 e2  ⎋[38;2;215;166;232mcodex/herdr⎋[0m  ⎋[38;2;255;158;87mblocked⎋[0m
+  vps     ⎋[38;2;168;173;179mbackend   ⎋[0m⎋[38;2;255;158;87m󰾡! ⎋[0m  ⎋[38;2;128;134;139m[⎋[0m⎋[38;2;255;196;48m██████⎋[0m⎋[38;2;128;134;139m░░⎋[0m⎋[38;2;128;134;139m]⎋[0m ⎋[1m 75%⎋[0m⎋[38;2;168;173;179m  6/8⎋[0m  ⎋[38;2;255;158;87mblocked⎋[0m  migrate users
+  mac     ⎋[38;2;168;173;179mfrontend  ⎋[0m⎋[38;2;139;212;158m󱃎  ⎋[0m  ⎋[38;2;128;134;139m[⎋[0m⎋[38;2;255;138;128m████████⎋[0m⎋[38;2;128;134;139m]⎋[0m ⎋[1m100%⎋[0m⎋[38;2;168;173;179m  8/8⎋[0m  ⎋[38;2;139;212;158mdone⎋[0m⎋[38;2;255;138;128m (1 failed)⎋[0m
+⎋[38;2;128;134;139m── ⎋[0m⎋[38;2;168;173;179;1mITEM⎋[0m⎋[38;2;128;134;139m ────────────────────────────────────────────────────────⎋[0m⎋[38;2;168;173;179m I-3 · epoch 1 ⎋[0m⎋[38;2;128;134;139m─⎋[0m
+⎋[38;2;168;173;179m  Item    ⎋[0mI-3 (web)  add a health check
+⎋[38;2;168;173;179m  Agent   ⎋[0m⎋[38;2;215;166;232mclaude⎋[0m⎋[38;2;128;134;139m · ⎋[0m⎋[38;2;168;173;179mview ⎋[0mpty⎋[38;2;128;134;139m · ⎋[0m⎋[38;2;255;196;48mrunning⎋[0m
+⎋[38;2;168;173;179m  Submit  ⎋[0m⎋[38;2;255;158;87mp pr / u push / n none / s skip?⎋[0m
+⎋[38;2;128;134;139m── ⎋[0m⎋[38;2;168;173;179;1mOUTPUT⎋[0m⎋[38;2;128;134;139m ──────────────────────────────────────────────────────⎋[0m⎋[38;2;168;173;179m last 11 of 30 ⎋[0m⎋[38;2;128;134;139m─⎋[0m
+    tail line 20
+    tail line 21
+    tail line 22
+    tail line 23
+    tail line 24
+    tail line 25
+    tail line 26
+    tail line 27
+    tail line 28
+    tail line 29
+    tail line 30
+ ⎋[38;2;255;196;48;1m↑↓⎋[0m⎋[38;2;168;173;179m select⎋[0m⎋[38;2;128;134;139m · ⎋[0m⎋[38;2;255;158;87;1mp⎋[0m⎋[38;2;168;173;179m pr⎋[0m⎋[38;2;128;134;139m · ⎋[0m⎋[38;2;255;158;87;1mu⎋[0m⎋[38;2;168;173;179m push⎋[0m⎋[38;2;128;134;139m · ⎋[0m⎋[38;2;255;158;87;1mn⎋[0m⎋[38;2;168;173;179m none⎋[0m⎋[38;2;128;134;139m · ⎋[0m⎋[38;2;255;158;87;1ms⎋[0m⎋[38;2;168;173;179m skip⎋[0m⎋[38;2;128;134;139m · ⎋[0m⎋[38;2;255;196;48;1mq⎋[0m⎋[38;2;168;173;179m quit⎋[0m                       ⎋[38;2;168;173;179m1/2⎋[0m "
+`;

@@ -174,7 +174,8 @@ function context(extra: Partial<UiCliContext> = {}) {
         stderr += s;
       },
     },
-    env: { SKEP_HOME: home },
+    // ASCII glyphs keep frames independent of the fonts installed on the test machine.
+    env: { SKEP_HOME: home, SKEP_TUI_GLYPHS: "ascii" },
     output(): never {
       throw new Error("output() called before runCli bound it");
     },
@@ -208,11 +209,11 @@ describe("skep ui on a master", () => {
     });
     const run = runCli(["ui"], c.ctx);
     await until(() => time.sleeping() === 2);
-    expect(term.frame()[2]).toContain("~b  ");
+    expect(term.frame()[2]).toContain("~b> ");
     expect(term.frame()[2]).toContain("[###.....]  37%  3/8  working");
     time.tick();
     await until(() => time.sleeping() === 2);
-    expect(term.frame()[2]).toContain(" ~b ");
+    expect(term.frame()[2]).toContain(" ~b>");
     term.stdin.write("q");
     await expect(run).resolves.toBe(0);
     expect(term.output().endsWith(LEAVE_ALT)).toBe(true);
@@ -232,13 +233,13 @@ describe("skep ui on a master", () => {
     const run = runCli(["ui"], c.ctx);
     await until(() => time.sleeping() === 1);
     let frame = term.frame();
-    expect(frame[0]).toBe(" skep  session s-1  device hub  role master");
-    expect(frame.slice(1, 4)).toEqual([
-      "Peers",
+    expect(frame[0]).toMatch(/^ skep {3}session s-1 \| device hub \| role master +v\d+\.\d+\.\d+$/);
+    expect(frame[1]).toMatch(/^-- PEERS -+ 2 peers -$/);
+    expect(frame.slice(2, 4)).toEqual([
       "> laptop  coding  I-1 e1  claimed",
-      "  desk  -  joined",
+      "  desk    -       joined",
     ]);
-    expect(frame).toContain("Agent  runs on its device; item claimed");
+    expect(frame).toContain("  Agent   runs on its device | item claimed");
     // Nothing to attach to or submit on the master.
     expect(frame[23]).toBe(" q quit");
 
@@ -246,14 +247,60 @@ describe("skep ui on a master", () => {
     await until(() => uiStatus.mock.calls.length === 2 && time.sleeping() === 1);
     frame = term.frame();
     expect(frame[2]).toBe("> laptop  coding  I-1 e1  done");
-    expect(frame).toContain("Submit pr opened https://example.com/org/web/pull/3");
-    expect(frame).toContain("  agent exited 0");
+    expect(frame).toContain("  Submit  pr opened https://example.com/org/web/pull/3");
+    expect(frame).toContain("    agent exited 0");
 
     term.stdin.write("q");
     await expect(run).resolves.toBe(0);
     expect(term.rawModes()).toEqual([true, false]);
     expect(term.output().endsWith(LEAVE_ALT)).toBe(true);
     expect(term.hooks.listenerCount("SIGINT")).toBe(0);
+  });
+
+  it.each([
+    [{ NO_COLOR: "1" }, false],
+    [{ TERM: "dumb" }, false],
+    [{ SKEP_TUI_COLOR: "truecolor" }, true],
+    [{ SKEP_TUI_COLOR: "256", NO_COLOR: "1" }, true],
+  ])("honors the color environment %j", async (env, colored) => {
+    const term = fakeTerminal();
+    const time = manualClock();
+    const c = context({
+      env: { SKEP_HOME: home, SKEP_TUI_GLYPHS: "ascii", ...env },
+      uiIo: { stdin: term.stdin, stdout: term.stdout },
+      uiHooks: term.hooks,
+      uiStatus: async () => status("claimed"),
+      clock: time.clock,
+    });
+    const run = runCli(["ui"], c.ctx);
+    await until(() => time.sleeping() === 1);
+    // biome-ignore lint/suspicious/noControlCharactersInRegex: matching SGR
+    expect(/\x1b\[(\d+;)*(3\d|9\d|38)(;\d+)*m/.test(term.output())).toBe(colored);
+    term.stdin.write("q");
+    await expect(run).resolves.toBe(0);
+  });
+
+  it("SKEP_TUI_ANIMATE=0 never starts the bee ticker", async () => {
+    const term = fakeTerminal();
+    const time = manualClock();
+    const current = status("claimed");
+    const peer = current.peers[0];
+    if (peer === undefined) throw new Error("missing test peer");
+    peer.progress = { phase: "working", done: 1, total: 2, failed: 0, percent: 50, summary: "" };
+    const c = context({
+      env: { SKEP_HOME: home, SKEP_TUI_GLYPHS: "ascii", SKEP_TUI_ANIMATE: "0" },
+      uiIo: { stdin: term.stdin, stdout: term.stdout },
+      uiHooks: term.hooks,
+      uiStatus: async () => current,
+      clock: time.clock,
+    });
+    const run = runCli(["ui"], c.ctx);
+    await until(() => time.sleeping() === 1);
+    for (let i = 0; i < 5; i++) await flush();
+    // Only the status poll sleeps.
+    expect(time.sleeping()).toBe(1);
+    term.stdin.write("q");
+    await expect(run).resolves.toBe(0);
   });
 
   it("ends cleanly when the master goes away", async () => {
@@ -366,10 +413,9 @@ describe("masterSnapshot", () => {
     try {
       view.tui.model.set(masterSnapshot(parsed, "hub"));
       view.tui.render();
-      expect(term.frame().slice(1, 4)).toEqual([
-        "Peers",
+      expect(term.frame().slice(2, 4)).toEqual([
         "> laptop  coding  I-1 e1  claimed",
-        "  desk  -  joined",
+        "  desk    -       joined",
       ]);
     } finally {
       view.close();
@@ -427,6 +473,19 @@ describe("session join --ui factory", () => {
     }
   });
 
+  it("passes the palette from SKEP_TUI_THEME to the join view", () => {
+    const env = { SKEP_TUI_GLYPHS: "ascii", SKEP_TUI_COLOR: "truecolor", SKEP_TUI_THEME: "light" };
+    const ctx = { ...context().ctx, env };
+    const term = fakeTerminal();
+    const view = joinViewFactory(ctx)({
+      stdin: term.stdin as unknown as NodeJS.ReadStream,
+      stdout: term.stdout as unknown as NodeJS.WriteStream,
+    });
+    view.close();
+    // Light primary #7A5900 colors the brand in the header.
+    expect(term.output()).toContain("\x1b[38;2;122;89;0;1mskep");
+  });
+
   it("is registered only when the CLI owns the process terminal", () => {
     const setter = vi.mocked(session.setJoinViewFactory);
     buildProgram(context().ctx);
@@ -458,7 +517,7 @@ describe("session join --ui factory", () => {
     // loaded event loop that read can outrun a fixed number of flushes, so wait for hostReady
     // first; the prompt itself is drawn synchronously after that.
     await view.tui.hostReady;
-    await until(() => term.frame().includes("Submit p mr / u push / n none / s skip?"));
+    await until(() => term.frame().includes("  Submit  p mr / u push / n none / s skip?"));
     term.stdin.write("p");
     await expect(choice).resolves.toBe("mr");
 

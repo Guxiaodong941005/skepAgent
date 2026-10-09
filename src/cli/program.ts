@@ -9,11 +9,10 @@ import { expandStartWithMaster, register as registerSession } from "./commands/s
 import { register as registerUi } from "./commands/ui.js";
 import type { CliContext } from "./context.js";
 import { CliError, createOutput, EXIT, type Output } from "./output.js";
+import { SKEP_VERSION } from "./version.js";
 
 export type { SkepPaths } from "../config/paths.js";
 export type { CliContext } from "./context.js";
-
-const VERSION = "0.1.2";
 
 /**
  * Build a fresh program bound to `ctx`. A new tree per invocation: Commander holds parse state
@@ -25,7 +24,7 @@ export function buildProgram(ctx: CliContext): Command {
   program
     .name("skep")
     .description("Cross-device collaboration for AI coding agents via live join-code sessions.")
-    .version(VERSION, "-V", "output the version number")
+    .version(SKEP_VERSION, "-V", "output the version number")
     .option("--machine", "print stable JSON instead of human text")
     .option("--home <dir>", "override SKEP_HOME for this invocation")
     .showHelpAfterError(false)

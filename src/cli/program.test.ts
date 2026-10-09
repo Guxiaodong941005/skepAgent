@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { buildProgram, runCli } from "./program.js";
 import type { CliContext } from "./context.js";
+import { buildProgram, runCli } from "./program.js";
 
 function ctx(): CliContext {
   const out: string[] = [];
