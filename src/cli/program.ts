@@ -23,6 +23,7 @@ import { register as registerSim } from "./commands/sim.js";
 import { register as registerStatus } from "./commands/status.js";
 import { register as registerSubmit } from "./commands/submit.js";
 import { register as registerTask } from "./commands/task.js";
+import { register as registerUi } from "./commands/ui.js";
 import { type CliContext, connectDaemon } from "./context.js";
 import { CliError, createOutput, EXIT, type Output } from "./output.js";
 
@@ -75,6 +76,7 @@ export function buildProgram(ctx: CliContext): Command {
   registerLogs(program, ctx);
   registerDoctor(program, ctx);
   registerSim(program, ctx);
+  registerUi(program, ctx);
   registerSession(program, ctx);
 
   return program;
