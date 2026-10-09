@@ -25,6 +25,32 @@ evidence, and a live blackboard needs a human re-genesis.
 
 ## [Unreleased]
 
+### Added
+- Peer progress over the existing encrypted session channel: a new `progress` session message.
+  A sub reports its own phase (`idle`, `working`, `blocked`, `done`) and the title of the item
+  it is on. The master rebuilds every relay from its own state, fills in the subject's
+  `peerId`/`device`/`role` from the authenticated connection, and sends it to every other
+  opted-in peer, never back to the subject. A disconnected peer is announced with
+  `phase: "left"`. `SessionStatus.peers[].progress` carries the same strip for `skep ui`.
+  `SubOptions.onProgress`, `SubOptions.progress` and `SubHandle.reportAgent` expose it to the
+  CLI. The heartbeat stays liveness-only.
+- Progress metric (MVP): `percent = floor(100 * done / total)` over the items assigned to the
+  peer. An item counts as done once its result is accepted or it failed (dropped assignee). It
+  counts as failed when it failed or a check reported `fail`. The master derives the counts, so a
+  sub cannot inflate its percentage. A reported `blocked` wins, even at 100 %: the code is in,
+  but a human still owes an answer or a submit. Summaries are only master-sent item titles,
+  re-redacted by the master and capped at 120 characters.
+- Rate limits: at most one progress frame per subject every 500 ms, on both sides. Phase
+  changes go out at once, unchanged values are dropped, and changes inside the window collapse
+  into one trailing frame with the latest value.
+
+### Compatibility
+- Opt-in: a master sends `progress` only to subs that have sent one, so a 0.1.2 sub stays
+  connected. Its strip is still derived by the master and shown to the other peers.
+- A 0.1.3 sub cannot join a 0.1.2 master: the old master rejects the unknown `progress` frame
+  right after `welcome`. Upgrade the master device first; all session devices should run
+  ≥ 0.1.3.
+
 ## [0.1.1] - 2026-10-09
 
 Session mode and the local agent view, on top of the v0.1.0 blackboard. Package name stays

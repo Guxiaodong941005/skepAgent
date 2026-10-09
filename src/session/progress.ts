@@ -7,6 +7,7 @@
  * the phase `blocked` and the summary come from the sub's own report.
  */
 import { Redactor } from "../exec/redact.js";
+import { ChannelError } from "./channel.js";
 import type { ItemStatus } from "./messages.js";
 
 export const PEER_PHASES = ["idle", "working", "blocked", "done"] as const;
@@ -46,6 +47,14 @@ export interface ReportedProgress {
 }
 
 export const SUMMARY_MAX = 120;
+
+/** Default 500 ms (plan §2.5); 0 disables coalescing, which tests use. */
+export function progressInterval(value: number | undefined): number {
+  const result = value ?? 500;
+  if (!Number.isFinite(result) || result < 0)
+    throw new ChannelError("Progress interval must be non-negative finite milliseconds");
+  return result;
+}
 
 export function percentOf(done: number, total: number): number {
   return total === 0 ? 0 : Math.floor((100 * done) / total);
@@ -97,4 +106,122 @@ export function deriveProgress(
     summary: subject ? subject.summary.slice(0, SUMMARY_MAX) : "",
     ...(subject ? { itemId: subject.itemId } : {}),
   };
+}
+
+export type SubItemState = "claiming" | "working" | "sent" | "done" | "rejected";
+export type SubAgentState = "starting" | "running" | "blocked" | "done" | "failed";
+
+/**
+ * What a sub reports about itself (plan §3.1). Pure. `items` must be in claim order. `blocked`
+ * is the sticky "an agent of this join was ever blocked" flag: the human finishes a blocked item
+ * with `skep session submit` in another process, which this process never sees.
+ */
+export function subProgress(
+  items: Iterable<{ itemId: string; title: string; state: SubItemState }>,
+  agents: ReadonlyMap<string, SubAgentState>,
+  blocked: boolean,
+): ProgressValue {
+  const counted = [...items].filter((item) => item.state !== "rejected");
+  const finished = counted.filter((item) => item.state === "done");
+  // Only finished items count as failed, so `failed ≤ done` holds for the wire schema.
+  const failed = finished.filter((item) => agents.get(item.itemId) === "failed").length;
+  const active = counted.filter((item) => item.state !== "done").at(-1);
+  const agentStates = [...agents.values()];
+  const phase: PeerPhase =
+    blocked || agentStates.includes("blocked")
+      ? "blocked"
+      : active || agentStates.some((state) => state === "starting" || state === "running")
+        ? "working"
+        : counted.length > 0 && finished.length === counted.length
+          ? "done"
+          : "idle";
+  // Only master-sent (already redacted) titles: the sub never reports free text.
+  return {
+    phase,
+    done: finished.length,
+    total: counted.length,
+    failed,
+    percent: percentOf(finished.length, counted.length),
+    summary: active ? active.title.slice(0, SUMMARY_MAX) : "",
+    ...(active ? { itemId: active.itemId } : {}),
+  };
+}
+
+type Comparable = ProgressValue | PeerProgress;
+const PROGRESS_KEYS = [
+  "peerId",
+  "device",
+  "role",
+  "phase",
+  "done",
+  "total",
+  "failed",
+  "percent",
+  "summary",
+  "itemId",
+] as const;
+
+export function sameProgress(a: Comparable, b: Comparable): boolean {
+  return PROGRESS_KEYS.every(
+    (key) => (a as Partial<PeerProgress>)[key] === (b as Partial<PeerProgress>)[key],
+  );
+}
+
+/**
+ * At most one frame per `intervalMs` per subject (plan §2.5). A phase change goes out at once,
+ * a value equal to the last one sent is dropped, and changes inside the window collapse into
+ * one trailing send of the latest value at `lastSentAt + intervalMs`.
+ */
+export class ProgressCoalescer<T extends Comparable> {
+  private last: T | null = null;
+  private lastSentAt = 0;
+  private pending: T | null = null;
+  private cancelTrailing: (() => void) | null = null;
+
+  constructor(
+    private readonly o: {
+      intervalMs: number;
+      monotonicMs: () => number;
+      /** The owner's Clock-backed timer (`SessionMaster.timer` / `SessionWire.timer`). */
+      schedule: (ms: number, fn: () => void) => () => void;
+      send: (value: T) => void;
+    },
+  ) {}
+
+  push(value: T): void {
+    if (this.last && sameProgress(this.last, value)) {
+      // Back to what the peer already has: a pending trailing send would only repeat it.
+      this.drop();
+      return;
+    }
+    const wait = this.lastSentAt + this.o.intervalMs - this.o.monotonicMs();
+    if (!this.last || this.last.phase !== value.phase || wait <= 0) {
+      this.drop();
+      this.emit(value);
+      return;
+    }
+    this.pending = value;
+    this.cancelTrailing ??= this.o.schedule(wait, () => {
+      this.cancelTrailing = null;
+      const latest = this.pending;
+      this.pending = null;
+      if (latest) this.emit(latest);
+    });
+  }
+
+  cancel(): void {
+    this.drop();
+  }
+
+  private drop(): void {
+    this.pending = null;
+    this.cancelTrailing?.();
+    this.cancelTrailing = null;
+  }
+
+  private emit(value: T): void {
+    this.last = value;
+    this.lastSentAt = this.o.monotonicMs();
+    this.o.send(value);
+  }
 }

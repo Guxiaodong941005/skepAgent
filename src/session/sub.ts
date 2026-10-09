@@ -14,7 +14,7 @@ import {
   type KeyMaterial,
   normalizeJoinCode,
 } from "./handshake.js";
-import type { SubHandle, SubOptions } from "./index.js";
+import type { AgentProgressState, SubHandle, SubOptions } from "./index.js";
 import {
   DATALIST_CAP,
   type DatalistEntry,
@@ -23,10 +23,20 @@ import {
   DeviceSchema,
   HandshakeMsgSchema,
   type PlanItem,
+  type ProgressMsg,
   type SessionMsg,
   SessionMsgSchema,
   SubResultSchema,
 } from "./messages.js";
+import {
+  type PeerProgress,
+  ProgressCoalescer,
+  type ProgressValue,
+  progressInterval,
+  type SubItemState,
+  sameProgress,
+  subProgress,
+} from "./progress.js";
 
 /** Redact before sizing: escaping and UTF-8 encoding both count against the wire limit. */
 export function prepareDatalist(input: DatalistEntry[]): {
@@ -70,6 +80,8 @@ export async function connectSub(o: SubOptions): Promise<SubHandle> {
   const clock = o.clock ?? systemClock;
   const random = o.random ?? cryptoRandom;
   const heartbeatMs = positiveDuration(o.heartbeatMs, 10_000);
+  const progressMs = progressInterval(o.progressIntervalMs);
+  const sendsProgress = o.progress !== false;
   const ephemeral = createEphemeral(random);
   const subNonce = Buffer.from(random.bytes(16));
   const stream = o.stream ?? createConnection(o.target ?? { host: "", port: 0 });
@@ -89,10 +101,11 @@ export async function connectSub(o: SubOptions): Promise<SubHandle> {
   });
   const descriptions = new Map<string, z.infer<typeof DescriptionSchema> | null>();
   const requests = new Set<string>();
-  const items = new Map<
-    string,
-    { item: PlanItem; state: "claiming" | "working" | "sent" | "done" }
-  >();
+  const items = new Map<string, { item: PlanItem; state: SubItemState }>();
+  const agents = new Map<string, AgentProgressState>();
+  let everBlocked = false;
+  let role: string | null = null;
+  let lastSelf: PeerProgress | null = null;
   const event = (kind: string, message: string) => o.onEvent?.({ kind, message });
   const callbackFailed = () => {
     event("error", "Session callback failed or returned invalid data");
@@ -100,6 +113,51 @@ export async function connectSub(o: SubOptions): Promise<SubHandle> {
       "callback_error",
       wire.channel ? { type: "bye", reason: "callback_error" } : undefined,
     );
+  };
+
+  const coalescer = new ProgressCoalescer<ProgressValue>({
+    intervalMs: progressMs,
+    monotonicMs: () => clock.monotonicMs(),
+    schedule: (ms, fn) => wire.timer(ms, fn),
+    // No identity on the way up: the master fills it from the authenticated wire (plan §2.4).
+    send: (value) => {
+      if (wire.active) wire.send({ type: "progress", ...value });
+    },
+  });
+  const progressChanged = () => {
+    if (!handle || !wire.active) return;
+    const value = subProgress(
+      [...items.values()].map(({ item, state }) => ({
+        itemId: item.itemId,
+        title: item.title,
+        state,
+      })),
+      agents,
+      everBlocked,
+    );
+    if (sendsProgress) coalescer.push(value);
+    const self: PeerProgress = { peerId: handle.peerId, device: o.device, role, ...value };
+    if (lastSelf && sameProgress(lastSelf, self)) return;
+    lastSelf = self;
+    try {
+      o.onProgress?.({ ...self, self: true });
+    } catch {
+      callbackFailed();
+    }
+  };
+  const relayed = (message: ProgressMsg) => {
+    if (
+      message.peerId === undefined ||
+      message.device === undefined ||
+      message.peerId === handle?.peerId
+    )
+      throw new ChannelError("Relayed progress must name another peer");
+    const { type: _type, peerId, device, role: peerRole, ...value } = message;
+    try {
+      o.onProgress?.({ peerId, device, role: peerRole ?? null, ...value, self: false });
+    } catch {
+      callbackFailed();
+    }
   };
 
   const receive = (message: SessionMsg) => {
@@ -121,6 +179,8 @@ export async function connectSub(o: SubOptions): Promise<SubHandle> {
             const description = DescriptionSchema.parse(value);
             descriptions.set(message.intentId, description);
             wire.send({ type: "capability", intentId: message.intentId, ...description });
+            role = description.role;
+            progressChanged();
           })
           .catch(callbackFailed);
         return;
@@ -167,6 +227,7 @@ export async function connectSub(o: SubOptions): Promise<SubHandle> {
           throw new ChannelError("Unexpected claim acknowledgement");
         work.state = "working";
         event("claim-ack", message.itemId);
+        progressChanged();
         void Promise.resolve()
           .then(() => o.onItem({ ...work.item }))
           .then((value) => {
@@ -189,8 +250,9 @@ export async function connectSub(o: SubOptions): Promise<SubHandle> {
       case "claim-reject": {
         const work = items.get(message.itemId);
         if (work?.state !== "claiming") throw new ChannelError("Unexpected claim rejection");
-        work.state = "done";
+        work.state = "rejected";
         event("claim-reject", `${message.itemId}: ${message.reason}`);
+        progressChanged();
         return;
       }
       case "result-ack":
@@ -204,8 +266,12 @@ export async function connectSub(o: SubOptions): Promise<SubHandle> {
             ? `${message.itemId}: ${message.reason}`
             : message.itemId,
         );
+        progressChanged();
         return;
       }
+      case "progress":
+        relayed(message);
+        return;
       default:
         throw new ChannelError("Message is not allowed from a master");
     }
@@ -262,9 +328,17 @@ export async function connectSub(o: SubOptions): Promise<SubHandle> {
               await closed;
             },
             closed,
-            reportAgent: () => {},
+            reportAgent: (itemId, state) => {
+              if (!wire.active) return;
+              if (!items.has(itemId)) throw new ChannelError(`Unknown session item ${itemId}`);
+              agents.set(itemId, state);
+              if (state === "blocked") everBlocked = true;
+              progressChanged();
+            },
           };
           wire.startHeartbeat(heartbeatMs);
+          // The first progress frame is the opt-in for relays (plan §2.6).
+          progressChanged();
           resolveReady(handle);
         } else {
           receive(message);

@@ -4,6 +4,7 @@ import {
   ControlResultSchema,
   FirstFrameSchema,
   HandshakeMsgSchema,
+  ProgressMsgSchema,
   SessionMsgSchema,
   SessionStatusSchema,
   SubmitOutcomeSchema,
@@ -59,6 +60,29 @@ const status = {
   ],
 };
 
+const progressUp = {
+  type: "progress",
+  phase: "working",
+  done: 1,
+  total: 3,
+  failed: 1,
+  percent: 33,
+  summary: "add a health check",
+  itemId: "I-2",
+};
+const progressRelay = {
+  type: "progress",
+  peerId: "peer-1",
+  device: "mac",
+  role: null,
+  phase: "left",
+  done: 0,
+  total: 0,
+  failed: 0,
+  percent: 0,
+  summary: "",
+};
+
 const groups: { name: string; schema: z.ZodType; messages: Record<string, unknown>[] }[] = [
   {
     name: "first",
@@ -110,6 +134,8 @@ const groups: { name: string; schema: z.ZodType; messages: Record<string, unknow
       { type: "result-ack", itemId: "I-1" },
       { type: "result-reject", itemId: "I-1", reason: "stale_epoch" },
       { type: "bye", reason: "closed" },
+      progressUp,
+      progressRelay,
     ],
   },
   {
@@ -231,5 +257,60 @@ describe("structured submit outcome on results", () => {
     expect(SubmitOutcomeSchema.safeParse({ ...noUrl, state: "local", branch: "" }).success).toBe(
       false,
     );
+  });
+});
+
+describe("peer progress", () => {
+  it("accepts the sub form and the relay form", () => {
+    expect(ProgressMsgSchema.parse(progressUp)).toEqual(progressUp);
+    expect(SessionMsgSchema.parse(progressRelay)).toEqual(progressRelay);
+    const { itemId: _itemId, ...noItem } = progressUp;
+    expect(SessionMsgSchema.safeParse({ ...noItem, summary: "" }).success).toBe(true);
+    expect(
+      SessionMsgSchema.safeParse({ ...progressRelay, role: "backend", phase: "done" }).success,
+    ).toBe(true);
+  });
+
+  it("runs the count refinements inside the discriminated union", () => {
+    for (const change of [
+      { done: 4, total: 3, percent: 133 },
+      { done: 4, total: 3, percent: 100 },
+      { failed: 2, done: 1 },
+      { percent: 34 },
+      { percent: 33.3 },
+      { done: 1.5 },
+      { total: -1 },
+      { summary: "x".repeat(121) },
+      { itemId: "item-2" },
+      { phase: "running" },
+      { done: 10_001, total: 10_001, percent: 100 },
+      { device: "Mac" },
+      { role: "Bad" },
+      { peerId: "" },
+    ]) {
+      expect(SessionMsgSchema.safeParse({ ...progressUp, ...change }).success).toBe(false);
+    }
+    expect(SessionMsgSchema.safeParse({ ...progressUp, summary: "x".repeat(120) }).success).toBe(
+      true,
+    );
+    expect(
+      SessionMsgSchema.safeParse({ ...progressUp, done: 0, total: 0, failed: 0, percent: 0 })
+        .success,
+    ).toBe(true);
+  });
+
+  it("requires peers[].progress in status and applies the same refinements", () => {
+    const [peer] = status.peers;
+    if (!peer) throw new Error("fixture has a peer");
+    const { progress, ...noProgress } = peer;
+    expect(SessionStatusSchema.safeParse({ ...status, peers: [noProgress] }).success).toBe(false);
+    for (const change of [{ percent: 50 }, { phase: "left" }, { done: 2 }]) {
+      expect(
+        SessionStatusSchema.safeParse({
+          ...status,
+          peers: [{ ...peer, progress: { ...progress, ...change } }],
+        }).success,
+      ).toBe(false);
+    }
   });
 });
