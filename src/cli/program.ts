@@ -18,6 +18,7 @@ import { register as registerLogs } from "./commands/logs.js";
 import { register as registerPlan } from "./commands/plan.js";
 import { register as registerPull } from "./commands/pull.js";
 import { register as registerReplan } from "./commands/replan.js";
+import { expandStartWithMaster, register as registerSession } from "./commands/session.js";
 import { register as registerSim } from "./commands/sim.js";
 import { register as registerStatus } from "./commands/status.js";
 import { register as registerTask } from "./commands/task.js";
@@ -72,6 +73,7 @@ export function buildProgram(ctx: CliContext): Command {
   registerLogs(program, ctx);
   registerDoctor(program, ctx);
   registerSim(program, ctx);
+  registerSession(program, ctx);
 
   return program;
 }
@@ -83,6 +85,7 @@ export function buildProgram(ctx: CliContext): Command {
 export async function runCli(argv: string[], ctx: CliContext): Promise<number> {
   // A reused context must not keep a previous action's failure (sim violations set this).
   ctx.exitCode = undefined;
+  argv = expandStartWithMaster(argv);
   // The daemon socket is the CLI's way to publish and query (ARCHITECTURE §12). An action or a
   // test may supply its own factory; otherwise talk to the socket under the resolved home.
   ctx.connectDaemon ??= () => connectDaemon(ctx);
