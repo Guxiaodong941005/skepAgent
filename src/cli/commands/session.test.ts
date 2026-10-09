@@ -1773,7 +1773,20 @@ describe("session join with a live agent", () => {
     expect(log.events).toContain("choose:I-1");
     expect(log.events.at(-1)).toBe("close");
     expect(log.models[0]?.peers).toEqual([
-      { peerId: expect.any(String), device: "vps", role: "coding", state: "joined" },
+      {
+        peerId: expect.any(String),
+        device: "vps",
+        role: "coding",
+        state: "idle",
+        progress: {
+          phase: "idle",
+          done: 0,
+          total: 0,
+          failed: 0,
+          percent: 0,
+          summary: "",
+        },
+      },
     ]);
     expect(item.result?.submit).toMatchObject({ method: "push", state: "pushed" });
     // The full-screen view owns the terminal: no line output and no stdin question.
