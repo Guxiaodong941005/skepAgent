@@ -1,32 +1,23 @@
 # Changelog
 
-## 0.1.2
-
-### Removed
-- Signed git blackboard protocol, `skepd` daemon, and related CLI (`init`, `task`, `plan`, `pull`, `replan`, `lease`, `decide`, `status`, `log`, `logs`, `doctor`, `sim`, role-slot `agent`, …).
-- Deploy units (`skepd.service`, launchd plist).
-
-### Kept
-- Session mode: `skep session start|join|…`, `skep ui`, bare `skep` → local agent TUI.
-- Join-code multi-device (and same-machine multi-directory) collaboration.
-
-
-# Changelog
-
 All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-While 0.x, a **minor** bump may break CLI flags, config or the blackboard protocol, and a
-**patch** bump may not. A protocol or reducer change additionally follows
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §4.4: a new `REDUCER_VERSION` needs golden
-evidence, and a live blackboard needs a human re-genesis.
+While 0.x, a **minor** bump may break CLI flags, config or the session protocol, and a
+**patch** bump may not. Releases 0.1.0 and 0.1.1 also shipped the signed git blackboard; its
+protocol rules ([`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §4.4) apply to those tags only.
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-10-09
+
+Peer progress and a redesigned session screen. Versions 0.1.3 and 0.1.4 were never released.
+
 ### Added
-- Peer progress over the existing encrypted session channel: a new `progress` session message.
+
+* Peer progress over the existing encrypted session channel: a new `progress` session message.
   A sub reports its own phase (`idle`, `working`, `blocked`, `done`) and the title of the item
   it is on. The master rebuilds every relay from its own state, fills in the subject's
   `peerId`/`device`/`role` from the authenticated connection, and sends it to every other
@@ -34,22 +25,69 @@ evidence, and a live blackboard needs a human re-genesis.
   `phase: "left"`. `SessionStatus.peers[].progress` carries the same strip for `skep ui`.
   `SubOptions.onProgress`, `SubOptions.progress` and `SubHandle.reportAgent` expose it to the
   CLI. The heartbeat stays liveness-only.
-- Progress metric (MVP): `percent = floor(100 * done / total)` over the items assigned to the
+* Progress metric (MVP): `percent = floor(100 * done / total)` over the items assigned to the
   peer. An item counts as done once its result is accepted or it failed (dropped assignee). It
   counts as failed when it failed or a check reported `fail`. The master derives the counts, so a
   sub cannot inflate its percentage. A reported `blocked` wins, even at 100 %: the code is in,
   but a human still owes an answer or a submit. Summaries are only master-sent item titles,
   re-redacted by the master and capped at 120 characters.
-- Rate limits: at most one progress frame per subject every 500 ms, on both sides. Phase
+* Rate limits: at most one progress frame per subject every 500 ms, on both sides. Phase
   changes go out at once, unchanged values are dropped, and changes inside the window collapse
   into one trailing frame with the latest value.
+* Peer progress strips in `skep ui` and `skep session join --ui`: an animated bee
+  (Nerd Font `nf-md-bee` / `bee-flower`, `beehive` when done) with an eight-cell bar,
+  percentage, `done/total`, phase and summary. Without a Nerd Font, or with
+  `SKEP_TUI_GLYPHS=ascii` (legacy `SKEP_TUI_ASCII=1`), it falls back to ASCII (`~b>`, `#`/`.`).
+* Semantic color theme for the session screen (`src/cli/theme.ts`): Material-style roles
+  (primary honey, on-surface, variant, outline, secondary, tertiary, success, warning, error)
+  with a dark and a light palette. Text roles meet WCAG 4.5:1 and the outline 3:1, checked by
+  tests.
+* `SKEP_TUI_COLOR` (`auto`, `never`, `16`, `256`, `truecolor`), `SKEP_TUI_THEME` (`auto`,
+  `dark`, `light`) and `SKEP_TUI_ANIMATE=0` (stops the bee animation). `NO_COLOR`,
+  `FORCE_COLOR`, `COLORTERM`, `TERM` and `COLORFGBG` are honored when detecting the color
+  level and palette.
+
+### Changed
+
+* Redesigned session screen. A one-line header shows the brand, session, device, role and
+  version. `PEERS`, `ITEM` and `OUTPUT` are labeled rules. Device and role columns are aligned.
+  Every state is a colored chip that keeps its word (`blocked`, `done (1 failed)`), so the
+  screen reads the same without color. The footer lists only the keys that act now, puts
+  pending submit keys in the warning color, and shows the selection's position. Empty states
+  say what is happening. The header and footer are no longer inverse bars: inverse marks the
+  selected row only.
+* Narrow terminals shed detail in order: below 70 columns the `done/total` count goes, below
+  60 the bar goes (the percentage stays), and the header drops the version, then the role.
+  ASCII mode uses no ambiguous-width characters for rules and separators.
+* Focus and code-host failures are shown as `! …` messages in the error color.
+* `skep -V` prints the package version (from `src/cli/version.ts`).
 
 ### Compatibility
-- Opt-in: a master sends `progress` only to subs that have sent one, so a 0.1.2 sub stays
+
+* Opt-in: a master sends `progress` only to subs that have sent one, so a 0.1.2 sub stays
   connected. Its strip is still derived by the master and shown to the other peers.
-- A 0.1.3 sub cannot join a 0.1.2 master: the old master rejects the unknown `progress` frame
+* A 0.1.5 sub cannot join a 0.1.2 master: the old master rejects the unknown `progress` frame
   right after `welcome`. Upgrade the master device first; all session devices should run
-  ≥ 0.1.3.
+  ≥ 0.1.5.
+* Anything that scraped the alternate screen will see new strings. Row positions are
+  unchanged, and the screen was never an interface.
+
+## [0.1.2] - 2026-10-09
+
+Session mode only. The signed git blackboard from 0.1.0 is gone.
+
+### Removed
+
+* Signed git blackboard protocol, `skepd` daemon, and related CLI (`init`, `task`, `plan`,
+  `pull`, `replan`, `lease`, `decide`, `status`, `log`, `logs`, `doctor`, `sim`, role-slot
+  `agent`, …).
+* Deploy units (`skepd.service`, launchd plist).
+
+### Changed
+
+* What remains: session mode (`skep session start|join|…`), `skep ui`, and bare `skep`, which
+  opens the local agent TUI. Join-code collaboration works across devices and across
+  directories on one machine.
 
 ## [0.1.1] - 2026-10-09
 
@@ -181,6 +219,8 @@ creates the npm org `skepagent` and explicitly says go. See [`docs/RELEASE.md`](
 * Manual lease revoke; no auto-merge. The human holds plan approval, escalation decisions and
   merges.
 
-[Unreleased]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.2...v0.1.5
+[0.1.2]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Guxiaodong941005/skepAgent/releases/tag/v0.1.0

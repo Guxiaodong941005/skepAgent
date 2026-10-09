@@ -1,8 +1,68 @@
 # Skep release record
 
-Tag-only public releases. This document records the package-name decision (v0.1.0), the npm
-registry re-check, the v0.1.0 checklist, the v0.1.1 session-TUI notes, and the steps the
-orchestrator runs. Agents must not `git push`, create tags, or `npm publish`.
+This document records the package-name decision (v0.1.0), the npm registry re-check, the
+v0.1.0 checklist, the v0.1.1 session-TUI notes, the v0.1.5 peer-progress and TUI notes, and the
+steps the orchestrator runs. Task agents must not `git push`, create tags, or `npm publish`.
+
+## v0.1.5 — peer progress and the redesigned session screen (2026-10-09)
+
+The human ordered this release as **0.1.5**. Versions 0.1.3 and 0.1.4 are skipped and were
+never tagged. Package name stays **`@skepagent/skep`** (public, `publishConfig.access`
+`"public"`). The only bin is `skep`. `files` stays `dist`, `README.md`, `LICENSE`,
+`CHANGELOG.md`.
+
+What this tag adds on top of v0.1.2 (details in [`../CHANGELOG.md`](../CHANGELOG.md)):
+
+* **Peer progress**: a new opt-in `progress` session message. The master derives every peer's
+  phase and `done/total` and relays them, rate-limited. `skep ui` and `skep session join --ui`
+  draw one strip per peer: an animated Nerd Font bee (ASCII fallback), an eight-cell bar, the
+  percentage, the phase and the item title.
+* **Redesigned session screen**: a one-line header with the version, `PEERS` / `ITEM` /
+  `OUTPUT` rules, aligned columns, state chips colored by phase, a footer that shows only
+  the keys that act now, and calmer empty states. Inverse marks only the selected row.
+* **Theme and environment**: `SKEP_TUI_COLOR`, `SKEP_TUI_THEME`, `SKEP_TUI_ANIMATE`, plus
+  `NO_COLOR` and `FORCE_COLOR`. `SKEP_TUI_GLYPHS` / `SKEP_TUI_ASCII` are unchanged.
+* `skep -V` prints `0.1.5`, read from `src/cli/version.ts`, which is kept in step with
+  `package.json`.
+
+Compatibility: upgrade the **master device first**. A 0.1.5 sub cannot join a 0.1.2 master,
+because the old master rejects the unknown `progress` frame. A 0.1.2 sub can join a 0.1.5
+master.
+
+Orchestrator, after `feat/tui-material-0.1.5` merges into `main`:
+
+1. Confirm `node -e "console.log(require('./package.json').name, require('./package.json').version)"`
+   prints `@skepagent/skep 0.1.5`, and `node dist/bin/skep.js -V` prints `0.1.5` after the
+   build.
+2. `npm ci && npm run lint && npm test && npm run build`. Any pre-existing failures must be the
+   ones listed in the merge commit and be accepted by the human. Check that
+   `npm pack --dry-run` lists only `dist/**`, `README.md`, `LICENSE`, `CHANGELOG.md` and
+   `package.json`.
+3. Manual QA from the TUI plan (`docs/plans/tui-material-redesign.md` §6.5). Use two
+   devices or directories, each running `session join --ui`, plus `skep ui`. Repeat with
+   `NO_COLOR=1`, `SKEP_TUI_THEME=light`, `SKEP_TUI_GLYPHS=ascii`, and at 80×24.
+4. Create the annotated tag `v0.1.5` on the merge commit and push it:
+
+   ```bash
+   git tag -a v0.1.5 <merge-commit-sha> -m "v0.1.5"
+   git push origin v0.1.5
+   ```
+
+5. **The orchestrator may publish this release**, because the human has ordered 0.1.5. This
+   needs a logged-in npm account with publish rights on the `skepagent` org:
+
+   ```bash
+   npm publish --access public
+   npm view @skepagent/skep@0.1.5 version   # expect 0.1.5
+   ```
+
+Install from git until the publish has happened:
+
+```bash
+npm install -g github:Guxiaodong941005/skepAgent#v0.1.5
+```
+
+---
 
 ## v0.1.1 — session TUI (2026-10-09)
 
