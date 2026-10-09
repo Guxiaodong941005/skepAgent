@@ -128,6 +128,326 @@ relay). Provider-config sync (former D17 tasks) was withdrawn and must not be re
 | SK-702 | Enrollment and trust bundles (replaces Tailscale SSH provisioning) | SK-102, SK-607 | pi | `src/cli/commands/{enroll,trust}.ts`, `src/config/enroll.ts` (+ tests), `docs/RUNBOOK.md` (provisioning section) | §17.6: `skep enroll export\|import`, `skep trust import`; `skep.enroll/v1` and `skep.trust_bundle/v1` contain public data only (schema rejects private-key blocks and unknown keys; test) and are signed by the human key; import requires typing the human key's short fingerprint on first trust; later trust bundles verified against the installed human key and applied atomically; tampered or wrong-signer bundles rejected; no network access in tests | todo |
 | SK-703 | `skep logs` without SSH | SK-604, SK-506 | pi | `src/cli/commands/logs.ts` (+ tests) | Local agents: tail the journal/log via `logs.tail`, redacted; remote agents: print the last heartbeat (state, task, item, epoch, observed age) and the journal path on that device, exit 0; no log transport between devices (§17.2) | todo |
 
+
+---
+
+## Wave 8 — live agent view (D27–D30)
+
+Session mode (`skep session start/join`, SK-615/SK-616 on `task/session-mode`) runs an item with a
+dry marker commit, or a non-interactive agent with captured output. The human never sees the
+agent working. Wave 8 adds a **local live view**:
+
+* **One watcher:** `skep session join` runs the device's agent CLI in a PTY attached to the
+  human's terminal and tees the bytes.
+* **Several agents, detach, or the human already uses herdr:** the agent runs in a local herdr
+  pane, and Skep prints the `herdr agent focus` command.
+* **A small Skep TUI** shows state and lets the human attach or submit.
+
+Out of scope: embedding or forking herdr, the Chinese human layer, a GitLab client, Wave 7
+(SK-701..SK-703), SK-609 and SK-610.
+
+Fixed by the product decision (D27–D30):
+
+* The executing device picks its agent CLI from its own AGENT.md `agent_cli`; the master never
+  chooses (D19 unchanged).
+* Full output stays on the executing device. The master receives status and a **redacted**
+  summary only.
+* Skep never parses a vendor's TUI, and never answers a `blocked` agent.
+* Fallback order: herdr ⇒ PTY ⇒ native non-interactive CLI (ARCHITECTURE §10.2, PRD §13.2).
+
+| ID | Title | Depends on | Assignee | Files/area | Acceptance criteria | Status |
+|---|---|---|---|---|---|---|
+| SK-620 | PTY runner + thin herdr session client | SK-303 (runtime types), SK-401 (interrupt ladder) | codex | `src/runtime/pty.ts`, `src/runtime/pty-helper.ts`, `src/runtime/herdr.ts`, `src/runtime/types.ts` (**additive only**: the new `AgentSessionBackend` types beside `RuntimeBackend`; `spawn`/`RuntimeBackend` unchanged), colocated tests, `test/fixtures/herdr/*.json`. **No CLI files.** | (1) A PTY echo test with a fake argv (a node script, or `cat` fed by `input`) returns the exact bytes in the transcript (terminal noise stripped), the child sees a TTY, and the exit code is propagated (e.g. 7). (2) Aborting sends SIGTERM to the agent's process group, then SIGKILL after `graceMs` on the injected `Clock`; the test proves both signals and the order with a child that ignores SIGTERM. (3) The herdr client builds argv arrays and spawns with `shell: false` only; tests assert the exact argv for `api schema --json`, `tab create`, `agent start`, `agent prompt`, `agent wait`, `agent read`, `agent focus` and `pane close`. (4) The herdr client parses `agent wait` / `agent read` success JSON and `error_response` JSON with Zod, using fixtures recorded from herdr 0.9.3. (5) A missing binary (`ENOENT`), a non-zero exit, unparsable output, or a protocol/`schema_version` mismatch each raise a typed `AgentSessionError` subclass with a `fallbackSafe` flag (true only before a prompt was accepted). (6) No network, no real herdr and no real agent CLI in tests (an injected `exec`); the PTY tests skip with a reason only when the platform's `script(1)` is missing. | todo |
+| SK-621 | Live view in `skep session join` | SK-616, SK-615 (on `task/session-mode`); SK-620 **contract** only (below) | claude | `src/cli/commands/session.ts` and `src/cli/commands/session.test.ts`, `test/integration/session.test.ts`. May import `src/runtime/{types,pty,herdr}.js`; **must not edit `src/runtime/**` or `src/cli/program.ts`**. | (1) `skep session join --agent pty` runs the item through `PtyRunner.run` (tests inject a fake runner; no real CLI). (2) `--agent herdr` calls the `AgentSessionBackend` (fake in tests) and prints `herdr agent focus <name>` from `handle.focusCommand`. (3) The default is unchanged: the dry marker commit when `SKEP_SESSION_EXEC` is unset. (4) `SKEP_SESSION_EXEC=1` selects pty, or herdr when `SKEP_SESSION_VIEW=herdr`; `--agent` overrides both; a `fallbackSafe` herdr error or an unavailable PTY falls back to the native non-interactive CLI, and the reason is printed. (5) The agent CLI is AGENT.md `agent_cli` from `--role-dir` (default: current directory), not the master. (6) herdr `blocked` ⇒ the result's submit state is `pending`, nothing is submitted, the human is told (stderr + existing notify path if configured), and Skep sends **no** keys. (7) Every byte that reaches the master (`summary`) passes through `Redactor` and terminal-control stripping and is ≤ 4000 characters; the full transcript stays in the local journal directory. (8) SK-616's submit policy is unchanged (existing tests still pass untouched). (9) Exposes the `JoinView` hook (below) and a `--ui` flag that uses it. | todo |
+| SK-622 | Skep TUI: `skep ui` + `session join --ui` | SK-621 (its exported `JoinView` contract; can start from the brief) | claude | `src/cli/tui.ts`, `src/cli/commands/ui.ts`, colocated tests, **one** register line in `src/cli/program.ts`. Must not edit `src/runtime/**`, `src/session/**` or `src/cli/commands/session.ts`. | (1) A full-screen view, dependency-free (ANSI escapes + `setRawMode` + alternate screen), restoring the terminal on quit, error and SIGINT. (2) It shows peers, the current item, agent state (running / blocked / done / failed), the redacted output tail and the submit choice. (3) Keys: `a` attach/open the live view (PTY: suspend the TUI and give the terminal to the agent, resume on exit; herdr: run `focus` and show the command), `p`/`u`/`n`/`s` submit pr / push / none / skip (only offered when policy is `ask`), `↑`/`↓`+`Enter` choose an agent from the list, `q` quit. There is **no** approve key. (4) One agent occupies the terminal; several agents are a list; no panes, tabs or terminal emulator. (5) Tests drive the view with a fake stdin and a fixed-size output buffer (e.g. 80×24), with no real TTY, and assert rendered frames and key handling. (6) `skep ui` works against a fake `JoinView` source in tests. | todo |
+
+### Wave 8 parallel schedule
+
+| Batch | Tasks | Notes |
+|---|---|---|
+| 8A | **SK-620 ∥ SK-621 ∥ SK-622** | All three branch from `task/session-mode` (or `main` once session mode merges) and share no files. SK-621 writes against the SK-620 contract below with fakes; SK-622 writes against the `JoinView` contract below with fakes. |
+| 8B | Merge order: SK-620 → SK-621 → SK-622 | SK-621's real wiring compiles only once SK-620's exports exist. If SK-621 lands first, its imports fail typecheck, so merge SK-620 first. SK-622's `setJoinViewFactory` call needs SK-621. Each merge must stay green; rebase the later branch if needed. |
+
+Owned and forbidden files:
+
+| Task | Owns | Must not touch |
+|---|---|---|
+| SK-620 | `src/runtime/pty.ts`, `src/runtime/pty-helper.ts`, `src/runtime/herdr.ts`, additive types in `src/runtime/types.ts`, their tests, `test/fixtures/herdr/` | `src/cli/**`, `src/session/**`, `package.json` |
+| SK-621 | `src/cli/commands/session.ts` (+ test), `test/integration/session.test.ts` | `src/runtime/**`, `src/session/**` (unless a protocol bug blocks it: stop and report), `src/cli/program.ts`, `src/cli/tui.ts`, `src/cli/commands/ui.ts` |
+| SK-622 | `src/cli/tui.ts`, `src/cli/commands/ui.ts` (+ tests), one line in `src/cli/program.ts` | `src/runtime/**`, `src/session/**`, `src/cli/commands/session.ts` |
+
+No new dependencies in any task. If SK-620 cannot meet the PTY criteria without one (e.g.
+`node-pty`), or SK-622 cannot render without one, **stop and report for a decision**; do not add
+it.
+
+### SK-620 brief — PTY runner and herdr session client (codex)
+
+**PTY without a dependency.** Node has no PTY API. Use the platform's `script(1)`:
+
+* **macOS (BSD):** `script -q <transcript> <argv...>`, an argv form with no shell.
+* **Linux (util-linux; 2.38 checked):** there is no argv form, only `-c <string>`. Pass a
+  **fixed literal** command string, `exec "$SKEP_PTY_NODE" "$SKEP_PTY_HELPER"`, and put the data
+  in the environment:
+  * `SKEP_PTY_NODE` = `process.execPath`;
+  * `SKEP_PTY_HELPER` = the compiled `pty-helper.js` path;
+  * `SKEP_PTY_ARGV` = the JSON argv.
+
+  No caller data is ever interpolated into the string, so this follows the no-shell-strings rule.
+  Flags: `-q -e -f` (`-e` returns the child's exit code; checked with exit 7).
+* **The helper (`pty-helper.ts`)** parses `SKEP_PTY_ARGV` with Zod, spawns the agent with
+  `stdio: "inherit"` (so the agent's stdio is the PTY), writes its own pid to a 0600 sidecar file
+  named by `SKEP_PTY_PIDFILE`, and exits with the child's code (128 + signal number on a signal).
+  The helper is the session leader inside the PTY, so its pid is the agent's process group.
+* **The runner** spawns `script` with stdin/stdout inherited when `input === "inherit"` (the
+  human's terminal; the human sees the agent's own UI). Otherwise it uses pipes, writes `input`
+  and closes stdin (tests).
+* **The transcript is `script`'s log file:**
+  * strip the `Script started/done` header and footer lines;
+  * keep the raw bytes for the local journal (0600, under the item's local directory);
+  * `stripTerminalControls()` removes CSI/OSC/DCS sequences, carriage returns and backspace
+    overstrikes for summaries.
+* **Abort** (`signal`) runs the ladder on the injected `Clock`: SIGTERM to `-helperPid` (the
+  agent group inside the PTY) and to the `script` group, then SIGKILL to both after `graceMs`
+  (default 10 s). This is the same shape as `runInterruptLadder`, without its SIGINT grace
+  phase.
+* If `script` is missing or the helper cannot start, throw `PtyUnavailableError` (the caller falls
+  back to native).
+
+**herdr client: verified locally against herdr 0.9.3.**
+
+* **Compatibility:** `herdr api schema --json` gives `{ protocol, schema_version, … }`. Supported
+  means `protocol ∈ SUPPORTED_HERDR_PROTOCOLS` (start with `[22]`) and `schema_version === 1`.
+  Anything else is a `HerdrSchemaError`.
+* **Do not pass `--machine`.** In herdr 0.9.3, `--machine <label>` selects a *remote machine*; it
+  is not a JSON switch (D28 corrects ARCHITECTURE §10.2). Socket-API subcommands already answer
+  JSON.
+* **Calls** (argv only; `exec` injected):
+  * `herdr tab create --cwd <dir> --label <name> --no-focus [--env K=V…]` ⇒ the pane id;
+  * `herdr agent start <name> --kind <claude|codex|pi> --pane <id> [--timeout <ms>] [-- <args…>]`;
+  * `herdr agent prompt <name> <text>`, with no `--wait`; the caller waits;
+  * `herdr agent wait <name> --until idle --until done --until blocked --timeout <ms>`;
+  * `herdr agent read <name> --source recent --lines <n> --format text`;
+  * `herdr agent focus <name>`;
+  * `herdr pane close <id>`.
+* **The prompt text is an argv element**, never shell-quoted. It is at most 16 KiB; above that,
+  write a prompt file in the worktree and send a one-line prompt pointing to it.
+* **Record fixtures** for the JSON success and `error_response {error:{code,message}}` shapes
+  from a local herdr in `test/fixtures/herdr/`, with ids and paths replaced by placeholders.
+  Known error codes include `agent_blocked`, `agent_prompt_stalled` and `timeout`.
+
+**The contract SK-621 and SK-622 rely on** (names and types are binding; implementation details
+are not):
+
+```ts
+// src/runtime/types.ts (additive)
+import type { AgentCli } from "../core/schemas/common.js"; // "codex" | "claude" | "pi"
+export type AgentViewState = "working" | "idle" | "done" | "blocked" | "unknown";
+export interface AgentSessionStart {
+  name: string;                 // /^[a-z0-9][a-z0-9-]{0,63}$/, e.g. "skep-i-3-e1"
+  kind: AgentCli;               // from the executing device's AGENT.md (D19, D27)
+  cwd: string;
+  env: Record<string, string>;  // already sanitized; never provider credentials (D19)
+  args?: string[];              // extra agent argv
+}
+export interface AgentSessionHandle {
+  name: string;
+  paneId: string;
+  focusCommand: readonly [string, ...string[]]; // ["herdr", "agent", "focus", name]
+}
+export interface AgentSessionBackend {
+  readonly name: "herdr";
+  probe(): Promise<{ protocol: number; schemaVersion: number }>;
+  start(opts: AgentSessionStart): Promise<AgentSessionHandle>;
+  prompt(h: AgentSessionHandle, text: string): Promise<void>;
+  /** Resolves on the first of idle | done | blocked; rejects with HerdrCallError("timeout"). */
+  wait(h: AgentSessionHandle, opts: { timeoutMs: number; signal?: AbortSignal }): Promise<AgentViewState>;
+  /** Plain text, NOT redacted: the caller redacts before anything leaves the device. */
+  read(h: AgentSessionHandle, opts?: { lines?: number }): Promise<string>;
+  focus(h: AgentSessionHandle): Promise<void>;
+  close(h: AgentSessionHandle): Promise<void>;
+}
+
+// src/runtime/herdr.ts
+export class AgentSessionError extends Error { readonly fallbackSafe: boolean; }
+export class HerdrUnavailableError extends AgentSessionError {}  // ENOENT / not running; fallbackSafe = true
+export class HerdrSchemaError extends AgentSessionError {}       // protocol mismatch; fallbackSafe = true
+export class HerdrCallError extends AgentSessionError { readonly code: string; } // fallbackSafe = !promptAccepted
+export const SUPPORTED_HERDR_PROTOCOLS: readonly number[];
+export function createHerdrBackend(deps?: { exec?: typeof execFileChecked; bin?: string }): AgentSessionBackend;
+
+// src/runtime/pty.ts
+export interface PtyRunOptions {
+  argv: [string, ...string[]];
+  cwd: string;
+  env: Record<string, string>;
+  transcriptPath: string;          // created 0600
+  input: "inherit" | string;       // "inherit" = this terminal; a string = test input, then EOF
+  signal?: AbortSignal;
+  clock: Clock;
+  graceMs?: number;                // SIGTERM → SIGKILL, default 10_000
+}
+export interface PtyRunResult {
+  exit: ProcessExit;               // from ./types.js
+  aborted: boolean;
+  transcript: Buffer;              // raw bytes, header/footer removed (local only)
+}
+export interface PtyRunner { run(opts: PtyRunOptions): Promise<PtyRunResult>; }
+export class PtyUnavailableError extends Error {}
+export function createPtyRunner(deps?: { platform?: NodeJS.Platform; scriptPath?: string }): PtyRunner;
+export function stripTerminalControls(text: string): string;
+```
+
+**Fallback rule** (the callers apply it, and SK-620 documents it):
+
+* Fall back to native **only** if `fallbackSafe` is true, meaning no prompt has been accepted.
+* After a prompt is accepted, a herdr failure is a `failed` item with the error text. It is
+  never re-run natively, because an unknown invocation is never replayed (§11.4).
+
+### SK-621 brief — live view in `skep session join` (claude)
+
+**Selection.** Replace `executeItem` with a strategy:
+
+| Selection | Strategy |
+|---|---|
+| `SKEP_SESSION_EXEC` unset | `dry` (today's marker) |
+| `SKEP_SESSION_EXEC=1` | `pty` |
+| `SKEP_SESSION_EXEC=1` + `SKEP_SESSION_VIEW=herdr` | `herdr` |
+| `--agent <dry\|pty\|herdr\|native>` | the named strategy; overrides both variables |
+
+**Agent CLI.** Load the AGENT.md in `--role-dir` (default: the current directory) with
+`loadAgentMd`, and take `agent_cli`. The master's plan never names one (D27). With
+`--agent native`, or after a fallback, use the existing non-interactive runner with the
+per-CLI argv: `codex exec -`, `claude -p`, `pi -p`. The prompt goes on stdin, as today. **No**
+approval-bypass flags.
+
+**Interactive argv** (pty / herdr). Start the CLI interactively in the worktree, with the item
+prompt as its initial message. The prompt is the item title plus the repo's session context,
+exactly as today's stdin text:
+
+* `codex <prompt>`, `claude <prompt>`, `pi <prompt>` as argv elements in pty;
+* `agent start` followed by `agent prompt` in herdr.
+
+The human ends a PTY run by quitting the agent. A herdr run ends when `wait` returns `done` or
+`idle`.
+
+**Result.**
+
+* Commit the worktree if it changed. If nothing changed, report `no changes` and submit nothing.
+* Run the trusted check and the SK-616 submit policy exactly as today.
+* `summary` = `Redactor.redact(stripTerminalControls(tail))`, capped at 4000 characters:
+  * pty: the transcript tail;
+  * herdr: `read(--lines 200)`.
+* The raw transcript stays in the local session directory (0600) and is never sent.
+
+**Blocked.** When herdr `wait` returns `blocked`:
+
+* the result's submit state is `pending` (the existing `SubmitStateSchema` value);
+* print `agent <name> is waiting for you: <focus command>` and notify;
+* return without committing, checking or submitting. **Never** `send-keys`.
+
+The human can re-run `skep session submit` after finishing in the pane. PTY mode has no blocked
+detection: the human is at the terminal, answering the agent's own prompts.
+
+**`JoinView` hook (for SK-622).** Export from `session.ts`:
+
+```ts
+export type JoinAgentState = "starting" | "running" | "blocked" | "done" | "failed";
+export interface JoinViewModel {
+  peers: { peerId: string; device: string; role: string; state: string }[];
+  item: { itemId: string; title: string; repo: string; epoch: number } | null;
+  agent: {
+    cli: AgentCli;
+    view: "dry" | "pty" | "herdr" | "native";
+    state: JoinAgentState;
+    focusCommand?: readonly string[];
+  } | null;
+  tail: string;                                 // already redacted + control-stripped, ≤ 4000
+  submit: { policy: SubmitMethod; outcome?: SubmitOutcome };
+}
+export interface JoinView {
+  update(model: JoinViewModel): void;
+  /** Replaces ItemWorker.ask when the policy is "ask"; null = defer (skip). */
+  chooseSubmit(model: JoinViewModel): Promise<"pr" | "mr" | "push" | "none" | null>;
+  /** PTY: give the terminal to the agent; resolves when the TUI may redraw. */
+  suspend(): Promise<void>;
+  resume(): void;
+  close(): void;
+}
+export function setJoinViewFactory(
+  factory: (io: { stdin: NodeJS.ReadStream; stdout: NodeJS.WriteStream }) => JoinView,
+): void;
+```
+
+* Without `--ui`, join uses a built-in line view: today's output plus the state lines.
+* With `--ui`, it uses the registered factory. If none is registered, it exits with "the
+  full-screen view is not available in this build".
+* Around a PTY run, join calls `suspend()` before and `resume()` after.
+
+**Tests.** Fake `PtyRunner` and `AgentSessionBackend` cover:
+
+* each strategy, and the env/flag selection;
+* the AGENT.md choice;
+* fallback on `fallbackSafe` errors, and no re-run after an accepted prompt;
+* blocked ⇒ `pending`, with no submit and no keys sent;
+* redaction of a planted secret in the tail;
+* the focus command printed;
+* the `--ui` path with a fake factory.
+
+Existing SK-615/SK-616 tests stay green and unmodified.
+
+### SK-622 brief — Skep TUI (claude)
+
+**Renderer (`src/cli/tui.ts`).** Dependency-free:
+
+* `Screen` over `{ stdin, stdout, columns, rows }`: alternate screen (`ESC[?1049h`), hidden cursor,
+  a full redraw per frame (the screen is small, so no diffing is needed), and truncation to
+  `columns`;
+* `stdin.setRawMode(true)` when `isTTY`;
+* a key decoder for arrows, Enter, `q`, letters, and Ctrl-C (= quit).
+
+Always restore the terminal: raw mode off, main screen and cursor back, on quit, on a thrown
+error, on `SIGINT`/`SIGTERM`, and in `suspend()`.
+
+**Layout** (24 rows minimum; below that, show a "terminal too small" line):
+
+* a header with session, device and role;
+* the peers list, where the selected agent row is highlighted;
+* the current item;
+* agent state and view (pty/herdr/native/dry);
+* the redacted tail, filling the remaining rows (last N lines);
+* a footer with only the valid keys.
+
+**Keys:**
+
+| Key | Action |
+|---|---|
+| `a` | Attach. PTY: `suspend()`, the agent runs in this terminal, `resume()` afterwards. herdr: run `focus` and show the command for another terminal. |
+| `p` / `u` / `n` / `s` | Submit pr / push / none / skip, resolving `chooseSubmit`; shown only while it is pending. `mr` replaces `pr` when the device's host is GitLab. |
+| `↑` / `↓` / `Enter` | Select an agent (several agents form a list). |
+| `q` | Quit. |
+
+There is no approve key and no input forwarding; a blocked agent shows "answer in the agent's own
+view (a)".
+
+**`src/cli/commands/ui.ts`:**
+
+* `register(program, ctx)` adds `skep ui`, the same view over the local session: a master shows
+  `session status` and the per-item results it already receives; a sub uses its join.
+* It calls `setJoinViewFactory(…)` so that `skep session join --ui` uses this screen.
+* **One** line in `program.ts` registers it.
+
+**Tests.** A fake stdin (a `PassThrough` with `isTTY` true and a `setRawMode` spy) and a fake
+80×24 stdout buffer. Assert:
+
+* the frames for each agent state;
+* truncation;
+* the key-to-action mapping;
+* the submit choice resolving `chooseSubmit`;
+* `a` calling `suspend`/`resume` (PTY) or `focus` (herdr);
+* terminal restoration after a thrown error;
+* "too small".
+
+There are no real TTYs or processes.
 ---
 
 ## Wave 2b / Wave 3 parallel schedule
