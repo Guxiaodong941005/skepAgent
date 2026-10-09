@@ -1,6 +1,6 @@
 {
   "name": "@skepagent/skep",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Cross-device, decentralized collaboration for AI coding agents over a signed git blackboard.",
   "license": "MIT",
   "type": "module",

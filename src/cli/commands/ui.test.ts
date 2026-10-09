@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { skepPaths } from "../../config/paths.js";
 import type { Clock } from "../../util/clock.js";
 import { buildProgram, runCli } from "../program.js";
-import type { ProcessHooks } from "../tui.js";
+import { type ProcessHooks, TuiJoinView } from "../tui.js";
 import type { SessionStatus } from "./session.js";
 import { joinViewFactory, masterSnapshot, type UiCliContext } from "./ui.js";
 
@@ -340,6 +340,7 @@ describe("session join --ui factory", () => {
       stdin: term.stdin as unknown as NodeJS.ReadStream,
       stdout: term.stdout as unknown as NodeJS.WriteStream,
     });
+    if (!(view instanceof TuiJoinView)) throw new Error("join view is not the TUI");
     const model = {
       peers: [{ peerId: "peer-1", device: "laptop", role: "coding", state: "joined" }],
       item: { itemId: "I-1", title: "fix", repo: "web", epoch: 1 },
@@ -349,6 +350,10 @@ describe("session join --ui factory", () => {
     };
     view.update(model);
     const choice = view.chooseSubmit(model);
+    // `chooseSubmit` waits for device.toml (pr vs mr) before drawing the question. Under a
+    // loaded event loop that read can outrun a fixed number of flushes, so wait for hostReady
+    // first; the prompt itself is drawn synchronously after that.
+    await view.tui.hostReady;
     await until(() => term.frame().includes("Submit p mr / u push / n none / s skip?"));
     term.stdin.write("p");
     await expect(choice).resolves.toBe("mr");

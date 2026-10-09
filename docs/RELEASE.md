@@ -1,8 +1,60 @@
-# Skep v0.1.0 release record
+# Skep release record
 
-Tag-only first public release of the MVP. This document records the package-name decision, the
-npm registry re-check, the pre-release checklist, and the steps the orchestrator runs. Agents
-must not `git push`, create tags, or `npm publish`.
+Tag-only public releases. This document records the package-name decision (v0.1.0), the npm
+registry re-check, the v0.1.0 checklist, the v0.1.1 session-TUI notes, and the steps the
+orchestrator runs. Agents must not `git push`, create tags, or `npm publish`.
+
+## v0.1.1 — session TUI (2026-10-09)
+
+Patch on the v0.1.0 blackboard. Package name stays **`@skepagent/skep`** (public). Bins stay
+`skep` and `skepd`. `publishConfig.access` stays `"public"`. `files` stays `dist`, `README.md`,
+`LICENSE`, `CHANGELOG.md`.
+
+Product UX for this tag:
+
+* Bare `skep` (no subcommand) opens the locally installed agent CLI (claude, then codex, then
+  pi). `skep tui` is the same entry. The agent keeps its own TUI.
+* `skep ui` and `skep session join --ui` open the Skep session screen: peers, current item,
+  agent state, redacted output tail, submit choice (D30). One agent occupies the terminal.
+* Session protocol: `skep session start|join|intent|status`. Subs work items and apply this
+  device's submit policy (`ask` / `pr` / `mr` / `push` / `none`).
+* Live view: PTY, else optional local herdr, else the native non-interactive CLI (D27–D29).
+  Full transcripts stay on the executing device. No provider credentials are transported (D19).
+
+`REDUCER_VERSION` and `protocol_version` stay 1. `skep -V` still prints the scaffold string
+`0.0.1`.
+
+SK-609 remains waived (no `docs/MVP-RUN-REPORT.md`). Wave 7 is not in this tag. `npm publish`
+stays deferred until the human creates org `skepagent` and says go.
+
+Install until then:
+
+```bash
+npm install -g github:Guxiaodong941005/skepAgent#v0.1.1
+```
+
+Orchestrator, after this branch merges (do **not** push, tag, or publish from the task agent):
+
+1. Confirm `node -e "console.log(require('./package.json').name, require('./package.json').version)"`
+   prints `@skepagent/skep 0.1.1`.
+2. `npm run lint && npm test && npm run build` green. `npm pack --dry-run` lists `dist/**`,
+   `README.md`, `LICENSE`, `CHANGELOG.md`, `package.json` only (no `src/`, `test/`, fixtures, keys).
+3. Annotated tag `v0.1.1` on the merge commit, pushed only on explicit human go:
+
+   ```bash
+   git tag -a v0.1.1 <merge-commit-sha> -m "v0.1.1"
+   # git push origin v0.1.1    # only on explicit human go
+   ```
+
+4. **Do not run `npm publish`.**
+
+---
+
+## v0.1.0 — first public tag
+
+Tag-only first public release of the MVP. The sections below are the v0.1.0 record and are kept
+as history. v0.1.1 **does** merge `task/session-mode`; the "do not merge session-mode" line
+applies only to the 0.1.0 tag.
 
 Normative product scope: [`PRD-v0.4.md`](PRD-v0.4.md) §16. Architecture: [`ARCHITECTURE.md`](ARCHITECTURE.md).
 Operating procedures: [`RUNBOOK.md`](RUNBOOK.md). Changelog: [`../CHANGELOG.md`](../CHANGELOG.md).
@@ -70,7 +122,7 @@ print. Broader DEV-PLAN items are recorded honestly.
 | 2b | `SKEP_PROPERTY_LOGS=1000` | **fail** (not run for this tag). |
 | 2c | Sim scenarios at 50 seeds (`SKEP_SIM_SEEDS=50 npx vitest run test/integration/sim`, G1) | **fail** (not run for this tag; `npm test` keeps the 3-seed default and is green). |
 | 2d | Opt-in real-adapter tests on a device with the pinned CLI | **fail** (not run; no `SKEP_REAL_CODEX=1` in this environment). |
-| 3 | Secret scan clean: `gitleaks detect` over full git history and over the `npm pack` tarball; only allowlisted findings are the documented test keys | **pass with notes.** `.gitleaks.toml` allowlists `test/fixtures/keys/`. Full-history `gitleaks detect` still reports (G18) a dummy `ssh-ed25519` body in `src/git/trust.test.ts`, plus historical session-mode test tokens that are **not** in this tree (`task/session-mode` was not merged). Pack tarball does not include `src/` or `test/`. |
+| 3 | Secret scan clean: `gitleaks detect` over full git history and over the `npm pack` tarball; only allowlisted findings are the documented test keys | **pass with notes** (recorded for the 0.1.0 tag, when `task/session-mode` was not merged). `.gitleaks.toml` allowlists `test/fixtures/keys/`. Full-history `gitleaks detect` still reports (G18) a dummy `ssh-ed25519` body in `src/git/trust.test.ts`. Pack tarball does not include `src/` or `test/`. v0.1.1 merges session-mode; re-scan that tree before its tag. |
 | 4 | No absolute host paths, real hostnames, IPs or personal emails in the repo | **pass.** Grep on 2026-10-09 found no public IPv4 and no personal emails. Remaining hosts are examples (`example.invalid`, `github.com` in fixtures/PRD, `skepagent.com`). |
 | 5 | D19 non-goal in README, ARCHITECTURE (top + §16) and the release notes; D18 "no inbound connectivity" in README | **pass** (this change set). |
 | 6 | All DEV-PLAN MVP tasks `done` with reviews in `docs/reviews/`; Wave 2b/3 follow-ups F1–F21 closed or deferred in CHANGELOG known limitations | **pass with notes.** SK-101..SK-608 and SK-611..SK-614 are `done` with reviews. SK-609 remains `todo` (waived for this tag). F21 (relay) stays with SK-701 / Wave 7 and is listed as a known limitation. Wave 8 session-mode/TUI is not included. |
@@ -86,7 +138,8 @@ Recorded in [`CHANGELOG.md`](../CHANGELOG.md) as well:
 * No `npm publish`; org `skepagent` may not exist yet.
 * Codex adapter only; macOS/Linux; single slot per device.
 * Wave 7 relay / enrollment not required and not shipped.
-* Wave 8 session-mode / TUI **not merged** (`task/session-mode` stayed off `main`).
+* Wave 8 session-mode / TUI **not merged** into the 0.1.0 tag (`task/session-mode` stayed off
+  `main`; it lands in 0.1.1).
 * G2: moving an item to another agent = revoke + human-approved replan.
 * G4: sim fixture keys live under `test/` and are not in the npm pack.
 * G18: gitleaks dummy-key false positive in `src/git/trust.test.ts`.
@@ -104,8 +157,8 @@ MVP from current `main` lineage only:
 * Wave 6b: SK-611, SK-612, SK-613, SK-614.
 * D18 outbound-only networking; D19 no credential transport.
 
-Not in this tag: SK-609 evidence, Wave 7 (SK-701..SK-703), Wave 8 session/TUI, npm registry
-package.
+Not in the 0.1.0 tag: SK-609 evidence, Wave 7 (SK-701..SK-703), Wave 8 session/TUI (shipped in
+0.1.1), npm registry package.
 
 ## Orchestrator: commit, tag, do not publish
 
