@@ -34,9 +34,11 @@ import {
   type DatalistEntry,
   type MasterHandle,
   type MasterOptions,
+  type PeerPhase,
+  type PeerProgress,
   type PlanItem,
-  type SubHandle as SessionSubHandle,
-  type SubOptions as SessionSubOptions,
+  type SubHandle,
+  type SubOptions,
   type SubmitMethod,
   type SubmitOutcome,
   SubmitOutcomeSchema,
@@ -71,26 +73,7 @@ export interface HostPort {
   port: number;
 }
 
-// TODO: Import PeerPhase/PeerProgress and use the shared sub contracts once §2.1/§5 land.
-export type PeerPhase = "idle" | "working" | "blocked" | "done";
-export interface PeerProgress {
-  peerId: string;
-  device: string;
-  role: string | null;
-  phase: PeerPhase | "left";
-  done: number;
-  total: number;
-  failed: number;
-  percent: number;
-  summary: string;
-  itemId?: string;
-}
-export type SubOptions = SessionSubOptions & {
-  onProgress?(progress: PeerProgress & { self: boolean }): void;
-};
-export type SubHandle = SessionSubHandle & {
-  reportAgent?(itemId: string, state: JoinAgentState): void;
-};
+export type { PeerPhase, PeerProgress, SubHandle, SubOptions };
 
 export interface SessionApi {
   startMaster(options: MasterOptions): Promise<MasterHandle>;
