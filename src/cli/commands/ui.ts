@@ -16,7 +16,9 @@ import { type Clock, systemClock } from "../../util/clock.js";
 import { execFileChecked } from "../../util/exec.js";
 import type { CliContext } from "../context.js";
 import { CliError } from "../output.js";
+import { createTheme, detectColorLevel, detectScheme, type Theme } from "../theme.js";
 import {
+  detectGlyphs,
   type ProcessHooks,
   type ScreenIo,
   Tui,
@@ -76,6 +78,9 @@ export function joinViewFactory(ctx: CliContext): JoinViewFactory {
     const deviceToml = ctx.paths?.deviceToml;
     return new TuiJoinView({
       io: { stdin: io.stdin, stdout: io.stdout },
+      glyphs: detectGlyphs(ctx.env),
+      theme: themeFromEnv(ctx, io.stdout.isTTY === true),
+      animate: ctx.env.SKEP_TUI_ANIMATE !== "0",
       host:
         deviceToml === undefined
           ? "github"
@@ -91,6 +96,14 @@ export function joinViewFactory(ctx: CliContext): JoinViewFactory {
       },
     });
   };
+}
+
+/**
+ * Color level and palette from the environment (SKEP_TUI_COLOR/THEME, NO_COLOR, FORCE_COLOR,
+ * COLORTERM, TERM, COLORFGBG; docs/plans/tui-material-redesign.md §4).
+ */
+function themeFromEnv(ctx: CliContext, isTty: boolean): Theme {
+  return createTheme({ level: detectColorLevel(ctx.env, isTty), scheme: detectScheme(ctx.env) });
 }
 
 async function runFocus(ctx: CliContext, argv: readonly string[]): Promise<void> {
@@ -117,6 +130,10 @@ async function uiCommand(ctx: UiCliContext): Promise<void> {
   const stop = new AbortController();
   const tui = new Tui({
     io,
+    clock,
+    glyphs: detectGlyphs(ctx.env),
+    theme: themeFromEnv(ctx, io.stdout.isTTY === true),
+    animate: ctx.env.SKEP_TUI_ANIMATE !== "0",
     ...(ctx.uiHooks === undefined ? {} : { hooks: ctx.uiHooks }),
     onQuit: () => stop.abort(),
   });
@@ -172,7 +189,8 @@ export function masterSnapshot(status: SessionStatus, device: string): TuiSnapsh
       peerId: peer.peerId,
       device: peer.device,
       role: peer.role ?? "-",
-      state: peer.repo === null ? "joined" : `repo ${peer.repo}`,
+      state: peer.progress?.phase ?? (peer.repo === null ? "joined" : `repo ${peer.repo}`),
+      ...(peer.progress === undefined ? {} : { progress: peer.progress }),
     })),
     entries,
   };

@@ -10,7 +10,6 @@ import {
   normalizeJoinCode,
 } from "./handshake.js";
 
-
 function seededBytes(seed: number): { bytes(n: number): Uint8Array } {
   let x = seed >>> 0 || 1;
   return {

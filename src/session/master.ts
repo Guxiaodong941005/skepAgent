@@ -23,6 +23,8 @@ import {
   IntentInputSchema,
   type ItemStatus,
   type JoinRejectReason,
+  type ProgressMsg,
+  ProgressMsgSchema,
   type SessionMsg,
   SessionMsgSchema,
   type SessionStatus,
@@ -30,6 +32,14 @@ import {
   TokenSchema,
 } from "./messages.js";
 import type { PeerPath } from "./path.js";
+import {
+  deriveProgress,
+  type PeerPhase,
+  type PeerProgress,
+  ProgressCoalescer,
+  progressInterval,
+  type ReportedProgress,
+} from "./progress.js";
 import { applyClaim, applyResult, buildPlan, matchSub, type SubCandidate } from "./state.js";
 
 export class ListenAddressError extends Error {
@@ -52,6 +62,14 @@ interface Peer {
   repo: string | null;
   head: string | null;
   role: string | null;
+  progress: {
+    /** Only peers that sent a `progress` frame receive relays (plan §2.6). */
+    optIn: boolean;
+    reported: ReportedProgress | null;
+    /** Coalesces relays *about* this peer to every other opted-in peer. */
+    coalescer: ProgressCoalescer<PeerProgress>;
+    lastPhase: PeerPhase | null;
+  };
 }
 interface Request {
   requestId: string;
@@ -105,6 +123,7 @@ class SessionMaster implements MasterHandle {
   private readonly heartbeatMs: number;
   private readonly ttlMs: number;
   private readonly datalistMs: number;
+  private readonly progressMs: number;
   private readonly wires = new Set<SessionWire>();
   private readonly unauthenticated = new Set<SessionWire>();
   private readonly peers = new Map<string, Peer>();
@@ -124,6 +143,7 @@ class SessionMaster implements MasterHandle {
     this.heartbeatMs = positiveDuration(options.heartbeatMs, 10_000);
     this.ttlMs = positiveDuration(options.joinCodeTtlMs, 600_000);
     this.datalistMs = positiveDuration(options.datalistTimeoutMs, 30_000);
+    this.progressMs = progressInterval(options.progressIntervalMs);
     this.sessionId = `session-${Buffer.from(this.random.bytes(16)).toString("hex")}`;
     this.closed = new Promise((resolve) => {
       this.resolveClosed = resolve;
@@ -190,6 +210,7 @@ class SessionMaster implements MasterHandle {
         repo: peer.repo,
         head: peer.head,
         role: peer.role,
+        progress: deriveProgress(this.allItems(), peer.peerId, peer.progress.reported),
       })),
       intents: this.intents.map(({ intentId, text, state, items }) => ({
         intentId,
@@ -368,7 +389,7 @@ class SessionMaster implements MasterHandle {
               cancelHandshake();
               this.unauthenticated.delete(wire);
               const joinedOrder = ++this.peerSeq;
-              peer = {
+              const joined: Peer = {
                 peerId: `peer-${joinedOrder}`,
                 device,
                 path: { ...path },
@@ -377,11 +398,24 @@ class SessionMaster implements MasterHandle {
                 repo: null,
                 head: null,
                 role: null,
+                progress: {
+                  optIn: false,
+                  reported: null,
+                  lastPhase: null,
+                  coalescer: new ProgressCoalescer<PeerProgress>({
+                    intervalMs: this.progressMs,
+                    monotonicMs: () => this.clock.monotonicMs(),
+                    schedule: (ms, fn) => this.timer(ms, fn),
+                    send: (value) => this.relay(joined, value),
+                  }),
+                },
               };
+              peer = joined;
               this.peers.set(peer.peerId, peer);
               wire.send({ type: "welcome", sessionId: this.sessionId, peerId: peer.peerId });
               wire.startHeartbeat(this.heartbeatMs);
               this.event("joined", `Peer ${peer.peerId} joined`);
+              this.progressChanged(peer);
             })
             .catch(() => {
               this.event("error", "Join approval failed");
@@ -428,6 +462,7 @@ class SessionMaster implements MasterHandle {
       peer.repo = message.repo;
       peer.head = message.head;
       peer.role = message.role;
+      this.progressChanged(peer);
       intent.candidates.push({
         peerId: peer.peerId,
         repo: message.repo,
@@ -471,6 +506,10 @@ class SessionMaster implements MasterHandle {
       if (intent) intent.items = change.items;
       peer.wire.send(change.reply);
       this.event(change.reply.type, message.itemId);
+      // Only the sender can be the assignee of an accepted claim or result.
+      this.progressChanged(peer);
+    } else if (message.type === "progress") {
+      this.receiveProgress(peer, message);
     } else {
       throw new ChannelError("Message is not allowed from a sub");
     }
@@ -546,10 +585,94 @@ class SessionMaster implements MasterHandle {
       });
     }
     this.event("planned", intent.intentId);
+    for (const assignee of new Set(items.map((item) => item.assignee))) {
+      const peer = this.peers.get(assignee);
+      if (peer) this.progressChanged(peer);
+    }
+  }
+
+  private receiveProgress(peer: Peer, message: ProgressMsg): void {
+    if (
+      message.peerId !== undefined ||
+      message.device !== undefined ||
+      message.role !== undefined ||
+      message.phase === "left"
+    )
+      throw new ChannelError("Progress from a sub must not name a peer");
+    // Counts and percent are informational: the master derives them from its own item state.
+    const reported: ReportedProgress = {
+      phase: message.phase,
+      summary: message.summary,
+      ...(message.itemId === undefined ? {} : { itemId: message.itemId }),
+    };
+    const state = peer.progress;
+    if (!state.optIn) {
+      state.optIn = true;
+      // The first frame is the opt-in: answer with everyone else's current strip, uncoalesced.
+      for (const other of this.peers.values()) {
+        if (other !== peer) peer.wire.send(progressFrame(this.effectiveProgress(other)));
+      }
+    } else if (
+      state.reported &&
+      state.reported.phase === reported.phase &&
+      state.reported.summary === reported.summary &&
+      state.reported.itemId === reported.itemId
+    ) {
+      return;
+    }
+    state.reported = reported;
+    this.progressChanged(peer);
+  }
+
+  private effectiveProgress(peer: Peer): PeerProgress {
+    return {
+      // Identity comes from the authenticated wire and the handshake, never from a frame.
+      peerId: peer.peerId,
+      device: peer.device,
+      role: peer.role,
+      ...deriveProgress(this.allItems(), peer.peerId, peer.progress.reported),
+    };
+  }
+
+  private progressChanged(peer: Peer): void {
+    if (this.stopped || this.peers.get(peer.peerId) !== peer) return;
+    const value = this.effectiveProgress(peer);
+    if (value.phase !== "left" && value.phase !== peer.progress.lastPhase) {
+      peer.progress.lastPhase = value.phase;
+      this.event("progress", peer.peerId);
+    }
+    peer.progress.coalescer.push(value);
+  }
+
+  /** Fan out a strip about `subject` to every opted-in peer except the subject (no echo). */
+  private relay(subject: Peer, value: PeerProgress): void {
+    const frame = progressFrame(value);
+    for (const other of this.peers.values()) {
+      if (other !== subject && other.progress.optIn && other.wire.active) other.wire.send(frame);
+    }
+  }
+
+  private allItems(): ItemStatus[] {
+    return this.intents.flatMap((intent) => intent.items);
   }
 
   private dropPeer(peer: Peer): void {
     this.peers.delete(peer.peerId);
+    peer.progress.coalescer.cancel();
+    if (!this.stopped) {
+      // Immediate, not coalesced: the row must disappear, whatever was pending for it.
+      this.relay(peer, {
+        peerId: peer.peerId,
+        device: peer.device,
+        role: peer.role,
+        phase: "left",
+        done: 0,
+        total: 0,
+        failed: 0,
+        percent: 0,
+        summary: "",
+      });
+    }
     for (const intent of this.intents) {
       intent.items = intent.items.map((item) =>
         item.assignee === peer.peerId && (item.state === "claimed" || item.state === "planned")
@@ -566,6 +689,9 @@ class SessionMaster implements MasterHandle {
       }
       if (intent.requests.length) this.plan(intent);
     }
+    // The dropped peer's items failed; anyone else whose plan just landed is already covered by
+    // plan(), and the coalescers drop unchanged values.
+    for (const other of this.peers.values()) this.progressChanged(other);
   }
 
   private local(path: PeerPath): boolean {
@@ -623,6 +749,7 @@ class SessionMaster implements MasterHandle {
     if (this.stopped) return this.closed;
     this.stopped = true;
     this.code = null;
+    for (const peer of this.peers.values()) peer.progress.coalescer.cancel();
     for (const timer of this.timers) timer.abort();
     this.timers.clear();
     for (const intent of this.intents)
@@ -636,6 +763,11 @@ class SessionMaster implements MasterHandle {
       await new Promise<void>((resolve) => this.server?.close(() => resolve()));
     this.resolveClosed();
   }
+}
+
+function progressFrame(value: PeerProgress): ProgressMsg {
+  // Parse on the way out: a derivation bug must fail here, not disconnect the receiving sub.
+  return ProgressMsgSchema.parse({ type: "progress", ...value });
 }
 
 function controlError(

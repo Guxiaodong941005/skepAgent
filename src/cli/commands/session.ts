@@ -34,6 +34,8 @@ import {
   type DatalistEntry,
   type MasterHandle,
   type MasterOptions,
+  type PeerPhase,
+  type PeerProgress,
   type PlanItem,
   type SubHandle,
   type SubmitMethod,
@@ -71,12 +73,14 @@ export interface HostPort {
   port: number;
 }
 
+export type { PeerPhase, PeerProgress, SubHandle, SubOptions };
+
 export interface SessionApi {
   startMaster(options: MasterOptions): Promise<MasterHandle>;
   connectSub(options: SubOptions): Promise<SubHandle>;
 }
 
-export type { DatalistEntry, MasterHandle, MasterOptions, PlanItem, SubHandle, SubOptions };
+export type { DatalistEntry, MasterHandle, MasterOptions, PlanItem };
 
 export type SessionCliContext = CliContext & {
   sessionApi?: SessionApi;
@@ -136,6 +140,30 @@ const ItemResultSchema = z.strictObject({
   submit: SubmitOutcomeSchema.optional(),
 });
 
+const PeerProgressSchema = z
+  .strictObject({
+    phase: z.enum(["idle", "working", "blocked", "done"]),
+    done: z.number().int().nonnegative().max(10_000),
+    total: z.number().int().nonnegative().max(10_000),
+    failed: z.number().int().nonnegative().max(10_000),
+    percent: z.number().int().min(0).max(100),
+    summary: z.string().max(120),
+    itemId: z
+      .string()
+      .regex(/^I-\d+$/)
+      .optional(),
+  })
+  .refine(
+    (progress) => progress.done <= progress.total && progress.failed <= progress.done,
+    "done ≤ total and failed ≤ done",
+  )
+  .refine(
+    (progress) =>
+      progress.percent ===
+      (progress.total === 0 ? 0 : Math.floor((100 * progress.done) / progress.total)),
+    "percent must equal floor(100*done/total)",
+  );
+
 export const SessionStatusSchema = z.strictObject({
   sessionId: z.string().min(1),
   listen: z.string().min(1),
@@ -151,6 +179,7 @@ export const SessionStatusSchema = z.strictObject({
       repo: z.string().nullable(),
       head: z.string().nullable(),
       role: z.string().nullable(),
+      progress: PeerProgressSchema.optional(),
     }),
   ),
   intents: z.array(
@@ -826,7 +855,15 @@ export const AGENT_VIEWS = ["dry", "pty", "herdr", "native"] as const;
 export type AgentView = (typeof AGENT_VIEWS)[number];
 
 export interface JoinViewModel {
-  peers: { peerId: string; device: string; role: string; state: string }[];
+  peers: {
+    peerId: string;
+    device: string;
+    role: string;
+    state: string;
+    progress?: Pick<PeerProgress, "done" | "total" | "failed" | "percent" | "summary"> & {
+      phase: PeerPhase;
+    };
+  }[];
   item: { itemId: string; title: string; repo: string; epoch: number } | null;
   agent: {
     cli: AgentCli;
@@ -1278,6 +1315,7 @@ export interface ItemWorker {
   terminal?: <T>(fn: () => Promise<T>) => Promise<T>;
   /** Aborted when the join is closing; stops a running PTY or herdr wait. */
   signal?: AbortSignal;
+  onAgentState?(itemId: string, state: JoinAgentState): void;
 }
 
 /**
@@ -1320,6 +1358,7 @@ export async function workItem(worker: ItemWorker, item: PlanItem): Promise<SubR
   const report = (state: JoinAgentState, focus?: readonly string[]): void => {
     agentState = state;
     if (focus !== undefined) focusCommand = focus;
+    worker.onAgentState?.(item.itemId, agentState);
     worker.view?.update(show());
   };
   const result = (
@@ -1331,6 +1370,7 @@ export async function workItem(worker: ItemWorker, item: PlanItem): Promise<SubR
       ...fields,
       summary: clipSummary(`${submitLine(fields.submit)}\n${clean(summary)}`),
     };
+    worker.onAgentState?.(item.itemId, agentState);
     worker.view?.update(show(fields.submit));
     return final;
   };
@@ -1785,6 +1825,7 @@ async function joinCommand(ctx: SessionCliContext, opts: JoinOptions): Promise<v
         });
   let terminalQueue: Promise<unknown> = Promise.resolve();
   const abort = new AbortController();
+  let subHandle: SubHandle | undefined;
   const worker: ItemWorker = {
     ctx,
     root: path.join(paths.home, "session", "worktrees"),
@@ -1800,6 +1841,59 @@ async function joinCommand(ctx: SessionCliContext, opts: JoinOptions): Promise<v
       return run;
     },
     signal: abort.signal,
+    onAgentState: (id, state) => subHandle?.reportAgent?.(id, state),
+  };
+
+  const roster = new Map<string, JoinViewModel["peers"][number]>();
+  const phases = new Map<string, PeerProgress["phase"]>();
+  let selfId: string | undefined;
+  const updatePeers = (): void => {
+    worker.peers = [...roster.values()].sort((left, right) => {
+      if (left.peerId === selfId) return -1;
+      if (right.peerId === selfId) return 1;
+      const numberOf = (id: string): number => Number(/^peer-(\d+)$/.exec(id)?.[1] ?? Infinity);
+      return (
+        numberOf(left.peerId) - numberOf(right.peerId) || left.peerId.localeCompare(right.peerId)
+      );
+    });
+    joinView.update({
+      peers: worker.peers,
+      item: null,
+      agent: null,
+      tail: "",
+      submit: { policy: method },
+    });
+  };
+  const onProgress: NonNullable<SubOptions["onProgress"]> = (progress) => {
+    const { peerId, phase } = progress;
+    if (progress.self) selfId = peerId;
+    if (phase === "left") {
+      roster.delete(peerId);
+    } else {
+      roster.set(peerId, {
+        peerId,
+        device: progress.self ? device : progress.device,
+        role: progress.self ? role : (progress.role ?? "-"),
+        state: phase,
+        progress: {
+          phase,
+          done: progress.done,
+          total: progress.total,
+          failed: progress.failed,
+          percent: progress.percent,
+          summary: progress.summary,
+        },
+      });
+    }
+    updatePeers();
+    if (phases.get(peerId) !== phase) {
+      phases.set(peerId, phase);
+      say(
+        { event: "peer-progress", ...progress },
+        () =>
+          `peer ${progress.device} ${phase} ${progress.done}/${progress.total} (${progress.percent}%)\n`,
+      );
+    }
   };
 
   let fingerprintShown = false;
@@ -1821,6 +1915,7 @@ async function joinCommand(ctx: SessionCliContext, opts: JoinOptions): Promise<v
       clock: systemClock,
       random: cryptoRandom,
       onFingerprint: showFingerprint,
+      onProgress,
       describe: async () => ({
         repo,
         role,
@@ -1846,6 +1941,7 @@ async function joinCommand(ctx: SessionCliContext, opts: JoinOptions): Promise<v
         return result;
       },
     });
+    subHandle = handle;
   } catch (error) {
     joinView.close();
     throw error;
@@ -1860,14 +1956,9 @@ async function joinCommand(ctx: SessionCliContext, opts: JoinOptions): Promise<v
   try {
     showFingerprint(handle.fingerprint);
     const { sessionId, peerId } = handle;
-    worker.peers = [{ peerId, device, role, state: "joined" }];
-    joinView.update({
-      peers: worker.peers,
-      item: null,
-      agent: null,
-      tail: "",
-      submit: { policy: method },
-    });
+    selfId = peerId;
+    if (!roster.has(peerId)) roster.set(peerId, { peerId, device, role, state: "joined" });
+    updatePeers();
     const at = formatHostPort(target);
     say(
       { event: "joined", sessionId, peerId, target: at },
@@ -2119,7 +2210,7 @@ export function renderSessionStatus(status: SessionStatus): string {
     lines.push("peers:");
     lines.push(
       table([
-        ["PEER", "DEVICE", "ADDRESS", "REPO", "HEAD", "ROLE"],
+        ["PEER", "DEVICE", "ADDRESS", "REPO", "HEAD", "ROLE", "PROGRESS"],
         ...status.peers.map((p) => [
           p.peerId,
           p.device,
@@ -2127,6 +2218,7 @@ export function renderSessionStatus(status: SessionStatus): string {
           p.repo ?? "-",
           p.head === null ? "-" : p.head.slice(0, 12),
           p.role ?? "-",
+          p.progress === undefined ? "-" : `${p.progress.phase} ${p.progress.percent}%`,
         ]),
       ]),
     );
