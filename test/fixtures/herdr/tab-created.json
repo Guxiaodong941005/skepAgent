@@ -1,0 +1,35 @@
+{
+  "id": "cli:tab:create",
+  "result": {
+    "type": "tab_created",
+    "tab": {
+      "tab_id": "workspace:tab",
+      "workspace_id": "workspace",
+      "number": 1,
+      "label": "skep-example",
+      "focused": false,
+      "pane_count": 1,
+      "agent_status": "idle"
+    },
+    "root_pane": {
+      "agent": "codex",
+      "agent_session": {
+        "agent": "codex",
+        "kind": "id",
+        "source": "herdr:codex",
+        "value": "<session-id>"
+      },
+      "agent_status": "idle",
+      "cwd": "<worktree>",
+      "focused": false,
+      "foreground_cwd": "<worktree>",
+      "pane_id": "workspace:pane",
+      "revision": 70,
+      "tab_id": "workspace:tab",
+      "terminal_id": "terminal",
+      "terminal_title": "Example task",
+      "terminal_title_stripped": "Example task",
+      "workspace_id": "workspace"
+    }
+  }
+}
