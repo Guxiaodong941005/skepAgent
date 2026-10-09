@@ -156,10 +156,10 @@ describe("peer progress glyphs", () => {
       const expected =
         glyphs === "unicode"
           ? {
-              working: ["🐝  ", " 🐝 ", "  🐝", " 🐝 "],
-              blocked: ["🐝! ", "🐝! ", "🐝  ", "🐝  "],
-              done: ["✓   ", "✓   ", "✓   ", "✓   "],
-              idle: ["·   ", "·   ", "·   ", "·   "],
+              working: [">*  ", " >* ", "  >*", " >* "],
+              blocked: ["*!  ", "*!  ", "*   ", "*   "],
+              done: ["[x] ", "[x] ", "[x] ", "[x] "],
+              idle: [".   ", ".   ", ".   ", ".   "],
             }
           : {
               working: ["~b  ", " ~b ", "  ~b", " ~b "],
@@ -314,10 +314,10 @@ describe("truncate", () => {
 
 describe("peer progress strips", () => {
   it.each([
-    ["working", "🐝", "working"],
-    ["blocked", "🐝!", "blocked"],
-    ["idle", "·", "idle"],
-    ["done", "✓", "done"],
+    ["working", ">*", "working"],
+    ["blocked", "*!", "blocked"],
+    ["idle", ".", "idle"],
+    ["done", "[x]", "done"],
   ] as const)("draws a remote %s peer without an entry", (phase, glyph, label) => {
     const term = fakeTerminal();
     const view = open(term, { animate: false });
@@ -347,7 +347,7 @@ describe("peer progress strips", () => {
         progress: { ...progress, phase: "done", done: 8, failed: 1, percent: 100, summary: "" },
       };
       view.update(snapshot);
-      expect(term.frame()[2]).toContain("✓   ");
+      expect(term.frame()[2]).toContain("[x] ");
       expect(term.frame()[2]).toContain("[████████] 100%  8/8  done (1 failed)");
       expect(term.frame()[3]).toBe("> laptop  coding  I-1 e1  codex/pty  running");
     } finally {
@@ -367,7 +367,7 @@ describe("peer progress strips", () => {
         progress.summary = "safe\n\r\ttext";
         view.tui.model.beat = 2;
         view.update(snapshot);
-        expect(term.frame()[3]).toContain(`backend    ${glyphs === "unicode" ? "🐝" : "~b"}  [`);
+        expect(term.frame()[3]).toContain(`backend    ${glyphs === "unicode" ? ">*" : "~b"}  [`);
         expect(term.frame()[3]).toContain("safe text");
         expect(term.frame()[3]).toContain(glyphs === "unicode" ? "███░░░░░" : "###.....");
       } finally {

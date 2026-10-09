@@ -31,16 +31,26 @@ export type Glyphs = "unicode" | "ascii";
 export const TICK_MS = 250;
 
 export function beeLane(phase: PeerPhase, beat: number, glyphs: Glyphs): string {
-  const bee = glyphs === "unicode" ? "🐝" : "~b";
+  // Portable BMP glyphs only — no emoji (many fonts render 🐝 as tofu).
+  // unicode: ">*" bee dart; ascii: "~b". Both are 4 display columns.
   if (phase === "working") {
-    const offset = [0, 1, 2, 1][beat % 4] ?? 0;
-    return `${" ".repeat(offset)}${bee}${" ".repeat(2 - offset)}`;
+    const frames =
+      glyphs === "ascii"
+        ? (["~b  ", " ~b ", "  ~b", " ~b "] as const)
+        : ([">*  ", " >* ", "  >*", " >* "] as const);
+    return frames[beat % 4] ?? frames[0];
   }
   if (phase === "blocked") {
-    return glyphs === "unicode" ? (beat % 4 < 2 ? "🐝! " : "🐝  ") : beat % 4 < 2 ? "b!  " : "b   ";
+    return glyphs === "ascii"
+      ? beat % 4 < 2
+        ? "b!  "
+        : "b   "
+      : beat % 4 < 2
+        ? "*!  "
+        : "*   ";
   }
-  if (phase === "done") return glyphs === "unicode" ? "✓   " : "ok  ";
-  return glyphs === "unicode" ? "·   " : ".   ";
+  if (phase === "done") return glyphs === "ascii" ? "ok  " : "[x] ";
+  return ".   ";
 }
 
 export function progressBar(percent: number, glyphs: Glyphs): string {
