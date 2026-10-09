@@ -6,17 +6,29 @@ import path from "node:path";
 import { PassThrough } from "node:stream";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { Notification } from "../../notify/ntfy.js";
 import { startMaster } from "../../session/index.js";
 import type { ItemStatus } from "../../session/messages.js";
 import { runCli } from "../program.js";
 import {
+  type AgentRuntime,
+  AgentRuntimeUnavailableError,
+  type AgentSessionBackend,
+  type AgentView,
   encodeFrame,
   expandStartWithMaster,
   FrameDecoder,
+  herdrAgentName,
+  type ItemWorker,
+  type JoinView,
+  type JoinViewModel,
   loadSubmitPolicy,
   type MasterHandle,
   type MasterOptions,
   materializeItem,
+  NATIVE_ARGV,
+  type PtyRunOptions,
+  type PtyRunResult,
   parseHostPort,
   pickListenHost,
   type SessionApi,
@@ -24,7 +36,10 @@ import {
   type SessionStatus,
   type SubHandle,
   type SubOptions,
+  selectAgentView,
   sessionBranch,
+  setJoinViewFactory,
+  summaryTail,
   workItem,
 } from "./session.js";
 
@@ -756,5 +771,691 @@ describe("session submit policy and materialize fallback", () => {
     expect(await gitIn(box.repo, ["rev-parse", "skep/session/I-5-e2"], box.env)).toBe(
       result.headSha,
     );
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// SK-621: live agent view. Fake PtyRunner and AgentSessionBackend; the native fallback runs a
+// fake CLI script from a temp PATH entry. No real agent CLI, PTY or herdr.
+
+const AGENT_MD = (cli: string): string =>
+  [
+    "---",
+    "schema: skep.agent/v1",
+    "role: coding",
+    `agent_cli: ${cli}`,
+    'cli_version: "1.0.0"',
+    "repos: [app]",
+    "capabilities: []",
+    "---",
+    "Write code.",
+    "",
+  ].join("\n");
+
+/** Built from pieces so no secret-shaped literal sits in the repo. */
+const PLANTED = `ghp_${"A1b2C3d4E5".repeat(4)}`;
+const ESC = "\u001b";
+
+class FakeSessionError extends Error {
+  constructor(
+    message: string,
+    readonly fallbackSafe: boolean,
+  ) {
+    super(message);
+  }
+}
+
+class FakePtyUnavailableError extends Error {}
+
+/** Mirrors SK-620's stripTerminalControls closely enough for the tests: CSI, OSC and CR. */
+function fakeStrip(text: string): string {
+  return text
+    .replace(new RegExp(`${ESC}\\[[0-?]*[ -/]*[@-~]`, "g"), "")
+    .replace(new RegExp(`${ESC}\\][^\\u0007]*\\u0007`, "g"), "")
+    .replace(/\r/g, "");
+}
+
+interface FakeRuntime {
+  runtime: () => Promise<AgentRuntime>;
+  ptyRuns: PtyRunOptions[];
+  herdrCalls: string[];
+  loads: number;
+}
+
+function fakeRuntime(
+  opts: {
+    pty?: (run: PtyRunOptions) => Promise<PtyRunResult>;
+    herdr?: Partial<AgentSessionBackend>;
+  } = {},
+): FakeRuntime {
+  const fake: FakeRuntime = {
+    ptyRuns: [],
+    herdrCalls: [],
+    loads: 0,
+    runtime: async () => {
+      fake.loads += 1;
+      return runtime;
+    },
+  };
+  const call = (name: string, detail = ""): void => {
+    fake.herdrCalls.push(detail === "" ? name : `${name} ${detail}`);
+  };
+  const backend: AgentSessionBackend = {
+    name: "herdr",
+    probe: async () => {
+      call("probe");
+      return { protocol: 22, schemaVersion: 1 };
+    },
+    start: async (start) => {
+      call("start", `${start.name} ${start.kind} ${start.cwd}`);
+      return {
+        name: start.name,
+        paneId: "pane-1",
+        focusCommand: ["herdr", "agent", "focus", start.name],
+      };
+    },
+    prompt: async (_h, text) => call("prompt", JSON.stringify(text)),
+    wait: async () => {
+      call("wait");
+      return "done";
+    },
+    read: async (_h, read) => {
+      call("read", String(read?.lines));
+      return "agent says hello";
+    },
+    focus: async () => call("focus"),
+    close: async () => call("close"),
+  };
+  for (const [key, value] of Object.entries(opts.herdr ?? {})) {
+    const name = key as keyof AgentSessionBackend;
+    const original = backend[name];
+    if (typeof value !== "function" || typeof original !== "function") continue;
+    (backend as unknown as Record<string, unknown>)[name] = async (...args: unknown[]) => {
+      call(name);
+      return (value as (...a: unknown[]) => unknown)(...args);
+    };
+  }
+  const runtime: AgentRuntime = {
+    ptyRunner: () => ({
+      run: async (run) => {
+        fake.ptyRuns.push(run);
+        if (opts.pty !== undefined) return opts.pty(run);
+        await writeFile(path.join(run.cwd, "feature.txt"), "done\n");
+        const transcript = Buffer.from(`${ESC}[32mworking${ESC}[0m\r\nfinished\r\n`);
+        await writeFile(run.transcriptPath, transcript, { mode: 0o600 });
+        return { exit: { code: 0, signal: null }, aborted: false, transcript };
+      },
+    }),
+    herdrBackend: () => backend,
+    stripTerminalControls: fakeStrip,
+    isPtyUnavailable: (error) => error instanceof FakePtyUnavailableError,
+  };
+  return fake;
+}
+
+/**
+ * A fake agent CLI on PATH for the native path: records argv and stdin into the worktree (so they
+ * are committed) and touches `$HOME/native-called`.
+ */
+async function fakeCli(box: Sandbox, name: string): Promise<NodeJS.ProcessEnv> {
+  const bin = path.join(box.home, "bin");
+  await mkdir(bin, { recursive: true });
+  const script = path.join(bin, name);
+  await writeFile(
+    script,
+    '#!/bin/sh\nprintf "%s\\n" "$@" > native-args.txt\ncat > native-stdin.txt\n' +
+      ': > "$HOME/native-called"\necho "native output"\n',
+    { mode: 0o755 },
+  );
+  return { ...box.env, PATH: `${bin}${path.delimiter}${box.env.PATH}` };
+}
+
+const ITEM = {
+  itemId: "I-7",
+  repo: "app",
+  assignee: "P-1",
+  epoch: 1,
+  title: "add a health check",
+  datalistEntries: 0,
+};
+
+interface ViewLog {
+  view: JoinView;
+  events: string[];
+  models: JoinViewModel[];
+}
+
+function recordingView(choice: "pr" | "mr" | "push" | "none" | null = null): ViewLog {
+  const events: string[] = [];
+  const models: JoinViewModel[] = [];
+  return {
+    events,
+    models,
+    view: {
+      update: (model) => {
+        models.push(model);
+        events.push(`update:${model.agent?.state ?? "-"}`);
+      },
+      chooseSubmit: async (model) => {
+        events.push(`choose:${model.item?.itemId}`);
+        return choice;
+      },
+      suspend: async () => {
+        events.push("suspend");
+      },
+      resume: () => events.push("resume"),
+      close: () => events.push("close"),
+    },
+  };
+}
+
+function itemWorker(
+  box: Sandbox,
+  c: ReturnType<typeof capture>,
+  view: AgentView,
+  fake: FakeRuntime,
+  extra: Partial<ItemWorker> = {},
+): ItemWorker & { notes: Notification[] } {
+  const notes: Notification[] = [];
+  return {
+    ctx: c.ctx,
+    root: path.join(box.home, "work"),
+    method: "push",
+    ask: async () => null,
+    agent: {
+      view,
+      cli: "claude",
+      runtime: fake.runtime,
+      journal: path.join(box.home, "journal"),
+      notify: async (note) => notes.push(note),
+    },
+    notes,
+    ...extra,
+  };
+}
+
+describe("agent strategy selection", () => {
+  it("dry by default, pty with SKEP_SESSION_EXEC=1, herdr with the view, --agent wins", () => {
+    expect(selectAgentView(undefined, {})).toBe("dry");
+    expect(selectAgentView(undefined, { SKEP_SESSION_VIEW: "herdr" })).toBe("dry");
+    expect(selectAgentView(undefined, { SKEP_SESSION_EXEC: "1" })).toBe("pty");
+    expect(selectAgentView(undefined, { SKEP_SESSION_EXEC: "1", SKEP_SESSION_VIEW: "herdr" })).toBe(
+      "herdr",
+    );
+    for (const flag of ["dry", "pty", "herdr", "native"] as const) {
+      expect(selectAgentView(flag, { SKEP_SESSION_EXEC: "1", SKEP_SESSION_VIEW: "herdr" })).toBe(
+        flag,
+      );
+    }
+  });
+
+  it("native argv never carries an approval-bypass flag", () => {
+    expect(NATIVE_ARGV).toEqual({ codex: ["exec", "-"], claude: ["-p"], pi: ["-p"] });
+    expect(herdrAgentName(ITEM)).toBe("skep-i-7-e1");
+  });
+
+  it("the summary tail strips controls, redacts, and is capped", () => {
+    const raw = `${"x".repeat(9_000)}\n${ESC}[1mtoken ${PLANTED}${ESC}[0m\r\n`;
+    const tail = summaryTail(raw, fakeStrip);
+    expect(tail.length).toBeLessThanOrEqual(4_000);
+    expect(tail).not.toContain(ESC);
+    expect(tail).not.toContain(PLANTED);
+    expect(tail).toContain("[REDACTED:");
+  });
+});
+
+describe("workItem with a live agent", () => {
+  it("pty: runs the CLI with the prompt as argv, suspends the view around it, commits", async () => {
+    const box = await sandbox();
+    const c = capture(box.home, { env: box.env, cwd: box.repo });
+    const fake = fakeRuntime();
+    const log = recordingView();
+    const worker = itemWorker(box, c, "pty", fake, { view: log.view, method: "none" });
+    const result = await workItem(worker, ITEM);
+    expect(fake.ptyRuns).toHaveLength(1);
+    const run = fake.ptyRuns[0];
+    expect(run?.argv).toEqual(["claude", "add a health check\n"]);
+    expect(run?.input).toBe("inherit");
+    expect(run?.cwd).toBe(path.join(box.home, "work", "app-I-7-e1"));
+    expect(run?.env.SKEP_SESSION_ITEM).toBe("I-7");
+    expect(run?.env).not.toHaveProperty("SKEP_HOME");
+    // The raw transcript stays in the local journal, 0600.
+    expect(path.dirname(run?.transcriptPath ?? "")).toBe(path.join(box.home, "journal"));
+    expect((await stat(run?.transcriptPath ?? "")).mode & 0o777).toBe(0o600);
+    const suspend = log.events.indexOf("suspend");
+    expect(log.events.slice(suspend, suspend + 2)).toEqual(["suspend", "resume"]);
+    expect(log.events).toContain("update:running");
+    expect(log.events.at(-1)).toBe("update:done");
+    expect(result.submit).toMatchObject({ method: "none", state: "local" });
+    expect(result.headSha).not.toBe(result.baseSha);
+    expect(await gitIn(box.repo, ["show", "skep/session/I-7-e1:feature.txt"], box.env)).toBe(
+      "done",
+    );
+    expect(result.summary).toContain("agent exited 0");
+    expect(result.summary).toContain("working\nfinished");
+    expect(result.summary).not.toContain(ESC);
+    expect(log.models.at(-1)?.tail).not.toContain(ESC);
+  });
+
+  it("pty: a planted secret in the transcript never reaches the summary", async () => {
+    const box = await sandbox();
+    const c = capture(box.home, { env: box.env, cwd: box.repo });
+    const fake = fakeRuntime({
+      pty: async (run) => {
+        await writeFile(path.join(run.cwd, "f.txt"), "x\n");
+        const transcript = Buffer.from(
+          `${"noise ".repeat(2_000)}\n${ESC}]0;title\u0007export GH=${PLANTED}\r\n`,
+        );
+        return { exit: { code: 0, signal: null }, aborted: false, transcript };
+      },
+    });
+    const log = recordingView();
+    const result = await workItem(
+      itemWorker(box, c, "pty", fake, { view: log.view, method: "none" }),
+      ITEM,
+    );
+    expect(result.summary.length).toBeLessThanOrEqual(4_000);
+    expect(result.summary).not.toContain(PLANTED);
+    expect(result.summary).toContain("[REDACTED:");
+    expect(result.summary).not.toContain(ESC);
+    expect(result.summary).not.toContain("\u0007");
+    for (const model of log.models) expect(model.tail).not.toContain(PLANTED);
+  });
+
+  it("pty: no changes reports so and submits nothing", async () => {
+    const box = await sandbox();
+    const c = capture(box.home, { env: box.env, cwd: box.repo });
+    const fake = fakeRuntime({
+      pty: async () => ({
+        exit: { code: 0, signal: null },
+        aborted: false,
+        transcript: Buffer.from("nothing to do\n"),
+      }),
+    });
+    const result = await workItem(itemWorker(box, c, "pty", fake), ITEM);
+    expect(result.headSha).toBe(result.baseSha);
+    expect(result.submit).toMatchObject({ method: "push", state: "skipped" });
+    expect(result.summary).toContain("no changes");
+    expect(await remoteHas(box, "skep/session/I-7-e1")).toBeNull();
+  });
+
+  it("pty: a non-zero exit fails the item without committing", async () => {
+    const box = await sandbox();
+    const c = capture(box.home, { env: box.env, cwd: box.repo });
+    const fake = fakeRuntime({
+      pty: async (run) => {
+        await writeFile(path.join(run.cwd, "half.txt"), "x\n");
+        return { exit: { code: 3, signal: null }, aborted: false, transcript: Buffer.from("") };
+      },
+    });
+    const result = await workItem(itemWorker(box, c, "pty", fake), ITEM);
+    expect(result.submit).toMatchObject({ state: "failed" });
+    expect(result.headSha).toBe(result.baseSha);
+    expect(result.summary).toContain("agent exited 3");
+  });
+
+  it("pty: an unavailable PTY falls back to the native CLI and says why", async () => {
+    const box = await sandbox();
+    const env = await fakeCli(box, "claude");
+    const c = capture(box.home, { env, cwd: box.repo });
+    const fake = fakeRuntime({
+      pty: async () => {
+        throw new FakePtyUnavailableError("script(1) not found");
+      },
+    });
+    const result = await workItem(itemWorker(box, c, "pty", fake, { method: "none" }), ITEM);
+    expect(c.stderr).toContain("pty is unavailable: script(1) not found");
+    expect(result.summary).toContain("ran claude non-interactively");
+    expect(result.submit).toMatchObject({ state: "local" });
+    const branch = "skep/session/I-7-e1";
+    expect(await gitIn(box.repo, ["show", `${branch}:native-args.txt`], box.env)).toBe("-p");
+    expect(await gitIn(box.repo, ["show", `${branch}:native-stdin.txt`], box.env)).toBe(
+      "add a health check",
+    );
+  });
+
+  it("a missing runtime module falls back to native", async () => {
+    const box = await sandbox();
+    const env = await fakeCli(box, "claude");
+    const c = capture(box.home, { env, cwd: box.repo });
+    const fake = fakeRuntime();
+    fake.runtime = async () => {
+      throw new AgentRuntimeUnavailableError("not in this build");
+    };
+    const result = await workItem(itemWorker(box, c, "herdr", fake, { method: "none" }), ITEM);
+    expect(c.stderr).toContain("herdr is unavailable: not in this build");
+    expect(result.submit).toMatchObject({ state: "local" });
+  });
+
+  it("native: runs `codex exec -` with the prompt on stdin", async () => {
+    const box = await sandbox();
+    const env = await fakeCli(box, "codex");
+    const c = capture(box.home, { env, cwd: box.repo });
+    const worker = itemWorker(box, c, "native", fakeRuntime(), { method: "none" });
+    if (worker.agent !== undefined) worker.agent.cli = "codex";
+    const result = await workItem(worker, ITEM);
+    expect(result.summary).toContain("agent exited 0\nnative output");
+    const branch = "skep/session/I-7-e1";
+    expect(await gitIn(box.repo, ["show", `${branch}:native-args.txt`], box.env)).toBe("exec\n-");
+  });
+
+  it("herdr: start, prompt, wait, read 200 lines; done commits and submits", async () => {
+    const box = await sandbox();
+    const c = capture(box.home, { env: box.env, cwd: box.repo });
+    const fake = fakeRuntime({
+      herdr: {
+        wait: async () => {
+          await writeFile(path.join(box.home, "work", "app-I-7-e1", "pane.txt"), "x\n");
+          return "done";
+        },
+        read: async () => `pane ${ESC}[31mred${ESC}[0m ${PLANTED}`,
+      },
+    });
+    const log = recordingView();
+    const result = await workItem(itemWorker(box, c, "herdr", fake, { view: log.view }), ITEM);
+    const dir = path.join(box.home, "work", "app-I-7-e1");
+    expect(fake.herdrCalls).toEqual([
+      "probe",
+      `start skep-i-7-e1 claude ${dir}`,
+      'prompt "add a health check\\n"',
+      "wait",
+      "read",
+    ]);
+    expect(result.submit).toMatchObject({ method: "push", state: "pushed" });
+    expect(result.summary).toContain("pane red");
+    expect(result.summary).not.toContain(PLANTED);
+    const running = log.models.find((m) => m.agent?.state === "running");
+    expect(running?.agent).toMatchObject({
+      cli: "claude",
+      view: "herdr",
+      focusCommand: ["herdr", "agent", "focus", "skep-i-7-e1"],
+    });
+  });
+
+  it("herdr: blocked is pending, sends no keys, commits and submits nothing, and notifies", async () => {
+    const box = await sandbox();
+    const c = capture(box.home, { env: box.env, cwd: box.repo });
+    const fake = fakeRuntime({
+      herdr: {
+        wait: async () => {
+          await writeFile(path.join(box.home, "work", "app-I-7-e1", "pane.txt"), "x\n");
+          return "blocked";
+        },
+      },
+    });
+    const log = recordingView("push");
+    const worker = itemWorker(box, c, "herdr", fake, {
+      view: log.view,
+      chooseSubmit: log.view.chooseSubmit,
+    });
+    const result = await workItem(worker, ITEM);
+    expect(result.submit).toEqual({
+      method: "push",
+      state: "pending",
+      branch: "skep/session/I-7-e1",
+    });
+    expect(result.headSha).toBe(result.baseSha);
+    expect(await remoteHas(box, "skep/session/I-7-e1")).toBeNull();
+    // Only the calls of a normal run: no focus, no prompt after the first, nothing else.
+    expect(fake.herdrCalls.map((call) => call.split(" ")[0])).toEqual([
+      "probe",
+      "start",
+      "prompt",
+      "wait",
+      "read",
+    ]);
+    const waiting = "agent skep-i-7-e1 is waiting for you: herdr agent focus skep-i-7-e1";
+    expect(c.stderr).toContain(waiting);
+    expect(worker.notes).toEqual([expect.objectContaining({ message: waiting })]);
+    expect(log.events).not.toContain("choose:I-7");
+    expect(log.models.at(-1)?.agent?.state).toBe("blocked");
+    expect(log.models.at(-1)?.submit.outcome?.state).toBe("pending");
+  });
+
+  it("herdr: a fallbackSafe error before the prompt falls back to native", async () => {
+    const box = await sandbox();
+    const env = await fakeCli(box, "claude");
+    const c = capture(box.home, { env, cwd: box.repo });
+    const fake = fakeRuntime({
+      herdr: {
+        prompt: async () => {
+          throw new FakeSessionError("herdr agent prompt failed: not ready", true);
+        },
+      },
+    });
+    const result = await workItem(itemWorker(box, c, "herdr", fake, { method: "none" }), ITEM);
+    expect(c.stderr).toContain("herdr is unavailable: herdr agent prompt failed: not ready");
+    // The pane it opened is closed before the native run.
+    expect(fake.herdrCalls.at(-1)).toBe("close");
+    expect(result.submit).toMatchObject({ state: "local" });
+    expect(await stat(path.join(box.env.HOME ?? "", "native-called"))).toBeTruthy();
+  });
+
+  it("herdr: an error after the prompt was accepted fails the item and never re-runs", async () => {
+    const box = await sandbox();
+    const env = await fakeCli(box, "claude");
+    const c = capture(box.home, { env, cwd: box.repo });
+    const fake = fakeRuntime({
+      herdr: {
+        wait: async () => {
+          throw new FakeSessionError("herdr agent wait: timeout", false);
+        },
+      },
+    });
+    const result = await workItem(itemWorker(box, c, "herdr", fake), ITEM);
+    expect(result.submit).toMatchObject({ method: "push", state: "failed" });
+    expect(result.summary).toContain("herdr agent wait: timeout");
+    await expect(stat(path.join(box.env.HOME ?? "", "native-called"))).rejects.toThrow();
+    expect(c.stderr).not.toContain("non-interactively");
+  });
+
+  it("ask with a view: chooseSubmit replaces the stdin question", async () => {
+    const box = await sandbox();
+    const c = capture(box.home, { env: box.env, cwd: box.repo });
+    const log = recordingView("push");
+    const result = await workItem(
+      itemWorker(box, c, "pty", fakeRuntime(), {
+        view: log.view,
+        chooseSubmit: log.view.chooseSubmit,
+        method: "ask",
+        ask: async () => {
+          throw new Error("ask must not be used");
+        },
+      }),
+      ITEM,
+    );
+    expect(log.events).toContain("choose:I-7");
+    expect(result.submit).toMatchObject({ method: "push", state: "pushed" });
+    expect(c.stderr).not.toContain("Submit this item?");
+  });
+});
+
+/** `skep session join` against a real master with extra context (fake runtime, notify). */
+async function joinWith(
+  box: Sandbox,
+  extraArgs: string[],
+  extra: Partial<SessionCliContext> = {},
+): Promise<{ item: ItemStatus; run: ReturnType<typeof capture>; exit: number }> {
+  const master = await startMaster({
+    listen: { host: HOST, port: 0 },
+    device: "mac",
+    repo: "app",
+    controlToken: TOKEN,
+    acceptJoin: async () => true,
+    onJoinCode: () => {},
+  });
+  try {
+    const code = master.status().joinCode;
+    if (code === null || master.address === null) throw new Error("master has no join code");
+    const c = capture(box.home, { env: box.env, cwd: box.repo, ...extra });
+    const exit = runCli(
+      [
+        "session",
+        "join",
+        "--code",
+        code,
+        "--host",
+        `${HOST}:${master.address.port}`,
+        "--repo",
+        "app",
+        "--device",
+        "vps",
+        ...extraArgs,
+      ],
+      c.ctx,
+    );
+    await vi.waitFor(() => expect(master.status().peers).toHaveLength(1), { timeout: 5_000 });
+    await master.submitIntent("add a health check");
+    await vi.waitFor(() => expect(master.status().intents[0]?.items[0]?.state).toBe("done"), {
+      timeout: 10_000,
+    });
+    const item = master.status().intents[0]?.items[0];
+    if (item === undefined) throw new Error("no item");
+    await master.close();
+    return { item, run: c, exit: await exit };
+  } finally {
+    await master.close();
+  }
+}
+
+async function roleDir(box: Sandbox, cli: string): Promise<string> {
+  const dir = path.join(box.home, "role");
+  await mkdir(dir, { recursive: true });
+  await writeFile(path.join(dir, "AGENT.md"), AGENT_MD(cli));
+  return dir;
+}
+
+describe("session join with a live agent", () => {
+  afterEach(() => setJoinViewFactory(null));
+
+  it("SKEP_SESSION_EXEC=1 selects pty with the AGENT.md CLI from --role-dir", async () => {
+    const box = await sandbox();
+    box.env = { ...box.env, SKEP_SESSION_EXEC: "1" };
+    const fake = fakeRuntime();
+    const role = await roleDir(box, "pi");
+    const { item, exit, run } = await joinWith(box, ["--submit", "none", "--role-dir", role], {
+      agentRuntime: fake.runtime,
+    });
+    expect(exit).toBe(0);
+    expect(fake.ptyRuns.map((r) => r.argv)).toEqual([["pi", "add a health check\n"]]);
+    expect(item.result?.submit).toMatchObject({ state: "local" });
+    expect(run.stderr).toContain("item I-1: agent pi (pty) running");
+    expect(run.stderr).toContain("item I-1: agent pi (pty) done");
+  });
+
+  it("the role dir defaults to the current directory", async () => {
+    const box = await sandbox();
+    await writeFile(path.join(box.repo, "AGENT.md"), AGENT_MD("codex"));
+    const fake = fakeRuntime();
+    await joinWith(box, ["--submit", "none", "--agent", "pty"], { agentRuntime: fake.runtime });
+    expect(fake.ptyRuns[0]?.argv[0]).toBe("codex");
+  });
+
+  it("SKEP_SESSION_VIEW=herdr selects herdr and prints the focus command", async () => {
+    const box = await sandbox();
+    box.env = { ...box.env, SKEP_SESSION_EXEC: "1", SKEP_SESSION_VIEW: "herdr" };
+    const fake = fakeRuntime({
+      herdr: {
+        wait: async () => {
+          await writeFile(
+            path.join(box.home, "skep", "session", "worktrees", "app-I-1-e1", "h"),
+            "",
+          );
+          return "idle";
+        },
+      },
+    });
+    const role = await roleDir(box, "claude");
+    const { item, run } = await joinWith(box, ["--submit", "none", "--role-dir", role], {
+      agentRuntime: fake.runtime,
+    });
+    expect(fake.ptyRuns).toHaveLength(0);
+    expect(fake.herdrCalls[1]).toContain("start skep-i-1-e1 claude");
+    expect(run.stderr).toContain("watch with: herdr agent focus skep-i-1-e1");
+    expect(item.result?.submit).toMatchObject({ state: "local" });
+  });
+
+  it("--agent dry overrides the variables and never loads the runtime", async () => {
+    const box = await sandbox();
+    box.env = { ...box.env, SKEP_SESSION_EXEC: "1", SKEP_SESSION_VIEW: "herdr" };
+    const fake = fakeRuntime();
+    const { item } = await joinWith(box, ["--submit", "none", "--agent", "dry"], {
+      agentRuntime: fake.runtime,
+    });
+    expect(fake.loads).toBe(0);
+    expect(await gitIn(box.repo, ["show", "skep/session/I-1-e1:.skep-session-item"], box.env)).toBe(
+      "I-1",
+    );
+    expect(item.result?.summary).toContain("dry run");
+  });
+
+  it("--agent herdr blocked: pending result, message printed, notification sent", async () => {
+    const box = await sandbox();
+    const notes: Notification[] = [];
+    const fake = fakeRuntime({ herdr: { wait: async () => "blocked" } });
+    const role = await roleDir(box, "claude");
+    const { item, run } = await joinWith(
+      box,
+      ["--submit", "push", "--agent", "herdr", "--role-dir", role],
+      { agentRuntime: fake.runtime, notify: async (n) => notes.push(n) },
+    );
+    expect(item.result?.submit).toMatchObject({ method: "push", state: "pending" });
+    expect(run.stderr).toContain(
+      "agent skep-i-1-e1 is waiting for you: herdr agent focus skep-i-1-e1",
+    );
+    expect(notes).toHaveLength(1);
+    expect(await remoteHas(box, "skep/session/I-1-e1")).toBeNull();
+  });
+
+  it("a missing AGENT.md is a usage error before joining", async () => {
+    const box = await sandbox();
+    const c = capture(box.home, { env: box.env, cwd: box.repo });
+    const exit = await runCli(
+      ["session", "join", "--code", "123456789012", "--host", "127.0.0.1:1", "--agent", "pty"],
+      c.ctx,
+    );
+    expect(exit).toBe(2);
+    expect(c.stderr).toContain("needs this device's AGENT.md");
+  });
+
+  it("--ui without a registered view exits with a clear message", async () => {
+    const box = await sandbox();
+    const c = capture(box.home, { env: box.env, cwd: box.repo });
+    const exit = await runCli(
+      ["session", "join", "--code", "123456789012", "--host", "127.0.0.1:1", "--ui"],
+      c.ctx,
+    );
+    expect(exit).toBe(1);
+    expect(c.stderr).toContain("the full-screen view is not available in this build");
+  });
+
+  it("--ui uses the registered factory: updates, suspend/resume around pty, chooseSubmit", async () => {
+    const box = await sandbox();
+    const log = recordingView("push");
+    let made = 0;
+    setJoinViewFactory(() => {
+      made += 1;
+      return log.view;
+    });
+    const fake = fakeRuntime();
+    const role = await roleDir(box, "claude");
+    const { item, run, exit } = await joinWith(
+      box,
+      ["--ui", "--submit", "ask", "--agent", "pty", "--role-dir", role],
+      { agentRuntime: fake.runtime, stdin: new PassThrough() },
+    );
+    expect(exit).toBe(0);
+    expect(made).toBe(1);
+    expect(log.events).toContain("suspend");
+    expect(log.events.indexOf("resume")).toBe(log.events.indexOf("suspend") + 1);
+    expect(log.events).toContain("choose:I-1");
+    expect(log.events.at(-1)).toBe("close");
+    expect(log.models[0]?.peers).toEqual([
+      { peerId: expect.any(String), device: "vps", role: "coding", state: "joined" },
+    ]);
+    expect(item.result?.submit).toMatchObject({ method: "push", state: "pushed" });
+    // The full-screen view owns the terminal: no line output and no stdin question.
+    expect(run.stdout).toBe("");
+    expect(run.stderr).not.toContain("Submit this item?");
   });
 });

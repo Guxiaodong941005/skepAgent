@@ -22,10 +22,13 @@ import { createInterface, type Interface } from "node:readline";
 import type { Readable } from "node:stream";
 import { type Command, Option } from "commander";
 import { z } from "zod";
+import { loadAgentMd } from "../../config/agent-md.js";
 import { ConfigError, parseTomlConfig } from "../../config/errors.js";
-import { RepoRefSchema, ShaSchema } from "../../core/schemas/common.js";
+import { type AgentCliSchema, RepoRefSchema, ShaSchema } from "../../core/schemas/common.js";
 import { CHECKS_FILE_PATH, ChecksFileSchema } from "../../core/schemas/config.js";
 import { Redactor } from "../../exec/redact.js";
+import { type Notification, NtfyNotifier } from "../../notify/ntfy.js";
+import type { ProcessExit } from "../../runtime/types.js";
 import {
   connectSub,
   type DatalistEntry,
@@ -81,6 +84,10 @@ export type SessionCliContext = CliContext & {
   networkInterfaces?: () => NodeJS.Dict<os.NetworkInterfaceInfo[]>;
   /** Directory inside the device's repo (default: `process.cwd()`). Tests point it at a temp repo. */
   cwd?: string;
+  /** The SK-620 PTY runner and herdr client (default: {@link loadAgentRuntime}). Tests inject fakes. */
+  agentRuntime?: () => Promise<AgentRuntime>;
+  /** Tells the human something needs them (default: ntfy from `device.toml`, if configured). */
+  notify?: (notification: Notification) => Promise<unknown>;
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -486,6 +493,14 @@ class LineReader {
     return new Promise((resolve) => this.waiters.push(resolve));
   }
 
+  pause(): void {
+    this.rl.pause();
+  }
+
+  resume(): void {
+    this.rl.resume();
+  }
+
   close(): void {
     this.rl.close();
   }
@@ -664,41 +679,462 @@ async function commitAll(ctx: SessionCliContext, dir: string, message: string): 
   return true;
 }
 
-/**
- * Runs the configured agent (only with `SKEP_SESSION_EXEC=1` and `SKEP_SESSION_AGENT`), or, by
- * default, commits a marker file so the result still carries a real new head.
- */
-async function executeItem(
-  ctx: SessionCliContext,
-  item: PlanItem,
-  dir: string,
-): Promise<{ ok: boolean; summary: string }> {
-  const message = `session ${item.itemId} epoch ${item.epoch}`;
-  const agent = ctx.env.SKEP_SESSION_AGENT;
-  if (ctx.env.SKEP_SESSION_EXEC !== "1" || agent === undefined || agent === "") {
-    await writeFile(path.join(dir, MARKER_FILE), `${item.itemId}\n`);
-    await commitAll(ctx, dir, message);
-    return { ok: true, summary: "dry run: committed the session marker (no agent configured)" };
+// ---------------------------------------------------------------------------------------------
+// Agent runtime: the SK-620 contract (`src/runtime/{pty,herdr,types}.ts`).
+//
+// The declarations below copy that contract's names and shapes. They live here, and the modules
+// are loaded lazily by `loadAgentRuntime`, so this file builds and runs its dry and native paths
+// before SK-620 merges; tests inject fakes through `SessionCliContext.agentRuntime`.
+
+export type AgentCli = z.infer<typeof AgentCliSchema>;
+export type AgentViewState = "working" | "idle" | "done" | "blocked" | "unknown";
+
+export interface AgentSessionStart {
+  name: string;
+  kind: AgentCli;
+  cwd: string;
+  env: Record<string, string>;
+  args?: string[];
+}
+
+export interface AgentSessionHandle {
+  name: string;
+  paneId: string;
+  focusCommand: readonly [string, ...string[]];
+}
+
+export interface AgentSessionBackend {
+  readonly name: "herdr";
+  probe(): Promise<{ protocol: number; schemaVersion: number }>;
+  start(opts: AgentSessionStart): Promise<AgentSessionHandle>;
+  prompt(h: AgentSessionHandle, text: string): Promise<void>;
+  wait(
+    h: AgentSessionHandle,
+    opts: { timeoutMs: number; signal?: AbortSignal },
+  ): Promise<AgentViewState>;
+  read(h: AgentSessionHandle, opts?: { lines?: number }): Promise<string>;
+  focus(h: AgentSessionHandle): Promise<void>;
+  close(h: AgentSessionHandle): Promise<void>;
+}
+
+export interface PtyRunOptions {
+  argv: [string, ...string[]];
+  cwd: string;
+  env: Record<string, string>;
+  transcriptPath: string;
+  input: "inherit" | string;
+  signal?: AbortSignal;
+  clock: Clock;
+  graceMs?: number;
+}
+
+export interface PtyRunResult {
+  exit: ProcessExit;
+  aborted: boolean;
+  transcript: Buffer;
+}
+
+export interface PtyRunner {
+  run(opts: PtyRunOptions): Promise<PtyRunResult>;
+}
+
+/** What a join needs from SK-620, bound together so tests replace it in one place. */
+export interface AgentRuntime {
+  ptyRunner(): PtyRunner;
+  herdrBackend(): AgentSessionBackend;
+  stripTerminalControls(text: string): string;
+  /** True for SK-620's `PtyUnavailableError`: the PTY never started, so native may run. */
+  isPtyUnavailable(error: unknown): boolean;
+}
+
+export class AgentRuntimeUnavailableError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "AgentRuntimeUnavailableError";
   }
-  const args = (ctx.env.SKEP_SESSION_AGENT_ARGS ?? "").split(" ").filter((arg) => arg !== "");
-  const env = {
-    ...pickEnv(ctx, AGENT_ENV_KEYS),
-    SKEP_SESSION_ITEM: item.itemId,
-    SKEP_SESSION_EPOCH: String(item.epoch),
+}
+
+interface PtyModule {
+  createPtyRunner(): PtyRunner;
+  stripTerminalControls(text: string): string;
+  PtyUnavailableError: abstract new (...args: never[]) => Error;
+}
+
+interface HerdrModule {
+  createHerdrBackend(): AgentSessionBackend;
+}
+
+/**
+ * Loads `src/runtime/pty.js` and `herdr.js`. The specifiers are computed, so the compiler does not
+ * resolve them; a build without the modules reports them unavailable and the item falls back.
+ */
+export async function loadAgentRuntime(): Promise<AgentRuntime> {
+  let pty: PtyModule;
+  let herdr: HerdrModule;
+  try {
+    [pty, herdr] = await Promise.all([
+      import(new URL("../../runtime/pty.js", import.meta.url).href) as Promise<PtyModule>,
+      import(new URL("../../runtime/herdr.js", import.meta.url).href) as Promise<HerdrModule>,
+    ]);
+  } catch (error) {
+    throw new AgentRuntimeUnavailableError(
+      `the PTY/herdr runtime is not in this build (${errorMessage(error)})`,
+      { cause: error },
+    );
+  }
+  return {
+    ptyRunner: () => pty.createPtyRunner(),
+    herdrBackend: () => herdr.createHerdrBackend(),
+    stripTerminalControls: (text) => pty.stripTerminalControls(text),
+    isPtyUnavailable: (error) => error instanceof pty.PtyUnavailableError,
   };
-  // The item title is the task; it goes on stdin so it never needs shell quoting.
-  const run = await execFileChecked(agent, args, {
+}
+
+/**
+ * SK-620's `AgentSessionError.fallbackSafe`, read structurally: true only while no prompt was
+ * accepted, so a native re-run cannot duplicate work (D28, §11.4).
+ */
+function isFallbackSafe(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    "fallbackSafe" in error &&
+    (error as { fallbackSafe: unknown }).fallbackSafe === true
+  );
+}
+
+/**
+ * Drops every control character but newline and tab. Only used when the runtime module is absent
+ * (the native path still has to keep terminal controls off the wire); SK-620's
+ * `stripTerminalControls` also removes whole escape sequences.
+ */
+function dropControlChars(text: string): string {
+  let out = "";
+  for (const char of text) {
+    const code = char.codePointAt(0) ?? 0;
+    const control = code < 0x20 || code === 0x7f || (code >= 0x80 && code < 0xa0);
+    if (!control || char === "\n" || char === "\t") out += char;
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Join view (SK-622 hook).
+
+export type JoinAgentState = "starting" | "running" | "blocked" | "done" | "failed";
+
+export const AGENT_VIEWS = ["dry", "pty", "herdr", "native"] as const;
+export type AgentView = (typeof AGENT_VIEWS)[number];
+
+export interface JoinViewModel {
+  peers: { peerId: string; device: string; role: string; state: string }[];
+  item: { itemId: string; title: string; repo: string; epoch: number } | null;
+  agent: {
+    cli: AgentCli;
+    view: AgentView;
+    state: JoinAgentState;
+    focusCommand?: readonly string[];
+  } | null;
+  /** Already redacted and control-stripped, at most 4000 characters. */
+  tail: string;
+  submit: { policy: SubmitMethod; outcome?: SubmitOutcome };
+}
+
+export interface JoinView {
+  update(model: JoinViewModel): void;
+  /** Replaces ItemWorker.ask when the policy is "ask"; null = defer (skip). */
+  chooseSubmit(model: JoinViewModel): Promise<"pr" | "mr" | "push" | "none" | null>;
+  /** PTY: give the terminal to the agent; resolves when the TUI may redraw. */
+  suspend(): Promise<void>;
+  resume(): void;
+  close(): void;
+}
+
+export type JoinViewFactory = (io: {
+  stdin: NodeJS.ReadStream;
+  stdout: NodeJS.WriteStream;
+}) => JoinView;
+
+let joinViewFactory: JoinViewFactory | null = null;
+
+/** Registers the full-screen view used by `session join --ui`; null unregisters it (tests). */
+export function setJoinViewFactory(factory: JoinViewFactory | null): void {
+  joinViewFactory = factory;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Running the agent: dry marker, PTY, herdr pane, or the native non-interactive CLI (D27, D28).
+
+/** Non-interactive argv per CLI; the prompt goes on stdin. Never an approval-bypass flag (D29). */
+export const NATIVE_ARGV: Readonly<Record<AgentCli, readonly string[]>> = {
+  codex: ["exec", "-"],
+  claude: ["-p"],
+  pi: ["-p"],
+};
+
+/** A herdr run waits for the human-paced agent far longer than a non-interactive one. */
+const HERDR_WAIT_MS = 4 * 60 * 60_000;
+const HERDR_READ_LINES = 200;
+/** Only this much of a transcript is cleaned for the summary; the file keeps everything. */
+const TAIL_WINDOW = 64 * 1024;
+
+/**
+ * `--agent` wins; otherwise `SKEP_SESSION_EXEC=1` selects pty, or herdr with
+ * `SKEP_SESSION_VIEW=herdr`; otherwise the dry marker.
+ */
+export function selectAgentView(flag: AgentView | undefined, env: NodeJS.ProcessEnv): AgentView {
+  if (flag !== undefined) return flag;
+  if (env.SKEP_SESSION_EXEC !== "1") return "dry";
+  return env.SKEP_SESSION_VIEW === "herdr" ? "herdr" : "pty";
+}
+
+/** How a joined device runs its agent. Absent on an {@link ItemWorker} means dry. */
+export interface AgentSetup {
+  view: AgentView;
+  /** This device's AGENT.md `agent_cli`; the master never chooses it (D27). */
+  cli: AgentCli;
+  runtime(): Promise<AgentRuntime>;
+  /** Local directory for raw transcripts (0600 files). Never sent anywhere. */
+  journal: string;
+  notify(notification: Notification): Promise<unknown>;
+}
+
+/** herdr agent names are `^[a-z0-9][a-z0-9-]{0,63}$`. */
+export function herdrAgentName(item: PlanItem): string {
+  return `skep-${item.itemId.toLowerCase()}-e${item.epoch}`;
+}
+
+/**
+ * Summary text from a raw transcript: terminal controls stripped, then redacted, then the tail.
+ * Redacting before cutting keeps a secret from being split into an unrecognisable fragment;
+ * anything cut at the window's start is far outside the final tail.
+ */
+export function summaryTail(
+  raw: string,
+  strip: (text: string) => string,
+  max = MAX_SUMMARY,
+): string {
+  const cleaned = new Redactor().redact(strip(raw.slice(-TAIL_WINDOW))).trim();
+  return cleaned.slice(-max);
+}
+
+type Executed =
+  | { status: "ok"; changed: boolean; summary: string }
+  | { status: "failed"; summary: string }
+  | { status: "blocked"; summary: string };
+
+/** One agent run's raw outcome, before commit and cleaning. `tail` is local, unredacted text. */
+interface AgentRun {
+  ok: boolean;
+  status: string;
+  tail: string;
+  blocked?: { name: string; focusCommand: readonly string[] };
+}
+
+interface RunContext {
+  worker: ItemWorker;
+  setup: AgentSetup;
+  item: PlanItem;
+  dir: string;
+  prompt: string;
+  env: Record<string, string>;
+  transcript: string;
+  report(state: JoinAgentState, focusCommand?: readonly string[]): void;
+}
+
+async function writePrivate(file: string, data: string | Uint8Array): Promise<void> {
+  await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+  await writeFile(file, data, { mode: 0o600 });
+}
+
+async function runNative(run: RunContext): Promise<AgentRun> {
+  const { setup, dir, prompt, env } = run;
+  run.report("running");
+  const result = await execFileChecked(setup.cli, [...NATIVE_ARGV[setup.cli]], {
     cwd: dir,
     env,
-    input: `${item.title}\n`,
+    input: prompt,
     timeoutMs: AGENT_TIMEOUT_MS,
     allowFailure: true,
   });
-  const output = `${run.stdout}\n${run.stderr}`.trim();
-  const ok = run.code === 0;
-  if (ok) await commitAll(ctx, dir, message);
-  const status = run.timedOut ? "timed out" : `exited ${run.code ?? run.signal ?? "?"}`;
-  return { ok, summary: `agent ${status}\n${output.slice(-MAX_SUMMARY)}` };
+  const tail = `${result.stdout}\n${result.stderr}`;
+  await writePrivate(run.transcript, tail);
+  const status = result.timedOut ? "timed out" : `exited ${result.code ?? result.signal ?? "?"}`;
+  return { ok: result.code === 0, status, tail };
+}
+
+/** The human watches and answers the agent in this terminal; it ends when they quit it. */
+async function runPty(run: RunContext, runtime: AgentRuntime): Promise<AgentRun> {
+  const { worker, setup, dir, prompt, env } = run;
+  const view = worker.view;
+  const exclusive = worker.terminal ?? ((fn) => fn());
+  return exclusive(async () => {
+    run.report("running");
+    await view?.suspend();
+    try {
+      const result = await runtime.ptyRunner().run({
+        argv: [setup.cli, prompt],
+        cwd: dir,
+        env,
+        transcriptPath: run.transcript,
+        input: "inherit",
+        clock: systemClock,
+        ...(worker.signal === undefined ? {} : { signal: worker.signal }),
+      });
+      const { code, signal } = result.exit;
+      return {
+        ok: !result.aborted && code === 0,
+        status: result.aborted ? "aborted" : `exited ${code ?? signal ?? "?"}`,
+        tail: result.transcript.toString("utf8"),
+      };
+    } finally {
+      view?.resume();
+    }
+  });
+}
+
+/**
+ * Starts the agent in a local herdr pane, prompts it once and waits. Errors before the prompt is
+ * accepted keep `fallbackSafe`; the pane is closed so the native run does not leave it behind.
+ */
+async function runHerdr(run: RunContext, runtime: AgentRuntime): Promise<AgentRun> {
+  const { setup, item, dir, prompt, env } = run;
+  const backend = runtime.herdrBackend();
+  await backend.probe();
+  const handle = await backend.start({
+    name: herdrAgentName(item),
+    kind: setup.cli,
+    cwd: dir,
+    env,
+  });
+  run.report("running", handle.focusCommand);
+  try {
+    await backend.prompt(handle, prompt);
+  } catch (error) {
+    if (isFallbackSafe(error)) await backend.close(handle).catch(() => undefined);
+    throw error;
+  }
+  const state = await backend.wait(handle, {
+    timeoutMs: HERDR_WAIT_MS,
+    ...(run.worker.signal === undefined ? {} : { signal: run.worker.signal }),
+  });
+  // The pane stays open: the human may still want to read it or, when blocked, answer it.
+  const tail = await backend
+    .read(handle, { lines: HERDR_READ_LINES })
+    .catch((error: unknown) => `(could not read the agent's output: ${errorMessage(error)})`);
+  await writePrivate(run.transcript, tail);
+  if (state === "blocked") {
+    return {
+      ok: false,
+      status: "blocked",
+      tail,
+      blocked: { name: handle.name, focusCommand: handle.focusCommand },
+    };
+  }
+  const ok = state === "done" || state === "idle";
+  return { ok, status: ok ? `${state}` : `stopped in state ${state}`, tail };
+}
+
+/**
+ * Runs the item with the worker's strategy. Dry commits a marker so the result still carries a
+ * real new head. herdr falls back to native only on a `fallbackSafe` error, PTY only when the PTY
+ * could not start (D28); the reason is printed.
+ */
+async function executeItem(
+  worker: ItemWorker,
+  item: PlanItem,
+  dir: string,
+  report: RunContext["report"],
+): Promise<Executed> {
+  const { ctx } = worker;
+  const message = `session ${item.itemId} epoch ${item.epoch}`;
+  const setup = worker.agent;
+  if (setup === undefined || setup.view === "dry") {
+    await writeFile(path.join(dir, MARKER_FILE), `${item.itemId}\n`);
+    await commitAll(ctx, dir, message);
+    return {
+      status: "ok",
+      changed: true,
+      summary: "dry run: committed the session marker (no agent configured)",
+    };
+  }
+
+  const run: RunContext = {
+    worker,
+    setup,
+    item,
+    dir,
+    // The item title is the task, exactly as the native CLI reads it on stdin.
+    prompt: `${item.title}\n`,
+    env: {
+      ...pickEnv(ctx, AGENT_ENV_KEYS),
+      SKEP_SESSION_ITEM: item.itemId,
+      SKEP_SESSION_EPOCH: String(item.epoch),
+    },
+    transcript: path.join(
+      setup.journal,
+      `${item.itemId}-e${item.epoch}-${systemClock.nowMs()}-${setup.view}.log`,
+    ),
+    report,
+  };
+  // The PTY runner creates the transcript file, not its directory.
+  await mkdir(setup.journal, { recursive: true, mode: 0o700 });
+  let runtime: AgentRuntime | null = null;
+  let unavailable = "";
+  try {
+    runtime = await setup.runtime();
+  } catch (error) {
+    unavailable = errorMessage(error);
+  }
+
+  report("starting");
+  let agent: AgentRun | null = null;
+  let fallback: string | null = null;
+  if (setup.view === "native") {
+    agent = await runNative(run);
+  } else if (runtime === null) {
+    fallback = `${setup.view} is unavailable: ${unavailable}`;
+  } else {
+    try {
+      agent = setup.view === "pty" ? await runPty(run, runtime) : await runHerdr(run, runtime);
+    } catch (error) {
+      const safe = setup.view === "pty" ? runtime.isPtyUnavailable(error) : isFallbackSafe(error);
+      if (!safe) throw error;
+      fallback = `${setup.view} is unavailable: ${errorMessage(error)}`;
+    }
+  }
+  let note = "";
+  if (agent === null) {
+    note = `${fallback}; ran ${setup.cli} non-interactively\n`;
+    ctx.stderr.write(`skep: item ${item.itemId}: ${note}`);
+    run.transcript = run.transcript.replace(/-[a-z]+\.log$/, "-native.log");
+    agent = await runNative(run);
+  }
+
+  const strip = runtime?.stripTerminalControls ?? dropControlChars;
+  const tail = summaryTail(agent.tail, strip);
+  if (agent.blocked !== undefined) {
+    const focus = agent.blocked.focusCommand.join(" ");
+    const waiting = `agent ${agent.blocked.name} is waiting for you: ${focus}`;
+    // Never answered for the human (D29): no keys are sent; they decide in the agent's own UI.
+    ctx.stderr.write(`${waiting}\n`);
+    await setup
+      .notify({ title: `skep: ${item.itemId} needs you`, message: waiting, tags: ["warning"] })
+      .catch(() => undefined);
+    report("blocked", agent.blocked.focusCommand);
+    return {
+      status: "blocked",
+      summary:
+        `${note}${waiting}\nfinish in the pane, commit in ${dir}, ` +
+        `then run skep session submit ${item.itemId} --epoch ${item.epoch}\n${tail}`,
+    };
+  }
+  if (!agent.ok) return { status: "failed", summary: `${note}agent ${agent.status}\n${tail}` };
+  const changed = await commitAll(ctx, dir, message);
+  return {
+    status: "ok",
+    changed,
+    summary: `${note}agent ${agent.status}${changed ? "" : "; no changes"}\n${tail}`,
+  };
 }
 
 type CheckStatus = { name: string; status: "pass" | "fail" | "skip" };
@@ -830,6 +1266,29 @@ export interface ItemWorker {
   ask(question: string): Promise<string | null>;
   /** False forces the clone fallback (tests; hosts whose git lacks `worktree`). */
   worktree?: boolean;
+  /** How the agent runs; absent means the dry marker. */
+  agent?: AgentSetup;
+  /** Receives state changes; a PTY run is bracketed by `suspend()`/`resume()`. */
+  view?: JoinView;
+  /** Replaces {@link ask} when set (`--ui`): the view asks the human. */
+  chooseSubmit?: JoinView["chooseSubmit"];
+  /** Peers shown in the view model (this device once joined). */
+  peers?: JoinViewModel["peers"];
+  /** Serializes PTY runs: one agent owns the terminal at a time. */
+  terminal?: <T>(fn: () => Promise<T>) => Promise<T>;
+  /** Aborted when the join is closing; stops a running PTY or herdr wait. */
+  signal?: AbortSignal;
+}
+
+/**
+ * Keeps the head (status lines) and the end (the agent's last output) of an over-long summary.
+ * It is cut only after redaction, so a cut can never expose part of a secret.
+ */
+function clipSummary(text: string): string {
+  if (text.length <= MAX_SUMMARY) return text;
+  const gap = "\n…\n";
+  const head = 1_000;
+  return `${text.slice(0, head)}${gap}${text.slice(-(MAX_SUMMARY - head - gap.length))}`;
 }
 
 /** Everything a sub does for one item. Never throws: a failure is a result with `failed`. */
@@ -837,14 +1296,44 @@ export async function workItem(worker: ItemWorker, item: PlanItem): Promise<SubR
   const { ctx } = worker;
   const redactor = new Redactor();
   const branch = sessionBranch(item.itemId, item.epoch);
+  // Every summary byte that leaves for the master is control-stripped and redacted (D27).
+  const clean = (text: string): string => redactor.redact(dropControlChars(text));
+
+  let agentState: JoinAgentState = "starting";
+  let focusCommand: readonly string[] | undefined;
+  let tail = "";
+  const show = (submit?: SubmitOutcome): JoinViewModel => ({
+    peers: worker.peers ?? [],
+    item: { itemId: item.itemId, title: item.title, repo: item.repo, epoch: item.epoch },
+    agent:
+      worker.agent === undefined
+        ? null
+        : {
+            cli: worker.agent.cli,
+            view: worker.agent.view,
+            state: agentState,
+            ...(focusCommand === undefined ? {} : { focusCommand }),
+          },
+    tail,
+    submit: { policy: worker.method, ...(submit === undefined ? {} : { outcome: submit }) },
+  });
+  const report = (state: JoinAgentState, focus?: readonly string[]): void => {
+    agentState = state;
+    if (focus !== undefined) focusCommand = focus;
+    worker.view?.update(show());
+  };
   const result = (
     fields: Omit<SubResult, "repo" | "summary" | "submit"> & { submit: SubmitOutcome },
     summary: string,
-  ): SubResult => ({
-    repo: item.repo,
-    ...fields,
-    summary: `${submitLine(fields.submit)}\n${redactor.redact(summary)}`.slice(0, MAX_SUMMARY),
-  });
+  ): SubResult => {
+    const final: SubResult = {
+      repo: item.repo,
+      ...fields,
+      summary: clipSummary(`${submitLine(fields.submit)}\n${clean(summary)}`),
+    };
+    worker.view?.update(show(fields.submit));
+    return final;
+  };
 
   let work: Materialized & { clone: string | null };
   try {
@@ -854,6 +1343,7 @@ export async function workItem(worker: ItemWorker, item: PlanItem): Promise<SubR
       .then((value) => value.trim())
       .catch(() => UNKNOWN_SHA);
     const sha = ShaSchema.safeParse(baseSha).success ? baseSha : UNKNOWN_SHA;
+    agentState = "failed";
     return result(
       {
         baseSha: sha,
@@ -870,15 +1360,31 @@ export async function workItem(worker: ItemWorker, item: PlanItem): Promise<SubR
     git(ctx, ["rev-parse", "HEAD"], dir)
       .then((value) => value.trim())
       .catch(() => baseSha);
-  let executed: { ok: boolean; summary: string };
+  let executed: Executed;
   try {
-    executed = await executeItem(ctx, item, dir);
-    if (work.clone !== null) await syncBack(ctx, work, work.clone);
+    executed = await executeItem(worker, item, dir, report);
+    if (work.clone !== null && executed.status === "ok") await syncBack(ctx, work, work.clone);
   } catch (error) {
-    executed = { ok: false, summary: errorMessage(error) };
+    // After an accepted prompt a herdr failure is final: never replayed natively (§11.4).
+    executed = { status: "failed", summary: errorMessage(error) };
   }
+  tail = clean(executed.summary).slice(-MAX_SUMMARY);
   const headSha = await headOf();
-  if (!executed.ok) {
+  if (executed.status === "blocked") {
+    // Nothing is committed, checked or submitted; `skep session submit` finishes it later (D29).
+    agentState = "blocked";
+    return result(
+      {
+        baseSha,
+        headSha,
+        checks: [{ name: "agent", status: "skip" }],
+        submit: outcome(worker.method, "pending", branch),
+      },
+      executed.summary,
+    );
+  }
+  if (executed.status === "failed") {
+    agentState = "failed";
     return result(
       {
         baseSha,
@@ -887,6 +1393,18 @@ export async function workItem(worker: ItemWorker, item: PlanItem): Promise<SubR
         submit: outcome(worker.method, "failed", branch),
       },
       executed.summary,
+    );
+  }
+  agentState = "done";
+  if (!executed.changed) {
+    return result(
+      {
+        baseSha,
+        headSha,
+        checks: [{ name: "none", status: "skip" }],
+        submit: outcome(worker.method, "skipped", branch),
+      },
+      `no changes; nothing submitted\n${executed.summary}`,
     );
   }
 
@@ -903,9 +1421,15 @@ export async function workItem(worker: ItemWorker, item: PlanItem): Promise<SubR
 
   let method: DirectMethod;
   if (worker.method === "ask") {
-    ctx.stderr.write(`item ${item.itemId} finished on ${branch} at ${headSha}\n`);
-    const answer = (await worker.ask("Submit this item? [pr/mr/push/none/skip] "))?.trim() ?? "";
-    const chosen = DIRECT_METHODS.find((value) => value === answer.toLowerCase());
+    let chosen: DirectMethod | undefined;
+    if (worker.chooseSubmit !== undefined) {
+      const picked = await worker.chooseSubmit(show());
+      chosen = DIRECT_METHODS.find((value) => value === picked);
+    } else {
+      ctx.stderr.write(`item ${item.itemId} finished on ${branch} at ${headSha}\n`);
+      const answer = (await worker.ask("Submit this item? [pr/mr/push/none/skip] "))?.trim() ?? "";
+      chosen = DIRECT_METHODS.find((value) => value === answer.toLowerCase());
+    }
     if (chosen === undefined) {
       return result(
         { baseSha, headSha, checks, submit: outcome("ask", "skipped", branch) },
@@ -921,7 +1445,7 @@ export async function workItem(worker: ItemWorker, item: PlanItem): Promise<SubR
     branch,
     method,
     title: item.title === "" ? `session ${item.itemId}` : item.title,
-    body: redactor.redact(executed.summary),
+    body: clean(executed.summary),
   }).catch((error: unknown) => ({
     submit: outcome(method, "failed", branch),
     detail: errorMessage(error),
@@ -947,6 +1471,9 @@ interface JoinOptions {
   repo?: string;
   role: string;
   submit?: SubmitMethod;
+  agent?: AgentView;
+  roleDir?: string;
+  ui?: boolean;
 }
 
 interface SubmitOptions {
@@ -989,6 +1516,14 @@ export function register(program: Command, ctx: CliContext): void {
         "how finished items are submitted (default: device policy)",
       ).choices(SUBMIT_METHODS),
     )
+    .addOption(
+      new Option(
+        "--agent <view>",
+        "how items run: dry, pty, herdr or native (default: SKEP_SESSION_EXEC/SKEP_SESSION_VIEW)",
+      ).choices(AGENT_VIEWS),
+    )
+    .option("--role-dir <dir>", "directory holding this device's AGENT.md (default: cwd)")
+    .option("--ui", "use the full-screen view")
     .action(async (opts: JoinOptions) => {
       await joinCommand(sctx, opts);
     });
@@ -1200,71 +1735,124 @@ async function joinCommand(ctx: SessionCliContext, opts: JoinOptions): Promise<v
   const device = validDevice(opts.device);
   const repo = validRepo(opts.repo ?? (await defaultRepo(ctx)));
   const role = opts.role;
+  if (ctx.paths === undefined) throw new Error("skep home is not resolved");
+  const paths = ctx.paths;
+  const ui = opts.ui === true;
+  if (ui && joinViewFactory === null) {
+    throw new CliError("ui_unavailable", "the full-screen view is not available in this build");
+  }
+  const warn = (message: string): void => ctx.stderr.write(`skep: ${message}\n`);
+  const view = selectAgentView(opts.agent, ctx.env);
+  let agent: AgentSetup | undefined;
+  if (view !== "dry") {
+    agent = {
+      view,
+      cli: await agentCliOf(path.resolve(ctx.cwd ?? process.cwd(), opts.roleDir ?? "."), view),
+      runtime: ctx.agentRuntime ?? loadAgentRuntime,
+      journal: path.join(paths.home, "session", "transcripts"),
+      notify: ctx.notify ?? (await deviceNotifier(paths.deviceToml, warn)),
+    };
+  }
   const api = await loadSessionApi(ctx);
   const output = ctx.output();
-  if (ctx.paths === undefined) throw new Error("skep home is not resolved");
-  const warn = (message: string): void => ctx.stderr.write(`skep: ${message}\n`);
+  // The full-screen view owns the terminal; event lines then go only to `--machine` output.
+  const say = (data: unknown, human: () => string): void =>
+    output.result(data, ui ? () => "" : human);
   // A human override on the command line wins over this device's file policy.
-  const method = opts.submit ?? (await loadSubmitPolicy(ctx.paths.deviceToml, warn)).method;
+  const method = opts.submit ?? (await loadSubmitPolicy(paths.deviceToml, warn)).method;
 
   let reader: LineReader | undefined;
   let prompts: Promise<unknown> = Promise.resolve();
+  const ask = (question: string): Promise<string | null> => {
+    // One prompt at a time: concurrent items must not interleave questions and answers.
+    const answer = prompts.then(async () => {
+      reader ??= new LineReader(ctx.stdin ?? process.stdin);
+      ctx.stderr.write(question);
+      return reader.next();
+    });
+    prompts = answer.catch(() => undefined);
+    return answer;
+  };
+  const joinView: JoinView =
+    ui && joinViewFactory !== null
+      ? joinViewFactory({
+          stdin: (ctx.stdin ?? process.stdin) as NodeJS.ReadStream,
+          stdout: process.stdout,
+        })
+      : new LineJoinView(ctx.stderr, ask, {
+          pause: () => reader?.pause(),
+          resume: () => reader?.resume(),
+        });
+  let terminalQueue: Promise<unknown> = Promise.resolve();
+  const abort = new AbortController();
   const worker: ItemWorker = {
     ctx,
-    root: path.join(ctx.paths.home, "session", "worktrees"),
+    root: path.join(paths.home, "session", "worktrees"),
     method,
-    ask: (question) => {
-      // One prompt at a time: concurrent items must not interleave questions and answers.
-      const answer = prompts.then(async () => {
-        reader ??= new LineReader(ctx.stdin ?? process.stdin);
-        ctx.stderr.write(question);
-        return reader.next();
-      });
-      prompts = answer.catch(() => undefined);
-      return answer;
+    ask,
+    ...(agent === undefined ? {} : { agent }),
+    view: joinView,
+    ...(ui ? { chooseSubmit: (model: JoinViewModel) => joinView.chooseSubmit(model) } : {}),
+    peers: [],
+    terminal: (fn) => {
+      const run = terminalQueue.then(fn);
+      terminalQueue = run.catch(() => undefined);
+      return run;
     },
+    signal: abort.signal,
   };
 
   let fingerprintShown = false;
   const showFingerprint = (fingerprint: string): void => {
     if (fingerprintShown) return;
     fingerprintShown = true;
-    output.result(
+    say(
       { event: "fingerprint", fingerprint },
       () => `fingerprint ${fingerprint} — check that the master shows the same\n`,
     );
   };
 
-  const handle = await api.connectSub({
-    target,
-    code,
-    device,
-    clock: systemClock,
-    random: cryptoRandom,
-    onFingerprint: showFingerprint,
-    describe: async () => ({ repo, role, head: (await git(ctx, ["rev-parse", "HEAD"])).trim() }),
-    collectDatalist: async () => {
-      const listed = await git(ctx, ["ls-files", "-z"]);
-      return listed
-        .split("\0")
-        .filter((file) => file.length > 0 && file.length <= MAX_DATALIST_PATH)
-        .map((file) => ({ kind: "path" as const, path: file }));
-    },
-    onItem: async (item) => {
-      output.result(
-        { event: "item", item },
-        () => `item ${item.itemId} (epoch ${item.epoch}, ${item.repo}): ${item.title}\n`,
-      );
-      const result = await workItem(worker, item);
-      output.result(
-        { event: "item-result", itemId: item.itemId, epoch: item.epoch, ...result },
-        () => `item ${item.itemId} ${result.summary.split("\n")[0] ?? ""} (${result.headSha})\n`,
-      );
-      return result;
-    },
-  });
+  let handle: SubHandle;
+  try {
+    handle = await api.connectSub({
+      target,
+      code,
+      device,
+      clock: systemClock,
+      random: cryptoRandom,
+      onFingerprint: showFingerprint,
+      describe: async () => ({
+        repo,
+        role,
+        head: (await git(ctx, ["rev-parse", "HEAD"])).trim(),
+      }),
+      collectDatalist: async () => {
+        const listed = await git(ctx, ["ls-files", "-z"]);
+        return listed
+          .split("\0")
+          .filter((file) => file.length > 0 && file.length <= MAX_DATALIST_PATH)
+          .map((file) => ({ kind: "path" as const, path: file }));
+      },
+      onItem: async (item) => {
+        say(
+          { event: "item", item },
+          () => `item ${item.itemId} (epoch ${item.epoch}, ${item.repo}): ${item.title}\n`,
+        );
+        const result = await workItem(worker, item);
+        say(
+          { event: "item-result", itemId: item.itemId, epoch: item.epoch, ...result },
+          () => `item ${item.itemId} ${result.summary.split("\n")[0] ?? ""} (${result.headSha})\n`,
+        );
+        return result;
+      },
+    });
+  } catch (error) {
+    joinView.close();
+    throw error;
+  }
 
   const stop = (): void => {
+    abort.abort();
     void handle.close();
   };
   process.once("SIGINT", stop);
@@ -1272,18 +1860,112 @@ async function joinCommand(ctx: SessionCliContext, opts: JoinOptions): Promise<v
   try {
     showFingerprint(handle.fingerprint);
     const { sessionId, peerId } = handle;
+    worker.peers = [{ peerId, device, role, state: "joined" }];
+    joinView.update({
+      peers: worker.peers,
+      item: null,
+      agent: null,
+      tail: "",
+      submit: { policy: method },
+    });
     const at = formatHostPort(target);
-    output.result(
+    say(
       { event: "joined", sessionId, peerId, target: at },
       () => `joined session ${sessionId} at ${at} as ${peerId}\n`,
     );
     await handle.closed;
-    output.result({ event: "closed" }, () => "session closed\n");
+    say({ event: "closed" }, () => "session closed\n");
   } finally {
     process.removeListener("SIGINT", stop);
     process.removeListener("SIGTERM", stop);
+    abort.abort();
     reader?.close();
+    joinView.close();
   }
+}
+
+/** This device's AGENT.md `agent_cli` (D27): the master's plan never names a CLI. */
+async function agentCliOf(roleDir: string, view: AgentView): Promise<AgentCli> {
+  try {
+    return (await loadAgentMd(roleDir)).frontMatter.agent_cli;
+  } catch (error) {
+    if (!(error instanceof ConfigError)) throw error;
+    throw new CliError(
+      "agent_md",
+      `--agent ${view} needs this device's AGENT.md (pass --role-dir): ${error.message}`,
+      EXIT.usage,
+    );
+  }
+}
+
+const NotifyFileSchema = z.object({
+  notify: z.object({ ntfy_topic_url: z.string() }).optional(),
+});
+
+/**
+ * The ntfy notifier from `device.toml` `notify.ntfy_topic_url`, read as loosely as the submit
+ * policy. No file or no topic means no notification; the stderr line is always printed.
+ */
+async function deviceNotifier(
+  file: string,
+  warn: (message: string) => void,
+): Promise<(notification: Notification) => Promise<unknown>> {
+  const none = async (): Promise<void> => {};
+  let text: string;
+  try {
+    text = await readFile(file, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return none;
+    throw error;
+  }
+  try {
+    const url = parseTomlConfig(NotifyFileSchema, text, file).notify?.ntfy_topic_url;
+    if (url === undefined) return none;
+    const notifier = new NtfyNotifier({ topicUrl: url, redactor: new Redactor() });
+    return (notification) => notifier.notify(notification);
+  } catch (error) {
+    warn(`notifications disabled: ${errorMessage(error)}`);
+    return none;
+  }
+}
+
+/** Without `--ui`: today's output plus one stderr line per agent state change. */
+class LineJoinView implements JoinView {
+  private readonly shown = new Map<string, string>();
+
+  constructor(
+    private readonly out: { write(s: string): void },
+    private readonly ask: (question: string) => Promise<string | null>,
+    private readonly input: { pause(): void; resume(): void },
+  ) {}
+
+  update(model: JoinViewModel): void {
+    const { item, agent } = model;
+    if (item === null || agent === null) return;
+    const watch =
+      agent.focusCommand === undefined ? "" : `; watch with: ${agent.focusCommand.join(" ")}`;
+    const line = `item ${item.itemId}: agent ${agent.cli} (${agent.view}) ${agent.state}${watch}\n`;
+    const key = `${item.itemId}-e${item.epoch}`;
+    if (this.shown.get(key) === line) return;
+    this.shown.set(key, line);
+    this.out.write(line);
+  }
+
+  async chooseSubmit(): Promise<"pr" | "mr" | "push" | "none" | null> {
+    const answer = (await this.ask("Submit this item? [pr/mr/push/none/skip] "))?.trim() ?? "";
+    return DIRECT_METHODS.find((value) => value === answer.toLowerCase()) ?? null;
+  }
+
+  /** The agent reads the terminal directly; a pending prompt must not steal its keystrokes. */
+  async suspend(): Promise<void> {
+    this.input.pause();
+  }
+
+  resume(): void {
+    this.input.resume();
+  }
+
+  close(): void {}
 }
 
 /**
