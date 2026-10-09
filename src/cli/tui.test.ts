@@ -1,11 +1,17 @@
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
+import type { Clock } from "../util/clock.js";
 import type { JoinAgentState, JoinViewModel } from "./commands/session.js";
 import {
+  beeLane,
+  charWidth,
   decodeKeys,
+  type Glyphs,
   type ProcessHooks,
+  progressBar,
   Screen,
+  TICK_MS,
   TuiJoinView,
   type TuiOptions,
   truncate,
@@ -105,6 +111,94 @@ function model(over: {
 
 /** Lets promise callbacks (key handlers, awaited host) run. */
 const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+function progressModel(
+  phase: NonNullable<JoinViewModel["peers"][number]["progress"]>["phase"],
+): JoinViewModel {
+  return {
+    ...model({}),
+    peers: [
+      ...PEERS,
+      {
+        peerId: "peer-2",
+        device: "vps",
+        role: "backend",
+        state: phase,
+        progress: { phase, done: 3, total: 8, failed: 0, percent: 37, summary: "health check" },
+      },
+    ],
+  };
+}
+
+function tickClock() {
+  let wake = (): void => {};
+  let signal: AbortSignal | undefined;
+  const sleep = vi.fn((milliseconds: number, nextSignal?: AbortSignal): Promise<void> => {
+    expect(milliseconds).toBe(TICK_MS);
+    signal = nextSignal;
+    return new Promise((resolve, reject) => {
+      const aborted = (): void => reject(new Error("aborted"));
+      nextSignal?.addEventListener("abort", aborted, { once: true });
+      wake = () => {
+        nextSignal?.removeEventListener("abort", aborted);
+        resolve();
+      };
+    });
+  });
+  const clock: Clock = { monotonicMs: () => 0, nowMs: () => 0, sleep };
+  return { clock, sleep, tick: () => wake(), signal: () => signal };
+}
+
+describe("peer progress glyphs", () => {
+  it.each(["unicode", "ascii"] as const)(
+    "renders every phase and beat with %s glyphs",
+    (glyphs) => {
+      const expected =
+        glyphs === "unicode"
+          ? {
+              working: ["🐝  ", " 🐝 ", "  🐝", " 🐝 "],
+              blocked: ["🐝! ", "🐝! ", "🐝  ", "🐝  "],
+              done: ["✓   ", "✓   ", "✓   ", "✓   "],
+              idle: ["·   ", "·   ", "·   ", "·   "],
+            }
+          : {
+              working: ["~b  ", " ~b ", "  ~b", " ~b "],
+              blocked: ["b!  ", "b!  ", "b   ", "b   "],
+              done: ["ok  ", "ok  ", "ok  ", "ok  "],
+              idle: [".   ", ".   ", ".   ", ".   "],
+            };
+      for (const phase of ["working", "blocked", "done", "idle"] as const) {
+        for (let beat = 0; beat < 4; beat++) {
+          const lane = beeLane(phase, beat, glyphs);
+          expect(lane).toBe(expected[phase][beat]);
+          expect(
+            [...lane].reduce((width, char) => width + charWidth(char.codePointAt(0) ?? 0), 0),
+          ).toBe(4);
+          expect(beeLane(phase, beat + 4, glyphs)).toBe(lane);
+        }
+      }
+    },
+  );
+
+  it.each([
+    [0, "░░░░░░░░", "........"],
+    [37, "███░░░░░", "###....."],
+    [99, "███████░", "#######."],
+    [100, "████████", "########"],
+  ] as const)("renders an eight-cell bar at %s%%", (percent, unicode, ascii) => {
+    expect(progressBar(percent, "unicode")).toBe(unicode);
+    expect(progressBar(percent, "ascii")).toBe(ascii);
+  });
+
+  it("counts the specified emoji range as two display columns", () => {
+    expect(charWidth(0x1f300)).toBe(2);
+    expect(charWidth(0x1f41d)).toBe(2);
+    expect(charWidth(0x1faff)).toBe(2);
+    expect(charWidth(0x1f2ff)).toBe(1);
+    expect(charWidth(0x1fb00)).toBe(1);
+    expect(charWidth(0x61)).toBe(1);
+  });
+});
 
 describe("decodeKeys", () => {
   it("decodes arrows, Enter, q, Ctrl-C and letters; swallows unknown escapes", () => {
@@ -208,6 +302,176 @@ describe("truncate", () => {
     expect(truncate("abcdef", 4)).toBe("abc…");
     expect(truncate("abc", 4)).toBe("abc");
     expect(truncate("a\x1b[31mb\tc", 10)).toBe("a[31mb c");
+  });
+
+  it("cuts by display width without splitting an emoji", () => {
+    expect(truncate("🐝abc", 4)).toBe("🐝a…");
+    expect(truncate("🐝a", 3)).toBe("🐝a");
+    expect(truncate("🐝", 1)).toBe("…");
+    expect(truncate("🐝", 0)).toBe("");
+  });
+});
+
+describe("peer progress strips", () => {
+  it.each([
+    ["working", "🐝", "working"],
+    ["blocked", "🐝!", "blocked"],
+    ["idle", "·", "idle"],
+    ["done", "✓", "done"],
+  ] as const)("draws a remote %s peer without an entry", (phase, glyph, label) => {
+    const term = fakeTerminal();
+    const view = open(term, { animate: false });
+    try {
+      view.update(progressModel(phase));
+      const strip = term.frame()[3];
+      expect(strip).toContain(glyph);
+      expect(strip).toContain("[███░░░░░]  37%  3/8");
+      expect(strip).toContain(`${label}  health check`);
+      expect(term.rawFrame()[3]).not.toContain("\x1b[7m");
+      expect(term.frame()[2]).toBe("> laptop  coding  I-1 e1  codex/pty  running");
+      expect(term.frame()).toHaveLength(24);
+    } finally {
+      view.close();
+    }
+  });
+
+  it("keeps self's strip before its selectable item and marks failed completion", () => {
+    const term = fakeTerminal();
+    const view = open(term, { animate: false });
+    try {
+      const snapshot = progressModel("done");
+      const progress = snapshot.peers[1]?.progress;
+      if (progress === undefined) throw new Error("missing test progress");
+      snapshot.peers[0] = {
+        ...(PEERS[0] as JoinViewModel["peers"][number]),
+        progress: { ...progress, phase: "done", done: 8, failed: 1, percent: 100, summary: "" },
+      };
+      view.update(snapshot);
+      expect(term.frame()[2]).toContain("✓   ");
+      expect(term.frame()[2]).toContain("[████████] 100%  8/8  done (1 failed)");
+      expect(term.frame()[3]).toBe("> laptop  coding  I-1 e1  codex/pty  running");
+    } finally {
+      view.close();
+    }
+  });
+
+  it.each(["unicode", "ascii"] as Glyphs[])(
+    "uses model.beat for %s frames and strips summary controls",
+    (glyphs) => {
+      const term = fakeTerminal();
+      const view = open(term, { animate: false, glyphs });
+      try {
+        const snapshot = progressModel("working");
+        const progress = snapshot.peers[1]?.progress;
+        if (progress === undefined) throw new Error("missing test progress");
+        progress.summary = "safe\n\r\ttext";
+        view.tui.model.beat = 2;
+        view.update(snapshot);
+        expect(term.frame()[3]).toContain(`backend    ${glyphs === "unicode" ? "🐝" : "~b"}  [`);
+        expect(term.frame()[3]).toContain("safe text");
+        expect(term.frame()[3]).toContain(glyphs === "unicode" ? "███░░░░░" : "###.....");
+      } finally {
+        view.close();
+      }
+    },
+  );
+
+  it("truncates emoji lines and pads inverse rows to exactly 80 display columns", () => {
+    const term = fakeTerminal();
+    const screen = new Screen(
+      { stdin: term.stdin, stdout: term.stdout },
+      { onKey: () => {} },
+      term.hooks,
+    );
+    screen.start();
+    try {
+      screen.draw([
+        "🐝".repeat(60),
+        { text: "a🐝", style: "inverse" },
+        { text: "🐝".repeat(60), style: "inverse" },
+      ]);
+      const lines = term.plainFrame();
+      expect(lines[0]).toBe(`${"🐝".repeat(39)}…`);
+      expect(lines[1]).toBe(`a🐝${" ".repeat(77)}`);
+      for (const line of lines) {
+        const width = [...line].reduce(
+          (total, char) => total + charWidth(char.codePointAt(0) ?? 0),
+          0,
+        );
+        expect(width).toBeLessThanOrEqual(80);
+      }
+      expect(lines[2]?.endsWith("… ")).toBe(true);
+    } finally {
+      screen.close();
+    }
+  });
+});
+
+describe("peer progress ticker", () => {
+  it("starts only while animating, keeps one loop, stops at idle, and aborts on close", async () => {
+    const term = fakeTerminal();
+    const time = tickClock();
+    const view = open(term, { clock: time.clock });
+    try {
+      view.update(progressModel("idle"));
+      expect(time.sleep).not.toHaveBeenCalled();
+      view.update(progressModel("working"));
+      view.tui.render();
+      expect(time.sleep).toHaveBeenCalledTimes(1);
+      time.tick();
+      await flush();
+      expect(view.tui.model.beat).toBe(1);
+      expect(time.sleep).toHaveBeenCalledTimes(2);
+      view.update(progressModel("idle"));
+      time.tick();
+      await flush();
+      expect(view.tui.model.beat).toBe(1);
+      expect(time.sleep).toHaveBeenCalledTimes(2);
+      view.update(progressModel("done"));
+      expect(time.sleep).toHaveBeenCalledTimes(2);
+      view.update(progressModel("blocked"));
+      expect(time.sleep).toHaveBeenCalledTimes(3);
+      view.close();
+      expect(time.signal()?.aborted).toBe(true);
+      await flush();
+      expect(time.sleep).toHaveBeenCalledTimes(3);
+    } finally {
+      view.close();
+    }
+  });
+
+  it("advances without drawing while suspended, then redraws on resume", async () => {
+    const term = fakeTerminal();
+    const time = tickClock();
+    const view = open(term, { clock: time.clock });
+    try {
+      view.update(progressModel("working"));
+      view.tui.screen.suspend();
+      const before = term.output();
+      time.tick();
+      await flush();
+      expect(view.tui.model.beat).toBe(1);
+      expect(term.output()).toBe(before);
+      view.resume();
+      expect(term.output()).not.toBe(before);
+      expect(time.sleep).toHaveBeenCalledTimes(2);
+    } finally {
+      view.close();
+      await flush();
+    }
+  });
+
+  it("never sleeps when animation is disabled", () => {
+    const term = fakeTerminal();
+    const time = tickClock();
+    const view = open(term, { clock: time.clock, animate: false });
+    try {
+      view.update(progressModel("working"));
+      view.update(progressModel("blocked"));
+      expect(time.sleep).not.toHaveBeenCalled();
+    } finally {
+      view.close();
+    }
   });
 });
 

@@ -76,6 +76,7 @@ export function joinViewFactory(ctx: CliContext): JoinViewFactory {
     const deviceToml = ctx.paths?.deviceToml;
     return new TuiJoinView({
       io: { stdin: io.stdin, stdout: io.stdout },
+      glyphs: ctx.env.SKEP_TUI_ASCII === "1" ? "ascii" : "unicode",
       host:
         deviceToml === undefined
           ? "github"
@@ -117,6 +118,8 @@ async function uiCommand(ctx: UiCliContext): Promise<void> {
   const stop = new AbortController();
   const tui = new Tui({
     io,
+    clock,
+    glyphs: ctx.env.SKEP_TUI_ASCII === "1" ? "ascii" : "unicode",
     ...(ctx.uiHooks === undefined ? {} : { hooks: ctx.uiHooks }),
     onQuit: () => stop.abort(),
   });
@@ -172,7 +175,8 @@ export function masterSnapshot(status: SessionStatus, device: string): TuiSnapsh
       peerId: peer.peerId,
       device: peer.device,
       role: peer.role ?? "-",
-      state: peer.repo === null ? "joined" : `repo ${peer.repo}`,
+      state: peer.progress?.phase ?? (peer.repo === null ? "joined" : `repo ${peer.repo}`),
+      ...(peer.progress === undefined ? {} : { progress: peer.progress }),
     })),
     entries,
   };

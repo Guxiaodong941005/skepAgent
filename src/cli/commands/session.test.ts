@@ -27,13 +27,16 @@ import {
   type MasterOptions,
   materializeItem,
   NATIVE_ARGV,
+  type PeerProgress,
   type PtyRunOptions,
   type PtyRunResult,
   parseHostPort,
   pickListenHost,
+  renderSessionStatus,
   type SessionApi,
   type SessionCliContext,
   type SessionStatus,
+  SessionStatusSchema,
   type SubHandle,
   type SubOptions,
   selectAgentView,
@@ -347,6 +350,244 @@ describe("session start", () => {
 });
 
 describe("session join", () => {
+  it("keeps self first, upserts peers by join number, removes left peers, and reports agent state", async () => {
+    const box = await sandbox();
+    const log = recordingView();
+    const connected = deferred();
+    const closed = deferred();
+    const fake = fakeApi();
+    const reportAgent = vi.fn();
+    fake.api.connectSub = async (options) => {
+      fake.calls.sub.push(options);
+      await connected.promise;
+      return {
+        peerId: "peer-5",
+        sessionId: "S-1",
+        fingerprint: "fingerprint",
+        reportAgent,
+        closed: closed.promise.then(() => ({ reason: "test" })),
+        close: async () => closed.resolve(),
+      };
+    };
+    setJoinViewFactory(() => log.view);
+    const c = capture(box.home, { env: box.env, cwd: box.repo, sessionApi: fake.api });
+    const run = runCli(
+      [
+        "--machine",
+        "session",
+        "join",
+        "--ui",
+        "--code",
+        "123456789012",
+        "--host",
+        "h:1",
+        "--repo",
+        "app",
+        "--device",
+        "mac",
+        "--role",
+        "backend",
+        "--submit",
+        "none",
+      ],
+      c.ctx,
+    );
+    try {
+      await vi.waitFor(() => expect(fake.calls.sub).toHaveLength(1));
+      const options = fake.calls.sub[0];
+      if (options?.onProgress === undefined) throw new Error("missing progress callback");
+      const progress: PeerProgress = {
+        peerId: "peer-5",
+        device: "mac",
+        role: "backend",
+        phase: "idle",
+        done: 0,
+        total: 0,
+        failed: 0,
+        percent: 0,
+        summary: "",
+      };
+      options.onProgress({ ...progress, self: true });
+      options.onProgress({
+        ...progress,
+        peerId: "peer-10",
+        device: "vps",
+        role: null,
+        self: false,
+      });
+      options.onProgress({ ...progress, peerId: "peer-2", device: "desk", self: false });
+      options.onProgress({
+        ...progress,
+        peerId: "peer-2",
+        device: "desk",
+        phase: "working",
+        done: 3,
+        total: 8,
+        percent: 37,
+        summary: "health check",
+        self: false,
+      });
+      expect(log.models.at(-1)?.peers.map((peer) => peer.peerId)).toEqual([
+        "peer-5",
+        "peer-2",
+        "peer-10",
+      ]);
+      expect(log.models.at(-1)?.peers[1]).toMatchObject({
+        state: "working",
+        progress: { percent: 37, summary: "health check" },
+      });
+      expect(log.models.at(-1)?.peers[2]?.role).toBe("-");
+      connected.resolve();
+      await vi.waitFor(() => expect(c.stdout).toContain('"event":"joined"'));
+      expect(log.models.at(-1)?.peers[0]).toMatchObject({
+        peerId: "peer-5",
+        state: "idle",
+        progress: { phase: "idle" },
+      });
+      options.onProgress({
+        ...progress,
+        peerId: "peer-2",
+        device: "desk",
+        phase: "left",
+        self: false,
+      });
+      expect(log.models.at(-1)?.peers.map((peer) => peer.peerId)).toEqual(["peer-5", "peer-10"]);
+      await options.onItem(ITEM);
+      expect(reportAgent).toHaveBeenCalledWith(ITEM.itemId, "done");
+    } finally {
+      connected.resolve();
+      closed.resolve();
+      await run;
+      setJoinViewFactory(null);
+    }
+    expect(log.events.at(-1)).toBe("close");
+  });
+
+  it("emits machine peer-progress only on per-peer phase changes", async () => {
+    const fake = fakeApi();
+    fake.api.connectSub = async (options) => {
+      const progress: PeerProgress = {
+        peerId: "peer-2",
+        device: "vps",
+        role: null,
+        phase: "working",
+        done: 3,
+        total: 8,
+        failed: 0,
+        percent: 37,
+        summary: "health check",
+      };
+      options.onProgress?.({ ...progress, self: false });
+      options.onProgress?.({
+        ...progress,
+        done: 4,
+        percent: 50,
+        summary: "more work",
+        self: false,
+      });
+      options.onProgress?.({ ...progress, peerId: "peer-3", device: "desk", self: false });
+      options.onProgress?.({ ...progress, phase: "done", done: 8, percent: 100, self: false });
+      options.onProgress?.({ ...progress, phase: "done", done: 8, percent: 100, self: false });
+      options.onProgress?.({
+        ...progress,
+        phase: "left",
+        done: 0,
+        total: 0,
+        percent: 0,
+        summary: "",
+        self: false,
+      });
+      return {
+        peerId: "peer-1",
+        sessionId: "S-1",
+        fingerprint: "fp",
+        closed: Promise.resolve({ reason: "test" }),
+        close: async () => {},
+      };
+    };
+    const c = capture(await home(), { sessionApi: fake.api });
+    expect(
+      await runCli(
+        [
+          "--machine",
+          "session",
+          "join",
+          "--code",
+          "123456789012",
+          "--host",
+          "h:1",
+          "--repo",
+          "app",
+          "--submit",
+          "none",
+        ],
+        c.ctx,
+      ),
+    ).toBe(0);
+    const events = c.stdout
+      .trim()
+      .split("\n")
+      .map(
+        (line) =>
+          JSON.parse(line).result as {
+            event: string;
+            peerId: string;
+            phase: string;
+            percent: number;
+            self: boolean;
+          },
+      );
+    expect(
+      events
+        .filter((event) => event.event === "peer-progress")
+        .map((event) => [event.peerId, event.phase, event.percent]),
+    ).toEqual([
+      ["peer-2", "working", 37],
+      ["peer-3", "working", 37],
+      ["peer-2", "done", 100],
+      ["peer-2", "left", 0],
+    ]);
+  });
+
+  it("prints human progress without a UI", async () => {
+    const fake = fakeApi();
+    const connect = fake.api.connectSub;
+    fake.api.connectSub = async (options) => {
+      options.onProgress?.({
+        peerId: "peer-2",
+        device: "vps",
+        role: null,
+        phase: "working",
+        done: 3,
+        total: 8,
+        failed: 0,
+        percent: 37,
+        summary: "",
+        self: false,
+      });
+      return connect(options);
+    };
+    const c = capture(await home(), { sessionApi: fake.api });
+    expect(
+      await runCli(
+        [
+          "session",
+          "join",
+          "--code",
+          "123456789012",
+          "--host",
+          "h:1",
+          "--repo",
+          "app",
+          "--submit",
+          "none",
+        ],
+        c.ctx,
+      ),
+    ).toBe(0);
+    expect(c.stdout).toContain("peer vps working 3/8 (37%)\n");
+  });
+
   it("rejects a short code with exit 2", async () => {
     const fake = fakeApi();
     const c = capture(await home(), { sessionApi: fake.api });
@@ -400,6 +641,51 @@ describe("session join", () => {
 });
 
 describe("control commands", () => {
+  it("accepts status with and without progress and renders its column", () => {
+    expect(SessionStatusSchema.parse(STATUS)).toEqual(STATUS);
+    expect(renderSessionStatus(STATUS)).toContain("PROGRESS");
+    const progress = {
+      phase: "working",
+      done: 3,
+      total: 8,
+      failed: 1,
+      percent: 37,
+      summary: "health check",
+      itemId: "I-1",
+    };
+    const current = { ...STATUS, peers: STATUS.peers.map((peer) => ({ ...peer, progress })) };
+    const parsed = SessionStatusSchema.parse(current);
+    expect(parsed.peers[0]?.progress).toEqual(progress);
+    expect(renderSessionStatus(parsed)).toContain("working 37%");
+  });
+
+  it.each([
+    { done: 9 },
+    { failed: 4 },
+    { percent: 38 },
+    { done: 1.5 },
+    { summary: "x".repeat(121) },
+    { itemId: "invalid" },
+    { phase: "left" },
+    { unknown: true },
+  ])("rejects malformed status progress: %j", (invalid) => {
+    const progress = {
+      phase: "working",
+      done: 3,
+      total: 8,
+      failed: 0,
+      percent: 37,
+      summary: "",
+      ...invalid,
+    };
+    expect(
+      SessionStatusSchema.safeParse({
+        ...STATUS,
+        peers: STATUS.peers.map((peer) => ({ ...peer, progress })),
+      }).success,
+    ).toBe(false);
+  });
+
   it("intent sends the token and text and prints the intentId", async () => {
     const dir = await home();
     const mock = await mockMaster({
@@ -1005,6 +1291,42 @@ describe("agent strategy selection", () => {
 });
 
 describe("workItem with a live agent", () => {
+  it.each(["done", "blocked", "unknown"] as const)(
+    "reports starting, running and the final %s agent state",
+    async (phase) => {
+      const box = await sandbox();
+      const c = capture(box.home, { env: box.env, cwd: box.repo });
+      const onAgentState = vi.fn();
+      const fake = fakeRuntime({ herdr: { wait: async () => phase } });
+      const worker = itemWorker(box, c, "herdr", fake, { method: "none", onAgentState });
+      await workItem(worker, ITEM);
+      const final = phase === "unknown" ? "failed" : phase;
+      expect(onAgentState.mock.calls).toEqual([
+        [ITEM.itemId, "starting"],
+        [ITEM.itemId, "running"],
+        ...(phase === "blocked" ? [[ITEM.itemId, "blocked"]] : []),
+        [ITEM.itemId, final],
+      ]);
+    },
+  );
+
+  it("reports a final failed state when materialization fails", async () => {
+    const dir = await home();
+    const c = capture(dir, { cwd: dir });
+    const onAgentState = vi.fn();
+    await workItem(
+      {
+        ctx: c.ctx,
+        root: path.join(dir, "work"),
+        method: "none",
+        ask: async () => null,
+        onAgentState,
+      },
+      ITEM,
+    );
+    expect(onAgentState).toHaveBeenCalledExactlyOnceWith(ITEM.itemId, "failed");
+  });
+
   it("pty: runs the CLI with the prompt as argv, suspends the view around it, commits", async () => {
     const box = await sandbox();
     const c = capture(box.home, { env: box.env, cwd: box.repo });
