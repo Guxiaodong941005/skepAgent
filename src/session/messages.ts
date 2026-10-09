@@ -89,6 +89,37 @@ export const PlanItemSchema = z.strictObject({
   datalistEntries: z.number().int().nonnegative().max(2000),
 });
 export type PlanItem = z.infer<typeof PlanItemSchema>;
+export const SubmitMethodSchema = z.enum(["pr", "mr", "push", "none", "ask"]);
+export type SubmitMethod = z.infer<typeof SubmitMethodSchema>;
+export const SubmitStateSchema = z.enum([
+  "opened",
+  "pushed",
+  "local",
+  "pending",
+  "skipped",
+  "failed",
+]);
+export type SubmitState = z.infer<typeof SubmitStateSchema>;
+/**
+ * How the sub's own Skep (its device policy or the human at it) submitted the item's code. The
+ * master only records it: it never pushes or talks to a code host on a sub's behalf.
+ */
+export const SubmitOutcomeSchema = z
+  .strictObject({
+    method: SubmitMethodSchema,
+    state: SubmitStateSchema,
+    url: z.string().url().max(512).optional(),
+    number: z.number().int().positive().optional(),
+    branch: z.string().min(1).max(255),
+  })
+  .refine(
+    (value) =>
+      value.state === "opened"
+        ? value.url !== undefined
+        : value.url === undefined && value.number === undefined,
+    { message: "url is required when state is opened and only allowed then", path: ["url"] },
+  );
+export type SubmitOutcome = z.infer<typeof SubmitOutcomeSchema>;
 export const SubResultSchema = z.strictObject({
   repo: RepoRefSchema,
   baseSha: ShaSchema,
@@ -102,6 +133,8 @@ export const SubResultSchema = z.strictObject({
     )
     .max(64),
   summary: z.string().max(4000),
+  // Optional so peers that predate structured submit outcomes still parse.
+  submit: SubmitOutcomeSchema.optional(),
 });
 export type SubResult = z.infer<typeof SubResultSchema>;
 export const ResultMsgSchema = z.strictObject({

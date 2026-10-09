@@ -1,7 +1,15 @@
 import type { Duplex } from "node:stream";
 import type { Clock } from "../util/clock.js";
 import type { RandomSource } from "../util/random.js";
-import type { DatalistEntry, PlanItem, SessionStatus, SubResult } from "./messages.js";
+import type {
+  DatalistEntry,
+  PlanItem,
+  SessionStatus,
+  SubmitMethod,
+  SubmitOutcome,
+  SubmitState,
+  SubResult,
+} from "./messages.js";
 import type { PeerPath } from "./path.js";
 
 export interface MasterOptions {
@@ -59,6 +67,16 @@ export interface SubHandle {
 
 export { JoinRejectedError, normalizeJoinCode } from "./handshake.js";
 export { ListenAddressError, startMaster } from "./master.js";
+export { SubmitOutcomeSchema } from "./messages.js";
 export { assertSamePath, PathMismatchError } from "./path.js";
 export { connectSub } from "./sub.js";
-export type { DatalistEntry, PeerPath, PlanItem, SessionStatus, SubResult };
+export type {
+  DatalistEntry,
+  PeerPath,
+  PlanItem,
+  SessionStatus,
+  SubmitMethod,
+  SubmitOutcome,
+  SubmitState,
+  SubResult,
+};

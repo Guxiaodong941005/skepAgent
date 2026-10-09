@@ -1,16 +1,20 @@
 /**
  * `skep session` — the CLI surface of session mode (in-memory master/sub channel on one TCP port).
  *
- * The protocol engine lives in `src/session/` (a separate task). This file only depends on the
- * {@link SessionApi} subset declared below and loads the module dynamically, so the CLI builds and
- * tests without it: tests inject `sessionApi` on the context instead.
+ * The protocol engine lives in `src/session/`. Commands reach it through the {@link SessionApi}
+ * subset declared below, so tests can inject `sessionApi` on the context instead.
+ *
+ * A joined sub works its items here: it checks out a session branch, runs the agent (or commits a
+ * marker on the dry path), runs one trusted check, and submits by this device's own policy. The
+ * master only learns the outcome; `skep session submit` finishes a deferred submit locally.
  *
  * `intent` and `status` talk to a running master over the plaintext control frame, authenticated
  * by the token in `${SKEP_HOME}/session.json`. The master writes that file after it binds and
  * removes it on clean exit.
  */
 
-import { mkdir, readFile, rm } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { access, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -18,7 +22,10 @@ import { createInterface, type Interface } from "node:readline";
 import type { Readable } from "node:stream";
 import { type Command, Option } from "commander";
 import { z } from "zod";
+import { ConfigError, parseTomlConfig } from "../../config/errors.js";
 import { RepoRefSchema, ShaSchema } from "../../core/schemas/common.js";
+import { CHECKS_FILE_PATH, ChecksFileSchema } from "../../core/schemas/config.js";
+import { Redactor } from "../../exec/redact.js";
 import {
   connectSub,
   type DatalistEntry,
@@ -26,12 +33,16 @@ import {
   type MasterOptions,
   type PlanItem,
   type SubHandle,
+  type SubmitMethod,
+  type SubmitOutcome,
+  SubmitOutcomeSchema,
   type SubOptions,
+  type SubResult,
   startMaster,
 } from "../../session/index.js";
 import { type Clock, isoUtc, systemClock } from "../../util/clock.js";
 import { execFileChecked } from "../../util/exec.js";
-import { atomicWrite } from "../../util/fs.js";
+import { atomicWrite, safeJoin } from "../../util/fs.js";
 import { cryptoRandom } from "../../util/random.js";
 import type { CliContext } from "../context.js";
 import { CliError, EXIT } from "../output.js";
@@ -68,6 +79,8 @@ export type SessionCliContext = CliContext & {
   sessionApi?: SessionApi;
   stdin?: Readable;
   networkInterfaces?: () => NodeJS.Dict<os.NetworkInterfaceInfo[]>;
+  /** Directory inside the device's repo (default: `process.cwd()`). Tests point it at a temp repo. */
+  cwd?: string;
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -113,6 +126,7 @@ const ItemResultSchema = z.strictObject({
     )
     .max(64),
   summary: z.string().max(4000),
+  submit: SubmitOutcomeSchema.optional(),
 });
 
 export const SessionStatusSchema = z.strictObject({
@@ -374,17 +388,23 @@ async function loadSessionApi(ctx: SessionCliContext): Promise<SessionApi> {
   return { startMaster, connectSub };
 }
 
-/** Git with only the variables it needs: `execFileChecked` never inherits the environment. */
-async function git(ctx: CliContext, args: string[]): Promise<string> {
+/** Only the named variables of `ctx.env`: `execFileChecked` never inherits the environment. */
+function pickEnv(ctx: CliContext, keys: readonly string[]): Record<string, string> {
   const env: Record<string, string> = {};
-  for (const key of ["PATH", "HOME"]) {
+  for (const key of keys) {
     const value = ctx.env[key];
     if (value !== undefined) env[key] = value;
   }
-  return (await execFileChecked("git", args, { env })).stdout;
+  return env;
 }
 
-async function defaultRepo(ctx: CliContext): Promise<string> {
+/** Git with only the variables it needs, run in the device's repo unless `cwd` says otherwise. */
+async function git(ctx: SessionCliContext, args: string[], cwd?: string): Promise<string> {
+  const env = pickEnv(ctx, ["PATH", "HOME"]);
+  return (await execFileChecked("git", args, { env, cwd: cwd ?? ctx.cwd })).stdout;
+}
+
+async function defaultRepo(ctx: SessionCliContext): Promise<string> {
   let top: string;
   try {
     top = (await git(ctx, ["rev-parse", "--show-toplevel"])).trim();
@@ -472,6 +492,445 @@ class LineReader {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Sub-side item work: materialize, execute, check, submit.
+//
+// A sub and the master do not share a repo, so what happens to a finished item's code is decided
+// here, by this device's own policy or the human at it. The master only records the outcome.
+
+const SUBMIT_METHODS = ["pr", "mr", "push", "none", "ask"] as const;
+const SUBMIT_COMMAND_METHODS = ["pr", "mr", "push", "none", "skip"] as const;
+const DIRECT_METHODS = ["pr", "mr", "push", "none"] as const;
+type DirectMethod = (typeof DIRECT_METHODS)[number];
+
+const AGENT_TIMEOUT_MS = 10 * 60_000;
+const MARKER_FILE = ".skep-session-item";
+const MAX_SUMMARY = 4_000;
+/** Stands in for a base sha when git could not even read `HEAD`: the result must still parse. */
+const UNKNOWN_SHA = "0".repeat(40);
+/** Variables the agent may see. Credentials are never forwarded to it (D19). */
+const AGENT_ENV_KEYS = ["PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TERM", "TMPDIR"];
+/** `git push` uses this device's own transport setup; nothing here crosses to the master. */
+const PUSH_ENV_KEYS = ["PATH", "HOME", "SSH_AUTH_SOCK", "GIT_SSH_COMMAND", "XDG_CONFIG_HOME"];
+const HOST_ENV_KEYS = [
+  ...PUSH_ENV_KEYS,
+  "GH_TOKEN",
+  "GITHUB_TOKEN",
+  "GH_HOST",
+  "GITLAB_TOKEN",
+  "GITLAB_HOST",
+];
+
+/**
+ * The `submit` key of this device's `device.toml`. Parsed locally and loosely: every other key
+ * of the file is ignored, so this tolerates the device schema with or without `submit`.
+ */
+const SubmitPolicySchema = z
+  .strictObject({
+    method: z.enum(SUBMIT_METHODS).default("ask"),
+    host: z.enum(["github", "gitlab", "git"]).default("github"),
+  })
+  .default({ method: "ask", host: "github" });
+export type SubmitPolicy = z.infer<typeof SubmitPolicySchema>;
+const DevicePolicyFileSchema = z.object({ submit: SubmitPolicySchema });
+
+const DEFAULT_POLICY: SubmitPolicy = { method: "ask", host: "github" };
+
+/**
+ * Submit policy from `device.toml`. A missing file, a missing key, or a file that does not parse
+ * all mean `ask`: the human decides. A plain git host has no PR/MR concept, so it forces `push`.
+ */
+export async function loadSubmitPolicy(
+  file: string,
+  warn: (message: string) => void = () => {},
+): Promise<SubmitPolicy> {
+  let text: string;
+  try {
+    text = await readFile(file, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return DEFAULT_POLICY;
+    throw error;
+  }
+  let policy: SubmitPolicy;
+  try {
+    policy = parseTomlConfig(DevicePolicyFileSchema, text, file).submit;
+  } catch (error) {
+    if (!(error instanceof ConfigError)) throw error;
+    warn(`ignoring submit policy (${error.message}); falling back to ask`);
+    return DEFAULT_POLICY;
+  }
+  return policy.host === "git" ? { ...policy, method: "push" } : policy;
+}
+
+export function sessionBranch(itemId: string, epoch: number): string {
+  return `skep/session/${itemId}-e${epoch}`;
+}
+
+export class SessionItemError extends Error {
+  constructor(stage: string, message: string, options?: ErrorOptions) {
+    super(`${stage}: ${message}`, options);
+    this.name = "SessionItemError";
+  }
+}
+
+async function onPath(bin: string, env: NodeJS.ProcessEnv): Promise<boolean> {
+  for (const dir of (env.PATH ?? "").split(path.delimiter)) {
+    if (dir === "") continue;
+    try {
+      await access(path.join(dir, bin), fsConstants.X_OK);
+      return true;
+    } catch {
+      // Not in this PATH entry; keep looking.
+    }
+  }
+  return false;
+}
+
+async function exists(file: string): Promise<boolean> {
+  try {
+    await stat(file);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+interface Materialized {
+  dir: string;
+  branch: string;
+  baseSha: string;
+}
+
+/**
+ * A fresh checkout of this device's `HEAD` on the item's session branch. A linked worktree keeps
+ * the branch in the device's repo; when `git worktree` is unavailable a local clone is used and
+ * the branch is fetched back after the commit (see {@link syncBack}).
+ */
+export async function materializeItem(
+  ctx: SessionCliContext,
+  item: PlanItem,
+  root: string,
+  opts: { worktree?: boolean } = {},
+): Promise<Materialized & { clone: string | null }> {
+  const top = (await git(ctx, ["rev-parse", "--show-toplevel"])).trim();
+  const baseSha = (await git(ctx, ["rev-parse", "HEAD"], top)).trim();
+  const branch = sessionBranch(item.itemId, item.epoch);
+  const dir = path.join(root, `${path.basename(top)}-${item.itemId}-e${item.epoch}`);
+  // Item ids restart in every session; an earlier session's unsubmitted work is never clobbered.
+  const existing = await git(ctx, ["branch", "--list", branch], top);
+  if (existing.trim() !== "" || (await exists(dir))) {
+    throw new SessionItemError(
+      "materialize",
+      `${branch} or ${dir} already exists; submit or delete it first`,
+    );
+  }
+  await mkdir(root, { recursive: true, mode: 0o700 });
+  if (opts.worktree !== false) {
+    try {
+      await git(ctx, ["worktree", "add", "--quiet", "-b", branch, dir, baseSha], top);
+      return { dir, branch, baseSha, clone: null };
+    } catch {
+      // Fall through to a plain clone below; its failure is the one reported.
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+  await git(ctx, ["clone", "--quiet", "--no-checkout", top, dir]);
+  await git(ctx, ["checkout", "--quiet", "-b", branch, baseSha], dir);
+  // The clone's `origin` is the device repo; pushes must go where the device repo pushes.
+  const origin = await git(ctx, ["remote", "get-url", "origin"], top).catch(() => null);
+  if (origin === null) await git(ctx, ["remote", "remove", "origin"], dir);
+  else await git(ctx, ["remote", "set-url", "origin", origin.trim()], dir);
+  return { dir, branch, baseSha, clone: top };
+}
+
+/** A clone's branch is copied into the device repo so `skep session submit` can find it later. */
+async function syncBack(ctx: SessionCliContext, work: Materialized, top: string): Promise<void> {
+  await git(ctx, ["fetch", "--quiet", work.dir, `${work.branch}:${work.branch}`], top);
+}
+
+/** Commit everything in the checkout. Falls back to a placeholder identity only if none is set. */
+async function commitAll(ctx: SessionCliContext, dir: string, message: string): Promise<boolean> {
+  await git(ctx, ["add", "-A"], dir);
+  const status = await git(ctx, ["status", "--porcelain"], dir);
+  if (status.trim() === "") return false;
+  const configured = await git(ctx, ["config", "user.email"], dir).then(
+    (value) => value.trim() !== "",
+    () => false,
+  );
+  const identity = configured
+    ? []
+    : ["-c", "user.name=skep", "-c", "user.email=skep@example.invalid"];
+  await git(ctx, [...identity, "commit", "--quiet", "--no-verify", "-m", message], dir);
+  return true;
+}
+
+/**
+ * Runs the configured agent (only with `SKEP_SESSION_EXEC=1` and `SKEP_SESSION_AGENT`), or, by
+ * default, commits a marker file so the result still carries a real new head.
+ */
+async function executeItem(
+  ctx: SessionCliContext,
+  item: PlanItem,
+  dir: string,
+): Promise<{ ok: boolean; summary: string }> {
+  const message = `session ${item.itemId} epoch ${item.epoch}`;
+  const agent = ctx.env.SKEP_SESSION_AGENT;
+  if (ctx.env.SKEP_SESSION_EXEC !== "1" || agent === undefined || agent === "") {
+    await writeFile(path.join(dir, MARKER_FILE), `${item.itemId}\n`);
+    await commitAll(ctx, dir, message);
+    return { ok: true, summary: "dry run: committed the session marker (no agent configured)" };
+  }
+  const args = (ctx.env.SKEP_SESSION_AGENT_ARGS ?? "").split(" ").filter((arg) => arg !== "");
+  const env = {
+    ...pickEnv(ctx, AGENT_ENV_KEYS),
+    SKEP_SESSION_ITEM: item.itemId,
+    SKEP_SESSION_EPOCH: String(item.epoch),
+  };
+  // The item title is the task; it goes on stdin so it never needs shell quoting.
+  const run = await execFileChecked(agent, args, {
+    cwd: dir,
+    env,
+    input: `${item.title}\n`,
+    timeoutMs: AGENT_TIMEOUT_MS,
+    allowFailure: true,
+  });
+  const output = `${run.stdout}\n${run.stderr}`.trim();
+  const ok = run.code === 0;
+  if (ok) await commitAll(ctx, dir, message);
+  const status = run.timedOut ? "timed out" : `exited ${run.code ?? run.signal ?? "?"}`;
+  return { ok, summary: `agent ${status}\n${output.slice(-MAX_SUMMARY)}` };
+}
+
+type CheckStatus = { name: string; status: "pass" | "fail" | "skip" };
+
+/** One trusted check from the checkout's own `.skep/checks.toml`: `unit`, else the first. */
+async function runChecks(ctx: SessionCliContext, dir: string): Promise<CheckStatus[]> {
+  const file = path.join(dir, CHECKS_FILE_PATH);
+  let text: string;
+  try {
+    text = await readFile(file, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT")
+      return [{ name: "none", status: "skip" }];
+    throw error;
+  }
+  let checks: z.infer<typeof ChecksFileSchema>["checks"];
+  try {
+    checks = parseTomlConfig(ChecksFileSchema, text, CHECKS_FILE_PATH).checks;
+  } catch (error) {
+    if (error instanceof ConfigError) return [{ name: "checks-file", status: "fail" }];
+    throw error;
+  }
+  const name = "unit" in checks ? "unit" : Object.keys(checks)[0];
+  const check = name === undefined ? undefined : checks[name];
+  if (name === undefined || check === undefined) return [{ name: "none", status: "skip" }];
+  const [file0, ...args] = check.argv;
+  if (file0 === undefined) return [{ name, status: "fail" }];
+  try {
+    const cwd = check.cwd === undefined ? dir : await safeJoin(dir, check.cwd);
+    const run = await execFileChecked(file0, args, {
+      cwd,
+      env: { ...pickEnv(ctx, ["PATH", "HOME"]), ...check.env },
+      timeoutMs: check.timeout_sec * 1000,
+      allowFailure: true,
+    });
+    return [{ name, status: run.code === 0 ? "pass" : "fail" }];
+  } catch {
+    // The check could not even start (missing binary, bad cwd): that is a failing check.
+    return [{ name, status: "fail" }];
+  }
+}
+
+async function defaultBranch(ctx: SessionCliContext, cwd: string): Promise<string> {
+  const remoteHead = await git(ctx, ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], cwd)
+    .then((value) => value.trim())
+    .catch(() => "");
+  if (remoteHead.startsWith("origin/")) return remoteHead.slice("origin/".length);
+  return "main";
+}
+
+/** `{ method, state, url?, number?, branch }`, validated so a bad URL can never reach the wire. */
+function outcome(
+  method: SubmitMethod,
+  state: SubmitOutcome["state"],
+  branch: string,
+  opened?: { url: string; number?: number },
+): SubmitOutcome {
+  return SubmitOutcomeSchema.parse({ method, state, branch, ...opened });
+}
+
+/** The URL a host CLI printed for the new PR/MR, if it printed a valid one. */
+function openedFrom(stdout: string): { url: string; number?: number } | null {
+  const urls = stdout.match(/https?:\/\/\S+/g);
+  const url = urls?.[urls.length - 1];
+  if (url === undefined || url.length > 512 || !z.string().url().safeParse(url).success) {
+    return null;
+  }
+  const number = url.match(/\/(?:pull|merge_requests)\/(\d+)/)?.[1];
+  return number === undefined ? { url } : { url, number: Number(number) };
+}
+
+/**
+ * Pushes the session branch (never the base branch) and opens a PR/MR when asked. Every failure
+ * becomes a `failed` outcome rather than an exception, so `onItem` always has a result to send.
+ */
+export async function submitBranch(
+  ctx: SessionCliContext,
+  opts: { cwd: string; branch: string; method: DirectMethod; title: string; body: string },
+): Promise<{ submit: SubmitOutcome; detail: string }> {
+  const { cwd, branch, method } = opts;
+  if (method === "none") return { submit: outcome("none", "local", branch), detail: "" };
+  const host = method === "pr" ? "gh" : method === "mr" ? "glab" : null;
+  if (host !== null && !(await onPath(host, ctx.env))) {
+    return {
+      submit: outcome(method, "local", branch),
+      detail: `${host} is not on PATH; ${branch} stays local`,
+    };
+  }
+  const refspec = `refs/heads/${branch}:refs/heads/${branch}`;
+  const push = await execFileChecked("git", ["push", "--quiet", "origin", refspec], {
+    cwd,
+    env: pickEnv(ctx, PUSH_ENV_KEYS),
+    allowFailure: true,
+  }).catch((error: unknown) => ({ code: null, stdout: "", stderr: errorMessage(error) }));
+  if (push.code !== 0) {
+    return { submit: outcome(method, "failed", branch), detail: push.stderr.trim() };
+  }
+  if (host === null) return { submit: outcome(method, "pushed", branch), detail: "" };
+  const base = await defaultBranch(ctx, cwd);
+  const args =
+    host === "gh"
+      ? ["pr", "create", "--head", branch, "--base", base, "--title", opts.title]
+      : ["mr", "create", "--source-branch", branch, "--target-branch", base, "--title", opts.title];
+  args.push(host === "gh" ? "--body" : "--description", opts.body);
+  const created = await execFileChecked(host, args, {
+    cwd,
+    env: pickEnv(ctx, HOST_ENV_KEYS),
+    allowFailure: true,
+  }).catch((error: unknown) => ({ code: null, stdout: "", stderr: errorMessage(error) }));
+  if (created.code !== 0) {
+    return { submit: outcome(method, "failed", branch), detail: created.stderr.trim() };
+  }
+  const opened = openedFrom(created.stdout);
+  // Created but no URL to show for it: the branch is at least pushed.
+  if (opened === null) return { submit: outcome(method, "pushed", branch), detail: "" };
+  return { submit: outcome(method, "opened", branch, opened), detail: "" };
+}
+
+function submitLine(submit: SubmitOutcome): string {
+  return `submit ${submit.method} ${submit.state}${submit.url === undefined ? "" : ` ${submit.url}`}`;
+}
+
+export interface ItemWorker {
+  ctx: SessionCliContext;
+  /** Where session checkouts live (under SKEP_HOME, never inside the device repo). */
+  root: string;
+  method: SubmitMethod;
+  /** Asks the human; null on EOF. Only used when `method` is `ask`. */
+  ask(question: string): Promise<string | null>;
+  /** False forces the clone fallback (tests; hosts whose git lacks `worktree`). */
+  worktree?: boolean;
+}
+
+/** Everything a sub does for one item. Never throws: a failure is a result with `failed`. */
+export async function workItem(worker: ItemWorker, item: PlanItem): Promise<SubResult> {
+  const { ctx } = worker;
+  const redactor = new Redactor();
+  const branch = sessionBranch(item.itemId, item.epoch);
+  const result = (
+    fields: Omit<SubResult, "repo" | "summary" | "submit"> & { submit: SubmitOutcome },
+    summary: string,
+  ): SubResult => ({
+    repo: item.repo,
+    ...fields,
+    summary: `${submitLine(fields.submit)}\n${redactor.redact(summary)}`.slice(0, MAX_SUMMARY),
+  });
+
+  let work: Materialized & { clone: string | null };
+  try {
+    work = await materializeItem(ctx, item, worker.root, { worktree: worker.worktree });
+  } catch (error) {
+    const baseSha = await git(ctx, ["rev-parse", "HEAD"])
+      .then((value) => value.trim())
+      .catch(() => UNKNOWN_SHA);
+    const sha = ShaSchema.safeParse(baseSha).success ? baseSha : UNKNOWN_SHA;
+    return result(
+      {
+        baseSha: sha,
+        headSha: sha,
+        checks: [{ name: "git", status: "fail" }],
+        submit: outcome(worker.method, "failed", branch),
+      },
+      errorMessage(error),
+    );
+  }
+
+  const { dir, baseSha } = work;
+  const headOf = () =>
+    git(ctx, ["rev-parse", "HEAD"], dir)
+      .then((value) => value.trim())
+      .catch(() => baseSha);
+  let executed: { ok: boolean; summary: string };
+  try {
+    executed = await executeItem(ctx, item, dir);
+    if (work.clone !== null) await syncBack(ctx, work, work.clone);
+  } catch (error) {
+    executed = { ok: false, summary: errorMessage(error) };
+  }
+  const headSha = await headOf();
+  if (!executed.ok) {
+    return result(
+      {
+        baseSha,
+        headSha,
+        checks: [{ name: "agent", status: "fail" }],
+        submit: outcome(worker.method, "failed", branch),
+      },
+      executed.summary,
+    );
+  }
+
+  const checks = await runChecks(ctx, dir).catch((): CheckStatus[] => [
+    { name: "checks-file", status: "fail" },
+  ]);
+  if (checks.some((check) => check.status === "fail")) {
+    // Failing code is never submitted; the human can fix it and run `skep session submit`.
+    return result(
+      { baseSha, headSha, checks, submit: outcome(worker.method, "skipped", branch) },
+      `checks failed; ${branch} not submitted\n${executed.summary}`,
+    );
+  }
+
+  let method: DirectMethod;
+  if (worker.method === "ask") {
+    ctx.stderr.write(`item ${item.itemId} finished on ${branch} at ${headSha}\n`);
+    const answer = (await worker.ask("Submit this item? [pr/mr/push/none/skip] "))?.trim() ?? "";
+    const chosen = DIRECT_METHODS.find((value) => value === answer.toLowerCase());
+    if (chosen === undefined) {
+      return result(
+        { baseSha, headSha, checks, submit: outcome("ask", "skipped", branch) },
+        executed.summary,
+      );
+    }
+    method = chosen;
+  } else {
+    method = worker.method;
+  }
+  const submitted = await submitBranch(ctx, {
+    cwd: dir,
+    branch,
+    method,
+    title: item.title === "" ? `session ${item.itemId}` : item.title,
+    body: redactor.redact(executed.summary),
+  }).catch((error: unknown) => ({
+    submit: outcome(method, "failed", branch),
+    detail: errorMessage(error),
+  }));
+  const detail = submitted.detail === "" ? "" : `${submitted.detail}\n`;
+  return result({ baseSha, headSha, checks, submit: submitted.submit }, detail + executed.summary);
+}
+
+// ---------------------------------------------------------------------------------------------
 // Commands.
 
 interface StartOptions {
@@ -487,6 +946,12 @@ interface JoinOptions {
   device?: string;
   repo?: string;
   role: string;
+  submit?: SubmitMethod;
+}
+
+interface SubmitOptions {
+  method: (typeof SUBMIT_COMMAND_METHODS)[number];
+  epoch: string;
 }
 
 export function register(program: Command, ctx: CliContext): void {
@@ -518,8 +983,28 @@ export function register(program: Command, ctx: CliContext): void {
     .option("--device <name>", "this device's name (default: hostname)")
     .option("--repo <name>", "this device's repo (default: basename of the git toplevel)")
     .option("--role <role>", "role advertised to the master", "coding")
+    .addOption(
+      new Option(
+        "--submit <method>",
+        "how finished items are submitted (default: device policy)",
+      ).choices(SUBMIT_METHODS),
+    )
     .action(async (opts: JoinOptions) => {
       await joinCommand(sctx, opts);
+    });
+
+  session
+    .command("submit")
+    .description("Submit a finished session item's local branch after a join asked or deferred")
+    .argument("<itemId>", "the item id, e.g. I-1")
+    .addOption(
+      new Option("--method <method>", "pr, mr, push, none or skip")
+        .choices(SUBMIT_COMMAND_METHODS)
+        .makeOptionMandatory(),
+    )
+    .option("--epoch <n>", "the item's epoch", "1")
+    .action(async (itemId: string, opts: SubmitOptions) => {
+      await submitCommand(sctx, itemId, opts);
     });
 
   session
@@ -717,6 +1202,28 @@ async function joinCommand(ctx: SessionCliContext, opts: JoinOptions): Promise<v
   const role = opts.role;
   const api = await loadSessionApi(ctx);
   const output = ctx.output();
+  if (ctx.paths === undefined) throw new Error("skep home is not resolved");
+  const warn = (message: string): void => ctx.stderr.write(`skep: ${message}\n`);
+  // A human override on the command line wins over this device's file policy.
+  const method = opts.submit ?? (await loadSubmitPolicy(ctx.paths.deviceToml, warn)).method;
+
+  let reader: LineReader | undefined;
+  let prompts: Promise<unknown> = Promise.resolve();
+  const worker: ItemWorker = {
+    ctx,
+    root: path.join(ctx.paths.home, "session", "worktrees"),
+    method,
+    ask: (question) => {
+      // One prompt at a time: concurrent items must not interleave questions and answers.
+      const answer = prompts.then(async () => {
+        reader ??= new LineReader(ctx.stdin ?? process.stdin);
+        ctx.stderr.write(question);
+        return reader.next();
+      });
+      prompts = answer.catch(() => undefined);
+      return answer;
+    },
+  };
 
   let fingerprintShown = false;
   const showFingerprint = (fingerprint: string): void => {
@@ -748,7 +1255,12 @@ async function joinCommand(ctx: SessionCliContext, opts: JoinOptions): Promise<v
         { event: "item", item },
         () => `item ${item.itemId} (epoch ${item.epoch}, ${item.repo}): ${item.title}\n`,
       );
-      return null;
+      const result = await workItem(worker, item);
+      output.result(
+        { event: "item-result", itemId: item.itemId, epoch: item.epoch, ...result },
+        () => `item ${item.itemId} ${result.summary.split("\n")[0] ?? ""} (${result.headSha})\n`,
+      );
+      return result;
     },
   });
 
@@ -770,7 +1282,69 @@ async function joinCommand(ctx: SessionCliContext, opts: JoinOptions): Promise<v
   } finally {
     process.removeListener("SIGINT", stop);
     process.removeListener("SIGTERM", stop);
+    reader?.close();
   }
+}
+
+/**
+ * The "decide after the task" path: submits an item's local session branch. The master already
+ * acked the result, so this never talks to it.
+ */
+async function submitCommand(
+  ctx: SessionCliContext,
+  itemId: string,
+  opts: SubmitOptions,
+): Promise<void> {
+  if (!/^I-\d+$/.test(itemId)) {
+    throw new CliError("bad_item", `invalid item id: ${JSON.stringify(itemId)}`, EXIT.usage);
+  }
+  const epoch = Number(opts.epoch);
+  if (!/^\d+$/.test(opts.epoch) || !Number.isSafeInteger(epoch) || epoch < 1) {
+    throw new CliError(
+      "bad_epoch",
+      `--epoch must be a positive integer, got ${opts.epoch}`,
+      EXIT.usage,
+    );
+  }
+  const branch = sessionBranch(itemId, epoch);
+  let top: string;
+  let headSha: string;
+  try {
+    top = (await git(ctx, ["rev-parse", "--show-toplevel"])).trim();
+    headSha = (
+      await git(ctx, ["rev-parse", "--verify", `refs/heads/${branch}^{commit}`], top)
+    ).trim();
+  } catch (error) {
+    throw new CliError(
+      "no_branch",
+      `no local session branch ${branch}; run this inside the joined repo (${errorMessage(error)})`,
+    );
+  }
+  let submitted: { submit: SubmitOutcome; detail: string };
+  if (opts.method === "skip") {
+    submitted = { submit: outcome("ask", "skipped", branch), detail: "" };
+  } else {
+    const message = (await git(ctx, ["log", "-1", "--format=%B", headSha], top)).trim();
+    const [subject = `session ${itemId}`, ...rest] = message.split("\n");
+    submitted = await submitBranch(ctx, {
+      cwd: top,
+      branch,
+      method: opts.method,
+      title: subject,
+      body: new Redactor().redact(rest.join("\n").trim() || subject),
+    });
+  }
+  const { submit, detail } = submitted;
+  const data = { itemId, epoch, branch, headSha, submit };
+  const human = () => `${submitLine(submit)}${detail === "" ? "" : `\n${detail}`}\n`;
+  if (submit.state === "failed") {
+    ctx
+      .output()
+      .fail(new CliError("submit_failed", detail || `submitting ${branch} failed`), data, human);
+    ctx.exitCode = EXIT.error;
+    return;
+  }
+  ctx.output().result(data, human);
 }
 
 /** Sends one control op to the master named in `session.json` and returns its `result`. */
@@ -890,6 +1464,9 @@ export function renderSessionStatus(status: SessionStatus): string {
               item.state,
               item.repo,
               item.assignee,
+              item.result?.submit === undefined
+                ? "-"
+                : `${item.result.submit.method}:${item.result.submit.state}`,
               item.title,
             ]),
           ),

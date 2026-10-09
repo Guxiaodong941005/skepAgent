@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { ItemStatus, ResultMsg } from "./messages.js";
+import { type ItemStatus, ItemStatusSchema, type ResultMsg } from "./messages.js";
 import { applyClaim, applyResult, buildPlan, matchSub } from "./state.js";
 
 const peers = [
@@ -87,5 +87,30 @@ describe("pure session state", () => {
     expect(applyResult(accepted.items, "first", result).reply).toMatchObject({
       reason: "not_claimed",
     });
+  });
+});
+
+describe("structured submit outcomes", () => {
+  const claimed: ItemStatus[] = [{ ...item, state: "claimed" }];
+
+  it("keeps the submit object when it acks a result", () => {
+    const submit = {
+      method: "pr" as const,
+      state: "opened" as const,
+      url: "https://example.invalid/app/pull/3",
+      number: 3,
+      branch: "skep/session/I-1-e1",
+    };
+    const accepted = applyResult(claimed, "first", { ...result, submit });
+    expect(accepted.reply.type).toBe("result-ack");
+    expect(accepted.items[0]?.result?.submit).toEqual(submit);
+    expect(ItemStatusSchema.parse(accepted.items[0]).result?.submit).toEqual(submit);
+  });
+
+  it("still acks a result from a peer that sends no submit", () => {
+    const accepted = applyResult(claimed, "first", result);
+    expect(accepted.reply.type).toBe("result-ack");
+    expect(accepted.items[0]?.result).not.toHaveProperty("submit");
+    expect(ItemStatusSchema.safeParse(accepted.items[0]).success).toBe(true);
   });
 });

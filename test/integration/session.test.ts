@@ -1,6 +1,7 @@
 /**
  * Real master and sub on 127.0.0.1. No git remote, no code host, no agent CLI.
- * The sub reports a local result; nothing is pushed.
+ * The sub reports a local result with a structured `none`/`local` submit outcome; nothing is
+ * pushed.
  */
 
 import { describe, expect, it, vi } from "vitest";
@@ -34,6 +35,7 @@ describe("session mode on loopback", () => {
         headSha: SHA_B,
         checks: [{ name: "unit", status: "pass" }],
         summary: "local commit only",
+        submit: { method: "none", state: "local", branch: "skep/session/I-1-e1" },
       }),
     });
 
@@ -48,7 +50,11 @@ describe("session mode on loopback", () => {
       repo: "app",
       assignee: sub.peerId,
       state: "done",
-      result: { headSha: SHA_B, summary: "local commit only" },
+      result: {
+        headSha: SHA_B,
+        summary: "local commit only",
+        submit: { method: "none", state: "local", branch: "skep/session/I-1-e1" },
+      },
     });
 
     await sub.close();

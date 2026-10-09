@@ -6,6 +6,8 @@ import {
   HandshakeMsgSchema,
   SessionMsgSchema,
   SessionStatusSchema,
+  SubmitOutcomeSchema,
+  SubResultSchema,
 } from "./messages.js";
 
 const pub = Buffer.alloc(32, 1).toString("base64");
@@ -192,4 +194,41 @@ it("rejects malformed base64, roles, SHA, limits and protocol versions", () => {
       role: "Bad",
     }).success,
   ).toBe(false);
+});
+
+describe("structured submit outcome on results", () => {
+  const opened = {
+    method: "pr",
+    state: "opened",
+    url: "https://example.invalid/app/pull/7",
+    number: 7,
+    branch: "skep/session/I-1-e1",
+  };
+
+  it("accepts a result with or without submit", () => {
+    expect(SessionMsgSchema.safeParse(result).success).toBe(true);
+    expect(SessionMsgSchema.parse({ ...result, submit: opened })).toMatchObject({ submit: opened });
+    const local = { method: "none", state: "local", branch: "skep/session/I-1-e1" };
+    expect(SessionMsgSchema.parse({ ...result, submit: local })).toMatchObject({ submit: local });
+    const { type: _type, itemId: _id, epoch: _epoch, ...sub } = result;
+    expect(SubResultSchema.parse({ ...sub, submit: local }).submit).toEqual(local);
+  });
+
+  it("requires url exactly when state is opened", () => {
+    const { url: _url, number: _number, ...noUrl } = opened;
+    expect(SubmitOutcomeSchema.safeParse(opened).success).toBe(true);
+    expect(SubmitOutcomeSchema.safeParse(noUrl).success).toBe(false);
+    expect(SubmitOutcomeSchema.safeParse({ ...opened, state: "pushed" }).success).toBe(false);
+    expect(SubmitOutcomeSchema.safeParse({ ...noUrl, state: "pushed", number: 7 }).success).toBe(
+      false,
+    );
+    expect(SubmitOutcomeSchema.safeParse({ ...noUrl, state: "pushed" }).success).toBe(true);
+    expect(SubmitOutcomeSchema.safeParse({ ...opened, url: "not a url" }).success).toBe(false);
+    expect(SubmitOutcomeSchema.safeParse({ ...noUrl, state: "local", extra: 1 }).success).toBe(
+      false,
+    );
+    expect(SubmitOutcomeSchema.safeParse({ ...noUrl, state: "local", branch: "" }).success).toBe(
+      false,
+    );
+  });
 });
