@@ -1,7 +1,7 @@
 // Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
 
 exports[`TuiModel colors > matches the golden ascii frame with none color 1`] = `
-" ⎋[1mskep⎋[0m   ⎋[2msession ⎋[0ms-1⎋[2m | ⎋[0m⎋[2mdevice ⎋[0mlaptop⎋[2m | ⎋[0m⎋[2mrole ⎋[0mcoding                        ⎋[2mv0.1.5⎋[0m
+" ⎋[1mskep⎋[0m   ⎋[2msession ⎋[0ms-1⎋[2m | ⎋[0m⎋[2mdevice ⎋[0mlaptop⎋[2m | ⎋[0m⎋[2mrole ⎋[0mcoding                        ⎋[2mv0.1.6⎋[0m
 ⎋[2m-- ⎋[0m⎋[1;2mPEERS⎋[0m⎋[2m -------------------------------------⎋[0m⎋[2m 3 peers | 1 working | 1 blocked ⎋[0m⎋[2m-⎋[0m
   laptop  ⎋[2mcoding    ⎋[0m⎋[1m~b> ⎋[0m  ⎋[2m[⎋[0m⎋[1m####⎋[0m⎋[2m....⎋[0m⎋[2m]⎋[0m ⎋[1m 50%⎋[0m⎋[2m  4/8⎋[0m  ⎋[1mworking⎋[0m  add a health check
 ⎋[7m> laptop  coding    I-3 e1  claude/pty  running                                 ⎋[0m
@@ -28,7 +28,7 @@ exports[`TuiModel colors > matches the golden ascii frame with none color 1`] = 
 `;
 
 exports[`TuiModel colors > matches the golden ascii frame with truecolor color 1`] = `
-" ⎋[38;2;255;196;48;1mskep⎋[0m   ⎋[38;2;168;173;179msession ⎋[0ms-1⎋[38;2;128;134;139m | ⎋[0m⎋[38;2;168;173;179mdevice ⎋[0mlaptop⎋[38;2;128;134;139m | ⎋[0m⎋[38;2;168;173;179mrole ⎋[0mcoding                        ⎋[38;2;128;134;139mv0.1.5⎋[0m
+" ⎋[38;2;255;196;48;1mskep⎋[0m   ⎋[38;2;168;173;179msession ⎋[0ms-1⎋[38;2;128;134;139m | ⎋[0m⎋[38;2;168;173;179mdevice ⎋[0mlaptop⎋[38;2;128;134;139m | ⎋[0m⎋[38;2;168;173;179mrole ⎋[0mcoding                        ⎋[38;2;128;134;139mv0.1.6⎋[0m
 ⎋[38;2;128;134;139m-- ⎋[0m⎋[38;2;168;173;179;1mPEERS⎋[0m⎋[38;2;128;134;139m -------------------------------------⎋[0m⎋[38;2;168;173;179m 3 peers | 1 working | 1 blocked ⎋[0m⎋[38;2;128;134;139m-⎋[0m
   laptop  ⎋[38;2;168;173;179mcoding    ⎋[0m⎋[38;2;255;196;48m~b> ⎋[0m  ⎋[38;2;128;134;139m[⎋[0m⎋[38;2;255;196;48m####⎋[0m⎋[38;2;128;134;139m....⎋[0m⎋[38;2;128;134;139m]⎋[0m ⎋[1m 50%⎋[0m⎋[38;2;168;173;179m  4/8⎋[0m  ⎋[38;2;255;196;48mworking⎋[0m  add a health check
 ⎋[7m> laptop  coding    I-3 e1  claude/pty  running                                 ⎋[0m
@@ -55,7 +55,7 @@ exports[`TuiModel colors > matches the golden ascii frame with truecolor color 1
 `;
 
 exports[`TuiModel colors > matches the golden nerd frame with none color 1`] = `
-" ⎋[1m󱃎 ⎋[0m⎋[1mskep⎋[0m   ⎋[2msession ⎋[0ms-1⎋[2m · ⎋[0m⎋[2mdevice ⎋[0mlaptop⎋[2m · ⎋[0m⎋[2mrole ⎋[0mcoding                     ⎋[2mv0.1.5⎋[0m
+" ⎋[1m󱃎 ⎋[0m⎋[1mskep⎋[0m   ⎋[2msession ⎋[0ms-1⎋[2m · ⎋[0m⎋[2mdevice ⎋[0mlaptop⎋[2m · ⎋[0m⎋[2mrole ⎋[0mcoding                     ⎋[2mv0.1.6⎋[0m
 ⎋[2m── ⎋[0m⎋[1;2mPEERS⎋[0m⎋[2m ─────────────────────────────────────⎋[0m⎋[2m 3 peers · 1 working · 1 blocked ⎋[0m⎋[2m─⎋[0m
   laptop  ⎋[2mcoding    ⎋[0m⎋[1m󰾡  ⎋[0m  ⎋[2m[⎋[0m⎋[1m████⎋[0m⎋[2m░░░░⎋[0m⎋[2m]⎋[0m ⎋[1m 50%⎋[0m⎋[2m  4/8⎋[0m  ⎋[1mworking⎋[0m  add a health check
 ⎋[7m> laptop  coding    I-3 e1  claude/pty  running                                 ⎋[0m
@@ -82,7 +82,7 @@ exports[`TuiModel colors > matches the golden nerd frame with none color 1`] = `
 `;
 
 exports[`TuiModel colors > matches the golden nerd frame with truecolor color 1`] = `
-" ⎋[38;2;255;196;48m󱃎 ⎋[0m⎋[38;2;255;196;48;1mskep⎋[0m   ⎋[38;2;168;173;179msession ⎋[0ms-1⎋[38;2;128;134;139m · ⎋[0m⎋[38;2;168;173;179mdevice ⎋[0mlaptop⎋[38;2;128;134;139m · ⎋[0m⎋[38;2;168;173;179mrole ⎋[0mcoding                     ⎋[38;2;128;134;139mv0.1.5⎋[0m
+" ⎋[38;2;255;196;48m󱃎 ⎋[0m⎋[38;2;255;196;48;1mskep⎋[0m   ⎋[38;2;168;173;179msession ⎋[0ms-1⎋[38;2;128;134;139m · ⎋[0m⎋[38;2;168;173;179mdevice ⎋[0mlaptop⎋[38;2;128;134;139m · ⎋[0m⎋[38;2;168;173;179mrole ⎋[0mcoding                     ⎋[38;2;128;134;139mv0.1.6⎋[0m
 ⎋[38;2;128;134;139m── ⎋[0m⎋[38;2;168;173;179;1mPEERS⎋[0m⎋[38;2;128;134;139m ─────────────────────────────────────⎋[0m⎋[38;2;168;173;179m 3 peers · 1 working · 1 blocked ⎋[0m⎋[38;2;128;134;139m─⎋[0m
   laptop  ⎋[38;2;168;173;179mcoding    ⎋[0m⎋[38;2;255;196;48m󰾡  ⎋[0m  ⎋[38;2;128;134;139m[⎋[0m⎋[38;2;255;196;48m████⎋[0m⎋[38;2;128;134;139m░░░░⎋[0m⎋[38;2;128;134;139m]⎋[0m ⎋[1m 50%⎋[0m⎋[38;2;168;173;179m  4/8⎋[0m  ⎋[38;2;255;196;48mworking⎋[0m  add a health check
 ⎋[7m> laptop  coding    I-3 e1  claude/pty  running                                 ⎋[0m
