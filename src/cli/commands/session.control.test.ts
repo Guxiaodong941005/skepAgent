@@ -1,10 +1,16 @@
 // Control client outcome classification (review R1): a request that never left is
 // "unreachable"; an intent whose reply was lost has an unknown outcome.
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { skepPaths } from "../../config/paths.js";
 import { systemClock } from "../../util/clock.js";
+import type { CliContext } from "../context.js";
 import {
   ControlConnectionError,
+  clearStaleSessionFile,
   controlRequest,
   encodeFrame,
   FrameDecoder,
@@ -15,9 +21,11 @@ import {
 
 const TOKEN = "c".repeat(32);
 const servers: net.Server[] = [];
+const roots: string[] = [];
 
 afterEach(async () => {
   await Promise.all(servers.splice(0).map((s) => new Promise((r) => s.close(() => r(null)))));
+  await Promise.all(roots.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
 /** A loopback control port that reads one request, then does `answer` with the socket. */
@@ -115,5 +123,48 @@ describe("submitIntentAt outcome", () => {
     await expect(
       fetchSessionStatusAt({ listen: `127.0.0.1:${port}`, token: TOKEN }),
     ).rejects.toMatchObject({ code: "session_unreachable" });
+  });
+});
+
+describe("clearStaleSessionFile", () => {
+  async function home(content?: string): Promise<{ ctx: CliContext; file: string }> {
+    const dir = await mkdtemp(path.join(tmpdir(), "skep-clean-"));
+    roots.push(dir);
+    const file = path.join(dir, "session.json");
+    if (content !== undefined) await writeFile(file, content);
+    const ctx = { env: {}, paths: skepPaths(dir) } as unknown as CliContext;
+    return { ctx, file };
+  }
+
+  it("reports none when no session.json exists", async () => {
+    const { ctx } = await home();
+    expect(await clearStaleSessionFile(ctx, systemClock)).toEqual({ kind: "none" });
+  });
+
+  it("removes a file whose master no longer answers", async () => {
+    const port = await closedPort();
+    const listen = `127.0.0.1:${port}`;
+    const { ctx, file } = await home(`${JSON.stringify({ listen, token: TOKEN })}\n`);
+    expect(await clearStaleSessionFile(ctx, systemClock)).toEqual({ kind: "removed", listen });
+    await expect(readFile(file, "utf8")).rejects.toThrow(/ENOENT/);
+  });
+
+  it("removes a corrupt file", async () => {
+    const { ctx, file } = await home("{not json");
+    expect(await clearStaleSessionFile(ctx, systemClock)).toEqual({
+      kind: "removed",
+      listen: null,
+    });
+    await expect(readFile(file, "utf8")).rejects.toThrow(/ENOENT/);
+  });
+
+  it("keeps the file of a master that answers", async () => {
+    const port = await server((socket) =>
+      reply(socket, { type: "control-result", ok: true, result: {} }),
+    );
+    const listen = `127.0.0.1:${port}`;
+    const { ctx, file } = await home(`${JSON.stringify({ listen, token: TOKEN })}\n`);
+    expect(await clearStaleSessionFile(ctx, systemClock)).toEqual({ kind: "live", listen });
+    expect(await readFile(file, "utf8")).toContain(listen);
   });
 });

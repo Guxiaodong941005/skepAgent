@@ -87,7 +87,7 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
 
 /** A fake session module: records options, never opens a socket. */
 function fakeApi(address = { host: "192.168.1.20", port: 7419 }) {
-  const masterClosed = deferred<void>();
+  let masterClosed = deferred<void>();
   const subClosed = deferred<{ reason: string }>();
   const calls: { master: MasterOptions[]; sub: SubOptions[]; intents: string[] } = {
     master: [],
@@ -98,9 +98,15 @@ function fakeApi(address = { host: "192.168.1.20", port: 7419 }) {
   const peers: MasterPeer[] = [];
   let intentError: Error | null = null;
   let subError: Error | null = null;
+  /** While set, `connectSub` waits for it: a join stuck in its handshake. */
+  let subGate: Promise<void> | null = null;
+  const subCloses: string[] = [];
   const api: SessionApi = {
     async startMaster(options): Promise<MasterHandle> {
       calls.master.push(options);
+      // Each master closes on its own: a second /start must not inherit a closed promise.
+      masterClosed = deferred<void>();
+      const closed = masterClosed;
       options.onJoinCode({ code: "123456789012", expiresAtMs: 1_800_000_000_000 });
       return {
         address,
@@ -123,19 +129,23 @@ function fakeApi(address = { host: "192.168.1.20", port: 7419 }) {
         attach: () => {
           throw new Error("fake master has no attach");
         },
-        closed: masterClosed.promise,
-        close: async () => masterClosed.resolve(),
+        closed: closed.promise,
+        close: async () => closed.resolve(),
       };
     },
     async connectSub(options): Promise<SubHandle> {
       calls.sub.push(options);
+      if (subGate !== null) await subGate;
       if (subError !== null) throw subError;
       return {
         sessionId: "S-1",
         peerId: "peer-1",
         fingerprint: "abcd-ef01-2345-6789",
         closed: subClosed.promise,
-        close: async () => subClosed.resolve({ reason: "left" }),
+        close: async () => {
+          subCloses.push(options.code);
+          subClosed.resolve({ reason: "left" });
+        },
       };
     },
   };
@@ -148,6 +158,16 @@ function fakeApi(address = { host: "192.168.1.20", port: 7419 }) {
     },
     failJoins(error: Error) {
       subError = error;
+    },
+    subCloses,
+    /** Holds every join in its handshake until the returned function is called. */
+    holdJoins(): () => void {
+      const gate = deferred<void>();
+      subGate = gate.promise;
+      return () => {
+        subGate = null;
+        gate.resolve();
+      };
     },
     endSub(reason: string) {
       subClosed.resolve({ reason });
@@ -682,5 +702,124 @@ describe("parseFlags", () => {
   it("rejects unknown options and a missing value", () => {
     expect(() => parseFlags("--nope", [], [])).toThrow(/unknown option --nope/);
     expect(() => parseFlags("--host", ["host"], [])).toThrow(/--host needs a value/);
+  });
+});
+
+describe("/clean", () => {
+  it("is listed in /help and in the slash menu without a session", async () => {
+    const h = await harness();
+    h.stdin.type("/cl");
+    expect(h.shell.model.menu.map((command) => command.name)).toEqual(["clean"]);
+    h.stdin.type("\x1b");
+    h.stdin.type("\x03");
+    await h.shell.submit("/help");
+    expect(h.scrollback()).toMatch(/\/clean\s+end local session\(s\) and clear connection state/);
+    await h.shell.quit();
+  });
+
+  it("is a no-op without a session and keeps the shell open", async () => {
+    const h = await harness();
+    await h.shell.submit("/clean");
+    expect(h.scrollback()).toContain("nothing to clean — no session on this device");
+    expect(h.shell.model.scrollback.some((line) => line.tone === "error")).toBe(false);
+    expect(h.raw.endsWith("\x1b[?1049l")).toBe(false);
+    await h.shell.quit();
+  });
+
+  it("stops the shell's master, removes session.json and lets /start run again", async () => {
+    const h = await harness();
+    await h.shell.submit("/start --yes --repo app");
+    h.fake.peers.push(peer("peer-1", "vps", "app"));
+    h.shell.sync();
+    expect(h.shell.model.peers).toHaveLength(1);
+    await h.shell.submit("/clear");
+    expect(h.scrollback()).toContain("cleared: stopped master on 192.168.1.20:7419 — session idle");
+    expect(h.shell.session.snapshot().mode).toBe("none");
+    expect(h.shell.model.sessionLive).toBe(false);
+    expect(h.shell.model.peers).toEqual([]);
+    expect(h.frame()).toContain("no session");
+    await expect(readFile(path.join(h.dir, "session.json"), "utf8")).rejects.toThrow(/ENOENT/);
+    await h.shell.submit("/status");
+    expect(h.scrollback()).toContain("no session on this device — /start a master or /join one");
+    await h.shell.submit("/start --yes --repo app");
+    expect(h.fake.calls.master).toHaveLength(2);
+    expect(h.shell.session.snapshot().mode).toBe("master");
+    await h.shell.quit();
+  });
+
+  it("leaves the shell's join and drops its peer strip", async () => {
+    const h = await harness();
+    await h.shell.submit("/join 1234-5678-9012 --host 192.168.1.20:7419 --repo app");
+    expect(h.scrollback()).not.toContain("/quit to leave");
+    await h.shell.submit("/join 1234-5678-9012 --host 192.168.1.20:7419");
+    expect(h.scrollback()).toContain("/clean leaves the session, /quit leaves the shell");
+    h.fake.calls.sub[0]?.onProgress?.({
+      peerId: "peer-2",
+      device: "vps",
+      role: "frontend",
+      phase: "working",
+      done: 1,
+      total: 4,
+      failed: 0,
+      percent: 25,
+      summary: "forms",
+      self: false,
+    });
+    expect(h.shell.model.peers.map((p) => p.peerId)).toContain("peer-2");
+    await h.shell.submit("/clean");
+    expect(h.fake.subCloses).toEqual(["123456789012"]);
+    expect(h.scrollback()).toContain("cleared: left 192.168.1.20:7419 as peer-1 — session idle");
+    expect(h.shell.session.snapshot().mode).toBe("none");
+    expect(h.shell.model.peers).toEqual([]);
+    await h.shell.quit();
+  });
+
+  it("cancels a join stuck in its handshake without waiting for it", async () => {
+    const h = await harness();
+    const release = h.fake.holdJoins();
+    const joining = h.shell.submit("/join 1234-5678-9012 --host 192.168.1.20:7419 --repo app");
+    await waitFor(() => h.fake.calls.sub.length === 1);
+    expect(h.shell.session.snapshot().mode).toBe("joining");
+    await h.shell.submit("/clean");
+    expect(h.scrollback()).toContain("cleared: cancelled join of 192.168.1.20:7419");
+    expect(h.shell.session.snapshot().mode).toBe("none");
+    // The handshake finishing late must not bring the session back; its flow is closed.
+    release();
+    await joining;
+    expect(h.fake.subCloses).toHaveLength(1);
+    expect(h.shell.session.snapshot().mode).toBe("none");
+    await h.shell.quit();
+  });
+
+  it("removes a session.json whose master is gone", async () => {
+    const dead = net.createServer();
+    await new Promise<void>((resolve) => dead.listen(0, "127.0.0.1", resolve));
+    const { port } = dead.address() as net.AddressInfo;
+    await new Promise((resolve) => dead.close(resolve));
+    const h = await harness(undefined, (dir) =>
+      writeFile(
+        path.join(dir, "session.json"),
+        `${JSON.stringify({ listen: `127.0.0.1:${port}`, token: "0".repeat(32) })}\n`,
+      ),
+    );
+    await h.shell.submit("/clean");
+    expect(h.scrollback()).toContain(
+      `cleared: removed stale session.json (master at 127.0.0.1:${port} gone) — session idle`,
+    );
+    await expect(readFile(path.join(h.dir, "session.json"), "utf8")).rejects.toThrow(/ENOENT/);
+    await h.shell.quit();
+  });
+
+  it("never stops a live master in another process and keeps showing it", async () => {
+    const other = await externalMaster("A", "app");
+    const h = await harness(undefined, other.publish);
+    await waitFor(() => h.shell.session.snapshot().mode === "external");
+    await h.shell.submit("/clean");
+    expect(h.scrollback()).toContain(
+      `a session master in another process still runs at 127.0.0.1:${other.port}`,
+    );
+    expect(h.shell.session.snapshot().mode).toBe("external");
+    expect(await readFile(path.join(h.dir, "session.json"), "utf8")).toContain(`${other.port}`);
+    await h.shell.quit();
   });
 });

@@ -223,3 +223,33 @@ describe("texts", () => {
     expect(noMatchText(status(), ["app"])).toContain("no peers joined yet");
   });
 });
+
+describe("SessionController /clean support", () => {
+  it("abortJoin drops a handshake in flight and refuses its late flow", () => {
+    const session = new SessionController();
+    expect(session.abortJoin()).toBeNull();
+    const generation = session.beginJoin("192.168.1.20:7419");
+    session.joinRoster(generation, [row]);
+    expect(session.abortJoin()).toBe("192.168.1.20:7419");
+    expect(session.joinBusy).toBe(false);
+    expect(session.joinStarted(generation, joinFlow())).toBe(false);
+    expect(session.joinRoster(generation, [row])).toBe(false);
+    expect(session.snapshot().mode).toBe("none");
+    expect(session.snapshot().peers).toEqual([]);
+  });
+
+  it("clearExternal forgets the other master and voids discoveries in flight", () => {
+    const session = new SessionController();
+    const external: ExternalMaster = {
+      endpoint: { listen: "192.168.1.20:7419", token: "t" },
+      status: status([vps]),
+    };
+    expect(session.applyProbe(session.beginProbe(), external)).toBe(true);
+    expect(session.snapshot().mode).toBe("external");
+    const pending = session.beginProbe();
+    session.clearExternal();
+    expect(session.snapshot().mode).toBe("none");
+    expect(session.applyProbe(pending, external)).toBe(false);
+    expect(session.snapshot().live).toBe(false);
+  });
+});
