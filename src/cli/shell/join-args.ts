@@ -3,16 +3,21 @@
  * by shape, so `/join <host:port> <code>` and `/join <code> --host <host:port>` both work.
  */
 
-import { normalizeJoinCode, parseHostPort } from "../commands/session.js";
+import { normalizeJoinCode, parseHostPort, SUBMIT_METHODS } from "../commands/session.js";
 import { CliError } from "../output.js";
 import { parseFlags } from "./flags.js";
 
-/** Codes are one word: `8632-1727-0308` or `863217270308` (arguments split on whitespace). */
+/**
+ * Codes are one word: `8632-1727-0308` or `863217270308` (arguments split on whitespace). The
+ * first form is the line the master prints to paste (docs/plans/join-paste-auto.md).
+ */
 export const JOIN_USAGE = [
-  "usage: /join <NNNN-NNNN-NNNN> [--host host:port]",
+  "usage: /join --host <host:port> --code <NNNN-NNNN-NNNN> --repo <repo>",
+  "       /join <NNNN-NNNN-NNNN> [--host host:port]",
   "       /join <host:port> <NNNN-NNNN-NNNN>",
-  "       /join --host <host:port> --code <NNNN-NNNN-NNNN>",
   "       /join            (this device's own master)",
+  "options: --manual (confirm each item; default auto), --submit pr|mr|push|none|ask,",
+  "         --role <role>, --agent <view>, --device <name>",
 ].join("\n");
 
 export interface JoinArgs {
@@ -22,6 +27,9 @@ export interface JoinArgs {
   agent?: string;
   repo?: string;
   device?: string;
+  submit?: (typeof SUBMIT_METHODS)[number];
+  /** Opt out of auto control. */
+  manual?: boolean;
 }
 
 function usage(problem: string): CliError {
@@ -31,11 +39,19 @@ function usage(problem: string): CliError {
 export function parseJoinArgs(args: string): JoinArgs {
   let flags: ReturnType<typeof parseFlags>;
   try {
-    flags = parseFlags(args, ["host", "role", "agent", "code", "repo", "device"], []);
+    flags = parseFlags(
+      args,
+      ["host", "role", "agent", "code", "repo", "device", "submit"],
+      ["manual"],
+    );
   } catch (error) {
     throw usage(error instanceof Error ? error.message : String(error));
   }
-  const { code: codeFlag, host: hostFlag, role, agent, repo, device } = flags.values;
+  const { code: codeFlag, host: hostFlag, role, agent, repo, device, submit } = flags.values;
+  const method = SUBMIT_METHODS.find((value) => value === submit);
+  if (submit !== undefined && method === undefined) {
+    throw usage(`--submit must be ${SUBMIT_METHODS.join(", ")}, got ${submit}`);
+  }
   if (codeFlag !== undefined && normalizeJoinCode(codeFlag) === null) {
     throw usage(`--code must be 12 digits, got ${codeFlag}`);
   }
@@ -63,5 +79,7 @@ export function parseJoinArgs(args: string): JoinArgs {
     ...(agent === undefined ? {} : { agent }),
     ...(repo === undefined ? {} : { repo }),
     ...(device === undefined ? {} : { device }),
+    ...(method === undefined ? {} : { submit: method }),
+    ...(flags.switches.has("manual") ? { manual: true } : {}),
   };
 }

@@ -20,6 +20,7 @@ import {
   clearStaleSessionFile,
   fetchSessionStatus,
   fetchSessionStatusAt,
+  formatJoinPaste,
   INTENT_OUTCOME_UNKNOWN,
   type JoinFlow,
   type JoinFlowOptions,
@@ -32,6 +33,7 @@ import {
   type SessionCliContext,
   type SessionStatus,
   selectAgentView,
+  startedText,
   startMasterFlow,
   submitIntentAt,
 } from "../commands/session.js";
@@ -513,13 +515,13 @@ export class Shell {
       {
         name: "start",
         description: "start a local session master",
-        usage: "[--listen host:port] [--repo name] [--yes]",
+        usage: "[--listen host:port] [--advertise host:port] [--repo name] [--yes]",
         run: (_ctx, args) => this.startCommand(args),
       },
       {
         name: "join",
         description: "join a session (same machine or --host)",
-        usage: "[<code>] [<host:port>|--host host:port] [--role role] [--agent view]",
+        usage: "--host h:p --code c --repo r [--manual]",
         run: (_ctx, args) => this.joinCommand(args),
       },
       {
@@ -582,10 +584,11 @@ export class Shell {
         message: `a master already runs here (code ${own.joinCode ?? "none"})`,
       };
     }
-    const flags = parseFlags(args, ["listen", "repo", "device"], ["yes"]);
-    const { listen, repo, device } = flags.values;
+    const flags = parseFlags(args, ["listen", "advertise", "repo", "device"], ["yes"]);
+    const { listen, advertise, repo, device } = flags.values;
     const flow = await startMasterFlow(this.ctx, {
       ...(listen === undefined ? {} : { listen }),
+      ...(advertise === undefined ? {} : { advertise }),
       ...(repo === undefined ? {} : { repo }),
       ...(device === undefined ? {} : { device }),
       ...(flags.switches.has("yes") ? { yes: true } : {}),
@@ -596,7 +599,13 @@ export class Shell {
         return answer !== null && /^\s*y(es)?\s*$/i.test(answer);
       },
       onJoinCode: (code, expiresAtMs) => {
-        this.log(`join code: ${code}${expiry(expiresAtMs)}`, "event");
+        // A rotated code invalidates the line pasted earlier, so the new one is printed in full.
+        const own = this.session.ownMaster;
+        const paste =
+          own === null
+            ? ""
+            : `\npaste: ${formatJoinPaste({ host: own.advertise, code, repo: own.repo })}`;
+        this.log(`join code: ${code}${expiry(expiresAtMs)}${paste}`, "event");
         this.sync();
       },
       onEvent: (event) => this.masterEvent(event),
@@ -607,14 +616,9 @@ export class Shell {
       (error: unknown) => this.masterEnded(flow, `session closed: ${errorMessage(error)}`),
     );
     this.sync();
-    const code = flow.joinCode ?? "none";
     return {
       type: "ok",
-      message:
-        `session master listening on ${flow.listen} (repo ${flow.repo})\n` +
-        `join code: ${code}${expiry(flow.joinCodeExpiresAtMs)}\n` +
-        `on another device: skep → /join ${code} --host ${flow.listen}\n` +
-        "intents need at least one joined peer working on the same repo",
+      message: `${startedText(flow)}intents need at least one joined peer working on the same repo`,
     };
   }
 
@@ -628,8 +632,12 @@ export class Shell {
         const at = message.lastIndexOf(": ");
         const text =
           at < 0 ? message : `${message.slice(0, at + 2)}${explainReason(message.slice(at + 2))}`;
-        const code = this.session.ownMaster?.joinCode ?? "<code>";
-        this.log(`${text}\nit can rejoin with the current code: /join ${code}`, "error");
+        const own = this.session.ownMaster;
+        const rejoin =
+          own === null || own.joinCode === null
+            ? "/join <code>"
+            : formatJoinPaste({ host: own.advertise, code: own.joinCode, repo: own.repo });
+        this.log(`${text}\nit can rejoin with the current code: ${rejoin}`, "error");
         break;
       }
       case "join-failed":
@@ -703,6 +711,8 @@ export class Shell {
       ...(host === undefined ? {} : { host }),
       ...(parsed.repo === undefined ? {} : { repo: parsed.repo }),
       ...(parsed.device === undefined ? {} : { device: parsed.device }),
+      ...(parsed.submit === undefined ? {} : { submit: parsed.submit }),
+      ...(parsed.manual === true ? { manual: true } : {}),
       ...this.agentOptions(requested as AgentView | undefined),
     };
     const generation = this.session.beginJoin(host ?? "this device's master");
@@ -773,7 +783,8 @@ export class Shell {
     if (!this.session.joinEnded(flow)) return;
     const rejoin =
       this.quitting === null && reason !== "sub_closed"
-        ? "\nthe join code is single-use: /join again with the master's current code"
+        ? "\nthe join code is single-use: ask the master for its current code, then\n" +
+          `/join --host ${flow.target} --code <code> --repo ${flow.repo}`
         : "";
     this.log(`left the session (${explainReason(reason)})${rejoin}`, "event");
     this.sync();

@@ -18,6 +18,20 @@ protocol rules ([`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §4.4) apply to t
   returns to `no session` without leaving the shell. A live master in another process is never
   stopped. `/join` while joined now points at `/clean` (leave the session) vs `/quit` (leave the
   shell).
+* Pasteable join line: `/start` and `skep session start` print
+  `/join --host <host:port> --code <NNNN-NNNN-NNNN> --repo <repo>` for the peer's skep shell, plus
+  its `skep session join …` twin. The same line is printed again when the code rotates, when an
+  intent finds no peer, and when a peer leaves. `/join` usage leads with this form.
+* `--advertise <host:port>` on `/start` and `skep session start`: the address peers dial (NAT,
+  public IP, relay). The paste line uses it; `--listen` stays the bind address. Wildcards and
+  malformed values are refused as for `--listen`.
+* Peer control mode. A join is **auto** by default: master-driven items run without a skep
+  prompt; only the submit policy may still ask (`--submit` / `device.toml` `submit.method`).
+  `/join … --manual` and `skep session join --manual` opt out: each item is confirmed
+  (`[Y/n]`) before it runs, and a declined item is reported as skipped without a checkout.
+  The joined line names the mode. Agent CLI approval prompts are untouched (D29).
+  `--manual` is not available with `--ui` yet.
+* `/join --submit pr|mr|push|none|ask`, as on `skep session join`.
 
 ## [0.1.7] - 2026-10-10
 
