@@ -113,7 +113,7 @@ export function charWidth(cp: number): number {
   return 1;
 }
 
-function displayWidth(text: string): number {
+export function displayWidth(text: string): number {
   return [...text].reduce((width, char) => width + charWidth(char.codePointAt(0) ?? 0), 0);
 }
 
@@ -219,7 +219,7 @@ export function truncate(text: string, width: number): string {
  * Cuts styled spans to `width` display columns as {@link truncate} cuts text: the controls of
  * every span are stripped first, and the ellipsis keeps the style of the span it ends.
  */
-function fitSpans(spans: readonly Span[], width: number): Span[] {
+export function fitSpans(spans: readonly Span[], width: number): Span[] {
   const clean = spans.map((span) => ({ ...span, text: printable(span.text) }));
   if (spansWidth(clean) <= width) return clean;
   if (width <= 0) return [];
@@ -445,7 +445,7 @@ type Row = { spans: Span[]; entry: string | null };
 export type MessageTone = "info" | "error";
 
 /** Glyph tokens (§3.4). Ascii mode avoids East-Asian ambiguous-width chrome (`─`, `·`). */
-function chrome(glyphs: Glyphs): { rule: string; sep: string; icon: string; enter: string } {
+export function chrome(glyphs: Glyphs): { rule: string; sep: string; icon: string; enter: string } {
   return glyphs === "nerd"
     ? { rule: "─", sep: " · ", icon: `${NF_MD_BEEHIVE} `, enter: "⏎" }
     : { rule: "-", sep: " | ", icon: "", enter: "enter" };
@@ -486,7 +486,7 @@ function muted(text: string): Line {
 }
 
 /** `text` cut and padded to exactly `width` display columns, for aligned columns. */
-function column(text: string, width: number): string {
+export function column(text: string, width: number): string {
   const cut = truncate(text, width);
   return cut + " ".repeat(Math.max(0, width - displayWidth(cut)));
 }
