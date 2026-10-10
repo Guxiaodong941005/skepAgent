@@ -11,6 +11,10 @@ protocol rules ([`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §4.4) apply to t
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-10-10
+
+TUI and session reliability for the unified shell: single session truth, ergonomic `/join`, clearer intents, peer presence.
+
 ### Fixed
 
 * Shell session state has one source of truth (`SessionController`): the header, peer footer,
@@ -277,7 +281,8 @@ creates the npm org `skepagent` and explicitly says go. See [`docs/RELEASE.md`](
 * Manual lease revoke; no auto-merge. The human holds plan approval, escalation decisions and
   merges.
 
-[Unreleased]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.2...v0.1.5
 [0.1.2]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.1...v0.1.2

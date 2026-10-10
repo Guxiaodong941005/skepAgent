@@ -4,6 +4,32 @@ This document records the package-name decision (v0.1.0), the npm registry re-ch
 v0.1.0 checklist, the v0.1.1 session-TUI notes, the v0.1.5 peer-progress and TUI notes, and the
 steps the orchestrator runs. Task agents must not `git push`, create tags, or `npm publish`.
 
+## v0.1.7 — TUI/session reliability (2026-10-10)
+
+The human ordered this release as **0.1.7**. Package name stays **`@skepagent/skep`**
+(public). The only bin is `skep`.
+
+What this tag adds on top of v0.1.6 (details in [`../CHANGELOG.md`](../CHANGELOG.md)):
+
+* **Single session truth** in the unified shell (`SessionController`): header, peers, slash
+  gating and intents share one snapshot. External masters are bound by identity.
+* **`/join` ergonomics**: `/join <host:port> <code>` (either order) and the existing flagged
+  forms; clearer usage errors.
+* **Intent UX**: refuse when no peers joined; descriptive `no_match`; lost-reply reported as
+  may-have-been-accepted (no unsafe “resend” claim).
+* **Presence**: named peer leave reasons, heartbeat/quiet ages in the bee footer.
+
+Compatibility: upgrade both devices. Wire protocol is additive (presence display only).
+
+Install:
+
+```bash
+npm install -g @skepagent/skep@0.1.7
+```
+
+---
+
+
 ## v0.1.5 — peer progress and the redesigned session screen (2026-10-09)
 
 The human ordered this release as **0.1.5**. Versions 0.1.3 and 0.1.4 are skipped and were
