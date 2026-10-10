@@ -14,7 +14,7 @@
  */
 
 import { constants as fsConstants } from "node:fs";
-import { access, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { access, link, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -438,6 +438,10 @@ async function readSessionFile(file: string): Promise<SessionFile | null> {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw error;
   }
+  return parseSessionFile(file, raw);
+}
+
+function parseSessionFile(file: string, raw: string): SessionFile {
   let json: unknown;
   try {
     json = JSON.parse(raw);
@@ -1845,10 +1849,147 @@ async function refuseIfRunning(file: string): Promise<void> {
   );
 }
 
+export type StaleSessionFile =
+  | { kind: "none" }
+  | { kind: "live"; listen: string }
+  | { kind: "removed"; listen: string | null }
+  /** Another master published itself while the stale file was being removed; it was kept. */
+  | { kind: "replaced" };
+
+export interface ClearStaleOptions {
+  timeoutMs?: number;
+  /** Test seam: runs after the probe decided the file is stale, before it is moved aside. */
+  beforeRemove?(): Promise<void>;
+  /** Test seam: runs after the file was moved aside, before its content is checked. */
+  afterMoveAside?(): Promise<void>;
+  /** Test seam: replaces the hard link that restores a moved-aside file. */
+  link?(existing: string, created: string): Promise<void>;
+}
+
+/**
+ * Removes `session.json` when no master answers behind it (its process is gone, or the file is
+ * corrupt). A master that answers is left alone: clearing this device never stops another
+ * process. Only the exact bytes that were judged stale are removed (see `removeSessionFileIf`),
+ * so a master that publishes itself meanwhile keeps its file.
+ */
+export async function clearStaleSessionFile(
+  ctx: CliContext,
+  clock: Clock,
+  options: ClearStaleOptions = {},
+): Promise<StaleSessionFile> {
+  const file = sessionFilePath(ctx);
+  let raw: string;
+  try {
+    raw = await readFile(file, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { kind: "none" };
+    throw error;
+  }
+  let existing: SessionFile | null = null;
+  try {
+    existing = parseSessionFile(file, raw);
+  } catch (error) {
+    // A corrupt file cannot point at a live master (see `refuseIfRunning`).
+    if (!(error instanceof CliError && error.code === "bad_session_file")) throw error;
+  }
+  const target = existing === null ? null : parseHostPort(existing.listen);
+  if (existing !== null && target !== null) {
+    try {
+      await controlRequest(
+        target,
+        { type: "control", v: 1, token: existing.token, op: "status" },
+        clock,
+        options.timeoutMs ?? PROBE_TIMEOUT_MS,
+      );
+      return { kind: "live", listen: existing.listen };
+    } catch (error) {
+      // Only a request that never left proves nobody listens there. A reply that was malformed,
+      // late or cut off still came from a live process: keep its file.
+      if (!(error instanceof ControlConnectionError) || error.requestSent) {
+        return { kind: "live", listen: existing.listen };
+      }
+    }
+  }
+  await options.beforeRemove?.();
+  const outcome = await removeSessionFileIf(file, (current) => current === raw, options);
+  if (outcome === "absent") return { kind: "none" };
+  if (outcome === "kept") return { kind: "replaced" };
+  return { kind: "removed", listen: existing?.listen ?? null };
+}
+
 /** Remove the control file only if it is still ours. */
 async function removeOwnSessionFile(file: string, token: string): Promise<void> {
-  const current = await readSessionFile(file).catch(() => null);
-  if (current?.token === token) await rm(file, { force: true });
+  await removeSessionFileIf(file, (raw) => {
+    try {
+      return parseSessionFile(file, raw).token === token;
+    } catch {
+      // Not parseable means not ours: never remove what this master did not write.
+      return false;
+    }
+  });
+}
+
+/**
+ * Removes `file` only while it holds what `matches` accepts. A read followed by an unlink would
+ * delete a publication that lands in between, so the file is renamed aside first (atomic: what
+ * is moved is exactly what gets checked). A file that does not match is put back without ever
+ * replacing a newer publication (see `restoreSessionFile`). Masters publish with an atomic
+ * rename, so the file is never seen half-written.
+ */
+async function removeSessionFileIf(
+  file: string,
+  matches: (raw: string) => boolean,
+  seams: Pick<ClearStaleOptions, "afterMoveAside" | "link"> = {},
+): Promise<"removed" | "kept" | "absent"> {
+  const aside = `${file}.${Buffer.from(cryptoRandom.bytes(6)).toString("hex")}.removing`;
+  try {
+    await rename(file, aside);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return "absent";
+    throw error;
+  }
+  await seams.afterMoveAside?.();
+  let raw: string;
+  try {
+    raw = await readFile(aside, "utf8");
+  } catch (error) {
+    await restoreSessionFile(aside, file, seams.link ?? link);
+    throw error;
+  }
+  if (matches(raw)) {
+    await rm(aside, { force: true });
+    return "removed";
+  }
+  await restoreSessionFile(aside, file, seams.link ?? link);
+  return "kept";
+}
+
+/**
+ * Puts a moved-aside file back with a hard link, which fails with `EEXIST` instead of replacing
+ * a publication that landed meanwhile; that newer one wins, as it would have by overwriting.
+ * Node has no other create-if-absent rename, and a `rename` onto the path would silently replace
+ * a newer master's file, so when linking is impossible the moved file is retained beside
+ * `session.json` and the caller is told where it is.
+ */
+async function restoreSessionFile(
+  aside: string,
+  file: string,
+  linkFile: (existing: string, created: string) => Promise<void>,
+): Promise<void> {
+  try {
+    await linkFile(aside, file);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    // A newer publication exists: the moved-aside one is older and is dropped, never restored.
+    if (code !== "EEXIST" && !(await exists(file))) {
+      throw new CliError(
+        "session_file_retained",
+        `could not put ${file} back (${code ?? errorMessage(error)}); it is kept at ${aside} — ` +
+          `rename it to ${path.basename(file)} if its master still runs`,
+      );
+    }
+  }
+  await rm(aside, { force: true });
 }
 
 export interface JoinFlowOptions extends Omit<JoinOptions, "ui"> {

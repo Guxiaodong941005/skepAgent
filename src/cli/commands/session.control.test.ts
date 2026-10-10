@@ -1,10 +1,16 @@
 // Control client outcome classification (review R1): a request that never left is
 // "unreachable"; an intent whose reply was lost has an unknown outcome.
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { skepPaths } from "../../config/paths.js";
 import { systemClock } from "../../util/clock.js";
+import type { CliContext } from "../context.js";
 import {
   ControlConnectionError,
+  clearStaleSessionFile,
   controlRequest,
   encodeFrame,
   FrameDecoder,
@@ -15,9 +21,11 @@ import {
 
 const TOKEN = "c".repeat(32);
 const servers: net.Server[] = [];
+const roots: string[] = [];
 
 afterEach(async () => {
   await Promise.all(servers.splice(0).map((s) => new Promise((r) => s.close(() => r(null)))));
+  await Promise.all(roots.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
 /** A loopback control port that reads one request, then does `answer` with the socket. */
@@ -115,5 +123,130 @@ describe("submitIntentAt outcome", () => {
     await expect(
       fetchSessionStatusAt({ listen: `127.0.0.1:${port}`, token: TOKEN }),
     ).rejects.toMatchObject({ code: "session_unreachable" });
+  });
+});
+
+describe("clearStaleSessionFile", () => {
+  async function home(content?: string): Promise<{ ctx: CliContext; file: string }> {
+    const dir = await mkdtemp(path.join(tmpdir(), "skep-clean-"));
+    roots.push(dir);
+    const file = path.join(dir, "session.json");
+    if (content !== undefined) await writeFile(file, content);
+    const ctx = { env: {}, paths: skepPaths(dir) } as unknown as CliContext;
+    return { ctx, file };
+  }
+
+  it("reports none when no session.json exists", async () => {
+    const { ctx } = await home();
+    expect(await clearStaleSessionFile(ctx, systemClock)).toEqual({ kind: "none" });
+  });
+
+  it("removes a file whose master no longer answers", async () => {
+    const port = await closedPort();
+    const listen = `127.0.0.1:${port}`;
+    const { ctx, file } = await home(`${JSON.stringify({ listen, token: TOKEN })}\n`);
+    expect(await clearStaleSessionFile(ctx, systemClock)).toEqual({ kind: "removed", listen });
+    await expect(readFile(file, "utf8")).rejects.toThrow(/ENOENT/);
+  });
+
+  it("removes a corrupt file", async () => {
+    const { ctx, file } = await home("{not json");
+    expect(await clearStaleSessionFile(ctx, systemClock)).toEqual({
+      kind: "removed",
+      listen: null,
+    });
+    await expect(readFile(file, "utf8")).rejects.toThrow(/ENOENT/);
+  });
+
+  it("keeps a valid publication that replaced a corrupt file after it was read (review B3)", async () => {
+    const { ctx, file } = await home("{not json");
+    const fresh = `${JSON.stringify({ listen: "127.0.0.1:7419", token: "d".repeat(32) })}\n`;
+    const result = await clearStaleSessionFile(ctx, systemClock, {
+      beforeRemove: () => writeFile(file, fresh),
+    });
+    expect(result).toEqual({ kind: "replaced" });
+    expect(await readFile(file, "utf8")).toBe(fresh);
+    expect(await readdir(path.dirname(file))).toEqual(["session.json"]);
+  });
+
+  it("keeps a new token published between the dead-master check and the unlink (review B3)", async () => {
+    const port = await closedPort();
+    const listen = `127.0.0.1:${port}`;
+    const { ctx, file } = await home(`${JSON.stringify({ listen, token: TOKEN })}\n`);
+    const fresh = `${JSON.stringify({ listen, token: "d".repeat(32) })}\n`;
+    const result = await clearStaleSessionFile(ctx, systemClock, {
+      beforeRemove: () => writeFile(file, fresh),
+    });
+    expect(result).toEqual({ kind: "replaced" });
+    expect(await readFile(file, "utf8")).toBe(fresh);
+  });
+
+  it("keeps a publication that lands while the stale file is moved aside", async () => {
+    const port = await closedPort();
+    const listen = `127.0.0.1:${port}`;
+    const { ctx, file } = await home(`${JSON.stringify({ listen, token: TOKEN })}\n`);
+    const fresh = `${JSON.stringify({ listen, token: "d".repeat(32) })}\n`;
+    const result = await clearStaleSessionFile(ctx, systemClock, {
+      afterMoveAside: () => writeFile(file, fresh),
+    });
+    // The stale bytes were the ones moved aside and removed; the new file was never touched.
+    expect(result).toEqual({ kind: "removed", listen });
+    expect(await readFile(file, "utf8")).toBe(fresh);
+    expect(await readdir(path.dirname(file))).toEqual(["session.json"]);
+  });
+
+  for (const code of ["EOPNOTSUPP", "EPERM", "EXDEV"]) {
+    it(`keeps a master published while a link restore fails with ${code} (review B3)`, async () => {
+      const { ctx, file } = await home("{not json");
+      const moved = `${JSON.stringify({ listen: "127.0.0.1:7419", token: "b".repeat(32) })}\n`;
+      const newest = `${JSON.stringify({ listen: "127.0.0.1:7420", token: "e".repeat(32) })}\n`;
+      const result = await clearStaleSessionFile(ctx, systemClock, {
+        // B replaces the corrupt file after the read, so B is moved aside and must go back.
+        beforeRemove: () => writeFile(file, moved),
+        // C is published while restoring B, and hard links are not available.
+        link: async () => {
+          await writeFile(file, newest);
+          throw Object.assign(new Error(`link: ${code}`), { code });
+        },
+      });
+      expect(result).toEqual({ kind: "replaced" });
+      expect(await readFile(file, "utf8")).toBe(newest);
+      expect(await readdir(path.dirname(file))).toEqual(["session.json"]);
+    });
+  }
+
+  it("retains a moved-aside file it cannot link back, without guessing", async () => {
+    const { ctx, file } = await home("{not json");
+    const moved = `${JSON.stringify({ listen: "127.0.0.1:7419", token: "b".repeat(32) })}\n`;
+    const error = await clearStaleSessionFile(ctx, systemClock, {
+      beforeRemove: () => writeFile(file, moved),
+      link: async () => {
+        throw Object.assign(new Error("link: EOPNOTSUPP"), { code: "EOPNOTSUPP" });
+      },
+    }).catch((e: unknown) => e);
+    expect((error as { code?: string }).code).toBe("session_file_retained");
+    const left = await readdir(path.dirname(file));
+    expect(left).toHaveLength(1);
+    expect(left[0]).toMatch(/^session\.json\.[0-9a-f]+\.removing$/);
+    expect((error as Error).message).toContain(left[0]);
+    expect(await readFile(path.join(path.dirname(file), left[0] ?? ""), "utf8")).toBe(moved);
+  });
+
+  it("keeps the file of an endpoint that answers with a malformed reply", async () => {
+    const port = await server((socket) => socket.end(encodeFrame(Buffer.from("not json"))));
+    const listen = `127.0.0.1:${port}`;
+    const { ctx, file } = await home(`${JSON.stringify({ listen, token: TOKEN })}\n`);
+    expect(await clearStaleSessionFile(ctx, systemClock)).toEqual({ kind: "live", listen });
+    expect(await readFile(file, "utf8")).toContain(listen);
+  });
+
+  it("keeps the file of a master that answers", async () => {
+    const port = await server((socket) =>
+      reply(socket, { type: "control-result", ok: true, result: {} }),
+    );
+    const listen = `127.0.0.1:${port}`;
+    const { ctx, file } = await home(`${JSON.stringify({ listen, token: TOKEN })}\n`);
+    expect(await clearStaleSessionFile(ctx, systemClock)).toEqual({ kind: "live", listen });
+    expect(await readFile(file, "utf8")).toContain(listen);
   });
 });

@@ -112,6 +112,26 @@ export class SessionController {
     this.roster = [];
   }
 
+  /** True while `generation` is the join attempt in its handshake or the joined flow. */
+  isJoinCurrent(generation: number): boolean {
+    return (
+      this.joining?.generation === generation ||
+      (this.join !== null && this.joinGeneration === generation)
+    );
+  }
+
+  /**
+   * Drops a join still in its handshake; its flow is refused by {@link joinStarted} when it
+   * arrives. Returns the dropped target, or null when no join was in flight.
+   */
+  abortJoin(): string | null {
+    const joining = this.joining;
+    if (joining === null) return null;
+    this.joining = null;
+    this.roster = [];
+    return joining.target;
+  }
+
   /** False when `flow` is not the current join. */
   joinEnded(flow: JoinFlow): boolean {
     if (this.join !== flow) return false;
@@ -122,10 +142,7 @@ export class SessionController {
 
   /** A sub roster update; ignored unless it belongs to the current join attempt or flow. */
   joinRoster(generation: number, peers: ShellPeer[]): boolean {
-    const current =
-      this.joining?.generation === generation ||
-      (this.join !== null && this.joinGeneration === generation);
-    if (!current) return false;
+    if (!this.isJoinCurrent(generation)) return false;
     this.roster = peers;
     return true;
   }
@@ -139,6 +156,12 @@ export class SessionController {
   /** Any discovery in flight is now stale (an own flow started, or the shell is leaving). */
   invalidateProbes(): void {
     this.probeGeneration += 1;
+  }
+
+  /** Forgets a master in another process; any discovery in flight no longer applies. */
+  clearExternal(): void {
+    this.external = null;
+    this.invalidateProbes();
   }
 
   /**
