@@ -80,8 +80,8 @@ peer = second machine on the same LAN, both inside a checkout of the **same repo
    intent: expect `the session master on this device changed (was …); the intent was not sent`
    and `now showing …`. The new master's `skep session status` shows no intent. Typing again
    sends to the new master. The 2 s poll may switch the header to the new master first; then
-   the intent goes there on purpose (the header already shows it). To hit the race reliably,
-   stop the poll by typing while the old master is still shown.
+   the intent goes there on purpose (the header already shows it). The race window is up to 2 s;
+   the automated test covers it deterministically.
 10. **B2 (rejected self-join):** start the external master *without* `--yes`
     (`skep session start`), attach the shell as in 7, `/join`, and answer `n` at the master's
     prompt in its terminal. Expect the rejection, then the header back to `master (other process)`
