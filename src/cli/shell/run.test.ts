@@ -41,7 +41,8 @@ async function controlServer(
       const request = JSON.parse(frame.toString("utf8"));
       requests.push(request);
       void Promise.resolve(reply(request)).then((answer) => {
-        socket.end(encodeFrame(Buffer.from(JSON.stringify(answer))));
+        if (answer === DROP) socket.destroy();
+        else socket.end(encodeFrame(Buffer.from(JSON.stringify(answer))));
       });
     });
   });
@@ -49,6 +50,9 @@ async function controlServer(
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   return { port: (server.address() as net.AddressInfo).port, requests };
 }
+
+/** A `controlServer` reply that closes the connection without answering (a lost reply). */
+const DROP = Symbol("drop");
 
 /** Never ticks: the shell's animation timer stays parked until it is aborted. */
 const parkedClock: Clock = {
@@ -497,6 +501,7 @@ describe("unified shell", () => {
 async function externalMaster(id: string, repo: string) {
   const token = id.toLowerCase().repeat(32).slice(0, 32);
   let accepted = token;
+  let dropIntentReplies = false;
   const held: (() => void)[] = [];
   let holding = false;
   let port = 0;
@@ -505,6 +510,8 @@ async function externalMaster(id: string, repo: string) {
       return { type: "control-result", ok: false, error: { code: "bad_token", message: "bad" } };
     }
     if (request.op !== "status") {
+      // The request was received (and recorded) before the reply is lost: it took effect.
+      if (dropIntentReplies) return DROP;
       return { type: "control-result", ok: true, result: { intentId: `${id}-intent-1` } };
     }
     if (holding) await new Promise<void>((resolve) => held.push(resolve));
@@ -530,6 +537,10 @@ async function externalMaster(id: string, repo: string) {
       ),
     hold() {
       holding = true;
+    },
+    /** Intents are accepted, but their replies never arrive. */
+    dropReplies() {
+      dropIntentReplies = true;
     },
     /** Another master took this port and has not published its file yet. */
     retoken() {
@@ -593,6 +604,28 @@ describe("external master identity and discovery (review B1-B3)", () => {
     expect(h.scrollback()).toContain("the intent was not sent");
     expect(h.scrollback()).toContain("no session master runs on this device now");
     expect(h.shell.session.snapshot().mode).toBe("none");
+    await h.shell.quit();
+  });
+
+  it("says an intent may have been accepted when its reply is lost, without inviting a resend", async () => {
+    const a = await externalMaster("A", "app");
+    const h = await harness(undefined, a.publish);
+    await waitFor(() => h.shell.session.externalStatus !== null);
+    a.dropReplies();
+    await h.shell.submit("add a health check");
+    // The master received the intent: it may well be planned there.
+    expect(a.intents()).toHaveLength(1);
+    const out = h.scrollback();
+    expect(out).toContain("no reply after the intent was sent — it may have been accepted");
+    expect(out).toContain("the master is still session-A");
+    expect(out).toContain("/status lists its intents");
+    expect(out).toContain("sending it again could start the same work twice");
+    expect(out).not.toContain("not sent");
+    expect(out).not.toContain("changed");
+    expect(out).not.toMatch(/\bresend\b/);
+    // Identity is unchanged, so the shell still shows (and stays bound to) the same master.
+    expect(h.shell.session.snapshot().mode).toBe("external");
+    expect(h.shell.session.externalStatus?.sessionId).toBe("session-A");
     await h.shell.quit();
   });
 

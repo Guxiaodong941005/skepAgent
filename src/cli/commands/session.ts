@@ -256,9 +256,16 @@ export class FrameDecoder {
 // Control client.
 
 export class ControlConnectionError extends Error {
-  constructor(target: string, reason: string, options?: ErrorOptions) {
+  /**
+   * True once the request was handed to the socket: the master may have acted on it even though
+   * no reply arrived (closed after write, timeout, malformed reply). False means it never left.
+   */
+  readonly requestSent: boolean;
+
+  constructor(target: string, reason: string, options?: ErrorOptions & { requestSent?: boolean }) {
     super(`session master at ${target}: ${reason}`, options);
     this.name = "ControlConnectionError";
+    this.requestSent = options?.requestSent ?? false;
   }
 }
 
@@ -275,6 +282,7 @@ export function controlRequest(
     const decoder = new FrameDecoder();
     const socket = net.connect({ host: target.host, port: target.port });
     let settled = false;
+    let written = false;
     const finish = (error: Error | null, reply?: ControlResult): void => {
       if (settled) return;
       settled = true;
@@ -284,11 +292,17 @@ export function controlRequest(
       else if (reply !== undefined) resolve(reply);
     };
     clock.sleep(timeoutMs, timer.signal).then(
-      () => finish(new ControlConnectionError(label, `no reply within ${timeoutMs} ms`)),
+      () =>
+        finish(
+          new ControlConnectionError(label, `no reply within ${timeoutMs} ms`, {
+            requestSent: written,
+          }),
+        ),
       // Aborted because the exchange finished first.
       () => undefined,
     );
     socket.on("connect", () => {
+      written = true;
       socket.write(encodeFrame(Buffer.from(JSON.stringify(request), "utf8")));
     });
     socket.on("data", (chunk: Buffer) => {
@@ -297,19 +311,32 @@ export function controlRequest(
         if (frame === undefined) return;
         const parsed = ControlResultSchema.safeParse(JSON.parse(frame.toString("utf8")));
         if (!parsed.success) {
-          finish(new ControlConnectionError(label, "malformed control-result"));
+          finish(
+            new ControlConnectionError(label, "malformed control-result", { requestSent: true }),
+          );
           return;
         }
         finish(null, parsed.data);
       } catch (error) {
-        finish(new ControlConnectionError(label, errorMessage(error), { cause: error }));
+        finish(
+          new ControlConnectionError(label, errorMessage(error), {
+            cause: error,
+            requestSent: true,
+          }),
+        );
       }
     });
     socket.on("error", (error) => {
-      finish(new ControlConnectionError(label, error.message, { cause: error }));
+      finish(
+        new ControlConnectionError(label, error.message, { cause: error, requestSent: written }),
+      );
     });
     socket.on("close", () => {
-      finish(new ControlConnectionError(label, "connection closed before a reply"));
+      finish(
+        new ControlConnectionError(label, "connection closed before a reply", {
+          requestSent: written,
+        }),
+      );
     });
   });
 }
@@ -2283,6 +2310,9 @@ async function submitCommand(
   ctx.output().result(data, human);
 }
 
+/** An intent request left this device but no usable reply came back (see `controlAt`). */
+export const INTENT_OUTCOME_UNKNOWN = "intent_outcome_unknown";
+
 /**
  * A master's control endpoint as published in `session.json`. The token is random per master, so
  * an endpoint also identifies *which* master: a replacement master never accepts an old token.
@@ -2327,6 +2357,15 @@ async function controlAt(
       timeoutMs ?? (op.op === "intent" ? INTENT_CONTROL_TIMEOUT_MS : CONTROL_TIMEOUT_MS),
     );
   } catch (error) {
+    // A lost reply to an intent is not a refusal: the master starts routing before it answers,
+    // so the intent may exist. Read-only ops (status) are simply unreachable either way.
+    if (error instanceof ControlConnectionError && error.requestSent && op.op === "intent") {
+      throw new CliError(
+        INTENT_OUTCOME_UNKNOWN,
+        `${error.message}; the intent was sent and may have been accepted — ` +
+          "check `skep session status` before sending it again",
+      );
+    }
     if (error instanceof ControlConnectionError) {
       throw new CliError("session_unreachable", error.message);
     }
@@ -2392,7 +2431,14 @@ export async function submitIntentAt(
 
 function parseIntentResult(result: unknown): { intentId: string } {
   const parsed = IntentResultSchema.safeParse(result);
-  if (!parsed.success) throw badReply("intent", parsed.error);
+  if (!parsed.success) {
+    // `ok: true` came back, so the master took the intent; only its id is unreadable.
+    throw new CliError(
+      INTENT_OUTCOME_UNKNOWN,
+      `session master accepted the intent but sent a malformed id (${parsed.error.message}); ` +
+        "check `skep session status` before sending it again",
+    );
+  }
   return parsed.data;
 }
 

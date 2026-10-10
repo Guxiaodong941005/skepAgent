@@ -1,0 +1,119 @@
+// Control client outcome classification (review R1): a request that never left is
+// "unreachable"; an intent whose reply was lost has an unknown outcome.
+import net from "node:net";
+import { afterEach, describe, expect, it } from "vitest";
+import { systemClock } from "../../util/clock.js";
+import {
+  ControlConnectionError,
+  controlRequest,
+  encodeFrame,
+  FrameDecoder,
+  fetchSessionStatusAt,
+  INTENT_OUTCOME_UNKNOWN,
+  submitIntentAt,
+} from "./session.js";
+
+const TOKEN = "c".repeat(32);
+const servers: net.Server[] = [];
+
+afterEach(async () => {
+  await Promise.all(servers.splice(0).map((s) => new Promise((r) => s.close(() => r(null)))));
+});
+
+/** A loopback control port that reads one request, then does `answer` with the socket. */
+async function server(answer: (socket: net.Socket) => void): Promise<number> {
+  const listener = net.createServer((socket) => {
+    const decoder = new FrameDecoder();
+    socket.on("data", (chunk) => {
+      if (decoder.push(chunk).length > 0) answer(socket);
+    });
+  });
+  servers.push(listener);
+  await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", resolve));
+  return (listener.address() as net.AddressInfo).port;
+}
+
+/** A loopback port with nothing listening: bind, read the port, close. */
+async function closedPort(): Promise<number> {
+  const listener = net.createServer();
+  await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", resolve));
+  const { port } = listener.address() as net.AddressInfo;
+  await new Promise((resolve) => listener.close(resolve));
+  return port;
+}
+
+function reply(socket: net.Socket, value: unknown): void {
+  socket.end(encodeFrame(Buffer.from(JSON.stringify(value))));
+}
+
+describe("controlRequest requestSent", () => {
+  it("is false when the connection is refused", async () => {
+    const port = await closedPort();
+    const error = await controlRequest(
+      { host: "127.0.0.1", port },
+      { type: "control", v: 1, token: TOKEN, op: "status" },
+      systemClock,
+    ).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ControlConnectionError);
+    expect((error as ControlConnectionError).requestSent).toBe(false);
+  });
+
+  it("is true when the connection closes after the request was written", async () => {
+    const port = await server((socket) => socket.destroy());
+    const error = await controlRequest(
+      { host: "127.0.0.1", port },
+      { type: "control", v: 1, token: TOKEN, op: "status" },
+      systemClock,
+    ).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ControlConnectionError);
+    expect((error as ControlConnectionError).requestSent).toBe(true);
+  });
+});
+
+describe("submitIntentAt outcome", () => {
+  it("reports a refused connection as unreachable (never sent)", async () => {
+    const port = await closedPort();
+    await expect(
+      submitIntentAt({ listen: `127.0.0.1:${port}`, token: TOKEN }, "add a health check"),
+    ).rejects.toMatchObject({ code: "session_unreachable" });
+  });
+
+  it("reports a lost reply as an unknown outcome", async () => {
+    const port = await server((socket) => socket.destroy());
+    const error = await submitIntentAt(
+      { listen: `127.0.0.1:${port}`, token: TOKEN },
+      "add a health check",
+    ).catch((e: unknown) => e);
+    expect(error).toMatchObject({ code: INTENT_OUTCOME_UNKNOWN });
+    expect((error as Error).message).toContain("may have been accepted");
+  });
+
+  it("reports an ok reply with a malformed id as an unknown outcome", async () => {
+    const port = await server((socket) =>
+      reply(socket, { type: "control-result", ok: true, result: { nope: 1 } }),
+    );
+    await expect(
+      submitIntentAt({ listen: `127.0.0.1:${port}`, token: TOKEN }, "add a health check"),
+    ).rejects.toMatchObject({ code: INTENT_OUTCOME_UNKNOWN });
+  });
+
+  it("keeps an explicit token rejection as a rejection", async () => {
+    const port = await server((socket) =>
+      reply(socket, {
+        type: "control-result",
+        ok: false,
+        error: { code: "bad_token", message: "Invalid session control token" },
+      }),
+    );
+    await expect(
+      submitIntentAt({ listen: `127.0.0.1:${port}`, token: TOKEN }, "add a health check"),
+    ).rejects.toMatchObject({ code: "bad_token" });
+  });
+
+  it("keeps a lost status reply as plain unreachable (read-only)", async () => {
+    const port = await server((socket) => socket.destroy());
+    await expect(
+      fetchSessionStatusAt({ listen: `127.0.0.1:${port}`, token: TOKEN }),
+    ).rejects.toMatchObject({ code: "session_unreachable" });
+  });
+});

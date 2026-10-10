@@ -19,6 +19,7 @@ import {
   checkIntent,
   fetchSessionStatus,
   fetchSessionStatusAt,
+  INTENT_OUTCOME_UNKNOWN,
   type JoinFlow,
   type JoinFlowOptions,
   type JoinView,
@@ -362,8 +363,10 @@ export class Shell {
 
   /**
    * An intent for the master in another process that the shell displays, sent to exactly the
-   * endpoint (and token) it was discovered at. If `session.json` now names another master, or the
-   * shown one is gone, nothing is sent: the shell re-discovers and says what it shows now.
+   * endpoint (and token) it was discovered at. When delivery is known to have failed (another
+   * master is published, the endpoint refused the connection or rejected the token), the shell
+   * re-discovers and says what it shows now. When the request left but no reply came back, the
+   * outcome is unknown and the shell says so: resending could duplicate the work.
    */
   private async sendExternalIntent(
     shown: ExternalMaster,
@@ -377,7 +380,11 @@ export class Shell {
       const { intentId } = await submitIntentAt(shown.endpoint, text);
       return { type: "ok", intentId };
     } catch (error) {
-      // A replacement master on the same port rejects the old token; a gone one does not answer.
+      if (error instanceof CliError && error.code === INTENT_OUTCOME_UNKNOWN) {
+        return this.intentOutcomeUnknown(shown, error.message);
+      }
+      // A replacement master on the same port rejects the old token; `session_unreachable` here
+      // means the request never left this device (see `ControlConnectionError.requestSent`).
       if (
         error instanceof CliError &&
         (error.code === "bad_token" || error.code === "session_unreachable")
@@ -386,6 +393,34 @@ export class Shell {
       }
       throw error;
     }
+  }
+
+  /** The intent left this device but its reply was lost: it may or may not exist on the master. */
+  private async intentOutcomeUnknown(
+    shown: ExternalMaster,
+    detail: string,
+  ): Promise<{ type: "error"; message: string }> {
+    await this.probeExternal();
+    const now = this.session.externalMaster;
+    const was = `${shown.status.sessionId} at ${shown.status.listen}`;
+    let next: string;
+    if (now !== null && sameEndpoint(now.endpoint, shown.endpoint)) {
+      next = `the master is still ${was}: /status lists its intents — look for this one there`;
+    } else if (now === null) {
+      next = `the master (${was}) no longer answers; it may have taken the intent before it went away`;
+    } else {
+      next =
+        `this device now shows ${now.status.sessionId} at ${now.status.listen}; ` +
+        `the intent may have reached the previous master (${was})`;
+    }
+    return {
+      type: "error",
+      message:
+        "no reply after the intent was sent — it may have been accepted\n" +
+        `${next}\n` +
+        "sending it again could start the same work twice\n" +
+        `(${detail})`,
+    };
   }
 
   private async externalChanged(
