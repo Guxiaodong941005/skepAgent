@@ -57,6 +57,11 @@ const SESSION_FILE = "session.json";
 /** A stale `session.json` must not hang `start`; a live master answers well within this. */
 const PROBE_TIMEOUT_MS = 2_000;
 const CONTROL_TIMEOUT_MS = 10_000;
+/**
+ * An `intent` op is answered only after routing, which may wait out the master's 30 s datalist
+ * timeout for capabilities; a shorter wait reports a live master as unreachable.
+ */
+const INTENT_CONTROL_TIMEOUT_MS = 40_000;
 const MAX_FRAME_BYTES = 65_536;
 const MAX_INTENT_TEXT = 4_000;
 const MAX_INTENT_REPOS = 16;
@@ -2002,6 +2007,12 @@ export async function joinSessionFlow(
       random: cryptoRandom,
       onFingerprint: showFingerprint,
       onProgress,
+      // A sub that hangs up on purpose (a failed describe/datalist callback) says so here;
+      // otherwise the human only sees the close reason.
+      onEvent: ({ kind, message }) => {
+        if (kind !== "error") return;
+        say({ event: "session-error", message }, () => `session: ${message}\n`);
+      },
       describe: async () => ({
         repo,
         role,
@@ -2289,6 +2300,7 @@ async function control(ctx: SessionCliContext, op: Record<string, unknown>): Pro
       target,
       { type: "control", v: 1, token: local.token, ...op },
       systemClock,
+      op.op === "intent" ? INTENT_CONTROL_TIMEOUT_MS : CONTROL_TIMEOUT_MS,
     );
   } catch (error) {
     if (error instanceof ControlConnectionError) {

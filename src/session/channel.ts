@@ -77,6 +77,8 @@ export class SessionWire {
   private readonly timers = new Set<AbortController>();
   private cancelSilence: (() => void) | null = null;
   private beatSeq = 0;
+  /** Monotonic time of the last frame from the other side (presence display). */
+  private lastReceivedMs: number;
 
   constructor(
     private readonly stream: Duplex,
@@ -84,6 +86,7 @@ export class SessionWire {
     onFrame: (frame: Buffer) => void,
     private readonly onClose: (reason: string) => void,
   ) {
+    this.lastReceivedMs = clock.monotonicMs();
     stream.on("data", (chunk: Buffer) => {
       if (!this.active) return;
       try {
@@ -143,7 +146,13 @@ export class SessionWire {
     this.received();
   }
 
+  /** Milliseconds since the other side was last heard from. */
+  silenceMs(): number {
+    return Math.max(0, this.clock.monotonicMs() - this.lastReceivedMs);
+  }
+
   received(): void {
+    this.lastReceivedMs = this.clock.monotonicMs();
     this.cancelSilence?.();
     // Silence is always 30 s, independently of the configurable sending cadence.
     this.cancelSilence = this.timer(30_000, () => this.destroy("heartbeat_timeout"));

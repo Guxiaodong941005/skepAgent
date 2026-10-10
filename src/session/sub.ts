@@ -335,6 +335,7 @@ export async function connectSub(o: SubOptions): Promise<SubHandle> {
               if (state === "blocked") everBlocked = true;
               progressChanged();
             },
+            silenceMs: () => wire.silenceMs(),
           };
           wire.startHeartbeat(heartbeatMs);
           // The first progress frame is the opt-in for relays (plan §2.6).
