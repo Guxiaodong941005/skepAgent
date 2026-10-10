@@ -1,8 +1,41 @@
 # Skep release record
 
 This document records the package-name decision (v0.1.0), the npm registry re-check, the
-v0.1.0 checklist, the v0.1.1 session-TUI notes, the v0.1.5 peer-progress and TUI notes, and the
-steps the orchestrator runs. Task agents must not `git push`, create tags, or `npm publish`.
+v0.1.0 checklist, the v0.1.1 session-TUI notes, the v0.1.5 peer-progress and TUI notes, the
+v0.1.8 join-UX notes, and the steps the orchestrator runs. Task agents must not `git push`,
+create tags, or `npm publish`.
+
+## v0.1.8 — join UX, clean, submit none, summary (2026-10-10)
+
+The human ordered this release as **0.1.8**. Package name stays **`@skepagent/skep`**
+(public). Bins: `skep` / `skepd` — the published bin is `skep`; `skepd` left the package in
+0.1.2.
+
+What this tag adds on top of v0.1.7 (details in [`../CHANGELOG.md`](../CHANGELOG.md)):
+
+* **`/clean`** (alias `/clear`): leave the session and return to `no session` without leaving
+  the shell. A live master in another process is never stopped.
+* **Pasteable `/join` line** plus **`--advertise`**: `/start` and `skep session start` print a
+  `/join --host … --code … --repo …` line peers can paste. `--advertise` is the address they
+  dial; `--listen` stays the bind address.
+* **Peer default auto mode**: a join runs master-driven items without a skep prompt. `--manual`
+  opts out and confirms each item (`[Y/n]`).
+* **Submit policy default `none`**: a finished item is committed on its local session branch and
+  nobody is prompted. `--submit` and `device.toml` `[submit]` still choose `pr`, `mr`, `push`,
+  or `ask`.
+* **Agent result summary on the master**: when a result is accepted, the master's scrollback
+  shows `item I-x: …` (redacted, capped). A rejection is `result rejected I-x: <reason>`.
+
+Compatibility: upgrade both devices. The wire protocol is unchanged; these are shell and
+default-policy changes.
+
+Install:
+
+```bash
+npm install -g @skepagent/skep@0.1.8
+```
+
+---
 
 ## v0.1.7 — TUI/session reliability (2026-10-10)
 

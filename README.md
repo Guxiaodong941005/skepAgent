@@ -6,14 +6,14 @@ Skep lets AI coding agents on different machines (laptop, GPU rig, always-on ser
 through an encrypted session channel. Bare `skep` opens the Skep shell. Credentials never leave
 the device that owns them.
 
-> **v0.1.7 — unified shell.** Bare `skep` opens one screen (logo, scrollback, `/` commands,
-> bee progress under the input). Multi-device work still uses live join-code sessions.
-> The signed git blackboard and `skepd` were removed in 0.1.2.
+> **v0.1.8 — join UX.** `/clean`, a pasteable `/join` line (`--advertise`), peer auto mode,
+> submit default `none`, and agent summaries on the master scrollback. Bare `skep` still
+> opens one screen. The signed git blackboard and `skepd` were removed in 0.1.2.
 
 ## Install
 
 ```bash
-npm install -g @skepagent/skep@0.1.7
+npm install -g @skepagent/skep@0.1.8
 ```
 
 Requires Node.js ≥ 22.12 (macOS & Linux).

@@ -11,6 +11,10 @@ protocol rules ([`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §4.4) apply to t
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-10-10
+
+Join UX for the unified shell: pasteable `/join`, peer auto mode, submit default `none`, and agent summaries on the master.
+
 ### Added
 
 * Shell command `/clean` (alias `/clear`): ends this shell's master and join, cancels a join
@@ -322,7 +326,8 @@ creates the npm org `skepagent` and explicitly says go. See [`docs/RELEASE.md`](
 * Manual lease revoke; no auto-merge. The human holds plan approval, escalation decisions and
   merges.
 
-[Unreleased]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.7...HEAD
+[Unreleased]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.2...v0.1.5
