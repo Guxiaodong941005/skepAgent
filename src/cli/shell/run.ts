@@ -40,7 +40,7 @@ import {
 import { CliError } from "../output.js";
 import { createTheme, detectColorLevel, detectScheme } from "../theme.js";
 import { detectGlyphs, type ProcessHooks, Screen, type ScreenIo, TICK_MS } from "../tui.js";
-import { parseFlags } from "./flags.js";
+import { parseFlags, quoteSlashWord } from "./flags.js";
 import { backspace, decodeShellKeys, insertText, menuQuery, type ShellKey } from "./input.js";
 import { JOIN_USAGE, parseJoinArgs } from "./join-args.js";
 import { ShellModel, type ShellPeer, type ShellTone } from "./model.js";
@@ -572,6 +572,9 @@ export class Shell {
     return [
       ...shown.map((command, i) => `${(labels[i] ?? "").padEnd(width)}  ${command.description}`),
       "text without / is sent as an intent to this device's session master (needs a joined peer)",
+      "/start: --listen is the address to bind, --advertise the one peers dial (default: listen)",
+      "/join: auto by default (master drives work, only submit may ask); --manual confirms each",
+      "  item first; --submit pr|mr|push|none|ask overrides device.toml",
       "advanced: `skep tui` opens the raw agent TUI",
     ].join("\n");
   }
@@ -784,7 +787,7 @@ export class Shell {
     const rejoin =
       this.quitting === null && reason !== "sub_closed"
         ? "\nthe join code is single-use: ask the master for its current code, then\n" +
-          `/join --host ${flow.target} --code <code> --repo ${flow.repo}`
+          `/join --host ${flow.target} --code <code> --repo ${quoteSlashWord(flow.repo)}`
         : "";
     this.log(`left the session (${explainReason(reason)})${rejoin}`, "event");
     this.sync();
@@ -889,7 +892,9 @@ export class Shell {
   // Questions (join prompts, submit choices) take the input box one at a time.
 
   ask(question: string): Promise<string | null> {
-    if (this.quitting !== null) return Promise.resolve(null);
+    // While `/clean` runs, the flows it is ending may still ask: a queued manual item question is
+    // released by the very answer `/clean` gives the one in front of it. Nothing is asked then.
+    if (this.quitting !== null || this.cleaning !== null) return Promise.resolve(null);
     return new Promise((resolve) => {
       this.questions.push({ text: question, resolve });
       if (this.questions.length === 1) this.showQuestion();

@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { skepPaths } from "../../config/paths.js";
 import type { Clock } from "../../util/clock.js";
 import {
@@ -337,6 +337,28 @@ describe("unified shell", () => {
     await h.shell.quit();
   });
 
+  it("/start never starts a master on a wildcard or blank --advertise host", async () => {
+    const h = await harness();
+    await h.shell.submit("/start --yes --repo app --advertise *:7419");
+    expect(h.scrollback()).toContain("--advertise must name one interface address, not a wildcard");
+    await h.shell.submit('/start --yes --repo app --advertise " :7419"');
+    expect(h.scrollback()).toContain('--advertise must name a hostname or IP address, got " "');
+    expect(h.fake.calls.master).toHaveLength(0);
+    await h.shell.quit();
+  });
+
+  it("pastes a repo with spaces as one quoted word that /join reads back", async () => {
+    const h = await harness();
+    await h.shell.submit('/start --yes --repo "my app"');
+    expect(h.scrollback()).toContain('--code 1234-5678-9012 --repo "my app"');
+    expect(h.scrollback()).toContain("--repo 'my app'");
+    await h.shell.submit("/clean");
+    await h.shell.submit('/join --host 192.168.1.20:7419 --code 1234-5678-9012 --repo "my app"');
+    expect(h.fake.calls.sub[0]?.code).toBe("123456789012");
+    expect(h.scrollback()).toContain("joined session S-1 at 192.168.1.20:7419 as peer-1");
+    await h.shell.quit();
+  });
+
   it("asks the human before accepting a join and takes the answer from the input", async () => {
     const h = await harness();
     await h.shell.submit("/start --repo app");
@@ -471,6 +493,39 @@ describe("unified shell", () => {
     expect(h.scrollback()).toContain(
       "as peer-1 (manual: you confirm each item before it runs; submit: none)",
     );
+    await h.shell.quit();
+  });
+
+  it("/clean drops manual item questions, also the one queued behind the first", async () => {
+    const h = await harness();
+    await h.shell.submit(
+      "/join --host 192.168.1.20:7419 --code 1234-5678-9012 --repo app --manual --submit none",
+    );
+    const sub = h.fake.calls.sub[0];
+    if (sub === undefined) throw new Error("no join");
+    const item = (n: number) => ({
+      itemId: `I-${n}`,
+      repo: "app",
+      assignee: "peer-1",
+      epoch: 1,
+      title: `item ${n}`,
+      datalistEntries: 0,
+    });
+    const first = sub.onItem(item(1));
+    const second = sub.onItem(item(2));
+    await vi.waitFor(() => expect(h.shell.model.question).toContain("Run item I-1"));
+    await h.shell.submit("/clean");
+    const results = await Promise.all([first, second]);
+    for (const result of results) {
+      expect(result?.checks).toEqual([{ name: "peer", status: "skip" }]);
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(h.shell.model.question).toBeNull();
+    expect(h.scrollback()).not.toContain("Run item I-2");
+    expect(h.shell.model.header.session).toBe("no session");
+    // The next command runs as a command, not as an answer to a stale question.
+    await h.shell.submit("/help");
+    expect(h.scrollback()).toMatch(/\/clean\s+end local session/);
     await h.shell.quit();
   });
 

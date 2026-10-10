@@ -23,7 +23,16 @@ Trial use showed two gaps.
 ```
 
 `formatJoinCli` returns its twin, `skep session join --host … --code … --repo …`. `joinHint`
-prints both lines. Every place that tells a human how to join uses them:
+prints both lines.
+
+Repo names are free text (`RepoRefSchema`; the default is the checkout's directory name), so
+the line quotes them. The slash parser (`src/cli/shell/flags.ts`) understands `"…"` with `\"`
+and `\\` escapes; a word that starts with a quote is always a value, never an option.
+`quoteSlashWord` is its inverse: safe words stay bare, everything else is quoted, so
+`formatJoinPaste` → `parseJoinArgs` round-trips spaces, option-like text and metacharacters.
+The CLI twin is POSIX single-quoted (`quoteShellWord`). A repo with control characters cannot
+be typed into the input box; the paste line then leaves `--repo` out and a note says to join
+from that checkout. Every place that tells a human how to join uses them:
 
 * `/start` and `skep session start`, through the shared `startedText` banner;
 * code rotation: the shell's `onJoinCode` log and the CLI's `join-code` line;
@@ -40,7 +49,9 @@ The peer's own "left the session" line cannot know the master's new code. It pri
 `/start --advertise <host:port>` and `skep session start --advertise <host:port>` set the address
 **peers dial**. `--listen` stays the **bind** address. The paste line uses advertise when it is
 set, else listen; the banner adds `peers dial <advertise>` only when the two differ. Advertise is
-validated exactly as `--listen` (`concreteHostPort`: host:port, no wildcard) and kept on
+validated exactly as `--listen` by `concreteHostPort`, before any master starts: host:port; the
+host a hostname, IPv4 or bracketed IPv6 literal; no wildcard (`*`, `0.0.0.0`, `::`), blank or
+stray text. It is kept on
 `MasterFlow.advertise`, so rotation lines and `noPeersText` stay correct. `--machine` output
 reports `advertise` in the `started` event.
 
@@ -61,7 +72,9 @@ announced:
   (EOF, `/clean`) declines it. A declined item is reported to the master with
   `checks: [{ name: "peer", status: "skip" }]` and submit state `skipped`; no branch or
   worktree is created. The question waits for the terminal like a PTY run, so it never prompts
-  while an agent owns the screen.
+  while an agent owns the screen. A closing join (abort signal) asks nothing more, and the shell
+  asks nothing while `/clean` runs: answering the front question would otherwise release the
+  next queued one into an idle shell.
 
 The joined line names the mode, e.g.
 `joined session S-1 at host:port as peer-2 (auto: master drives work; submit still asks unless
@@ -85,6 +98,7 @@ and the join flag is enough to opt out.
 * `src/cli/shell/run.ts`: `/start --advertise`, banner, rotation paste line, peer-left and rejoin
   hints, `/join --manual --submit`.
 * `src/cli/shell/join-args.ts`: `--manual`, `--submit`, `JOIN_USAGE`.
+* `src/cli/shell/flags.ts`: double-quoted words, `quoteSlashWord`.
 * `src/cli/shell/session-controller.ts`: `SessionView.master.advertise`,
   `noPeersText(host, code, repo)`.
 * Tests: `join-args.test.ts`, `run.test.ts`, `session-controller.test.ts`, `session.test.ts`.
@@ -98,7 +112,11 @@ and the join flag is enough to opt out.
 * `noPeersText` includes repo and uses the advertise address;
 * join is auto by default (joined line, `--machine` `control`, no per-item question);
   `--manual` asks, Enter runs, `n` declines without a checkout; `--manual --ui` refused;
-* existing submit-ask tests still pass.
+* existing submit-ask tests still pass;
+* review fixes: paste-line round-trips (spaces, option-like text, shell metacharacters, quotes,
+  control characters), the CLI twin read back by a real `sh`, invalid `--advertise`/`--listen`
+  never reaching `startMaster` (CLI and `/start`), and two concurrent manual items with `/clean`
+  during the first question leaving no question and a working `/help`.
 
 ## Out of scope
 

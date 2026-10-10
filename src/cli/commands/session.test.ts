@@ -18,6 +18,7 @@ import {
   encodeFrame,
   expandStartWithMaster,
   FrameDecoder,
+  formatJoinCli,
   herdrAgentName,
   type ItemWorker,
   type JoinView,
@@ -347,6 +348,50 @@ describe("session start", () => {
     expect(started).toMatchObject({ listen: "10.1.2.3:7500", advertise: "10.1.2.3:7500" });
     fake.closed.resolve();
     expect(await run).toBe(0);
+  });
+
+  it.each([
+    "*:7419",
+    " :7419",
+    "a b:7419",
+    "0.0.0.0:7419",
+    "[::]:7419",
+    "-x:7419",
+    "host:0",
+    "host",
+  ])("--advertise %j never reaches startMaster", async (advertise) => {
+    const fake = fakeApi("10.1.2.3:7500");
+    const c = capture(await home(), { sessionApi: fake.api });
+    const argv = ["--machine", "session", "start", "--yes", "--repo", "app"];
+    expect(await runCli([...argv, `--advertise=${advertise}`], c.ctx)).toBe(2);
+    expect(JSON.parse(c.stdout).error.message).toMatch(/^--advertise must/);
+    expect(fake.calls.master).toHaveLength(0);
+  });
+
+  it("--listen gets the same host checks", async () => {
+    const fake = fakeApi("10.1.2.3:7500");
+    const c = capture(await home(), { sessionApi: fake.api });
+    const argv = ["--machine", "session", "start", "--yes", "--repo", "app", "--listen=*:7419"];
+    expect(await runCli(argv, c.ctx)).toBe(2);
+    expect(JSON.parse(c.stdout).error.message).toMatch(/--listen must name one interface/);
+    expect(fake.calls.master).toHaveLength(0);
+  });
+
+  it("shell-quotes the CLI twin so a shell reads back the same arguments", async () => {
+    const repo = "it's my app; false $(x) `y` | z";
+    const twin = formatJoinCli({ host: "[fe80::1]:7419", code: "863217270308", repo });
+    expect(twin.startsWith("skep session join ")).toBe(true);
+    // The twin is meant for a shell, so a real POSIX shell is the oracle here.
+    const args = twin.slice("skep session join ".length);
+    const { stdout } = await execFileP("sh", ["-c", `set -- ${args}; printf '%s\\0' "$@"`]);
+    expect(stdout.split("\0").slice(0, -1)).toEqual([
+      "--host",
+      "[fe80::1]:7419",
+      "--code",
+      "8632-1727-0308",
+      "--repo",
+      repo,
+    ]);
   });
 
   it("asks on stdin and accepts y", async () => {

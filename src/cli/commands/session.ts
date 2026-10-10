@@ -51,6 +51,7 @@ import { atomicWrite, safeJoin } from "../../util/fs.js";
 import { cryptoRandom } from "../../util/random.js";
 import type { CliContext } from "../context.js";
 import { CliError, EXIT } from "../output.js";
+import { quoteSlashWord } from "../shell/flags.js";
 
 export const DEFAULT_PORT = 7419;
 const SESSION_FILE = "session.json";
@@ -373,13 +374,18 @@ export function parseHostPort(value: string): HostPort | null {
   return { host, port };
 }
 
-/** `host:port` naming one address: `--listen` binds it, `--advertise` is what peers dial. */
+/**
+ * `host:port` naming one address: `--listen` binds it, `--advertise` is what peers dial. The host
+ * must be a hostname, an IPv4 address or a bracketed IPv6 literal; wildcards and stray text
+ * (spaces, `*`, quotes) are refused before any master starts.
+ */
 function concreteHostPort(flag: string, value: string): HostPort {
   const parsed = parseHostPort(value);
   if (parsed === null) {
     throw new CliError("bad_listen", `${flag} must be host:port, got ${value}`, EXIT.usage);
   }
-  // A wildcard bind would expose the join handshake and control port on every interface.
+  // A wildcard bind would expose the join handshake and control port on every interface, and a
+  // wildcard advertise is no address a peer can dial.
   if (isWildcard(parsed.host)) {
     throw new CliError(
       "bad_listen",
@@ -387,11 +393,24 @@ function concreteHostPort(flag: string, value: string): HostPort {
       EXIT.usage,
     );
   }
+  const host = parsed.host.includes(":") ? IPV6_HOST_RE : NAME_HOST_RE;
+  if (!host.test(parsed.host)) {
+    throw new CliError(
+      "bad_listen",
+      `${flag} must name a hostname or IP address, got ${JSON.stringify(parsed.host)}`,
+      EXIT.usage,
+    );
+  }
   return parsed;
 }
 
+/** A hostname or IPv4 address: DNS label characters, not starting with `-` or `.`. */
+const NAME_HOST_RE = /^[A-Za-z0-9_][A-Za-z0-9._-]*$/;
+/** An IPv6 literal (from `[v6]:port`), optionally with a zone id. */
+const IPV6_HOST_RE = /^[0-9A-Fa-f:.]+(%[A-Za-z0-9._-]+)?$/;
+
 function isWildcard(host: string): boolean {
-  return host === "0.0.0.0" || host === "::" || /^[0:]+$/.test(host);
+  return host === "*" || host === "0.0.0.0" || host === "::" || /^[0:]+$/.test(host);
 }
 
 /**
@@ -434,20 +453,50 @@ export interface JoinTarget {
   repo: string;
 }
 
-/** The one line a peer pastes into its skep shell to join (docs/plans/join-paste-auto.md). */
-export function formatJoinPaste({ host, code, repo }: JoinTarget): string {
-  return `/join --host ${host} --code ${formatJoinCode(code)} --repo ${repo}`;
+/**
+ * A repo the paste line can carry. Control characters (a newline would submit the input early)
+ * cannot be typed into the shell's input box, so such a repo is left out and named instead.
+ */
+function pasteableRepo(repo: string): boolean {
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: control characters are the point.
+  return !/[\u0000-\u001f\u007f]/.test(repo);
 }
 
-/** The same join for a plain shell. */
+/**
+ * The one line a peer pastes into its skep shell to join (docs/plans/join-paste-auto.md). Each
+ * value is quoted for the slash grammar, so `parseJoinArgs` reads back exactly these values.
+ */
+export function formatJoinPaste({ host, code, repo }: JoinTarget): string {
+  const base = `/join --host ${quoteSlashWord(host)} --code ${formatJoinCode(code)}`;
+  return pasteableRepo(repo) ? `${base} --repo ${quoteSlashWord(repo)}` : base;
+}
+
+/** A POSIX shell word: bare when safe, else single-quoted. */
+export function quoteShellWord(value: string): string {
+  if (/^[A-Za-z0-9._/:@%+=,-]+$/.test(value)) return value;
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+/** The same join for a plain shell; every argument is shell-quoted. */
 export function formatJoinCli({ host, code, repo }: JoinTarget): string {
-  return `skep session join --host ${host} --code ${formatJoinCode(code)} --repo ${repo}`;
+  return [
+    "skep session join --host",
+    quoteShellWord(host),
+    "--code",
+    formatJoinCode(code),
+    "--repo",
+    quoteShellWord(repo),
+  ].join(" ");
 }
 
 /** What a master prints so a peer can join: the paste line first, then its CLI twin. */
 export function joinHint(target: JoinTarget): string {
+  const note = pasteableRepo(target.repo)
+    ? ""
+    : `\n(repo ${JSON.stringify(target.repo)} cannot be pasted: join from that checkout, ` +
+      "whose directory name is the default --repo)";
   return (
-    `on another device, paste into skep: ${formatJoinPaste(target)}\n` +
+    `on another device, paste into skep: ${formatJoinPaste(target)}${note}\n` +
     `or from a shell: ${formatJoinCli(target)}`
   );
 }
@@ -1418,9 +1467,14 @@ function clipSummary(text: string): string {
  */
 async function confirmItem(worker: ItemWorker, item: PlanItem): Promise<boolean> {
   const exclusive = worker.terminal ?? ((fn) => fn());
-  const answer = await exclusive(() =>
-    worker.ask(`Run item ${item.itemId} (${item.repo}): ${item.title}? [Y/n] `),
+  // A join that is closing asks nothing more: questions queued behind the current one are
+  // dropped instead of surfacing after the session ended.
+  const answer = await exclusive(async () =>
+    worker.signal?.aborted === true
+      ? null
+      : worker.ask(`Run item ${item.itemId} (${item.repo}): ${item.title}? [Y/n] `),
   );
+  if (worker.signal?.aborted === true) return false;
   return answer !== null && /^\s*(y(es)?)?\s*$/i.test(answer);
 }
 

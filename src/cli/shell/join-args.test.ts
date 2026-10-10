@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { formatJoinPaste, joinHint } from "../commands/session.js";
 import { JOIN_USAGE, parseJoinArgs } from "./join-args.js";
 
 describe("parseJoinArgs", () => {
@@ -65,5 +66,44 @@ describe("parseJoinArgs", () => {
     expect(JOIN_USAGE.split("\n")[0]).toBe(
       "usage: /join --host <host:port> --code <NNNN-NNNN-NNNN> --repo <repo>",
     );
+  });
+});
+
+describe("the pasteable /join line round-trips", () => {
+  it.each([
+    "app",
+    "my app",
+    "app --submit push",
+    "app; false",
+    "it's $(rm -rf) `x` | y & z",
+    'quote " and back\\slash',
+    "--manual",
+    "-x",
+    "naïve 名前",
+    "  padded  ",
+  ])("repo %j", (repo) => {
+    const line = formatJoinPaste({ host: "[fe80::1]:7419", code: "863217270308", repo });
+    expect(line.startsWith("/join ")).toBe(true);
+    expect(parseJoinArgs(line.slice("/join ".length))).toEqual({
+      host: "[fe80::1]:7419",
+      code: "8632-1727-0308",
+      repo,
+    });
+  });
+
+  it("keeps a plain repo bare", () => {
+    expect(formatJoinPaste({ host: "h:1", code: "863217270308", repo: "skep-agent" })).toBe(
+      "/join --host h:1 --code 8632-1727-0308 --repo skep-agent",
+    );
+  });
+
+  it("leaves out a repo the input box cannot take, and says why", () => {
+    const target = { host: "h:1", code: "863217270308", repo: "a\nb" };
+    expect(formatJoinPaste(target)).toBe("/join --host h:1 --code 8632-1727-0308");
+    expect(joinHint(target)).toContain('(repo "a\\nb" cannot be pasted: join from that checkout');
+  });
+
+  it("refuses an unterminated quote", () => {
+    expect(() => parseJoinArgs('--repo "my app')).toThrow(/unterminated quote/);
   });
 });
