@@ -112,6 +112,18 @@ export class SessionController {
     this.roster = [];
   }
 
+  /**
+   * Drops a join still in its handshake; its flow is refused by {@link joinStarted} when it
+   * arrives. Returns the dropped target, or null when no join was in flight.
+   */
+  abortJoin(): string | null {
+    const joining = this.joining;
+    if (joining === null) return null;
+    this.joining = null;
+    this.roster = [];
+    return joining.target;
+  }
+
   /** False when `flow` is not the current join. */
   joinEnded(flow: JoinFlow): boolean {
     if (this.join !== flow) return false;
@@ -139,6 +151,12 @@ export class SessionController {
   /** Any discovery in flight is now stale (an own flow started, or the shell is leaving). */
   invalidateProbes(): void {
     this.probeGeneration += 1;
+  }
+
+  /** Forgets a master in another process; any discovery in flight no longer applies. */
+  clearExternal(): void {
+    this.external = null;
+    this.invalidateProbes();
   }
 
   /**

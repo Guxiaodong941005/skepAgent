@@ -1845,6 +1845,55 @@ async function refuseIfRunning(file: string): Promise<void> {
   );
 }
 
+export type StaleSessionFile =
+  | { kind: "none" }
+  | { kind: "live"; listen: string }
+  | { kind: "removed"; listen: string | null };
+
+/**
+ * Removes `session.json` when no master answers behind it (its process is gone, or the file is
+ * corrupt). A master that answers is left alone: clearing this device never stops another
+ * process. The file is only removed while it still holds the token that was probed, so a master
+ * that published itself meanwhile keeps its file.
+ */
+export async function clearStaleSessionFile(
+  ctx: CliContext,
+  clock: Clock,
+  timeoutMs: number = PROBE_TIMEOUT_MS,
+): Promise<StaleSessionFile> {
+  const file = sessionFilePath(ctx);
+  let existing: SessionFile | null;
+  try {
+    existing = await readSessionFile(file);
+  } catch (error) {
+    // A corrupt file cannot point at a live master (see `refuseIfRunning`).
+    if (error instanceof CliError && error.code === "bad_session_file") {
+      await rm(file, { force: true });
+      return { kind: "removed", listen: null };
+    }
+    throw error;
+  }
+  if (existing === null) return { kind: "none" };
+  const target = parseHostPort(existing.listen);
+  if (target !== null) {
+    try {
+      await controlRequest(
+        target,
+        { type: "control", v: 1, token: existing.token, op: "status" },
+        clock,
+        timeoutMs,
+      );
+      return { kind: "live", listen: existing.listen };
+    } catch (error) {
+      // Anything other than "nobody answered" means a process listens there: keep its file.
+      if (!(error instanceof ControlConnectionError))
+        return { kind: "live", listen: existing.listen };
+    }
+  }
+  await removeOwnSessionFile(file, existing.token);
+  return { kind: "removed", listen: existing.listen };
+}
+
 /** Remove the control file only if it is still ours. */
 async function removeOwnSessionFile(file: string, token: string): Promise<void> {
   const current = await readSessionFile(file).catch(() => null);

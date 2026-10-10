@@ -17,6 +17,7 @@ import {
   type AgentView,
   type ControlEndpoint,
   checkIntent,
+  clearStaleSessionFile,
   fetchSessionStatus,
   fetchSessionStatusAt,
   INTENT_OUTCOME_UNKNOWN,
@@ -117,6 +118,7 @@ export class Shell {
   private readonly finished: Promise<void>;
   /** Commands run one at a time, in the order they were entered. */
   private queue: Promise<void> = Promise.resolve();
+  private cleaning: Promise<SlashResult> | null = null;
 
   private readonly onData = (chunk: Buffer | string): void => {
     for (const key of decodeShellKeys(chunk)) this.guard(() => this.onKey(key));
@@ -173,6 +175,11 @@ export class Shell {
     const line = text.trim();
     if (line === "") return Promise.resolve();
     this.log(`> ${line}`, "muted");
+    const slash = parseSlash(line);
+    // `/clean` must not wait behind a `/join` stuck in its handshake: it is how that join ends.
+    if (slash !== null && findCommand(this.commands, slash.name)?.name === "clean") {
+      return this.dispatch(line);
+    }
     const run = this.queue.then(() => this.dispatch(line));
     this.queue = run.catch(() => undefined);
     return run;
@@ -524,6 +531,12 @@ export class Shell {
         run: (_ctx, args) => this.agentCommand(args),
       },
       {
+        name: "clean",
+        aliases: ["clear"],
+        description: "end local session(s) and clear connection state (stay in shell)",
+        run: () => this.clean(),
+      },
+      {
         name: "help",
         description: "list commands",
         run: (ctx) => ({ type: "ok", message: this.helpText(ctx) }),
@@ -637,9 +650,14 @@ export class Shell {
   private async joinCommand(args: string): Promise<SlashResult> {
     const busy = this.session.ownJoin;
     if (busy !== null) {
-      return { type: "error", message: `already joined (${busy.target}); /quit to leave` };
+      return {
+        type: "error",
+        message: `already joined (${busy.target}); /clean leaves the session, /quit leaves the shell`,
+      };
     }
-    if (this.session.joinBusy) return { type: "error", message: "a join is already in progress" };
+    if (this.session.joinBusy) {
+      return { type: "error", message: "a join is already in progress; /clean cancels it" };
+    }
     const parsed = parseJoinArgs(args);
     let code = parsed.code;
     let host = parsed.host;
@@ -731,6 +749,75 @@ export class Shell {
     this.sync();
     // A self-join of a master in another process can drop while that master lives on.
     void this.probeExternal();
+  }
+
+  /** One `/clean` at a time; a second one while it runs just waits for the first. */
+  private clean(): Promise<SlashResult> {
+    if (this.cleaning === null) {
+      this.cleaning = this.cleanCommand().finally(() => {
+        this.cleaning = null;
+      });
+    }
+    return this.cleaning;
+  }
+
+  /**
+   * Ends every session this shell holds and clears what is left of a dead one, staying in the
+   * shell (docs/plans/tui-clean.md). Another process's live master is never stopped.
+   */
+  private async cleanCommand(): Promise<SlashResult> {
+    const cleared: string[] = [];
+    const problems: string[] = [];
+    for (const question of this.questions.splice(0)) question.resolve(null);
+    this.model.question = null;
+    // A handshake still running is refused by `joinStarted`, and `joinCommand` closes its flow.
+    const dropped = this.session.abortJoin();
+    if (dropped !== null) cleared.push(`cancelled join of ${dropped}`);
+    const join = this.session.ownJoin;
+    if (join !== null) {
+      await join.close().catch((error) => problems.push(errorMessage(error)));
+      // Ended here rather than in `joinEnded`: the shell is idle once this returns.
+      this.session.joinEnded(join);
+      cleared.push(`left ${join.target} as ${join.handle.peerId}`);
+    }
+    const master = this.session.ownMaster;
+    if (master !== null) {
+      await master.close().catch((error) => problems.push(errorMessage(error)));
+      this.session.masterEnded(master);
+      cleared.push(`stopped master on ${master.listen}`);
+    }
+    this.session.clearExternal();
+    let liveElsewhere: string | null = null;
+    try {
+      const stale = await clearStaleSessionFile(this.ctx, this.clock, PROBE_TIMEOUT_MS);
+      if (stale.kind === "removed") {
+        const was = stale.listen === null ? "unreadable" : `master at ${stale.listen} gone`;
+        cleared.push(`removed stale session.json (${was})`);
+      } else if (stale.kind === "live") {
+        liveElsewhere = stale.listen;
+      }
+    } catch (error) {
+      problems.push(`session.json: ${errorMessage(error)}`);
+    }
+    this.sync();
+    const lines: string[] = [];
+    if (cleared.length > 0) lines.push(`cleared: ${cleared.join("; ")} — session idle`);
+    if (liveElsewhere !== null) {
+      // Shown again so intents still have somewhere to go; it is not this shell's to stop.
+      await this.probeExternal();
+      lines.push(
+        `a session master in another process still runs at ${liveElsewhere}; ` +
+          "/clean does not stop other processes — quit that shell to end it",
+      );
+    }
+    if (lines.length === 0) lines.push("nothing to clean — no session on this device");
+    if (problems.length > 0) {
+      return {
+        type: "error",
+        message: [...lines, ...problems.map((p) => `problem: ${p}`)].join("\n"),
+      };
+    }
+    return { type: "ok", message: lines.join("\n") };
   }
 
   private agentCommand(args: string): SlashResult {
