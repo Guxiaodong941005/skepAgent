@@ -7,7 +7,7 @@ Branch: `feat/tui-session-reliability` (from `main` @ `d4095f9`). Plan:
 > decides the release (changes are under `CHANGELOG.md` `[Unreleased]`).
 
 Gate on the final commit: `npm run lint && npm test && npm run build` are green here (30 test
-files, 530 tests). Several tests (shell external-master cases, `master.presence.test.ts`, CLI
+files, 538 tests). Several tests (shell external-master cases, `master.presence.test.ts`, CLI
 work-item tests) need loopback listeners; the reviewer's sandbox denied `listen` (`EPERM`), so
 run the gate where `127.0.0.1` listeners are allowed.
 
@@ -15,7 +15,7 @@ run the gate where `127.0.0.1` listeners are allowed.
 
 | Finding | Fix | Commit | Regression tests |
 | --- | --- | --- | --- |
-| B1 — external intents not bound to the displayed master | The controller stores an external master as `{ endpoint: { listen, token }, status }`. Intents go to exactly that endpoint (`submitIntentAt`). Before sending, `session.json` must still name the same endpoint; a changed file, a `bad_token` (replacement on the same port) or an unreachable endpoint sends nothing, re-discovers, and reports `the session master on this device changed (was …); the intent was not sent` plus what is shown now. A `no_match` is explained from a fresh status of the routed endpoint. | `4d0f0eb` | `run.test.ts`: "never sends an intent to a replacement master…" (A→B swap, different repo; resend goes to B on purpose), "rejects an intent when the shown master's endpoint stopped accepting its token" |
+| B1 — external intents not bound to the displayed master | The controller stores an external master as `{ endpoint: { listen, token }, status }`. Intents go to exactly that endpoint (`submitIntentAt`). Before sending, `session.json` must still name the same endpoint; a changed file, a `bad_token` (replacement on the same port) or a refused connection delivers nothing, re-discovers, and reports `the session master on this device changed (was …); the intent was not sent` plus what is shown now. A lost reply after sending is **not** reported this way (see R1 below). A `no_match` is explained from a fresh status of the routed endpoint. | `4d0f0eb` | `run.test.ts`: "never sends an intent to a replacement master…" (A→B swap, different repo; resend goes to B on purpose), "rejects an intent when the shown master's endpoint stopped accepting its token" |
 | B2 — failed/ended join forgets a live external master | `probeExternal()` runs after a failed join, an ended join and an ended own master. It reads `session.json` and a fresh `status`; the old snapshot is never restored. | `4d0f0eb` | `run.test.ts`: external → join rejected → external; external → self-joined → `heartbeat_timeout` → external |
 | B3 — concurrent probes overwrite newer truth | `beginProbe()` / `applyProbe(generation, found)`: only the newest discovery applies; `setMaster`, `beginJoin` and shutdown call `invalidateProbes()`. Discovery uses a 2 s status timeout. | `4d0f0eb` | `session-controller.test.ts`: older-fail-after-newer-success, older-success-after-newer-miss, probe across `/start` and across a failed join, shutdown; `run.test.ts`: held startup probe completing after `/start` |
 
@@ -25,6 +25,18 @@ spaces not — the shell splits arguments on whitespace and has no quoting). The
 longer claims the views "can no longer disagree". Not taken (follow-ups): heartbeat-reset and
 real 30 s timeout tests with a firing clock, sleep/wake and rejoin-after-expiry tests, and a
 specific diagnosis of which git callback failed in `callback_error`.
+
+## Fix round 2 — R1 (review appendix, verdict FAIL on R1; B1–B3 confirmed fixed)
+
+| Finding | Fix | Commit | Regression tests |
+| --- | --- | --- | --- |
+| R1 — a lost intent reply was reported as non-delivery, inviting a duplicate | `ControlConnectionError.requestSent` records whether the request reached the socket. For `intent`, a failure after that (closed after write, reply timeout, malformed control-result) and an `ok` reply with an unreadable id become `intent_outcome_unknown`; `session_unreachable` now means the request never left. The shell re-discovers and says `no reply after the intent was sent — it may have been accepted`, names the master (`the master is still … /status lists its intents`, or that it no longer answers, or that another master is now shown), and warns `sending it again could start the same work twice`. It never says "not sent", "changed" or "resend" for this case. | `2f8db19` | `run.test.ts`: "says an intent may have been accepted when its reply is lost…" (master records the intent, reply dropped; asserts uncertain wording, no "not sent"/"changed"/"resend", still bound to the same master). `session.control.test.ts`: refused → `requestSent: false` / `session_unreachable`; closed after write → `requestSent: true` / `intent_outcome_unknown`; malformed ok id → unknown; `bad_token` stays a rejection; lost `status` reply stays `session_unreachable`. Existing replacement/token tests unchanged and green. |
+
+Delivery guarantees, precisely: the shell reports "not sent" only when non-delivery is known
+(another master published before sending, connection refused, explicit `bad_token`). Any loss
+after the request was written is reported as uncertain. There is no idempotent retry: whether a
+lost-reply intent exists can only be checked with `/status` on that master (a resend creates a
+second intent). Idempotency keys would need a control-protocol change; not done.
 
 ## Bugs addressed
 

@@ -17,9 +17,14 @@ protocol rules ([`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §4.4) apply to t
   slash gating, `/status` and intents read the same snapshot. Peer rows from a join that ended
   are dropped, and a session master running in another process on the same device is detected
   and used instead of reporting `no session`.
-* A master in another process is bound by identity (its control endpoint and token): if it is
-  replaced or stops answering, an intent typed in the shell is not sent anywhere, and the shell
-  says which master it shows now instead of silently sending to the replacement.
+* A master in another process is bound by identity (its control endpoint and token). An intent
+  typed in the shell goes only to the master it shows: if another master is published, the
+  endpoint refuses the connection, or it rejects the token, the intent is not delivered and the
+  shell says which master it shows now. If the intent was sent but no reply came back (connection
+  lost, timeout, malformed reply), the shell says it **may have been accepted**, points at
+  `/status`, and warns that sending it again could duplicate the work.
+* `skep session intent` reports a lost reply as `intent_outcome_unknown` (the intent may exist)
+  instead of `session_unreachable`, which now means the request never reached the master.
 * A failed or ended join (and an ended own master) re-discovers a master still running in
   another process instead of falling back to `no session`. Only the newest discovery applies,
   so an older, slower probe can no longer clear or resurrect the master shown.
