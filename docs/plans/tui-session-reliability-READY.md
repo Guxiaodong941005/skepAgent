@@ -6,8 +6,25 @@ Branch: `feat/tui-session-reliability` (from `main` @ `d4095f9`). Plan:
 > **Do not publish.** No version bump, no tag, no `npm publish`, not merged to `main`. The parent
 > decides the release (changes are under `CHANGELOG.md` `[Unreleased]`).
 
-Gate on the final commit: `npm run lint && npm test && npm run build` are green (30 test files,
-518 tests).
+Gate on the final commit: `npm run lint && npm test && npm run build` are green here (30 test
+files, 530 tests). Several tests (shell external-master cases, `master.presence.test.ts`, CLI
+work-item tests) need loopback listeners; the reviewer's sandbox denied `listen` (`EPERM`), so
+run the gate where `127.0.0.1` listeners are allowed.
+
+## Fix round (review `docs/reviews/tui-session-reliability.md`, verdict FAIL)
+
+| Finding | Fix | Commit | Regression tests |
+| --- | --- | --- | --- |
+| B1 — external intents not bound to the displayed master | The controller stores an external master as `{ endpoint: { listen, token }, status }`. Intents go to exactly that endpoint (`submitIntentAt`). Before sending, `session.json` must still name the same endpoint; a changed file, a `bad_token` (replacement on the same port) or an unreachable endpoint sends nothing, re-discovers, and reports `the session master on this device changed (was …); the intent was not sent` plus what is shown now. A `no_match` is explained from a fresh status of the routed endpoint. | `4d0f0eb` | `run.test.ts`: "never sends an intent to a replacement master…" (A→B swap, different repo; resend goes to B on purpose), "rejects an intent when the shown master's endpoint stopped accepting its token" |
+| B2 — failed/ended join forgets a live external master | `probeExternal()` runs after a failed join, an ended join and an ended own master. It reads `session.json` and a fresh `status`; the old snapshot is never restored. | `4d0f0eb` | `run.test.ts`: external → join rejected → external; external → self-joined → `heartbeat_timeout` → external |
+| B3 — concurrent probes overwrite newer truth | `beginProbe()` / `applyProbe(generation, found)`: only the newest discovery applies; `setMaster`, `beginJoin` and shutdown call `invalidateProbes()`. Discovery uses a 2 s status timeout. | `4d0f0eb` | `session-controller.test.ts`: older-fail-after-newer-success, older-success-after-newer-miss, probe across `/start` and across a failed join, shutdown; `run.test.ts`: held startup probe completing after `/start` |
+
+Non-blocking notes taken: repeated `--host`/`--code` are rejected (`3b1a9dc`); host-only `/join`
+errors show the usage list; `JOIN_USAGE` documents that a code is one word (dashes allowed,
+spaces not — the shell splits arguments on whitespace and has no quoting). The CHANGELOG no
+longer claims the views "can no longer disagree". Not taken (follow-ups): heartbeat-reset and
+real 30 s timeout tests with a firing clock, sleep/wake and rejoin-after-expiry tests, and a
+specific diagnosis of which git callback failed in `callback_error`.
 
 ## Bugs addressed
 
@@ -54,8 +71,19 @@ peer = second machine on the same LAN, both inside a checkout of the **same repo
 7. **Bug 1:** on the master device run `skep session start --yes` in one terminal, then open
    `skep` in another. Expect `a session master runs in another process on this device (…)`,
    header `master (other process) · code …`, `/status` showing the session, peers in the footer.
-   Stop the master: within ~2 s the shell says `the session master at … went away`, header
+   Stop the master: within about 2–4 s (2 s poll plus up to 2 s probe timeout) the shell says `the session master at … went away`, header
    `no session`.
+9. **B1 (master replacement):** with the shell attached as in 7, stop that master and start
+   another one (ideally `--repo other`) in the other terminal *before* typing anything. Type an
+   intent: expect `the session master on this device changed (was …); the intent was not sent`
+   and `now showing …`. The new master's `skep session status` shows no intent. Typing again
+   sends to the new master.
+10. **B2 (rejected self-join):** with the shell attached as in 7, `/join` and answer `n` on the
+    master's prompt. Expect the rejection, then the header back to `master (other process)`
+    without `/status`. Repeat with `y`, then kill the self-join's link (or wait for a timeout):
+    the shell returns to `master (other process)`.
+11. **B3:** while attached, run `/status` several times quickly while the master is slow or
+    briefly stopped/restarted; the header must end in the state the last answer reported.
 8. Repo mismatch: join from a checkout of a different repo name, send an intent on the master.
    Expect `no connected peer works on repo <repo> (peer-N <device>: repo <other>)`.
 

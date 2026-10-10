@@ -14,9 +14,16 @@ protocol rules ([`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §4.4) apply to t
 ### Fixed
 
 * Shell session state has one source of truth (`SessionController`): the header, peer footer,
-  slash gating, `/status` and intents can no longer disagree. Peer rows from a join that ended
+  slash gating, `/status` and intents read the same snapshot. Peer rows from a join that ended
   are dropped, and a session master running in another process on the same device is detected
   and used instead of reporting `no session`.
+* A master in another process is bound by identity (its control endpoint and token): if it is
+  replaced or stops answering, an intent typed in the shell is not sent anywhere, and the shell
+  says which master it shows now instead of silently sending to the replacement.
+* A failed or ended join (and an ended own master) re-discovers a master still running in
+  another process instead of falling back to `no session`. Only the newest discovery applies,
+  so an older, slower probe can no longer clear or resurrect the master shown.
+* `/join` rejects a repeated `--host` or `--code` instead of using the last one.
 * `/join` accepts `/join <host:port> <code>` (either order), `/join <code> --host <host:port>`,
   `/join --host <host:port> --code <code>` and `/join <code>`; other forms are rejected with the
   list of accepted forms instead of `--code must be 12 digits`.
