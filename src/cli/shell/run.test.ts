@@ -774,7 +774,7 @@ describe("/clean", () => {
     await h.shell.quit();
   });
 
-  it("cancels a join stuck in its handshake without waiting for it", async () => {
+  it("cancels a join stuck in its handshake and frees the command queue (review B2)", async () => {
     const h = await harness();
     const release = h.fake.holdJoins();
     const joining = h.shell.submit("/join 1234-5678-9012 --host 192.168.1.20:7419 --repo app");
@@ -783,11 +783,43 @@ describe("/clean", () => {
     await h.shell.submit("/clean");
     expect(h.scrollback()).toContain("cleared: cancelled join of 192.168.1.20:7419");
     expect(h.shell.session.snapshot().mode).toBe("none");
-    // The handshake finishing late must not bring the session back; its flow is closed.
-    release();
+    // The old handshake is still held: the queued /join must have let go anyway.
     await joining;
-    expect(h.fake.subCloses).toHaveLength(1);
+    await h.shell.submit("/help");
+    expect(h.scrollback()).toMatch(/\/status\s+show peers/);
+    await h.shell.submit("/start --yes --repo app");
+    expect(h.shell.session.snapshot().mode).toBe("master");
+    const before = h.scrollback();
+    // The handshake finishing late is closed and cannot touch the new master or the screen.
+    release();
+    await waitFor(() => h.fake.subCloses.length === 1);
+    expect(h.shell.session.snapshot().mode).toBe("master");
+    expect(h.shell.session.ownJoin).toBeNull();
+    expect(h.scrollback().slice(before.length)).not.toContain("joined session");
+    await h.shell.quit();
+  });
+
+  it("runs at a pending prompt, answering every question with no answer (review B1)", async () => {
+    const h = await harness();
+    await h.shell.submit("/start --repo app");
+    const accepted = h.fake.calls.master[0]?.acceptJoin({
+      device: "vps",
+      address: "10.0.0.2",
+      family: "IPv4",
+      fingerprint: "ffff",
+    });
+    const submitChoice = h.shell.ask("submit this item? [pr/mr/push/none/skip]");
+    expect(h.shell.model.question).toContain("accept vps from 10.0.0.2");
+    h.stdin.type("/clean\r");
+    expect(await accepted).toBe(false);
+    expect(await submitChoice).toBeNull();
+    await waitFor(() => h.scrollback().includes("cleared: stopped master"));
+    expect(h.shell.model.question).toBeNull();
     expect(h.shell.session.snapshot().mode).toBe("none");
+    await expect(readFile(path.join(h.dir, "session.json"), "utf8")).rejects.toThrow(/ENOENT/);
+    expect(h.raw.endsWith("\x1b[?1049l")).toBe(false);
+    await h.shell.submit("/status");
+    expect(h.scrollback()).toContain("no session on this device");
     await h.shell.quit();
   });
 

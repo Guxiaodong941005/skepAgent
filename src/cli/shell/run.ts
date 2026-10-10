@@ -119,6 +119,8 @@ export class Shell {
   /** Commands run one at a time, in the order they were entered. */
   private queue: Promise<void> = Promise.resolve();
   private cleaning: Promise<SlashResult> | null = null;
+  /** Releases the `/join` dispatch waiting on a handshake that `/clean` cancelled. */
+  private cancelJoin: (() => void) | null = null;
 
   private readonly onData = (chunk: Buffer | string): void => {
     for (const key of decodeShellKeys(chunk)) this.guard(() => this.onKey(key));
@@ -164,6 +166,11 @@ export class Shell {
 
   /** What Enter does with a line: answer a question, run a slash command, or send an intent. */
   submit(text: string): Promise<void> {
+    // `/clean` also works at a prompt: it answers every pending question with "no answer".
+    if (this.isClean(text)) {
+      this.log(`> ${text.trim()}`, "muted");
+      return this.dispatch(text.trim());
+    }
     const question = this.questions[0];
     if (question !== undefined) {
       this.questions.shift();
@@ -175,14 +182,18 @@ export class Shell {
     const line = text.trim();
     if (line === "") return Promise.resolve();
     this.log(`> ${line}`, "muted");
-    const slash = parseSlash(line);
-    // `/clean` must not wait behind a `/join` stuck in its handshake: it is how that join ends.
-    if (slash !== null && findCommand(this.commands, slash.name)?.name === "clean") {
-      return this.dispatch(line);
-    }
     const run = this.queue.then(() => this.dispatch(line));
     this.queue = run.catch(() => undefined);
     return run;
+  }
+
+  /**
+   * `/clean` (or `/clear`) runs at once, outside the queue and ahead of a pending question: a
+   * `/join` stuck in its handshake holds the queue, and `/clean` is how that join ends.
+   */
+  private isClean(text: string): boolean {
+    const slash = parseSlash(text);
+    return slash !== null && findCommand(this.commands, slash.name)?.name === "clean";
   }
 
   /** Leaves the session (if any), restores the terminal, and ends {@link run}. */
@@ -697,23 +708,42 @@ export class Shell {
     const generation = this.session.beginJoin(host ?? "this device's master");
     this.sync();
     const view = new ShellJoinView(this, generation);
-    let flow: JoinFlow;
+    // A handshake `/clean` cancelled may still talk; it must not reach the screen or the prompt.
+    const current = (): boolean => this.session.isJoinCurrent(generation);
+    const pending = joinSessionFlow(this.ctx, options, {
+      say: (_data, human) => {
+        const text = current() ? human() : "";
+        if (text !== "") this.log(text, "event");
+      },
+      ask: (question) => (current() ? this.ask(question.trim()) : Promise.resolve(null)),
+      warn: (message) => {
+        if (current()) this.log(`skep: ${message}`, "error");
+      },
+      createView: () => view,
+    });
+    const cancel = new Promise<null>((resolve) => {
+      this.cancelJoin = () => resolve(null);
+    });
+    let flow: JoinFlow | null;
     try {
-      flow = await joinSessionFlow(this.ctx, options, {
-        say: (_data, human) => {
-          const text = human();
-          if (text !== "") this.log(text, "event");
-        },
-        ask: (question) => this.ask(question.trim()),
-        warn: (message) => this.log(`skep: ${message}`, "error"),
-        createView: () => view,
-      });
+      flow = await Promise.race([pending, cancel]);
     } catch (error) {
       this.session.joinFailed(generation);
       this.sync();
       // The join is gone, but a master in another process may still run: find it again.
       void this.probeExternal();
       throw error;
+    } finally {
+      this.cancelJoin = null;
+    }
+    if (flow === null) {
+      // `/clean` cancelled the handshake: the queue moves on now, and a flow that still arrives
+      // is closed (its generation is no longer current, so it never becomes the shell's join).
+      pending.then(
+        (late) => late.close().catch(() => undefined),
+        () => undefined,
+      );
+      return { type: "ok" };
     }
     if (this.quitting !== null || !this.session.joinStarted(generation, flow)) {
       // The shell is leaving; it no longer wants this join.
@@ -772,7 +802,10 @@ export class Shell {
     this.model.question = null;
     // A handshake still running is refused by `joinStarted`, and `joinCommand` closes its flow.
     const dropped = this.session.abortJoin();
-    if (dropped !== null) cleared.push(`cancelled join of ${dropped}`);
+    if (dropped !== null) {
+      this.cancelJoin?.();
+      cleared.push(`cancelled join of ${dropped}`);
+    }
     const join = this.session.ownJoin;
     if (join !== null) {
       await join.close().catch((error) => problems.push(errorMessage(error)));
@@ -789,12 +822,17 @@ export class Shell {
     this.session.clearExternal();
     let liveElsewhere: string | null = null;
     try {
-      const stale = await clearStaleSessionFile(this.ctx, this.clock, PROBE_TIMEOUT_MS);
+      const stale = await clearStaleSessionFile(this.ctx, this.clock, {
+        timeoutMs: PROBE_TIMEOUT_MS,
+      });
       if (stale.kind === "removed") {
         const was = stale.listen === null ? "unreadable" : `master at ${stale.listen} gone`;
         cleared.push(`removed stale session.json (${was})`);
       } else if (stale.kind === "live") {
         liveElsewhere = stale.listen;
+      } else if (stale.kind === "replaced") {
+        // Published while /clean ran: kept and shown, like any master in another process.
+        liveElsewhere = "a newly published endpoint (it started while cleaning)";
       }
     } catch (error) {
       problems.push(`session.json: ${errorMessage(error)}`);

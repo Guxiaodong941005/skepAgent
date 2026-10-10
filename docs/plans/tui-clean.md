@@ -18,17 +18,21 @@ holds the queue, and `/clean` is how the human gets out of it.
 In order:
 
 1. Pending questions (join prompts, accept-join, submit choice) are answered with "no answer".
-2. A join attempt in flight is dropped from the controller (`SessionController.abortJoin`). When
-   the handshake finishes later, `joinStarted` refuses it and `joinCommand` closes the flow (the
-   same path `/quit` uses).
+   `/clean` typed at a prompt runs the command; it is not taken as the answer.
+2. A join attempt in flight is dropped from the controller (`SessionController.abortJoin`) and
+   its `/join` dispatch is released at once, so the command queue moves on. A flow that still
+   arrives later is closed; its generation is stale, so it cannot log, ask or become the join.
 3. The shell's own join is closed (`JoinFlow.close`, peer disconnect).
 4. The shell's own master is closed (`MasterFlow.close`; it removes its own `session.json`).
 5. External probe state is dropped (`SessionController.clearExternal`, which also invalidates any
    discovery in flight).
 6. `clearStaleSessionFile` (session.ts) looks at what is left of `session.json`:
    * absent → nothing to do;
-   * corrupt, or its master does not answer `status` within the probe timeout → the file is
-     removed (only if it still holds the same token, so a master that just started is safe);
+   * corrupt, or its endpoint refuses the connection (the request never left) → the file is
+     removed. It is renamed aside first and only deleted if the moved bytes are exactly the ones
+     judged stale; anything else is linked back, so a master publishing meanwhile keeps its file;
+   * an endpoint that accepts the request but replies late, malformed or not at all is treated
+     as live (kept);
    * a master answers → it is a **live master in another process**. `/clean` never stops another
      process; the shell re-discovers it and says so (quit that shell to end it).
 7. The UI syncs to the snapshot: `mode: none`, no peers, no bee strip (unless step 6 found a live
