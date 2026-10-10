@@ -166,3 +166,96 @@ and concurrent `/status` during discovery. The environment-limited test failures
 drive this verdict; the independently reproduced correctness failures do.
 
 **Verdict: FAIL.**
+
+## Fix round
+
+Date: October 10, 2026. Reviewer: My Codex. Reviewed `c6cb3cf..f5179ff` on
+`feat/tui-session-reliability`: `3b1a9dc`, `4d0f0eb`, `d649f64`, `00ebacb`, and `f5179ff`.
+Re-read the prior blockers, implementation brief/plan, complete fix diff, regression tests,
+READY hand-off, and CHANGELOG. This appendix is the only repository change; no source edits,
+merge, publication, or version bump.
+
+### Prior blockers
+
+| Finding | Fix verdict | Evidence and tests |
+| --- | --- | --- |
+| B1 — external intents target a different master from the displayed one | **FIXED** | `ExternalMaster` couples the discovered endpoint/token with its status; the intent route carries that identity (`src/cli/shell/session-controller.ts:39`, `src/cli/shell/session-controller.ts:255`). The shell checks the published identity and submits to the captured endpoint, not a newly read destination (`src/cli/shell/run.ts:368`, `src/cli/commands/session.ts:2382`). Replacement-file and old-token regressions are in `src/cli/shell/run.test.ts:565` and `src/cli/shell/run.test.ts:587`. Independent in-memory production-shell checks confirm that A-to-B replacement with a different repo sends to neither master, refreshes the view to B, and routes only an intentional resend to B; same-port token replacement also rejects the old action. This closes wrong-master routing, but its new connection-error messaging has the separate R1 blocker below. |
+| B2 — a failed/ended join permanently forgets a live external master | **FIXED** | Join failure, join closure, and own-master closure now trigger fresh discovery (`src/cli/shell/run.ts:658`, `src/cli/shell/run.ts:689`, `src/cli/shell/run.ts:595`), rather than restoring a cached snapshot. `src/cli/shell/run.test.ts:599` covers a rejected self-join and a subsequent successful external intent; `src/cli/shell/run.test.ts:613` covers a self-join heartbeat disconnect. Independent in-memory production-shell checks pass both transitions without `/status`, including restored intent routing after rejection. |
+| B3 — older discovery results overwrite newer truth | **FIXED** | `beginProbe`/`applyProbe` accept only the latest generation; master/join acquisition and shutdown invalidate pending discovery (`src/cli/shell/session-controller.ts:78`, `src/cli/shell/session-controller.ts:89`, `src/cli/shell/session-controller.ts:134`, `src/cli/shell/run.ts:875`). The production probe uses this guard and a two-second status deadline (`src/cli/shell/run.ts:767`). `src/cli/shell/session-controller.test.ts:164` tests both older-result orders, ownership transitions, and shutdown; `src/cli/shell/run.test.ts:625` holds startup discovery across `/start`. The controller tests pass. Independent in-memory production-shell checks also pass older-failure-after-newer-success, older-success-after-newer-miss, a failed-join transition, and shutdown. |
+
+The added socket regressions are present and target the right scenarios, but cannot complete
+against real loopback sockets in this sandbox. The independent checks replace file reads and
+sockets in memory, exercise production code, and create no source/test files; they do not
+substitute for a real TCP/LAN gate.
+
+### Remaining blocker
+
+#### R1 — P2: A lost intent reply is falsely reported as non-delivery, inviting duplicate work
+
+**Evidence:** `src/cli/shell/run.ts:379`, `src/cli/shell/run.ts:391`,
+`src/cli/commands/session.ts:286`, `src/cli/commands/session.ts:311`,
+`src/cli/commands/session.ts:2330`, `src/session/master.ts:314`.
+
+The new `sendExternalIntent` treats every `session_unreachable` as an identity change and calls
+`externalChanged`. However, that code includes a connection closing **after** the request was
+written, an acknowledgement timeout, and a malformed control-result. None proves that the
+master did not accept the intent. The master starts `submitIntent` before sending its reply;
+losing the control connection does not cancel the accepted intent. Nevertheless, the shell
+unconditionally says `the intent was not sent` and, after successful rediscovery, advises
+`check /status and resend` even when it has rediscovered the **same** master.
+
+**Deterministic reproduction:** Run the production `Shell`, `startMaster`, and `connectSub`
+with paired in-memory Duplex streams, a parked injected Clock, and virtual session-file reads.
+Allow the master to accept `add a health check`, but drop its successful control reply and
+close that control stream. Keep status replies and the peer link working. Assertions confirm:
+
+- The master already has `intent-1` in state `planned`, and the sub receives work item `I-1`.
+- The shell rediscovers the unchanged session yet says `the intent was not sent` and suggests
+  resending.
+- Following that hint creates `intent-2`, also `planned`, with identical text; the same sub
+  receives distinct work item `I-2`. Both plans survive the lost acknowledgement.
+
+This reproduction passes through the real control client, master/sub handshake, routing, and
+plan delivery; only the listener/socket transport and file reads are faked. No kernel listener,
+real network, or agent CLI is involved. The new tests cover pre-send replacement and explicit
+`bad_token`, not this post-send uncertainty. CHANGELOG's new “stops answering … not sent
+anywhere” claim and READY's unreachable-endpoint guarantee are consequently too strong.
+
+**Required fix/test:** Distinguish known pre-send non-delivery or explicit token rejection from
+an unknown post-send outcome. Re-probing is appropriate, but connection loss/timeout must say
+that the intent **may have been accepted**, advise inspecting `/status`, and not claim a master
+change when identity is unchanged or imply that retry is safe. Add a regression where an intent
+is accepted and its reply is lost; preserve the existing replacement/token tests. Idempotent
+retry would require additional design, but is not necessary to fix the false assurance.
+
+### Other notes and documentation
+
+- Repeated valued flags are now rejected, with repeated `--host`/`--code` tests; host-only
+  `/join` errors include accepted forms. The one-word code limitation is acknowledged in READY.
+- Discovery's two-second request deadline makes READY's revised approximately 2–4-second
+  disappearance expectation consistent with the polling path. The replacement checklist now
+  acknowledges that a poll can deliberately reattach before the user types.
+- The previous heartbeat-reset, real 30-second expiry, sleep/wake, rejoin-after-expiry, and
+  callback-diagnostic follow-ups remain explicitly deferred. No two-device Mac/LAN trial was
+  performed. These are notes, not the reason for the fix-round failure.
+
+### Fix-round validation
+
+- `npm run lint && npm test`: lint **PASS**; full suite **FAIL**, with **25 files passed / 5
+  failed; 480 tests passed / 50 failed; 11 unhandled errors**. Loopback listeners still fail
+  with `listen EPERM: operation not permitted 127.0.0.1`; the six socket-based shell tests
+  consequently time out. The unchanged subprocess tests again receive empty child stdout,
+  and CLI work-item tests fail in this environment. The reported 530-test green READY gate
+  is not reproduced here; these failures alone do not establish a fix-round regression.
+- Focused controller/parser/model tests: **34/34 PASS**, including all discovery-generation
+  and duplicate-flag cases.
+- Shell tests excluding the six listener-dependent cases: **16 PASS / 6 skipped**.
+- Independent in-memory production-shell checks: **eight B1–B3 checks PASS**. A separate
+  production-master/sub check confirms R1 by observing two planned intents and two delivered
+  work items after the shell's resend hint.
+
+B1–B3 are resolved, but R1 remains a correctness blocker for reliability sign-off. Re-run the
+complete gate where loopback listeners and subprocess output work, and perform the READY
+two-device checks after fixing R1. No release action is authorized by this review.
+
+**Fix verdict: FAIL.**
