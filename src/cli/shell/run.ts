@@ -327,7 +327,7 @@ export class Shell {
   }
 
   private buildCommands(): SlashCommand[] {
-    const live = (ctx: ShellCtx): boolean => ctx.sessionLive;
+    const live = (ctx: ShellCtx): boolean => ctx.sessionLive === true;
     return [
       {
         name: "start",

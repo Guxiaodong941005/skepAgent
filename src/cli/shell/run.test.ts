@@ -194,7 +194,7 @@ describe("unified shell", () => {
   it("draws the welcome with the input box, and /quit restores the terminal", async () => {
     const h = await harness();
     expect(h.frame()).toContain("skep");
-    expect(h.frame()).toContain("device laptop");
+    expect(h.frame()).toMatch(/device\s+laptop/);
     expect(h.frame()).toContain("no session");
     expect(h.frame()).toContain("/start");
     expect(h.frame()).toContain("> _");

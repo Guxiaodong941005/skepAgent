@@ -1,23 +1,33 @@
 /**
  * Frame layout of the unified shell: header, scrollback, slash menu, input, bee footer, hint
- * (docs/plans/unified-tui-shell.md §2–§3). Pure: `run.ts` owns the terminal and the session.
- *
- * TODO(merge feat/unified-tui-shell-ui): temporary stub so `run.ts` compiles before the UI branch
- * lands. Replace with the UI branch's `model.ts` and adapt `run.ts` to its API.
+ * (docs/plans/unified-tui-shell.md §2–§3). Visual chrome from feat/unified-tui-shell-ui;
+ * controller API kept for run.ts.
  */
 
 import type { JoinViewModel } from "../commands/session.js";
-import { bold, fg, type Role } from "../theme.js";
-import { beeLane, chip, type Glyphs, type Line, progressBar } from "../tui.js";
+import { bold, fg, type Role, type Span } from "../theme.js";
+import {
+  beeLane,
+  chip,
+  chrome,
+  column,
+  displayWidth,
+  fitSpans,
+  type Glyphs,
+  type Line,
+  MIN_ROWS,
+  progressBar,
+  truncate,
+} from "../tui.js";
 import { SKEP_VERSION } from "../version.js";
-import { logoSpans, welcomeLines } from "./logo.js";
-import { commandLabel, type SlashCommand } from "./slash.js";
+import { logoLine, welcomeLines } from "./logo.js";
+import type { SlashCommand } from "./slash.js";
 
 export const SCROLLBACK_CAP = 1_000;
-const MAX_BEE_ROWS = 3;
-const MAX_MENU_ROWS = 6;
+export const MAX_BEE_ROWS = 3;
+export const MAX_MENU_ROWS = 6;
 /** Below this the shell cannot show the input and footer, so only a notice is drawn. */
-export const SHELL_MIN_ROWS = 10;
+export const SHELL_MIN_ROWS = Math.min(10, MIN_ROWS);
 
 export type ShellTone = "info" | "event" | "error" | "muted";
 export type ShellPeer = JoinViewModel["peers"][number];
@@ -50,6 +60,7 @@ export class ShellModel {
   beat = 0;
   /** A pending question takes the input; the prompt shows it. */
   question: string | null = null;
+  version: string | null = SKEP_VERSION;
 
   /** Appends one or more lines; a multi-line text becomes several scrollback lines. */
   append(text: string, tone: ShellTone = "info"): void {
@@ -59,7 +70,6 @@ export class ShellModel {
     if (this.scrollback.length > SCROLLBACK_CAP) {
       this.scrollback.splice(0, this.scrollback.length - SCROLLBACK_CAP);
     }
-    // New output while scrolled back keeps the view where the human left it.
     if (this.scroll > 0) this.scroll = Math.min(this.scroll + 1, this.scrollback.length);
   }
 
@@ -72,46 +82,58 @@ export class ShellModel {
 
   frame(columns: number, rows: number): Line[] {
     if (rows < SHELL_MIN_ROWS) {
-      return [`skep needs at least ${SHELL_MIN_ROWS} rows (terminal has ${rows})`];
+      return [
+        {
+          spans: [
+            fg(
+              "error",
+              `terminal too small: ${columns}x${rows}; resize to at least ${SHELL_MIN_ROWS} rows`,
+            ),
+          ],
+        },
+      ];
     }
-    const { device, cwd } = this.header;
-    const header: Line[] = [
-      {
-        spans: [
-          { text: "  " },
-          ...logoSpans(this.glyphs),
-          fg("on-surface-variant", `   ${this.header.session}`),
-          fg("on-surface-variant", `   v${SKEP_VERSION}`),
-        ],
-      },
-      { spans: [fg("on-surface-variant", `  device ${device} · cwd ${cwd}`)] },
+    const g = chrome(this.glyphs);
+    const sessionLabel =
+      this.header.session === "no session" ? "" : this.header.session.replace(/^session\s+/i, "");
+    const context =
+      sessionLabel === ""
+        ? ""
+        : sessionLabel.startsWith("session")
+          ? sessionLabel
+          : `session ${sessionLabel}`;
+    const info = [
+      `device  ${this.header.device}`,
+      `cwd  ${this.header.cwd}`,
+      ...(this.sessionLive ? [`peers ${this.peers.length}`] : ["no session"]),
     ];
-    const bee = this.beeRows();
-    const hint: Line = {
-      spans: [
-        fg(
-          "on-surface-variant",
-          this.question !== null
-            ? "  enter answer · ctrl+c clear"
-            : "  / commands · enter send · pgup/pgdn scroll · ctrl+c clear · /quit",
-        ),
-      ],
-    };
+    const lines: Line[] = [
+      logoLine(columns, this.glyphs, context, this.version),
+      { spans: [fg("on-surface-variant", `  ${info.join(g.sep)}`)] },
+    ];
+    const bee = this.beeRows(columns);
+    const hint = this.hintLine();
     const prompt = this.question === null ? "> " : `${this.question} `;
-    const input: Line = { spans: [bold(prompt, "primary"), { text: `${this.input}_` }] };
-    const ruleChar = this.glyphs === "nerd" ? "─" : "-";
-    const rule: Line = { spans: [fg("outline", ruleChar.repeat(columns))] };
-    const bodyRows = Math.max(0, rows - header.length - 3 - bee.length);
+    const input = this.inputLine(columns, prompt);
+    const rule: Line = {
+      spans: [fg("outline", `  ${g.rule.repeat(Math.max(0, columns - 2))}`)],
+    };
+    const bodyRows = Math.max(0, rows - lines.length - 1 - 1 - bee.length - 1);
     const body = this.bodyLines(bodyRows);
     const menu = bodyRows === 0 ? [] : this.menuLines().slice(-bodyRows);
     body.splice(body.length - menu.length, menu.length, ...menu);
-    return [...header, ...body, input, rule, ...bee, hint];
+    const out = [...lines, ...body, input, rule, ...bee, hint];
+    return out.map((line) =>
+      typeof line === "string"
+        ? truncate(line, columns)
+        : { ...line, spans: fitSpans(line.spans, columns) },
+    );
   }
 
   private bodyLines(count: number): Line[] {
     const source: Line[] =
       this.scrollback.length === 0
-        ? ["", ...welcomeLines().map((line) => `  ${line}`)]
+        ? welcomeLines(this.glyphs)
         : this.scrollback.map((entry) => ({
             spans: [fg(TONE_ROLES[entry.tone], `  ${entry.text}`)],
           }));
@@ -123,37 +145,71 @@ export class ShellModel {
   private menuLines(): Line[] {
     const shown = this.menu.slice(0, MAX_MENU_ROWS);
     return shown.map((command, index) => {
-      const label = commandLabel(command).padEnd(22);
-      const text = `  ${label} ${command.description}`;
-      return index === this.menuIndex
-        ? { spans: [{ text }], selected: true }
-        : { spans: [bold(`  ${label}`), fg("on-surface-variant", ` ${command.description}`)] };
+      const usage = command.usage === undefined ? "" : ` ${command.usage}`;
+      return {
+        spans: [
+          { text: "  " },
+          bold(`/${command.name}`, "primary"),
+          fg("secondary", usage),
+          fg("on-surface-variant", `  ${command.description}`),
+        ],
+        selected: index === this.menuIndex,
+        fill: true,
+      };
     });
   }
 
-  private beeRows(): Line[] {
-    if (!this.sessionLive) return [];
+  private inputLine(columns: number, prompt: string): Line {
+    const characters = [...this.input];
+    const available = Math.max(0, columns - displayWidth(prompt) - 1);
+    const shown = truncate(characters.join(""), available);
+    return {
+      spans: [
+        bold(prompt, "primary"),
+        { text: shown },
+        { text: "_", role: "primary", inverse: true },
+      ],
+    };
+  }
+
+  private beeRows(columns: number): Line[] {
+    if (!this.sessionLive) return [{ spans: [fg("on-surface-variant", "  (no peers yet)")] }];
     if (this.peers.length === 0) return [{ spans: [fg("on-surface-variant", "  (no peers yet)")] }];
     const overflow = this.peers.length > MAX_BEE_ROWS;
     const shown = this.peers.slice(0, overflow ? MAX_BEE_ROWS - 1 : MAX_BEE_ROWS);
+    const deviceWidth = Math.min(
+      12,
+      Math.max(6, ...shown.map((peer) => displayWidth(peer.device))),
+    );
+    const roleWidth = Math.min(10, Math.max(6, ...shown.map((peer) => displayWidth(peer.role))));
     const lines: Line[] = shown.map((peer) => {
       const progress = peer.progress;
       const phase = progress?.phase ?? "idle";
-      return {
-        spans: [
-          { text: `  ${peer.device.padEnd(10).slice(0, 10)} ` },
-          fg("on-surface-variant", `${peer.role.padEnd(9).slice(0, 9)} `),
-          fg("primary", `${beeLane(phase, this.beat, this.glyphs)} `),
-          ...(progress === undefined
-            ? [chip(peer.state)]
-            : [
-                { text: `[${progressBar(progress.percent, this.glyphs)}] ` },
-                { text: `${progress.percent}% ${progress.done}/${progress.total} ` },
-                chip(phase),
-                fg("on-surface-variant", `  ${progress.summary}`),
-              ]),
-        ],
-      };
+      const spans: Span[] = [
+        { text: `  ${column(peer.device, deviceWidth)}  ` },
+        fg("on-surface-variant", `${column(peer.role, roleWidth)}  `),
+        fg("primary", `${beeLane(phase, this.beat, this.glyphs)} `),
+      ];
+      if (progress === undefined) {
+        spans.push(chip(peer.state));
+      } else {
+        const failed = progress.phase === "done" && progress.failed > 0;
+        if (columns >= 60) {
+          spans.push(
+            fg("outline", "["),
+            fg(failed ? "error" : "primary", progressBar(progress.percent, this.glyphs)),
+            fg("outline", "] "),
+          );
+        }
+        spans.push(bold(`${progress.percent}%`));
+        if (columns >= 70) {
+          spans.push(fg("on-surface-variant", ` ${progress.done}/${progress.total}`));
+        }
+        spans.push({ text: " " }, chip(phase), { text: "  " });
+        if (failed) spans.push(fg("error", `(${progress.failed} failed)  `));
+        spans.push({ text: progress.summary });
+      }
+      return { spans };
     });
     if (overflow) {
       lines.push({
@@ -161,5 +217,20 @@ export class ShellModel {
       });
     }
     return lines;
+  }
+
+  private hintLine(): Line {
+    const separator = chrome(this.glyphs).sep;
+    const keys =
+      this.question !== null
+        ? ["enter answer", "ctrl+c clear"]
+        : this.menu.length > 0
+          ? [
+              this.glyphs === "nerd" ? "↑↓ select" : "up/down select",
+              "tab/enter accept",
+              "esc close",
+            ]
+          : ["/ commands", "enter send", "pgup/pgdn scroll", "ctrl+c clear", "/quit"];
+    return { spans: [fg("on-surface-variant", `  ${keys.join(separator)}`)] };
   }
 }
