@@ -11,6 +11,14 @@ protocol rules ([`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §4.4) apply to t
 
 ## [Unreleased]
 
+### Added
+
+* Shell command `/clean` (alias `/clear`): ends this shell's master and join, cancels a join
+  still in its handshake, and removes a `session.json` whose master no longer answers, then
+  returns to `no session` without leaving the shell. A live master in another process is never
+  stopped. `/join` while joined now points at `/clean` (leave the session) vs `/quit` (leave the
+  shell).
+
 ## [0.1.7] - 2026-10-10
 
 TUI and session reliability for the unified shell: single session truth, ergonomic `/join`, clearer intents, peer presence.
