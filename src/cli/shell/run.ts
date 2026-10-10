@@ -15,30 +15,35 @@ import {
   AGENT_VIEWS,
   type AgentCli,
   type AgentView,
+  type ControlEndpoint,
   checkIntent,
   fetchSessionStatus,
+  fetchSessionStatusAt,
   type JoinFlow,
   type JoinFlowOptions,
   type JoinView,
   type JoinViewModel,
   joinSessionFlow,
   type MasterFlow,
+  readControlEndpoint,
   renderSessionStatus,
   type SessionCliContext,
   type SessionStatus,
   selectAgentView,
   startMasterFlow,
-  submitIntent,
+  submitIntentAt,
 } from "../commands/session.js";
 import { CliError } from "../output.js";
 import { createTheme, detectColorLevel, detectScheme } from "../theme.js";
 import { detectGlyphs, type ProcessHooks, Screen, type ScreenIo, TICK_MS } from "../tui.js";
 import { parseFlags } from "./flags.js";
 import { backspace, decodeShellKeys, insertText, menuQuery, type ShellKey } from "./input.js";
-import { parseJoinArgs } from "./join-args.js";
+import { JOIN_USAGE, parseJoinArgs } from "./join-args.js";
 import { ShellModel, type ShellPeer, type ShellTone } from "./model.js";
 import {
+  type ExternalMaster,
   explainReason,
+  type IntentRoute,
   noMatchText,
   QUIET_AFTER_MS,
   SessionController,
@@ -59,6 +64,8 @@ const PAGE_LINES = 10;
 const SUBMIT_CHOICES = ["pr", "mr", "push", "none"] as const;
 /** A master in another process is re-read every this many ticks (2 s at 250 ms). */
 const EXTERNAL_POLL_TICKS = 8;
+/** A live master answers `status` well within this; discovery must not stall the ticker. */
+const PROBE_TIMEOUT_MS = 2_000;
 
 export type ShellCliContext = SessionCliContext & {
   /** Terminal streams (default: the process's). Tests pass a fake stdin and a fixed size. */
@@ -333,12 +340,14 @@ export class Shell {
         checkIntent(text, undefined);
         ({ intentId } = await route.master.handle.submitIntent(text));
       } else {
-        ({ intentId } = await submitIntent(this.ctx, text));
+        const sent = await this.sendExternalIntent(route.external, text);
+        if (sent.type === "error") return sent;
+        intentId = sent.intentId;
       }
       return { type: "ok", message: `intent ${intentId} routed: ${text}` };
     } catch (error) {
       if (isNoMatch(error)) {
-        const status = this.currentStatus();
+        const status = await this.freshStatus(route);
         const repos = [status?.repo ?? "?"];
         return {
           type: "error",
@@ -351,11 +360,55 @@ export class Shell {
     }
   }
 
-  /** The master's status as this shell can see it right now, without I/O. */
-  private currentStatus(): SessionStatus | null {
-    const own = this.session.ownMaster;
-    if (own !== null) return own.handle.status();
-    return this.session.externalStatus;
+  /**
+   * An intent for the master in another process that the shell displays, sent to exactly the
+   * endpoint (and token) it was discovered at. If `session.json` now names another master, or the
+   * shown one is gone, nothing is sent: the shell re-discovers and says what it shows now.
+   */
+  private async sendExternalIntent(
+    shown: ExternalMaster,
+    text: string,
+  ): Promise<{ type: "ok"; intentId: string } | { type: "error"; message: string }> {
+    const published = await readControlEndpoint(this.ctx).catch(() => null);
+    if (published === null || !sameEndpoint(published, shown.endpoint)) {
+      return this.externalChanged(shown);
+    }
+    try {
+      const { intentId } = await submitIntentAt(shown.endpoint, text);
+      return { type: "ok", intentId };
+    } catch (error) {
+      // A replacement master on the same port rejects the old token; a gone one does not answer.
+      if (
+        error instanceof CliError &&
+        (error.code === "bad_token" || error.code === "session_unreachable")
+      ) {
+        return this.externalChanged(shown);
+      }
+      throw error;
+    }
+  }
+
+  private async externalChanged(
+    shown: ExternalMaster,
+  ): Promise<{ type: "error"; message: string }> {
+    await this.probeExternal();
+    const now = this.session.externalStatus;
+    const was = `${shown.status.sessionId} at ${shown.status.listen}, repo ${shown.status.repo}`;
+    const next =
+      now === null
+        ? "no session master runs on this device now"
+        : `now showing ${now.sessionId} at ${now.listen}, repo ${now.repo} — check /status and resend`;
+    return {
+      type: "error",
+      message: `the session master on this device changed (was ${was}); the intent was not sent\n${next}`,
+    };
+  }
+
+  /** The routed master's status for explaining a no_match: live, never a cached snapshot. */
+  private async freshStatus(route: IntentRoute): Promise<SessionStatus | null> {
+    if (route.kind === "own") return route.master.handle.status();
+    if (route.kind !== "control") return null;
+    return fetchSessionStatusAt(route.external.endpoint, PROBE_TIMEOUT_MS).catch(() => null);
   }
 
   private async statusCommand(): Promise<SlashResult> {
@@ -543,6 +596,7 @@ export class Shell {
     if (!this.session.masterEnded(flow)) return;
     this.log(message, "event");
     this.sync();
+    void this.probeExternal();
   }
 
   private async joinCommand(args: string): Promise<SlashResult> {
@@ -556,7 +610,10 @@ export class Shell {
     let host = parsed.host;
     if (code === undefined) {
       if (host !== undefined) {
-        return { type: "error", message: `/join ${host} needs the master's join code too` };
+        return {
+          type: "error",
+          message: `/join: ${host} needs the master's join code too\n${JOIN_USAGE}`,
+        };
       }
       // §4.1: no code means this device's own master.
       const own = this.session.ownMaster;
@@ -601,6 +658,8 @@ export class Shell {
     } catch (error) {
       this.session.joinFailed(generation);
       this.sync();
+      // The join is gone, but a master in another process may still run: find it again.
+      void this.probeExternal();
       throw error;
     }
     if (this.quitting !== null || !this.session.joinStarted(generation, flow)) {
@@ -635,6 +694,8 @@ export class Shell {
         : "";
     this.log(`left the session (${explainReason(reason)})${rejoin}`, "event");
     this.sync();
+    // A self-join of a master in another process can drop while that master lives on.
+    void this.probeExternal();
   }
 
   private agentCommand(args: string): SlashResult {
@@ -705,23 +766,29 @@ export class Shell {
    */
   private async probeExternal(): Promise<void> {
     if (this.session.ownMaster !== null || this.session.joinBusy || this.quitting !== null) return;
-    const before = this.session.externalStatus;
-    let status: SessionStatus | null;
+    // Only the newest discovery applies: an older one finishing late must not undo newer truth.
+    const generation = this.session.beginProbe();
+    let found: ExternalMaster | null = null;
     try {
-      status = await fetchSessionStatus(this.ctx);
+      const endpoint = await readControlEndpoint(this.ctx);
+      if (endpoint !== null) {
+        found = { endpoint, status: await fetchSessionStatusAt(endpoint, PROBE_TIMEOUT_MS) };
+      }
     } catch {
-      // No file, a stale file, or a dead port all mean the same thing here: nothing to attach to.
-      status = null;
+      // A stale file, a dead port or a bad reply all mean the same thing: nothing to attach to.
+      found = null;
     }
-    if (!this.session.setExternal(status)) return;
-    if (before === null && status !== null) {
+    const before = this.session.externalMaster;
+    if (!this.session.applyProbe(generation, found)) return;
+    if (found !== null && (before === null || !sameEndpoint(before.endpoint, found.endpoint))) {
+      const status = found.status;
       this.log(
-        `a session master runs in another process on this device (${status.listen}); ` +
-          "intents typed here go to it",
+        `a session master runs in another process on this device (${status.sessionId} at ` +
+          `${status.listen}, repo ${status.repo}); intents typed here go to it`,
         "event",
       );
-    } else if (before !== null && status === null) {
-      this.log(`the session master at ${before.listen} went away`, "event");
+    } else if (before !== null && found === null) {
+      this.log(`the session master at ${before.status.listen} went away`, "event");
     }
     this.sync();
   }
@@ -806,6 +873,7 @@ export class Shell {
   }
 
   private async shutdown(): Promise<void> {
+    this.session.invalidateProbes();
     this.log("leaving…", "muted");
     for (const question of this.questions.splice(0)) question.resolve(null);
     this.model.question = null;
@@ -904,6 +972,10 @@ function linkText(silentMs: number, glyphs: string): string {
   const seconds = Math.floor(silentMs / 1000);
   if (silentMs >= QUIET_AFTER_MS) return `master quiet ${seconds}s`;
   return `master ${glyphs === "nerd" ? "♥" : "hb"} ${seconds}s`;
+}
+
+function sameEndpoint(left: ControlEndpoint, right: ControlEndpoint): boolean {
+  return left.listen === right.listen && left.token === right.token;
 }
 
 function isNoMatch(error: unknown): boolean {

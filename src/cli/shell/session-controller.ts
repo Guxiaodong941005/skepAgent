@@ -7,7 +7,7 @@
  * control `status`), so a flow that ended can never leave rows behind.
  */
 
-import type { JoinFlow, MasterFlow, SessionStatus } from "../commands/session.js";
+import type { ControlEndpoint, JoinFlow, MasterFlow, SessionStatus } from "../commands/session.js";
 import { formatJoinCode } from "../commands/session.js";
 import type { ShellPeer } from "./model.js";
 
@@ -27,8 +27,18 @@ export interface SessionView {
 
 export type IntentRoute =
   | { kind: "own"; master: MasterFlow }
-  | { kind: "control" }
+  | { kind: "control"; external: ExternalMaster }
   | { kind: "refused"; message: string };
+
+/**
+ * A master in another process on this device: the endpoint it was discovered at (its token
+ * identifies it) and the status read from exactly that endpoint. Actions go to `endpoint`, never
+ * to whatever `session.json` names later.
+ */
+export interface ExternalMaster {
+  endpoint: ControlEndpoint;
+  status: SessionStatus;
+}
 
 /** Heartbeats are sent every 10 s and a link dies after 30 s of silence (`SessionWire`). */
 export const QUIET_AFTER_MS = 20_000;
@@ -40,7 +50,9 @@ export class SessionController {
   private joinGeneration = 0;
   private generation = 0;
   private roster: ShellPeer[] = [];
-  private external: SessionStatus | null = null;
+  private external: ExternalMaster | null = null;
+  /** Only the newest discovery may apply; ownership changes and shutdown invalidate older ones. */
+  private probeGeneration = 0;
 
   get ownMaster(): MasterFlow | null {
     return this.master;
@@ -56,12 +68,17 @@ export class SessionController {
   }
 
   get externalStatus(): SessionStatus | null {
+    return this.external?.status ?? null;
+  }
+
+  get externalMaster(): ExternalMaster | null {
     return this.external;
   }
 
   setMaster(flow: MasterFlow): void {
     this.master = flow;
     this.external = null;
+    this.invalidateProbes();
   }
 
   /** False when `flow` is not the current master (a late close of an older flow). */
@@ -77,6 +94,7 @@ export class SessionController {
     this.joining = { generation: this.generation, target };
     this.roster = [];
     this.external = null;
+    this.invalidateProbes();
     return this.generation;
   }
 
@@ -112,13 +130,25 @@ export class SessionController {
     return true;
   }
 
+  /** Starts a discovery of a master in another process; its result needs this generation. */
+  beginProbe(): number {
+    this.probeGeneration += 1;
+    return this.probeGeneration;
+  }
+
+  /** Any discovery in flight is now stale (an own flow started, or the shell is leaving). */
+  invalidateProbes(): void {
+    this.probeGeneration += 1;
+  }
+
   /**
-   * A master found through this device's `session.json` that runs in another process. Ignored
-   * while the shell owns a flow: then the shell's own flows are the truth.
+   * Applies a discovery result (null: no live master). Ignored when a newer discovery started
+   * or ownership changed since, and while the shell owns a flow: then its own flows are the truth.
    */
-  setExternal(status: SessionStatus | null): boolean {
-    if (status !== null && (this.master !== null || this.joinBusy)) return false;
-    this.external = status;
+  applyProbe(generation: number, found: ExternalMaster | null): boolean {
+    if (generation !== this.probeGeneration) return false;
+    if (this.master !== null || this.joinBusy) return false;
+    this.external = found;
     return true;
   }
 
@@ -174,7 +204,7 @@ export class SessionController {
       };
     }
     if (this.external !== null) {
-      const status = this.external;
+      const status = this.external.status;
       const code = status.joinCode === null ? "none" : formatJoinCode(status.joinCode);
       return {
         mode: "external",
@@ -222,7 +252,9 @@ export class SessionController {
     if (view.peers.length === 0) {
       return { kind: "refused", message: noPeersText(master.listen, master.joinCode) };
     }
-    return this.master === null ? { kind: "control" } : { kind: "own", master: this.master };
+    if (this.master !== null) return { kind: "own", master: this.master };
+    if (this.external === null) throw new Error("an external view without an external master");
+    return { kind: "control", external: this.external };
   }
 }
 

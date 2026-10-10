@@ -30,7 +30,7 @@ afterEach(async () => {
 
 /** A control port on loopback that answers every request with `reply(request)`. */
 async function controlServer(
-  reply: (request: { op?: string }) => unknown,
+  reply: (request: { op?: string; token?: string }) => unknown,
 ): Promise<{ port: number; requests: unknown[] }> {
   const requests: unknown[] = [];
   const server = net.createServer((socket) => {
@@ -40,8 +40,9 @@ async function controlServer(
       if (frame === undefined) return;
       const request = JSON.parse(frame.toString("utf8"));
       requests.push(request);
-      const answer = reply(request);
-      socket.end(encodeFrame(Buffer.from(JSON.stringify(answer))));
+      void Promise.resolve(reply(request)).then((answer) => {
+        socket.end(encodeFrame(Buffer.from(JSON.stringify(answer))));
+      });
     });
   });
   servers.push(server);
@@ -92,6 +93,7 @@ function fakeApi(address = { host: "192.168.1.20", port: 7419 }) {
   /** Peers the fake master reports in `status()`; tests push into it. */
   const peers: MasterPeer[] = [];
   let intentError: Error | null = null;
+  let subError: Error | null = null;
   const api: SessionApi = {
     async startMaster(options): Promise<MasterHandle> {
       calls.master.push(options);
@@ -123,6 +125,7 @@ function fakeApi(address = { host: "192.168.1.20", port: 7419 }) {
     },
     async connectSub(options): Promise<SubHandle> {
       calls.sub.push(options);
+      if (subError !== null) throw subError;
       return {
         sessionId: "S-1",
         peerId: "peer-1",
@@ -138,6 +141,9 @@ function fakeApi(address = { host: "192.168.1.20", port: 7419 }) {
     peers,
     failIntents(error: Error) {
       intentError = error;
+    },
+    failJoins(error: Error) {
+      subError = error;
     },
     endSub(reason: string) {
       subClosed.resolve({ reason });
@@ -484,6 +490,59 @@ describe("unified shell", () => {
   });
 });
 
+/**
+ * A master in another process: a loopback control port that checks its own token (a replacement
+ * master never accepts an old one), answers `status` and `intent`, and can hold `status` replies.
+ */
+async function externalMaster(id: string, repo: string) {
+  const token = id.toLowerCase().repeat(32).slice(0, 32);
+  let accepted = token;
+  const held: (() => void)[] = [];
+  let holding = false;
+  let port = 0;
+  const server = await controlServer(async (request) => {
+    if (request.token !== accepted) {
+      return { type: "control-result", ok: false, error: { code: "bad_token", message: "bad" } };
+    }
+    if (request.op !== "status") {
+      return { type: "control-result", ok: true, result: { intentId: `${id}-intent-1` } };
+    }
+    if (holding) await new Promise<void>((resolve) => held.push(resolve));
+    const result = {
+      sessionId: `session-${id}`,
+      listen: `127.0.0.1:${port}`,
+      repo,
+      joinCode: "111122223333",
+      joinCodeExpiresAtMs: null,
+      peers: [{ ...peer("peer-2", "mac", repo), progress: undefined }],
+      intents: [],
+    };
+    return { type: "control-result", ok: true, result };
+  });
+  port = server.port;
+  return {
+    ...server,
+    /** Writes this master into the shell's `session.json`. */
+    publish: (dir: string) =>
+      writeFile(
+        path.join(dir, "session.json"),
+        `${JSON.stringify({ listen: `127.0.0.1:${port}`, token })}\n`,
+      ),
+    hold() {
+      holding = true;
+    },
+    /** Another master took this port and has not published its file yet. */
+    retoken() {
+      accepted = "f".repeat(32);
+    },
+    release() {
+      holding = false;
+      for (const resolve of held.splice(0)) resolve();
+    },
+    intents: () => server.requests.filter((r) => (r as { op?: string }).op === "intent"),
+  };
+}
+
 function peer(peerId: string, device: string, repo: string): MasterPeer {
   return {
     peerId,
@@ -501,6 +560,83 @@ async function waitFor(check: () => boolean): Promise<void> {
   for (let i = 0; i < 200 && !check(); i++) await new Promise((r) => setTimeout(r, 5));
   expect(check()).toBe(true);
 }
+
+describe("external master identity and discovery (review B1-B3)", () => {
+  it("never sends an intent to a replacement master while showing the old one", async () => {
+    const a = await externalMaster("A", "app-a");
+    const b = await externalMaster("B", "app-b");
+    const h = await harness(undefined, a.publish);
+    await waitFor(() => h.shell.session.externalStatus !== null);
+    expect(h.shell.session.externalStatus?.sessionId).toBe("session-A");
+    // Master A is replaced by B before the next poll.
+    await b.publish(h.dir);
+    await h.shell.submit("add a health check");
+    expect(a.intents()).toEqual([]);
+    expect(b.intents()).toEqual([]);
+    expect(h.scrollback()).toContain("the session master on this device changed (was session-A");
+    expect(h.scrollback()).toContain("the intent was not sent");
+    expect(h.scrollback()).toContain("now showing session-B");
+    // The shell now shows B, so a resent intent goes to B on purpose.
+    expect(h.shell.session.externalStatus?.repo).toBe("app-b");
+    await h.shell.submit("add a health check");
+    expect(b.intents()).toHaveLength(1);
+    expect(h.scrollback()).toContain("intent B-intent-1 routed");
+    await h.shell.quit();
+  });
+
+  it("rejects an intent when the shown master's endpoint stopped accepting its token", async () => {
+    const a = await externalMaster("A", "app");
+    const h = await harness(undefined, a.publish);
+    await waitFor(() => h.shell.session.externalStatus !== null);
+    a.retoken();
+    await h.shell.submit("add a health check");
+    expect(h.scrollback()).toContain("the intent was not sent");
+    expect(h.scrollback()).toContain("no session master runs on this device now");
+    expect(h.shell.session.snapshot().mode).toBe("none");
+    await h.shell.quit();
+  });
+
+  it("re-discovers the external master after a failed self-join", async () => {
+    const a = await externalMaster("A", "app");
+    const h = await harness(undefined, a.publish);
+    await waitFor(() => h.shell.session.externalStatus !== null);
+    h.fake.failJoins(new Error("join rejected: declined"));
+    await h.shell.submit("/join --repo app");
+    expect(h.scrollback()).toContain("join rejected: declined");
+    await waitFor(() => h.shell.session.snapshot().mode === "external");
+    expect(h.frame()).toContain("master (other process)");
+    await h.shell.submit("add a health check");
+    expect(a.intents()).toHaveLength(1);
+    await h.shell.quit();
+  });
+
+  it("re-discovers the external master after a self-join disconnects", async () => {
+    const a = await externalMaster("A", "app");
+    const h = await harness(undefined, a.publish);
+    await waitFor(() => h.shell.session.externalStatus !== null);
+    await h.shell.submit("/join --repo app");
+    expect(h.shell.session.snapshot().mode).toBe("joined");
+    h.fake.endSub("heartbeat_timeout");
+    await waitFor(() => h.shell.session.snapshot().mode === "external");
+    expect(h.shell.model.header.session).toContain("master (other process)");
+    await h.shell.quit();
+  });
+
+  it("drops a discovery that completes after /start", async () => {
+    const a = await externalMaster("A", "app");
+    a.hold();
+    const h = await harness(undefined, a.publish);
+    await waitFor(() => a.requests.length > 0);
+    // The startup probe is still waiting for A's reply; A stops publishing so /start may run.
+    await rm(path.join(h.dir, "session.json"));
+    await h.shell.submit("/start --yes --repo app");
+    a.release();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(h.shell.session.snapshot().mode).toBe("master");
+    expect(h.frame()).toContain("master · code 1234-5678-9012");
+    await h.shell.quit();
+  });
+});
 
 describe("parseFlags", () => {
   it("reads values, switches and positionals", () => {

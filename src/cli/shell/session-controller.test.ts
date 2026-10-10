@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { JoinFlow, MasterFlow, SessionStatus } from "../commands/session.js";
 import {
+  type ExternalMaster,
   explainReason,
   noMatchText,
   SessionController,
@@ -145,17 +146,69 @@ describe("SessionController", () => {
 
   it("attaches to an external master only while it owns no flow", () => {
     const session = new SessionController();
-    expect(session.setExternal(status([vps]))).toBe(true);
+    const a = external("A", [vps]);
+    expect(session.applyProbe(session.beginProbe(), a)).toBe(true);
     expect(session.snapshot()).toMatchObject({
       mode: "external",
       label: "master (other process) · code 1234-5678-9012 · 192.168.1.20:7419",
     });
-    expect(session.intentRoute()).toEqual({ kind: "control" });
+    // Actions are bound to the endpoint the master was discovered at.
+    expect(session.intentRoute()).toEqual({ kind: "control", external: a });
     session.setMaster(masterFlow());
     expect(session.externalStatus).toBeNull();
-    expect(session.setExternal(status())).toBe(false);
+    expect(session.applyProbe(session.beginProbe(), external("B"))).toBe(false);
   });
 });
+
+describe("external discovery generations", () => {
+  it("an older probe failing after a newer success does not clear the master", () => {
+    const session = new SessionController();
+    const older = session.beginProbe();
+    const newer = session.beginProbe();
+    expect(session.applyProbe(newer, external("A", [vps]))).toBe(true);
+    expect(session.applyProbe(older, null)).toBe(false);
+    expect(session.snapshot()).toMatchObject({ mode: "external", live: true });
+  });
+
+  it("an older probe succeeding after a newer miss does not resurrect a master", () => {
+    const session = new SessionController();
+    const older = session.beginProbe();
+    const newer = session.beginProbe();
+    expect(session.applyProbe(newer, null)).toBe(true);
+    expect(session.applyProbe(older, external("A"))).toBe(false);
+    expect(session.snapshot().mode).toBe("none");
+  });
+
+  it("a probe that completes across /start or /join is dropped", () => {
+    const session = new SessionController();
+    const beforeStart = session.beginProbe();
+    session.setMaster(masterFlow());
+    expect(session.applyProbe(beforeStart, external("A"))).toBe(false);
+    expect(session.snapshot().mode).toBe("master");
+
+    const other = new SessionController();
+    const beforeJoin = other.beginProbe();
+    const generation = other.beginJoin("192.168.1.20:7419");
+    other.joinFailed(generation);
+    // The join failed, but the probe started before it is still stale; a new one must run.
+    expect(other.applyProbe(beforeJoin, external("A"))).toBe(false);
+    expect(other.applyProbe(other.beginProbe(), external("A"))).toBe(true);
+  });
+
+  it("shutdown invalidates a probe in flight", () => {
+    const session = new SessionController();
+    const probe = session.beginProbe();
+    session.invalidateProbes();
+    expect(session.applyProbe(probe, external("A"))).toBe(false);
+  });
+});
+
+function external(id: string, peers: MasterPeer[] = []): ExternalMaster {
+  return {
+    endpoint: { listen: "192.168.1.20:7419", token: id.toLowerCase().repeat(32).slice(0, 32) },
+    status: { ...status(peers), sessionId: `session-${id}` },
+  };
+}
 
 describe("texts", () => {
   it("explains known close reasons and passes others through", () => {

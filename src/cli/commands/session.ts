@@ -2283,24 +2283,48 @@ async function submitCommand(
   ctx.output().result(data, human);
 }
 
+/**
+ * A master's control endpoint as published in `session.json`. The token is random per master, so
+ * an endpoint also identifies *which* master: a replacement master never accepts an old token.
+ */
+export interface ControlEndpoint {
+  listen: string;
+  token: string;
+}
+
+/** This device's published master endpoint, or null when no `session.json` exists. */
+export async function readControlEndpoint(ctx: CliContext): Promise<ControlEndpoint | null> {
+  const local = await readSessionFile(sessionFilePath(ctx));
+  return local === null ? null : { listen: local.listen, token: local.token };
+}
+
 /** Sends one control op to the master named in `session.json` and returns its `result`. */
 async function control(ctx: SessionCliContext, op: Record<string, unknown>): Promise<unknown> {
-  const file = sessionFilePath(ctx);
-  const local = await readSessionFile(file);
+  const local = await readControlEndpoint(ctx);
   if (local === null) {
+    const file = sessionFilePath(ctx);
     throw new CliError("no_session", `no session master is running (${file} not found)`);
   }
-  const target = parseHostPort(local.listen);
+  return controlAt(local, op);
+}
+
+/** Sends one control op to exactly `endpoint`, without re-reading `session.json`. */
+async function controlAt(
+  endpoint: ControlEndpoint,
+  op: Record<string, unknown>,
+  timeoutMs?: number,
+): Promise<unknown> {
+  const target = parseHostPort(endpoint.listen);
   if (target === null) {
-    throw new CliError("bad_session_file", `${file} has an invalid listen address`);
+    throw new CliError("bad_session_file", `invalid control listen address ${endpoint.listen}`);
   }
   let reply: ControlResult;
   try {
     reply = await controlRequest(
       target,
-      { type: "control", v: 1, token: local.token, ...op },
+      { type: "control", v: 1, token: endpoint.token, ...op },
       systemClock,
-      op.op === "intent" ? INTENT_CONTROL_TIMEOUT_MS : CONTROL_TIMEOUT_MS,
+      timeoutMs ?? (op.op === "intent" ? INTENT_CONTROL_TIMEOUT_MS : CONTROL_TIMEOUT_MS),
     );
   } catch (error) {
     if (error instanceof ControlConnectionError) {
@@ -2349,11 +2373,24 @@ export async function submitIntent(
   repos?: string[],
 ): Promise<{ intentId: string }> {
   checkIntent(text, repos);
-  const result = await control(ctx, {
-    op: "intent",
-    text,
-    ...(repos === undefined ? {} : { repos }),
-  });
+  return parseIntentResult(
+    await control(ctx, { op: "intent", text, ...(repos === undefined ? {} : { repos }) }),
+  );
+}
+
+/** Sends an intent to exactly `endpoint` (a master the caller already identified). */
+export async function submitIntentAt(
+  endpoint: ControlEndpoint,
+  text: string,
+  repos?: string[],
+): Promise<{ intentId: string }> {
+  checkIntent(text, repos);
+  return parseIntentResult(
+    await controlAt(endpoint, { op: "intent", text, ...(repos === undefined ? {} : { repos }) }),
+  );
+}
+
+function parseIntentResult(result: unknown): { intentId: string } {
   const parsed = IntentResultSchema.safeParse(result);
   if (!parsed.success) throw badReply("intent", parsed.error);
   return parsed.data;
@@ -2361,7 +2398,18 @@ export async function submitIntent(
 
 /** Status of the master named in `session.json`. */
 export async function fetchSessionStatus(ctx: SessionCliContext): Promise<SessionStatus> {
-  const result = await control(ctx, { op: "status" });
+  return parseStatus(await control(ctx, { op: "status" }));
+}
+
+/** Status of exactly `endpoint`; `timeoutMs` bounds discovery probes. */
+export async function fetchSessionStatusAt(
+  endpoint: ControlEndpoint,
+  timeoutMs?: number,
+): Promise<SessionStatus> {
+  return parseStatus(await controlAt(endpoint, { op: "status" }, timeoutMs));
+}
+
+function parseStatus(result: unknown): SessionStatus {
   const parsed = SessionStatusSchema.safeParse(result);
   if (!parsed.success) throw badReply("status", parsed.error);
   return parsed.data;
