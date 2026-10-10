@@ -11,6 +11,30 @@ protocol rules ([`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §4.4) apply to t
 
 ## [Unreleased]
 
+### Fixed
+
+* Shell session state has one source of truth (`SessionController`): the header, peer footer,
+  slash gating, `/status` and intents can no longer disagree. Peer rows from a join that ended
+  are dropped, and a session master running in another process on the same device is detected
+  and used instead of reporting `no session`.
+* `/join` accepts `/join <host:port> <code>` (either order), `/join <code> --host <host:port>`,
+  `/join --host <host:port> --code <code>` and `/join <code>`; other forms are rejected with the
+  list of accepted forms instead of `--code must be 12 digits`.
+* Intents with no joined peer are refused in the shell with the `/join` command to share,
+  instead of being recorded as `no_match` with `Unable to route the session intent`. A
+  `no_match` now says which repo no peer works on (shell, `skep session intent`).
+* `skep session intent` waits up to 40 s for the master's answer, which may itself wait 30 s
+  for peers' capabilities; it no longer reports a live master as unreachable.
+* The master names the peer, device and reason when a peer leaves (`Peer peer-2 (mac) left:
+  heartbeat_timeout`) and no longer logs a `disconnected` event for every control request. A
+  joined shell shows sub-side errors and why it left, with how to rejoin.
+
+### Added
+
+* Heartbeat display in the shell: per-peer time since last heard on a master, master link age on
+  a peer, flagged `quiet Ns` after 20 s of silence (`MasterHandle.presence()`,
+  `SubHandle.silenceMs()`).
+
 ## [0.1.6] - 2026-10-10
 
 Unified Skep shell (Grok Build–style): one screen for every open, slash commands, bee progress under the input. Codex UI chrome merged in.
