@@ -12,6 +12,7 @@ import {
   type SubResult,
   startMaster,
 } from "./index.js";
+import { SCROLLBACK_SUMMARY_CHARS, SCROLLBACK_SUMMARY_LINES, scrollbackSummary } from "./master.js";
 import { deriveProgress } from "./progress.js";
 import { connectSub } from "./sub.js";
 
@@ -333,6 +334,35 @@ describe("peer progress relay", () => {
     await vi.waitFor(() => expect(a.seen.at(-1)).toMatchObject({ self: true, phase: "done" }));
     // idle (join) → working (claim) → done (result).
     expect(events).toEqual([a.handle.peerId, a.handle.peerId, a.handle.peerId]);
+  });
+
+  it("emits an accepted result's redacted, capped summary as an item-result event", async () => {
+    const events: { kind: string; message: string }[] = [];
+    const m = await master({ onEvent: (e) => events.push(e) });
+    const token = `ghp_${"a".repeat(36)}`;
+    const summary = ["", "added GET /healthz", `token ${token}`, "tests pass"].join("\n");
+    await join(m, "mac", "app", { work: async (item) => ({ ...resultFor(item), summary }) });
+    await m.submitIntent("add a health check");
+    await vi.waitFor(() => expect(events.some((e) => e.kind === "item-result")).toBe(true));
+    const result = events.find((e) => e.kind === "item-result");
+    expect(result?.message).toMatch(/^I-1: added GET \/healthz\ntoken .+\ntests pass$/);
+    expect(result?.message).not.toContain(token);
+    // Progress stays a bare peer id; the summary only arrives once, with the accepted result.
+    for (const e of events.filter((entry) => entry.kind === "progress"))
+      expect(e.message).not.toContain("healthz");
+    expect(events.some((e) => e.kind === "result-ack")).toBe(false);
+  });
+
+  it("caps the scrollback summary by lines and characters", () => {
+    expect(scrollbackSummary("")).toBe("(no summary)");
+    expect(scrollbackSummary("  \n\n")).toBe("(no summary)");
+    const many = Array.from({ length: 20 }, (_, n) => `line ${n}`).join("\n");
+    const capped = scrollbackSummary(many);
+    expect(capped.split("\n")).toHaveLength(SCROLLBACK_SUMMARY_LINES);
+    expect(capped.endsWith(" …")).toBe(true);
+    const long = scrollbackSummary("x".repeat(4_000));
+    expect(long).toBe(`${"x".repeat(SCROLLBACK_SUMMARY_CHARS)} …`);
+    expect(scrollbackSummary("done\r\n")).toBe("done");
   });
 
   it("rejects reportAgent for an unknown item and ignores it after close", async () => {

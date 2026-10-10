@@ -68,7 +68,8 @@ and running items never asked. Auto mode is therefore the existing behaviour, no
 announced:
 
 * **auto** (default): master-driven items run without a skep prompt. Submit asks only when the
-  policy (`--submit`, else `device.toml` `submit.method`, default `ask`) says `ask`.
+  policy (`--submit`, else `device.toml` `submit.method`, default `ask`, now `none`: see
+  [submit-none-summary](submit-none-summary.md)) says `ask`.
 * **manual** (`/join … --manual`, `skep session join --manual`): before each item is checked out,
   the peer is asked `Run item I-1 (app): <title>? [Y/n]`. Empty or `y` runs it. `n` or no answer
   (EOF, `/clean`) declines it. A declined item is reported to the master with

@@ -573,8 +573,8 @@ export class Shell {
       ...shown.map((command, i) => `${(labels[i] ?? "").padEnd(width)}  ${command.description}`),
       "text without / is sent as an intent to this device's session master (needs a joined peer)",
       "/start: --listen is the address to bind, --advertise the one peers dial (default: listen)",
-      "/join: auto by default (master drives work, only submit may ask); --manual confirms each",
-      "  item first; --submit pr|mr|push|none|ask overrides device.toml",
+      "/join: auto by default (master drives work, submit none: changes stay local); --manual",
+      "  confirms each item first; --submit pr|mr|push|none|ask overrides device.toml",
       "advanced: `skep tui` opens the raw agent TUI",
     ].join("\n");
   }
@@ -655,6 +655,13 @@ export class Shell {
         break;
       case "joined":
         this.log(message, "event");
+        break;
+      case "item-result":
+        // `I-4: <capped, redacted agent summary>`: what the peer's agent actually produced.
+        this.log(`item ${message}`, "event");
+        break;
+      case "result-reject":
+        this.log(`result rejected ${message}`, "error");
         break;
       default:
         this.log(`${kind} ${message}`, "event");

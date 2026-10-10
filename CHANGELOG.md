@@ -31,13 +31,26 @@ protocol rules ([`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §4.4) apply to t
   parser; wildcards and unspecified addresses (`*`, `0.0.0.0`, `::`, also with a zone id),
   blank or malformed hosts are refused before any master starts.
 * Peer control mode. A join is **auto** by default: master-driven items run without a skep
-  prompt; only the submit policy may still ask (`--submit` / `device.toml` `submit.method`).
+  prompt; only an explicit `ask` submit policy may still ask (`--submit` / `device.toml`
+  `submit.method`).
   `/join … --manual` and `skep session join --manual` opt out: each item is confirmed
   (`[Y/n]`) before it runs, and a declined item is reported as skipped without a checkout.
   The joined line names the mode. `/clean` drops a pending item question and any queued
   behind it. Agent CLI approval prompts are untouched (D29).
   `--manual` is not available with `--ui` yet.
 * `/join --submit pr|mr|push|none|ask`, as on `skep session join`.
+* The session master's shell scrollback shows the peer agent's summary when it accepts a result:
+  `item I-4: <summary>`, already redacted, capped at the first 8 non-empty lines and 600
+  characters (` …` marks a cut). A rejected result is logged as `result rejected I-4: <reason>`.
+  Progress ticks still only redraw the footer.
+
+### Changed
+
+* The session submit policy defaults to **`none`** instead of `ask`: when `device.toml` is
+  missing, has no `[submit]`, or does not parse (also an unknown method), a finished item is
+  committed on its local session branch and nobody is prompted `Submit this item?`. `--submit`
+  and `device.toml` `[submit] method = "ask"` (or `pr`/`mr`/`push`) still choose otherwise; host
+  `git` still forces `push`. The full device schema's `submit.method` default is unchanged.
 
 ## [0.1.7] - 2026-10-10
 

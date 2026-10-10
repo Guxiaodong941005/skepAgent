@@ -42,6 +42,29 @@ import {
 } from "./progress.js";
 import { applyClaim, applyResult, buildPlan, matchSub, type SubCandidate } from "./state.js";
 
+/** An accepted result's summary in operator scrollback: enough to read, never the full 4000. */
+export const SCROLLBACK_SUMMARY_LINES = 8;
+export const SCROLLBACK_SUMMARY_CHARS = 600;
+
+/**
+ * The first {@link SCROLLBACK_SUMMARY_LINES} non-empty lines of an (already redacted) summary,
+ * at most {@link SCROLLBACK_SUMMARY_CHARS} characters, marked when anything was cut.
+ */
+export function scrollbackSummary(summary: string): string {
+  const lines = summary
+    .split(/\r?\n/)
+    .map((line) => line.trimEnd())
+    .filter((line) => line.trim().length > 0);
+  if (lines.length === 0) return "(no summary)";
+  let text = lines.slice(0, SCROLLBACK_SUMMARY_LINES).join("\n");
+  let cut = lines.length > SCROLLBACK_SUMMARY_LINES;
+  if (text.length > SCROLLBACK_SUMMARY_CHARS) {
+    text = text.slice(0, SCROLLBACK_SUMMARY_CHARS).trimEnd();
+    cut = true;
+  }
+  return cut ? `${text} …` : text;
+}
+
 export class ListenAddressError extends Error {
   override readonly name = "ListenAddressError";
 }
@@ -522,7 +545,15 @@ class SessionMaster implements MasterHandle {
             });
       if (intent) intent.items = change.items;
       peer.wire.send(change.reply);
-      this.event(change.reply.type, message.itemId);
+      if (change.reply.type === "result-ack" && message.type === "result") {
+        // The operator reads the peer agent's outcome here instead of on the peer's machine.
+        const stored = change.items.find((item) => item.itemId === message.itemId)?.result;
+        this.event("item-result", `${message.itemId}: ${scrollbackSummary(stored?.summary ?? "")}`);
+      } else if (change.reply.type === "result-reject") {
+        this.event("result-reject", `${message.itemId}: ${change.reply.reason}`);
+      } else {
+        this.event(change.reply.type, message.itemId);
+      }
       // Only the sender can be the assignee of an accepted claim or result.
       this.progressChanged(peer);
     } else if (message.type === "progress") {
