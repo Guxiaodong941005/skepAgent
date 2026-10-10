@@ -38,6 +38,9 @@ describe("parseJoinArgs", () => {
     ["--host 192.168.30.182", /--host must be host:port/],
     ["--nope", /unknown option --nope/],
     ["a:1 1111-2222-3333 extra", /too many arguments/],
+    ["--host a:7419 --host b:7419 --code 123456789012", /--host given twice/],
+    ["--code 123456789012 --code 111122223333", /--code given twice/],
+    ["--code 1234 5678 9012", /--code must be 12 digits/],
   ])("rejects %j with the accepted forms", (args, problem) => {
     let message = "";
     try {

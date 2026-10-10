@@ -7,6 +7,7 @@ import { normalizeJoinCode, parseHostPort } from "../commands/session.js";
 import { CliError } from "../output.js";
 import { parseFlags } from "./flags.js";
 
+/** Codes are one word: `8632-1727-0308` or `863217270308` (arguments split on whitespace). */
 export const JOIN_USAGE = [
   "usage: /join <NNNN-NNNN-NNNN> [--host host:port]",
   "       /join <host:port> <NNNN-NNNN-NNNN>",

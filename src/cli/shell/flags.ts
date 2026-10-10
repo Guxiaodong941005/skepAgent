@@ -25,6 +25,8 @@ export function parseFlags(args: string, valued: string[], switches: string[]): 
     } else if (valued.includes(name)) {
       const value = match[2] ?? words[++i];
       if (value === undefined) throw new CliError("usage", `--${name} needs a value`);
+      // Last-value-wins would silently pick one of two hosts or codes.
+      if (flags.values[name] !== undefined) throw new CliError("usage", `--${name} given twice`);
       flags.values[name] = value;
     } else {
       throw new CliError("usage", `unknown option --${name}`);
