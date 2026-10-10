@@ -1497,14 +1497,14 @@ export async function workItem(worker: ItemWorker, item: PlanItem): Promise<SubR
 // ---------------------------------------------------------------------------------------------
 // Commands.
 
-interface StartOptions {
+export interface StartOptions {
   listen?: string;
   device?: string;
   repo?: string;
   yes?: boolean;
 }
 
-interface JoinOptions {
+export interface JoinOptions {
   code: string;
   host?: string;
   device?: string;
@@ -1599,7 +1599,42 @@ export function register(program: Command, ctx: CliContext): void {
     });
 }
 
-async function startCommand(ctx: SessionCliContext, opts: StartOptions): Promise<void> {
+// ---------------------------------------------------------------------------------------------
+// Session flows: the command bodies without Commander, signals or blocking, so the unified shell
+// (`src/cli/shell/run.ts`) drives the same code paths as `skep session start|join|intent|status`.
+
+export type JoinRequest = Parameters<MasterOptions["acceptJoin"]>[0];
+
+export interface StartMasterFlowOptions extends StartOptions {
+  /** Asked for every join unless `yes` is set. */
+  acceptJoin(request: JoinRequest): Promise<boolean>;
+  /** A rotated join code, after the flow resolved; the first one is on the returned flow. */
+  onJoinCode?(joinCode: string, expiresAtMs: number): void;
+  /** Protocol events of the master (peer joined, intent planned, ...). */
+  onEvent?(event: { kind: string; message: string }): void;
+}
+
+export interface MasterFlow {
+  readonly handle: MasterHandle;
+  readonly listen: string;
+  readonly repo: string;
+  readonly device: string;
+  /** Formatted `NNNN-NNNN-NNNN`, current as of the last rotation. */
+  readonly joinCode: string | null;
+  readonly joinCodeExpiresAtMs: number | null;
+  /** Settles once the master closed and this flow's `session.json` was removed. */
+  readonly closed: Promise<void>;
+  close(): Promise<void>;
+}
+
+/**
+ * Binds a master and publishes `session.json`. Resolves once the master listens; the caller owns
+ * how long it runs (`closed`) and how it stops (`close`).
+ */
+export async function startMasterFlow(
+  ctx: SessionCliContext,
+  opts: StartMasterFlowOptions,
+): Promise<MasterFlow> {
   let target: HostPort;
   if (opts.listen !== undefined) {
     const parsed = parseHostPort(opts.listen);
@@ -1631,7 +1666,6 @@ async function startCommand(ctx: SessionCliContext, opts: StartOptions): Promise
 
   const api = await loadSessionApi(ctx);
   const token = Buffer.from(cryptoRandom.bytes(16)).toString("hex");
-  const output = ctx.output();
 
   let started = false;
   let code: string | null = null;
@@ -1639,18 +1673,65 @@ async function startCommand(ctx: SessionCliContext, opts: StartOptions): Promise
   const onJoinCode = (info: { code: string; expiresAtMs: number }): void => {
     code = formatJoinCode(info.code);
     codeExpiresAtMs = info.expiresAtMs;
-    // The initial code may arrive before startMaster resolves; it is printed with the banner.
-    if (!started) return;
-    output.result(
-      { event: "join-code", joinCode: code, joinCodeExpiresAtMs: codeExpiresAtMs },
-      () => `join code: ${code ?? "none"}${expiryText(codeExpiresAtMs)}\n`,
-    );
+    // The initial code may arrive before startMaster resolves; it is reported with the flow.
+    if (started) opts.onJoinCode?.(code, codeExpiresAtMs);
   };
 
+  const handle = await api.startMaster({
+    listen: target,
+    repo,
+    device,
+    controlToken: token,
+    clock: systemClock,
+    random: cryptoRandom,
+    onJoinCode,
+    acceptJoin: (request) => (opts.yes === true ? Promise.resolve(true) : opts.acceptJoin(request)),
+    ...(opts.onEvent === undefined ? {} : { onEvent: opts.onEvent }),
+  });
+  const closed = handle.closed.then(
+    () => removeOwnSessionFile(file, token),
+    async (error: unknown) => {
+      await removeOwnSessionFile(file, token);
+      throw error;
+    },
+  );
+  let listen: string;
+  try {
+    listen = listenOf(handle);
+    await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+    await atomicWrite(file, `${JSON.stringify({ listen, token })}\n`, {
+      mode: 0o600,
+    });
+  } catch (error) {
+    await handle.close();
+    await closed.catch(() => undefined);
+    throw error;
+  }
+  started = true;
+  return {
+    handle,
+    listen,
+    repo,
+    device,
+    get joinCode() {
+      return code;
+    },
+    get joinCodeExpiresAtMs() {
+      return codeExpiresAtMs;
+    },
+    closed,
+    close: async () => {
+      await handle.close();
+      await closed;
+    },
+  };
+}
+
+async function startCommand(ctx: SessionCliContext, opts: StartOptions): Promise<void> {
+  const output = ctx.output();
   let reader: LineReader | undefined;
   let prompts: Promise<unknown> = Promise.resolve();
-  const acceptJoin = (request: Parameters<MasterOptions["acceptJoin"]>[0]): Promise<boolean> => {
-    if (opts.yes === true) return Promise.resolve(true);
+  const acceptJoin = (request: JoinRequest): Promise<boolean> => {
     // One prompt at a time: concurrent joins must not interleave questions and answers.
     const answer = prompts.then(async () => {
       reader ??= new LineReader(ctx.stdin ?? process.stdin);
@@ -1663,49 +1744,42 @@ async function startCommand(ctx: SessionCliContext, opts: StartOptions): Promise
     return answer;
   };
 
-  const handle = await api.startMaster({
-    listen: target,
-    repo,
-    device,
-    controlToken: token,
-    clock: systemClock,
-    random: cryptoRandom,
-    onJoinCode,
-    acceptJoin,
-  });
-  const listen = listenOf(handle);
+  let flow: MasterFlow;
+  try {
+    flow = await startMasterFlow(ctx, {
+      ...opts,
+      acceptJoin,
+      onJoinCode: (joinCode, expiresAtMs) =>
+        output.result(
+          { event: "join-code", joinCode, joinCodeExpiresAtMs: expiresAtMs },
+          () => `join code: ${joinCode}${expiryText(expiresAtMs)}\n`,
+        ),
+    });
+  } catch (error) {
+    reader?.close();
+    throw error;
+  }
 
   const stop = (): void => {
-    void handle.close();
+    // A failed close surfaces below through `flow.closed`.
+    flow.close().catch(() => undefined);
   };
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
   try {
-    await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
-    await atomicWrite(file, `${JSON.stringify({ listen, token })}\n`, {
-      mode: 0o600,
-    });
-    started = true;
+    const { listen, repo, device, joinCode, joinCodeExpiresAtMs } = flow;
     output.result(
-      {
-        event: "started",
-        listen,
-        repo,
-        device,
-        joinCode: code,
-        joinCodeExpiresAtMs: codeExpiresAtMs,
-      },
+      { event: "started", listen, repo, device, joinCode, joinCodeExpiresAtMs },
       () =>
         `session master listening on ${listen} (repo ${repo})\n` +
-        `join code: ${code ?? "none"}${expiryText(codeExpiresAtMs)}\n`,
+        `join code: ${joinCode ?? "none"}${expiryText(joinCodeExpiresAtMs)}\n`,
     );
-    await handle.closed;
+    await flow.closed;
     output.result({ event: "closed" }, () => "session closed\n");
   } finally {
     process.removeListener("SIGINT", stop);
     process.removeListener("SIGTERM", stop);
     reader?.close();
-    await removeOwnSessionFile(file, token);
   }
 }
 
@@ -1745,7 +1819,44 @@ async function removeOwnSessionFile(file: string, token: string): Promise<void> 
   if (current?.token === token) await rm(file, { force: true });
 }
 
-async function joinCommand(ctx: SessionCliContext, opts: JoinOptions): Promise<void> {
+export interface JoinFlowOptions extends Omit<JoinOptions, "ui"> {
+  /** This device's agent CLI chosen by its human; replaces the AGENT.md lookup when set. */
+  cli?: AgentCli;
+}
+
+export interface JoinFlowIo {
+  /** One join event: machine data and its human line (with trailing newline). */
+  say(data: unknown, human: () => string): void;
+  /** A question for this device's human; null means no answer (defer). */
+  ask(question: string): Promise<string | null>;
+  warn(message: string): void;
+  /** Opened once the options validated, so a bad flag never flashes a screen. */
+  createView(): JoinView;
+  /** The view answers the "ask" submit policy (`JoinView.chooseSubmit`) instead of `ask`. */
+  viewChoosesSubmit?: boolean;
+}
+
+export interface JoinFlow {
+  readonly handle: SubHandle;
+  /** `host:port` of the master. */
+  readonly target: string;
+  readonly device: string;
+  readonly role: string;
+  /** Settles once the channel closed and running items were aborted. */
+  readonly closed: Promise<{ reason: string }>;
+  /** Abort running items and leave the session. */
+  close(): Promise<void>;
+}
+
+/**
+ * Joins a master and works its items in the background. Resolves once joined; the caller owns
+ * how long it runs (`closed`) and how it stops (`close`).
+ */
+export async function joinSessionFlow(
+  ctx: SessionCliContext,
+  opts: JoinFlowOptions,
+  io: JoinFlowIo,
+): Promise<JoinFlow> {
   const code = normalizeJoinCode(opts.code);
   if (code === null) {
     throw new CliError("bad_code", "--code must be 12 digits (NNNN-NNNN-NNNN)", EXIT.usage);
@@ -1777,52 +1888,25 @@ async function joinCommand(ctx: SessionCliContext, opts: JoinOptions): Promise<v
   const role = opts.role;
   if (ctx.paths === undefined) throw new Error("skep home is not resolved");
   const paths = ctx.paths;
-  const ui = opts.ui === true;
-  if (ui && joinViewFactory === null) {
-    throw new CliError("ui_unavailable", "the full-screen view is not available in this build");
-  }
-  const warn = (message: string): void => ctx.stderr.write(`skep: ${message}\n`);
+  const { say, ask, warn } = io;
   const view = selectAgentView(opts.agent, ctx.env);
   let agent: AgentSetup | undefined;
   if (view !== "dry") {
     agent = {
       view,
-      cli: await agentCliOf(path.resolve(ctx.cwd ?? process.cwd(), opts.roleDir ?? "."), view),
+      cli:
+        opts.cli ??
+        (await agentCliOf(path.resolve(ctx.cwd ?? process.cwd(), opts.roleDir ?? "."), view)),
       runtime: ctx.agentRuntime ?? loadAgentRuntime,
       journal: path.join(paths.home, "session", "transcripts"),
       notify: ctx.notify ?? (await deviceNotifier(paths.deviceToml, warn)),
     };
   }
   const api = await loadSessionApi(ctx);
-  const output = ctx.output();
-  // The full-screen view owns the terminal; event lines then go only to `--machine` output.
-  const say = (data: unknown, human: () => string): void =>
-    output.result(data, ui ? () => "" : human);
   // A human override on the command line wins over this device's file policy.
   const method = opts.submit ?? (await loadSubmitPolicy(paths.deviceToml, warn)).method;
 
-  let reader: LineReader | undefined;
-  let prompts: Promise<unknown> = Promise.resolve();
-  const ask = (question: string): Promise<string | null> => {
-    // One prompt at a time: concurrent items must not interleave questions and answers.
-    const answer = prompts.then(async () => {
-      reader ??= new LineReader(ctx.stdin ?? process.stdin);
-      ctx.stderr.write(question);
-      return reader.next();
-    });
-    prompts = answer.catch(() => undefined);
-    return answer;
-  };
-  const joinView: JoinView =
-    ui && joinViewFactory !== null
-      ? joinViewFactory({
-          stdin: (ctx.stdin ?? process.stdin) as NodeJS.ReadStream,
-          stdout: process.stdout,
-        })
-      : new LineJoinView(ctx.stderr, ask, {
-          pause: () => reader?.pause(),
-          resume: () => reader?.resume(),
-        });
+  const joinView = io.createView();
   let terminalQueue: Promise<unknown> = Promise.resolve();
   const abort = new AbortController();
   let subHandle: SubHandle | undefined;
@@ -1833,7 +1917,9 @@ async function joinCommand(ctx: SessionCliContext, opts: JoinOptions): Promise<v
     ask,
     ...(agent === undefined ? {} : { agent }),
     view: joinView,
-    ...(ui ? { chooseSubmit: (model: JoinViewModel) => joinView.chooseSubmit(model) } : {}),
+    ...(io.viewChoosesSubmit === true
+      ? { chooseSubmit: (model: JoinViewModel) => joinView.chooseSubmit(model) }
+      : {}),
     peers: [],
     terminal: (fn) => {
       const run = terminalQueue.then(fn);
@@ -1947,31 +2033,97 @@ async function joinCommand(ctx: SessionCliContext, opts: JoinOptions): Promise<v
     throw error;
   }
 
-  const stop = (): void => {
+  const closed = handle.closed.finally(() => {
     abort.abort();
-    void handle.close();
-  };
-  process.once("SIGINT", stop);
-  process.once("SIGTERM", stop);
+    joinView.close();
+  });
+  const at = formatHostPort(target);
   try {
     showFingerprint(handle.fingerprint);
     const { sessionId, peerId } = handle;
     selfId = peerId;
     if (!roster.has(peerId)) roster.set(peerId, { peerId, device, role, state: "joined" });
     updatePeers();
-    const at = formatHostPort(target);
     say(
       { event: "joined", sessionId, peerId, target: at },
       () => `joined session ${sessionId} at ${at} as ${peerId}\n`,
     );
-    await handle.closed;
-    say({ event: "closed" }, () => "session closed\n");
+  } catch (error) {
+    abort.abort();
+    await handle.close();
+    await closed.catch(() => undefined);
+    throw error;
+  }
+  return {
+    handle,
+    target: at,
+    device,
+    role,
+    closed,
+    close: async () => {
+      abort.abort();
+      await handle.close();
+      await closed;
+    },
+  };
+}
+
+async function joinCommand(ctx: SessionCliContext, opts: JoinOptions): Promise<void> {
+  const ui = opts.ui === true;
+  if (ui && joinViewFactory === null) {
+    throw new CliError("ui_unavailable", "the full-screen view is not available in this build");
+  }
+  const output = ctx.output();
+  let reader: LineReader | undefined;
+  let prompts: Promise<unknown> = Promise.resolve();
+  const ask = (question: string): Promise<string | null> => {
+    // One prompt at a time: concurrent items must not interleave questions and answers.
+    const answer = prompts.then(async () => {
+      reader ??= new LineReader(ctx.stdin ?? process.stdin);
+      ctx.stderr.write(question);
+      return reader.next();
+    });
+    prompts = answer.catch(() => undefined);
+    return answer;
+  };
+  const { ui: _ui, ...flowOptions } = opts;
+  let flow: JoinFlow;
+  try {
+    flow = await joinSessionFlow(ctx, flowOptions, {
+      // The full-screen view owns the terminal; event lines then go only to `--machine` output.
+      say: (data, human) => output.result(data, ui ? () => "" : human),
+      ask,
+      warn: (message) => ctx.stderr.write(`skep: ${message}\n`),
+      createView: () =>
+        ui && joinViewFactory !== null
+          ? joinViewFactory({
+              stdin: (ctx.stdin ?? process.stdin) as NodeJS.ReadStream,
+              stdout: process.stdout,
+            })
+          : new LineJoinView(ctx.stderr, ask, {
+              pause: () => reader?.pause(),
+              resume: () => reader?.resume(),
+            }),
+      viewChoosesSubmit: ui,
+    });
+  } catch (error) {
+    reader?.close();
+    throw error;
+  }
+
+  const stop = (): void => {
+    // A failed close surfaces below through `flow.closed`.
+    flow.close().catch(() => undefined);
+  };
+  process.once("SIGINT", stop);
+  process.once("SIGTERM", stop);
+  try {
+    await flow.closed;
+    output.result({ event: "closed" }, ui ? () => "" : () => "session closed\n");
   } finally {
     process.removeListener("SIGINT", stop);
     process.removeListener("SIGTERM", stop);
-    abort.abort();
     reader?.close();
-    joinView.close();
   }
 }
 
@@ -2160,6 +2312,12 @@ async function intentCommand(
   text: string,
   repos: string[] | undefined,
 ): Promise<void> {
+  const result = await submitIntent(ctx, text, repos);
+  ctx.output().result(result, () => `${result.intentId}\n`);
+}
+
+/** Validates the intent's input; shared by the control path and an in-process master. */
+export function checkIntent(text: string, repos: string[] | undefined): void {
   if (text.length < 1 || text.length > MAX_INTENT_TEXT) {
     const message = `intent text must be 1..${MAX_INTENT_TEXT} chars`;
     throw new CliError("bad_intent", message, EXIT.usage);
@@ -2170,6 +2328,15 @@ async function intentCommand(
     }
     for (const repo of repos) validRepo(repo);
   }
+}
+
+/** Sends an intent to the master named in `session.json`. */
+export async function submitIntent(
+  ctx: SessionCliContext,
+  text: string,
+  repos?: string[],
+): Promise<{ intentId: string }> {
+  checkIntent(text, repos);
   const result = await control(ctx, {
     op: "intent",
     text,
@@ -2177,14 +2344,20 @@ async function intentCommand(
   });
   const parsed = IntentResultSchema.safeParse(result);
   if (!parsed.success) throw badReply("intent", parsed.error);
-  ctx.output().result(parsed.data, () => `${parsed.data.intentId}\n`);
+  return parsed.data;
 }
 
-async function statusCommand(ctx: SessionCliContext): Promise<void> {
+/** Status of the master named in `session.json`. */
+export async function fetchSessionStatus(ctx: SessionCliContext): Promise<SessionStatus> {
   const result = await control(ctx, { op: "status" });
   const parsed = SessionStatusSchema.safeParse(result);
   if (!parsed.success) throw badReply("status", parsed.error);
-  ctx.output().result(parsed.data, () => renderSessionStatus(parsed.data));
+  return parsed.data;
+}
+
+async function statusCommand(ctx: SessionCliContext): Promise<void> {
+  const status = await fetchSessionStatus(ctx);
+  ctx.output().result(status, () => renderSessionStatus(status));
 }
 
 function table(rows: string[][]): string {

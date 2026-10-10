@@ -4,21 +4,27 @@
 
 import { Command, CommanderError } from "commander";
 import { skepHome, skepPaths } from "../config/paths.js";
-import { launchAgent, register as registerAgentTui } from "./commands/agent-tui.js";
+import { register as registerAgentTui } from "./commands/agent-tui.js";
 import { expandStartWithMaster, register as registerSession } from "./commands/session.js";
 import { register as registerUi } from "./commands/ui.js";
 import type { CliContext } from "./context.js";
 import { CliError, createOutput, EXIT, type Output } from "./output.js";
+import { runShell } from "./shell/run.js";
 import { SKEP_VERSION } from "./version.js";
 
 export type { SkepPaths } from "../config/paths.js";
 export type { CliContext } from "./context.js";
 
+export type ProgramContext = CliContext & {
+  /** Runs the no-subcommand shell (default: {@link runShell}). Tests inject a fake. */
+  shell?: (ctx: CliContext) => Promise<void>;
+};
+
 /**
  * Build a fresh program bound to `ctx`. A new tree per invocation: Commander holds parse state
  * on the command objects, so reusing one across calls would leak options between runs.
  */
-export function buildProgram(ctx: CliContext): Command {
+export function buildProgram(ctx: ProgramContext): Command {
   const program = new Command();
 
   program
@@ -44,16 +50,16 @@ export function buildProgram(ctx: CliContext): Command {
   registerSession(program, ctx);
   registerAgentTui(program, ctx);
 
-  program
-    .argument("[prompt...]", "ask the agent; no subcommand opens it")
-    .action(async (words: string[]) => {
-      await launchAgent(ctx, words.join(" "), undefined);
-    });
+  // No subcommand opens the unified shell; it never hands the terminal to an agent's own TUI
+  // (docs/plans/unified-tui-shell.md §5). `skep tui` stays the explicit raw-agent escape.
+  program.action(async () => {
+    await (ctx.shell ?? runShell)(ctx);
+  });
 
   return program;
 }
 
-export async function runCli(argv: string[], ctx: CliContext): Promise<number> {
+export async function runCli(argv: string[], ctx: ProgramContext): Promise<number> {
   ctx.exitCode = undefined;
   argv = expandStartWithMaster(argv);
   const program = buildProgram(ctx);
