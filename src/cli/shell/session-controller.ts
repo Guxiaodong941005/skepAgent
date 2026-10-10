@@ -8,7 +8,8 @@
  */
 
 import type { ControlEndpoint, JoinFlow, MasterFlow, SessionStatus } from "../commands/session.js";
-import { formatJoinCode } from "../commands/session.js";
+import { formatJoinCode, joinHint } from "../commands/session.js";
+import { quoteSlashWord } from "./flags.js";
 import type { ShellPeer } from "./model.js";
 
 export type SessionMode = "none" | "joining" | "master" | "joined" | "external";
@@ -18,7 +19,14 @@ export interface SessionView {
   live: boolean;
   /** Header text: `no session`, `master · code …`, `joined … as peer-2 · coding`, … */
   label: string;
-  master: { listen: string; repo: string; joinCode: string | null; external: boolean } | null;
+  /** `advertise` is the address peers dial; it is `listen` unless `/start --advertise` set it. */
+  master: {
+    listen: string;
+    advertise: string;
+    repo: string;
+    joinCode: string | null;
+    external: boolean;
+  } | null;
   join: { target: string; role: string; peerId: string } | null;
   peers: ShellPeer[];
   /** A joined shell: milliseconds since the master was last heard from. */
@@ -193,6 +201,7 @@ export class SessionController {
         label,
         master: {
           listen: this.master.listen,
+          advertise: this.master.advertise,
           repo: this.master.repo,
           joinCode: this.master.joinCode,
           external: false,
@@ -233,7 +242,14 @@ export class SessionController {
         mode: "external",
         live: true,
         label: `master (other process) · code ${code} · ${status.listen}`,
-        master: { listen: status.listen, repo: status.repo, joinCode: code, external: true },
+        // Another process's advertise address is not published; its listen address is the guess.
+        master: {
+          listen: status.listen,
+          advertise: status.listen,
+          repo: status.repo,
+          joinCode: status.joinCode === null ? null : code,
+          external: true,
+        },
         join: null,
         peers: peersFromStatus(status),
         linkSilentMs: null,
@@ -273,7 +289,10 @@ export class SessionController {
     if (master === null) throw new Error("a master view without master details");
     // This shell's own join of its own master counts: it can work the items too.
     if (view.peers.length === 0) {
-      return { kind: "refused", message: noPeersText(master.listen, master.joinCode) };
+      return {
+        kind: "refused",
+        message: noPeersText(master.advertise, master.joinCode, master.repo),
+      };
     }
     if (this.master !== null) return { kind: "own", master: this.master };
     if (this.external === null) throw new Error("an external view without an external master");
@@ -281,17 +300,18 @@ export class SessionController {
   }
 }
 
-export function noPeersText(listen: string, joinCode: string | null): string {
-  const code = joinCode ?? "<code>";
-  return (
-    "no peers joined yet — nothing can take this intent\n" +
-    `on another device: skep → /join ${code} --host ${listen}`
-  );
+/** `host` is the address peers dial (the master's advertise address). */
+export function noPeersText(host: string, joinCode: string | null, repo: string): string {
+  const hint =
+    joinCode === null
+      ? `on another device: /join --host ${host} --code <code> --repo ${quoteSlashWord(repo)}`
+      : joinHint({ host, code: joinCode, repo });
+  return `no peers joined yet — nothing can take this intent\n${hint}`;
 }
 
 /** Why routing found no peer, naming each connected peer's repo (`?` until it described one). */
 export function noMatchText(status: SessionStatus, repos: readonly string[]): string {
-  if (status.peers.length === 0) return noPeersText(status.listen, status.joinCode);
+  if (status.peers.length === 0) return noPeersText(status.listen, status.joinCode, status.repo);
   const peers = status.peers.map(
     (peer) => `${peer.peerId} ${peer.device}: repo ${peer.repo ?? "?"}`,
   );

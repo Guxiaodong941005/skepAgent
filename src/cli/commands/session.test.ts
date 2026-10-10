@@ -18,6 +18,7 @@ import {
   encodeFrame,
   expandStartWithMaster,
   FrameDecoder,
+  formatJoinCli,
   herdrAgentName,
   type ItemWorker,
   type JoinView,
@@ -308,6 +309,130 @@ describe("session start", () => {
     fake.closed.resolve();
     expect(await run).toBe(0);
     await expect(stat(file)).rejects.toThrow(/ENOENT/);
+  });
+
+  it("prints the pasteable join line on the advertise address, and again on rotation", async () => {
+    const fake = fakeApi("10.1.2.3:7500");
+    const c = capture(await home(), { sessionApi: fake.api });
+    const run = runCli(
+      ["session", "start", "--yes", "--repo", "app", "--advertise", "203.0.113.7:7419"],
+      c.ctx,
+    );
+    await vi.waitFor(() => expect(c.stdout).toContain("join code:"));
+    expect(c.stdout).toContain("session master listening on 10.1.2.3:7500 (repo app)");
+    expect(c.stdout).toContain("peers dial 203.0.113.7:7419");
+    expect(c.stdout).toContain(
+      "paste into skep: /join --host 203.0.113.7:7419 --code 1234-5678-9012 --repo app",
+    );
+    expect(c.stdout).toContain(
+      "or from a shell: skep session join --host 203.0.113.7:7419 --code 1234-5678-9012 --repo app",
+    );
+    fake.calls.master[0]?.onJoinCode({ code: "999988887777", expiresAtMs: 1_800_000_600_000 });
+    expect(c.stdout).toContain("/join --host 203.0.113.7:7419 --code 9999-8888-7777 --repo app");
+    fake.closed.resolve();
+    expect(await run).toBe(0);
+  });
+
+  it("--advertise is checked like --listen and reported in --machine output", async () => {
+    const fake = fakeApi("10.1.2.3:7500");
+    const bad = capture(await home(), { sessionApi: fake.api });
+    const argv = ["--machine", "session", "start", "--yes", "--repo", "app", "--advertise"];
+    expect(await runCli([...argv, "0.0.0.0:7419"], bad.ctx)).toBe(2);
+    expect(JSON.parse(bad.stdout).error.message).toMatch(/--advertise must name one interface/);
+    expect(fake.calls.master).toHaveLength(0);
+
+    const c = capture(await home(), { sessionApi: fake.api });
+    const run = runCli(["--machine", "session", "start", "--yes", "--repo", "app"], c.ctx);
+    await vi.waitFor(() => expect(c.stdout).toContain('"started"'));
+    const started = JSON.parse(c.stdout.split("\n")[0] ?? "").result;
+    expect(started).toMatchObject({ listen: "10.1.2.3:7500", advertise: "10.1.2.3:7500" });
+    fake.closed.resolve();
+    expect(await run).toBe(0);
+  });
+
+  it.each([
+    "*:7419",
+    " :7419",
+    "a b:7419",
+    "0.0.0.0:7419",
+    "[::]:7419",
+    "-x:7419",
+    "host:0",
+    "host",
+    // Fix round 2: structure, not characters.
+    "[1:::2]:7419",
+    "[::%eth0]:7419",
+    "[0:0:0:0:0:0:0:0%eth0]:7419",
+    "[::ffff:0.0.0.0]:7419",
+    "[fe80::1%]:7419",
+    "a..b:7419",
+    ".a:7419",
+    "a.:7419",
+    "a-.b:7419",
+    "999.1.1.1:7419",
+    "0:7419",
+  ])("--advertise %j never reaches startMaster", async (advertise) => {
+    const fake = fakeApi("10.1.2.3:7500");
+    const c = capture(await home(), { sessionApi: fake.api });
+    const argv = ["--machine", "session", "start", "--yes", "--repo", "app"];
+    expect(await runCli([...argv, `--advertise=${advertise}`], c.ctx)).toBe(2);
+    expect(JSON.parse(c.stdout).error.message).toMatch(/^--advertise must/);
+    expect(fake.calls.master).toHaveLength(0);
+  });
+
+  it.each([
+    ["[1:::2]:7419", /must name a hostname or IP address/],
+    ["[::%eth0]:7419", /not a wildcard/],
+    ["a..b:7419", /must name a hostname or IP address/],
+  ])("--listen %j is refused like --advertise", async (listen, problem) => {
+    const fake = fakeApi("10.1.2.3:7500");
+    const c = capture(await home(), { sessionApi: fake.api });
+    const argv = ["--machine", "session", "start", "--yes", "--repo", "app"];
+    expect(await runCli([...argv, `--listen=${listen}`], c.ctx)).toBe(2);
+    expect(JSON.parse(c.stdout).error.message).toMatch(problem);
+    expect(fake.calls.master).toHaveLength(0);
+  });
+
+  it.each([
+    ["mac.local:7419", "mac.local:7419"],
+    ["203.0.113.7:7419", "203.0.113.7:7419"],
+    ["[2001:db8::7]:7419", "[2001:db8::7]:7419"],
+    ["[fe80::1%eth0]:7419", "[fe80::1%eth0]:7419"],
+  ])("--advertise %j is accepted", async (advertise, shown) => {
+    const fake = fakeApi("10.1.2.3:7500");
+    const c = capture(await home(), { sessionApi: fake.api });
+    const argv = ["--machine", "session", "start", "--yes", "--repo", "app"];
+    const run = runCli([...argv, `--advertise=${advertise}`], c.ctx);
+    await vi.waitFor(() => expect(c.stdout).toContain('"started"'));
+    expect(JSON.parse(c.stdout.split("\n")[0] ?? "").result.advertise).toBe(shown);
+    fake.closed.resolve();
+    expect(await run).toBe(0);
+  });
+
+  it("--listen gets the same host checks", async () => {
+    const fake = fakeApi("10.1.2.3:7500");
+    const c = capture(await home(), { sessionApi: fake.api });
+    const argv = ["--machine", "session", "start", "--yes", "--repo", "app", "--listen=*:7419"];
+    expect(await runCli(argv, c.ctx)).toBe(2);
+    expect(JSON.parse(c.stdout).error.message).toMatch(/--listen must name one interface/);
+    expect(fake.calls.master).toHaveLength(0);
+  });
+
+  it("shell-quotes the CLI twin so a shell reads back the same arguments", async () => {
+    const repo = "it's my app; false $(x) `y` | z";
+    const twin = formatJoinCli({ host: "[fe80::1]:7419", code: "863217270308", repo });
+    expect(twin.startsWith("skep session join ")).toBe(true);
+    // The twin is meant for a shell, so a real POSIX shell is the oracle here.
+    const args = twin.slice("skep session join ".length);
+    const { stdout } = await execFileP("sh", ["-c", `set -- ${args}; printf '%s\\0' "$@"`]);
+    expect(stdout.split("\0").slice(0, -1)).toEqual([
+      "--host",
+      "[fe80::1]:7419",
+      "--code",
+      "8632-1727-0308",
+      "--repo",
+      repo,
+    ]);
   });
 
   it("asks on stdin and accepts y", async () => {
@@ -909,6 +1034,49 @@ describe("session join works items", () => {
     const { item } = await joinAndWork(box, []);
     // host = "git" forces push.
     expect(item.result?.submit).toMatchObject({ method: "push", state: "pushed" });
+  });
+
+  it("joins in auto mode by default: no per-item question before the run", async () => {
+    const box = await sandbox();
+    const { item, run } = await joinAndWork(box, ["--submit", "none"]);
+    expect(run.stderr).not.toContain("Run item");
+    expect(run.stdout).toContain('"control":"auto"');
+    expect(item.result?.submit).toMatchObject({ method: "none", state: "local" });
+  });
+
+  it("--manual asks before each item; Enter runs it", async () => {
+    const box = await sandbox();
+    const stdin = new PassThrough();
+    stdin.write("\n");
+    const { item, run } = await joinAndWork(box, ["--manual", "--submit", "none"], stdin);
+    expect(run.stdout).toContain('"control":"manual"');
+    expect(run.stderr).toContain("Run item I-1 (app): add a health check? [Y/n]");
+    expect(item.result?.submit).toMatchObject({ method: "none", state: "local" });
+  });
+
+  it("--manual: n declines the item without checking anything out", async () => {
+    const box = await sandbox();
+    const stdin = new PassThrough();
+    stdin.write("n\n");
+    const { item } = await joinAndWork(box, ["--manual", "--submit", "push"], stdin);
+    const branch = "skep/session/I-1-e1";
+    expect(item.result?.checks).toEqual([{ name: "peer", status: "skip" }]);
+    expect(item.result?.submit).toEqual({ method: "push", state: "skipped", branch });
+    expect(item.result?.summary).toContain("declined on this device (manual mode)");
+    await expect(gitIn(box.repo, ["rev-parse", "--verify", branch], box.env)).rejects.toThrow();
+  });
+
+  it("--manual cannot be combined with --ui", async () => {
+    const box = await sandbox();
+    setJoinViewFactory(() => recordingView().view);
+    try {
+      const c = capture(box.home, { env: box.env, cwd: box.repo });
+      const argv = ["--machine", "session", "join", "--code", "123456789012", "--host", "h:1"];
+      expect(await runCli([...argv, "--ui", "--manual"], c.ctx)).toBe(2);
+      expect(JSON.parse(c.stdout).error.message).toMatch(/--manual cannot be combined with --ui/);
+    } finally {
+      setJoinViewFactory(null);
+    }
   });
 
   it("ask: prints branch and sha, then a typed answer submits", async () => {

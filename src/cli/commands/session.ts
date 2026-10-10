@@ -51,6 +51,7 @@ import { atomicWrite, safeJoin } from "../../util/fs.js";
 import { cryptoRandom } from "../../util/random.js";
 import type { CliContext } from "../context.js";
 import { CliError, EXIT } from "../output.js";
+import { quoteSlashWord } from "../shell/flags.js";
 
 export const DEFAULT_PORT = 7419;
 const SESSION_FILE = "session.json";
@@ -373,8 +374,65 @@ export function parseHostPort(value: string): HostPort | null {
   return { host, port };
 }
 
-function isWildcard(host: string): boolean {
-  return host === "0.0.0.0" || host === "::" || /^[0:]+$/.test(host);
+/**
+ * `host:port` naming one address: `--listen` binds it, `--advertise` is what peers dial. The one
+ * check for both, run before any master starts.
+ */
+function concreteHostPort(flag: string, value: string): HostPort {
+  const parsed = parseHostPort(value);
+  if (parsed === null) {
+    throw new CliError("bad_listen", `${flag} must be host:port, got ${value}`, EXIT.usage);
+  }
+  const problem = hostProblem(parsed.host);
+  if (problem === "wildcard") {
+    // A wildcard bind would expose the join handshake and control port on every interface, and
+    // a wildcard advertise is no address a peer can dial.
+    throw new CliError(
+      "bad_listen",
+      `${flag} must name one interface address, not a wildcard`,
+      EXIT.usage,
+    );
+  }
+  if (problem === "malformed") {
+    throw new CliError(
+      "bad_listen",
+      `${flag} must name a hostname or IP address, got ${JSON.stringify(parsed.host)}`,
+      EXIT.usage,
+    );
+  }
+  return parsed;
+}
+
+/** One DNS label: 1..63 characters, no leading or trailing `-` (`_` tolerated, as resolvers do). */
+const DNS_LABEL_RE = /^[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?$/;
+/** An IPv6 zone id (`fe80::1%eth0`). */
+const ZONE_RE = /^[A-Za-z0-9._-]+$/;
+
+/** Unspecified addresses: binding one means every interface, and nobody can dial one. */
+const UNSPECIFIED = new net.BlockList();
+UNSPECIFIED.addAddress("0.0.0.0", "ipv4");
+UNSPECIFIED.addAddress("::", "ipv6");
+UNSPECIFIED.addAddress("::ffff:0.0.0.0", "ipv6");
+
+/**
+ * Why `host` is not one concrete address, or null. IPs are checked by Node's own parser, not by
+ * character classes; an IPv6 zone id is split off first, so `[::%eth0]` is still a wildcard.
+ */
+function hostProblem(host: string): "wildcard" | "malformed" | null {
+  if (host === "*") return "wildcard";
+  if (host.includes(":")) {
+    // Only a bracketed `[v6]:port` yields a host with colons (see parseHostPort).
+    const at = host.indexOf("%");
+    const address = at < 0 ? host : host.slice(0, at);
+    if (at >= 0 && !ZONE_RE.test(host.slice(at + 1))) return "malformed";
+    if (!net.isIPv6(address)) return "malformed";
+    return UNSPECIFIED.check(address, "ipv6") ? "wildcard" : null;
+  }
+  if (net.isIPv4(host)) return UNSPECIFIED.check(host, "ipv4") ? "wildcard" : null;
+  // Digits and dots that are no valid IPv4 (`0`, `999.1.1.1`, `1.2.3`) are not a hostname either.
+  if (/^[\d.]+$/.test(host)) return /^0+$/.test(host) ? "wildcard" : "malformed";
+  if (host.length > 253) return "malformed";
+  return host.split(".").every((label) => DNS_LABEL_RE.test(label)) ? null : "malformed";
 }
 
 /**
@@ -408,6 +466,61 @@ export function formatJoinCode(code: string): string {
   const normalized = normalizeJoinCode(code);
   if (normalized === null) return code;
   return `${normalized.slice(0, 4)}-${normalized.slice(4, 8)}-${normalized.slice(8)}`;
+}
+
+export interface JoinTarget {
+  /** `host:port` peers dial (the master's advertise address, else its listen address). */
+  host: string;
+  code: string;
+  repo: string;
+}
+
+/**
+ * A repo the paste line can carry. Control characters (a newline would submit the input early)
+ * cannot be typed into the shell's input box, so such a repo is left out and named instead.
+ */
+function pasteableRepo(repo: string): boolean {
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: control characters are the point.
+  return !/[\u0000-\u001f\u007f]/.test(repo);
+}
+
+/**
+ * The one line a peer pastes into its skep shell to join (docs/plans/join-paste-auto.md). Each
+ * value is quoted for the slash grammar, so `parseJoinArgs` reads back exactly these values.
+ */
+export function formatJoinPaste({ host, code, repo }: JoinTarget): string {
+  const base = `/join --host ${quoteSlashWord(host)} --code ${formatJoinCode(code)}`;
+  return pasteableRepo(repo) ? `${base} --repo ${quoteSlashWord(repo)}` : base;
+}
+
+/** A POSIX shell word: bare when safe, else single-quoted. */
+export function quoteShellWord(value: string): string {
+  if (/^[A-Za-z0-9._/:@%+=,-]+$/.test(value)) return value;
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+/** The same join for a plain shell; every argument is shell-quoted. */
+export function formatJoinCli({ host, code, repo }: JoinTarget): string {
+  return [
+    "skep session join --host",
+    quoteShellWord(host),
+    "--code",
+    formatJoinCode(code),
+    "--repo",
+    quoteShellWord(repo),
+  ].join(" ");
+}
+
+/** What a master prints so a peer can join: the paste line first, then its CLI twin. */
+export function joinHint(target: JoinTarget): string {
+  const note = pasteableRepo(target.repo)
+    ? ""
+    : `\n(repo ${JSON.stringify(target.repo)} cannot be pasted: join from that checkout, ` +
+      "whose directory name is the default --repo)";
+  return (
+    `on another device, paste into skep: ${formatJoinPaste(target)}${note}\n` +
+    `or from a shell: ${formatJoinCli(target)}`
+  );
 }
 
 /**
@@ -577,7 +690,7 @@ class LineReader {
 // A sub and the master do not share a repo, so what happens to a finished item's code is decided
 // here, by this device's own policy or the human at it. The master only records the outcome.
 
-const SUBMIT_METHODS = ["pr", "mr", "push", "none", "ask"] as const;
+export const SUBMIT_METHODS = ["pr", "mr", "push", "none", "ask"] as const;
 const SUBMIT_COMMAND_METHODS = ["pr", "mr", "push", "none", "skip"] as const;
 const DIRECT_METHODS = ["pr", "mr", "push", "none"] as const;
 type DirectMethod = (typeof DIRECT_METHODS)[number];
@@ -1335,8 +1448,13 @@ export interface ItemWorker {
   /** Where session checkouts live (under SKEP_HOME, never inside the device repo). */
   root: string;
   method: SubmitMethod;
-  /** Asks the human; null on EOF. Only used when `method` is `ask`. */
+  /** Asks the human; null on EOF. Used when `method` is `ask` and, in manual mode, per item. */
   ask(question: string): Promise<string | null>;
+  /**
+   * Manual control: the human confirms each item before it runs. Absent or false is auto, where
+   * master-driven items run without a skep prompt and only the submit policy may still ask.
+   */
+  confirmItems?: boolean;
   /** False forces the clone fallback (tests; hosts whose git lacks `worktree`). */
   worktree?: boolean;
   /** How the agent runs; absent means the dry marker. */
@@ -1363,6 +1481,23 @@ function clipSummary(text: string): string {
   const gap = "\n…\n";
   const head = 1_000;
   return `${text.slice(0, head)}${gap}${text.slice(-(MAX_SUMMARY - head - gap.length))}`;
+}
+
+/**
+ * Manual mode's per-item question. It waits for the terminal like a PTY run, so it never asks
+ * while an agent owns the screen. Empty means yes; no answer (EOF, `/clean`) means no.
+ */
+async function confirmItem(worker: ItemWorker, item: PlanItem): Promise<boolean> {
+  const exclusive = worker.terminal ?? ((fn) => fn());
+  // A join that is closing asks nothing more: questions queued behind the current one are
+  // dropped instead of surfacing after the session ended.
+  const answer = await exclusive(async () =>
+    worker.signal?.aborted === true
+      ? null
+      : worker.ask(`Run item ${item.itemId} (${item.repo}): ${item.title}? [Y/n] `),
+  );
+  if (worker.signal?.aborted === true) return false;
+  return answer !== null && /^\s*(y(es)?)?\s*$/i.test(answer);
 }
 
 /** Everything a sub does for one item. Never throws: a failure is a result with `failed`. */
@@ -1411,14 +1546,32 @@ export async function workItem(worker: ItemWorker, item: PlanItem): Promise<SubR
     return final;
   };
 
+  const deviceHead = async (): Promise<string> => {
+    const sha = await git(ctx, ["rev-parse", "HEAD"])
+      .then((value) => value.trim())
+      .catch(() => UNKNOWN_SHA);
+    return ShaSchema.safeParse(sha).success ? sha : UNKNOWN_SHA;
+  };
+
+  if (worker.confirmItems === true && !(await confirmItem(worker, item))) {
+    // Declined before anything was checked out, so no branch or worktree is left behind.
+    const sha = await deviceHead();
+    return result(
+      {
+        baseSha: sha,
+        headSha: sha,
+        checks: [{ name: "peer", status: "skip" }],
+        submit: outcome(worker.method, "skipped", branch),
+      },
+      "declined on this device (manual mode)",
+    );
+  }
+
   let work: Materialized & { clone: string | null };
   try {
     work = await materializeItem(ctx, item, worker.root, { worktree: worker.worktree });
   } catch (error) {
-    const baseSha = await git(ctx, ["rev-parse", "HEAD"])
-      .then((value) => value.trim())
-      .catch(() => UNKNOWN_SHA);
-    const sha = ShaSchema.safeParse(baseSha).success ? baseSha : UNKNOWN_SHA;
+    const sha = await deviceHead();
     agentState = "failed";
     return result(
       {
@@ -1535,6 +1688,8 @@ export async function workItem(worker: ItemWorker, item: PlanItem): Promise<SubR
 
 export interface StartOptions {
   listen?: string;
+  /** `host:port` peers dial, when it differs from the bind address (NAT, relay, public IP). */
+  advertise?: string;
   device?: string;
   repo?: string;
   yes?: boolean;
@@ -1550,6 +1705,8 @@ export interface JoinOptions {
   agent?: AgentView;
   roleDir?: string;
   ui?: boolean;
+  /** Opt out of auto control: confirm each master-driven item before it runs. */
+  manual?: boolean;
 }
 
 interface SubmitOptions {
@@ -1571,6 +1728,10 @@ export function register(program: Command, ctx: CliContext): void {
     .command("start")
     .description("Start a session master and print the join code")
     .option("--listen <host:port>", `address to bind (default: LAN IPv4, port ${DEFAULT_PORT})`)
+    .option(
+      "--advertise <host:port>",
+      "address peers dial, printed in the join line (default: the --listen address)",
+    )
     .option("--device <name>", "this device's name (default: hostname)")
     .option("--repo <name>", "the master's repo (default: basename of the git toplevel)")
     .option("--yes", "accept every join without prompting")
@@ -1600,6 +1761,7 @@ export function register(program: Command, ctx: CliContext): void {
     )
     .option("--role-dir <dir>", "directory holding this device's AGENT.md (default: cwd)")
     .option("--ui", "use the full-screen view")
+    .option("--manual", "confirm each item before it runs (default: auto, only submit may ask)")
     .action(async (opts: JoinOptions) => {
       await joinCommand(sctx, opts);
     });
@@ -1652,7 +1814,10 @@ export interface StartMasterFlowOptions extends StartOptions {
 
 export interface MasterFlow {
   readonly handle: MasterHandle;
+  /** The bind address. */
   readonly listen: string;
+  /** The address peers dial: `--advertise`, else {@link listen}. */
+  readonly advertise: string;
   readonly repo: string;
   readonly device: string;
   /** Formatted `NNNN-NNNN-NNNN`, current as of the last rotation. */
@@ -1673,27 +1838,16 @@ export async function startMasterFlow(
 ): Promise<MasterFlow> {
   let target: HostPort;
   if (opts.listen !== undefined) {
-    const parsed = parseHostPort(opts.listen);
-    if (parsed === null) {
-      throw new CliError(
-        "bad_listen",
-        `--listen must be host:port, got ${opts.listen}`,
-        EXIT.usage,
-      );
-    }
-    // A wildcard bind would expose the join handshake and control port on every interface.
-    if (isWildcard(parsed.host)) {
-      throw new CliError(
-        "bad_listen",
-        "--listen must name one interface address, not a wildcard",
-        EXIT.usage,
-      );
-    }
-    target = parsed;
+    target = concreteHostPort("--listen", opts.listen);
   } else {
     const ifaces = (ctx.networkInterfaces ?? os.networkInterfaces)();
     target = { host: pickListenHost(ifaces), port: DEFAULT_PORT };
   }
+  // A wildcard is no address a peer can dial, so it is refused here exactly as for a bind.
+  const advertised =
+    opts.advertise === undefined
+      ? null
+      : formatHostPort(concreteHostPort("--advertise", opts.advertise));
   const device = validDevice(opts.device);
   const repo = validRepo(opts.repo ?? (await defaultRepo(ctx)));
 
@@ -1747,6 +1901,7 @@ export async function startMasterFlow(
   return {
     handle,
     listen,
+    advertise: advertised ?? listen,
     repo,
     device,
     get joinCode() {
@@ -1788,7 +1943,9 @@ async function startCommand(ctx: SessionCliContext, opts: StartOptions): Promise
       onJoinCode: (joinCode, expiresAtMs) =>
         output.result(
           { event: "join-code", joinCode, joinCodeExpiresAtMs: expiresAtMs },
-          () => `join code: ${joinCode}${expiryText(expiresAtMs)}\n`,
+          () =>
+            `join code: ${joinCode}${expiryText(expiresAtMs)}\n` +
+            `${formatJoinPaste({ host: flow.advertise, code: joinCode, repo: flow.repo })}\n`,
         ),
     });
   } catch (error) {
@@ -1803,12 +1960,10 @@ async function startCommand(ctx: SessionCliContext, opts: StartOptions): Promise
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
   try {
-    const { listen, repo, device, joinCode, joinCodeExpiresAtMs } = flow;
+    const { listen, advertise, repo, device, joinCode, joinCodeExpiresAtMs } = flow;
     output.result(
-      { event: "started", listen, repo, device, joinCode, joinCodeExpiresAtMs },
-      () =>
-        `session master listening on ${listen} (repo ${repo})\n` +
-        `join code: ${joinCode ?? "none"}${expiryText(joinCodeExpiresAtMs)}\n`,
+      { event: "started", listen, advertise, repo, device, joinCode, joinCodeExpiresAtMs },
+      () => startedText(flow),
     );
     await flow.closed;
     output.result({ event: "closed" }, () => "session closed\n");
@@ -1817,6 +1972,17 @@ async function startCommand(ctx: SessionCliContext, opts: StartOptions): Promise
     process.removeListener("SIGTERM", stop);
     reader?.close();
   }
+}
+
+/** The human start banner, shared by `skep session start` and the shell's `/start`. */
+export function startedText(flow: MasterFlow): string {
+  const { listen, advertise, repo, joinCode, joinCodeExpiresAtMs } = flow;
+  const dial = advertise === listen ? "" : `peers dial ${advertise}\n`;
+  const hint = joinCode === null ? "" : `${joinHint({ host: advertise, code: joinCode, repo })}\n`;
+  return (
+    `session master listening on ${listen} (repo ${repo})\n${dial}` +
+    `join code: ${joinCode ?? "none"}${expiryText(joinCodeExpiresAtMs)}\n${hint}`
+  );
 }
 
 /** A `session.json` whose master still answers `status` means a second master must not start. */
@@ -1992,6 +2158,24 @@ async function restoreSessionFile(
   await rm(aside, { force: true });
 }
 
+/**
+ * How much a joined device asks its human. `auto` (the default): master-driven items run without
+ * a skep prompt; only the submit policy may ask. `manual`: each item is confirmed first. Neither
+ * touches the agent CLI's own approval UI (D29).
+ */
+export type JoinControl = "auto" | "manual";
+
+/** The join line's note on what this device will still ask. */
+export function controlText(control: JoinControl, method: SubmitMethod): string {
+  const submit =
+    method === "ask"
+      ? "submit still asks unless --submit / device policy says otherwise"
+      : `submit: ${method}`;
+  return control === "auto"
+    ? `auto: master drives work; ${submit}`
+    : `manual: you confirm each item before it runs; ${submit}`;
+}
+
 export interface JoinFlowOptions extends Omit<JoinOptions, "ui"> {
   /** This device's agent CLI chosen by its human; replaces the AGENT.md lookup when set. */
   cli?: AgentCli;
@@ -2014,7 +2198,11 @@ export interface JoinFlow {
   /** `host:port` of the master. */
   readonly target: string;
   readonly device: string;
+  /** The repo this device joined with (`--repo`, else the git toplevel's basename). */
+  readonly repo: string;
   readonly role: string;
+  /** `auto` unless the human joined with `--manual`. */
+  readonly control: JoinControl;
   /** Settles once the channel closed and running items were aborted. */
   readonly closed: Promise<{ reason: string }>;
   /** Abort running items and leave the session. */
@@ -2078,6 +2266,7 @@ export async function joinSessionFlow(
   const api = await loadSessionApi(ctx);
   // A human override on the command line wins over this device's file policy.
   const method = opts.submit ?? (await loadSubmitPolicy(paths.deviceToml, warn)).method;
+  const control: JoinControl = opts.manual === true ? "manual" : "auto";
 
   const joinView = io.createView();
   let terminalQueue: Promise<unknown> = Promise.resolve();
@@ -2088,6 +2277,7 @@ export async function joinSessionFlow(
     root: path.join(paths.home, "session", "worktrees"),
     method,
     ask,
+    ...(control === "manual" ? { confirmItems: true } : {}),
     ...(agent === undefined ? {} : { agent }),
     view: joinView,
     ...(io.viewChoosesSubmit === true
@@ -2224,8 +2414,8 @@ export async function joinSessionFlow(
     if (!roster.has(peerId)) roster.set(peerId, { peerId, device, role, state: "joined" });
     updatePeers();
     say(
-      { event: "joined", sessionId, peerId, target: at },
-      () => `joined session ${sessionId} at ${at} as ${peerId}\n`,
+      { event: "joined", sessionId, peerId, target: at, control, submit: method },
+      () => `joined session ${sessionId} at ${at} as ${peerId} (${controlText(control, method)})\n`,
     );
   } catch (error) {
     abort.abort();
@@ -2237,7 +2427,9 @@ export async function joinSessionFlow(
     handle,
     target: at,
     device,
+    repo,
     role,
+    control,
     closed,
     close: async () => {
       abort.abort();
@@ -2251,6 +2443,10 @@ async function joinCommand(ctx: SessionCliContext, opts: JoinOptions): Promise<v
   const ui = opts.ui === true;
   if (ui && joinViewFactory === null) {
     throw new CliError("ui_unavailable", "the full-screen view is not available in this build");
+  }
+  if (ui && opts.manual === true) {
+    // The full-screen view only answers the submit question; a per-item prompt would fight it.
+    throw new CliError("usage", "--manual cannot be combined with --ui yet", EXIT.usage);
   }
   const output = ctx.output();
   let reader: LineReader | undefined;

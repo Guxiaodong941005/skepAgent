@@ -18,6 +18,26 @@ protocol rules ([`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §4.4) apply to t
   returns to `no session` without leaving the shell. A live master in another process is never
   stopped. `/join` while joined now points at `/clean` (leave the session) vs `/quit` (leave the
   shell).
+* Pasteable join line: `/start` and `skep session start` print
+  `/join --host <host:port> --code <NNNN-NNNN-NNNN> --repo <repo>` for the peer's skep shell, plus
+  its `skep session join …` twin. The same line is printed again when the code rotates, when an
+  intent finds no peer, and when a peer leaves. `/join` usage leads with this form. A repo
+  name with spaces or special characters is double-quoted (slash arguments now understand
+  `"…"` with `\"` / `\\` escapes) and single-quoted in the shell twin, so the line parses
+  back to the same values. A repo with control characters is left out, with a note.
+* `--advertise <host:port>` on `/start` and `skep session start`: the address peers dial (NAT,
+  public IP, relay). The paste line uses it; `--listen` stays the bind address. Both must name
+  a valid hostname (no empty labels), IPv4 or bracketed IPv6 address, checked with Node's IP
+  parser; wildcards and unspecified addresses (`*`, `0.0.0.0`, `::`, also with a zone id),
+  blank or malformed hosts are refused before any master starts.
+* Peer control mode. A join is **auto** by default: master-driven items run without a skep
+  prompt; only the submit policy may still ask (`--submit` / `device.toml` `submit.method`).
+  `/join … --manual` and `skep session join --manual` opt out: each item is confirmed
+  (`[Y/n]`) before it runs, and a declined item is reported as skipped without a checkout.
+  The joined line names the mode. `/clean` drops a pending item question and any queued
+  behind it. Agent CLI approval prompts are untouched (D29).
+  `--manual` is not available with `--ui` yet.
+* `/join --submit pr|mr|push|none|ask`, as on `skep session join`.
 
 ## [0.1.7] - 2026-10-10
 

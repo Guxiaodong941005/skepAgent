@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { formatJoinPaste, joinHint } from "../commands/session.js";
 import { JOIN_USAGE, parseJoinArgs } from "./join-args.js";
 
 describe("parseJoinArgs", () => {
@@ -23,6 +24,14 @@ describe("parseJoinArgs", () => {
       "mac.local:7419 8632-1727-0308 --role web --agent pty",
       { code: "8632-1727-0308", host: "mac.local:7419", role: "web", agent: "pty" },
     ],
+    [
+      "--host 203.0.113.7:7419 --code 8632-1727-0308 --repo app",
+      { code: "8632-1727-0308", host: "203.0.113.7:7419", repo: "app" },
+    ],
+    [
+      "--host h:1 --code 863217270308 --repo app --manual --submit none",
+      { code: "863217270308", host: "h:1", repo: "app", manual: true, submit: "none" },
+    ],
     ["", {}],
   ])("reads %j", (args, expected) => {
     expect(parseJoinArgs(args)).toEqual(expected);
@@ -41,6 +50,7 @@ describe("parseJoinArgs", () => {
     ["--host a:7419 --host b:7419 --code 123456789012", /--host given twice/],
     ["--code 123456789012 --code 111122223333", /--code given twice/],
     ["--code 1234 5678 9012", /--code must be 12 digits/],
+    ["--code 123456789012 --submit yolo", /--submit must be pr, mr, push, none, ask, got yolo/],
   ])("rejects %j with the accepted forms", (args, problem) => {
     let message = "";
     try {
@@ -50,5 +60,50 @@ describe("parseJoinArgs", () => {
     }
     expect(message).toMatch(problem);
     expect(message).toContain(JOIN_USAGE);
+  });
+
+  it("leads its usage with the line a master prints to paste", () => {
+    expect(JOIN_USAGE.split("\n")[0]).toBe(
+      "usage: /join --host <host:port> --code <NNNN-NNNN-NNNN> --repo <repo>",
+    );
+  });
+});
+
+describe("the pasteable /join line round-trips", () => {
+  it.each([
+    "app",
+    "my app",
+    "app --submit push",
+    "app; false",
+    "it's $(rm -rf) `x` | y & z",
+    'quote " and back\\slash',
+    "--manual",
+    "-x",
+    "naïve 名前",
+    "  padded  ",
+  ])("repo %j", (repo) => {
+    const line = formatJoinPaste({ host: "[fe80::1]:7419", code: "863217270308", repo });
+    expect(line.startsWith("/join ")).toBe(true);
+    expect(parseJoinArgs(line.slice("/join ".length))).toEqual({
+      host: "[fe80::1]:7419",
+      code: "8632-1727-0308",
+      repo,
+    });
+  });
+
+  it("keeps a plain repo bare", () => {
+    expect(formatJoinPaste({ host: "h:1", code: "863217270308", repo: "skep-agent" })).toBe(
+      "/join --host h:1 --code 8632-1727-0308 --repo skep-agent",
+    );
+  });
+
+  it("leaves out a repo the input box cannot take, and says why", () => {
+    const target = { host: "h:1", code: "863217270308", repo: "a\nb" };
+    expect(formatJoinPaste(target)).toBe("/join --host h:1 --code 8632-1727-0308");
+    expect(joinHint(target)).toContain('(repo "a\\nb" cannot be pasted: join from that checkout');
+  });
+
+  it("refuses an unterminated quote", () => {
+    expect(() => parseJoinArgs('--repo "my app')).toThrow(/unterminated quote/);
   });
 });
