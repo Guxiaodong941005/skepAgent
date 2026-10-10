@@ -71,21 +71,24 @@ peer = second machine on the same LAN, both inside a checkout of the **same repo
 7. **Bug 1:** on the master device run `skep session start --yes` in one terminal, then open
    `skep` in another. Expect `a session master runs in another process on this device (…)`,
    header `master (other process) · code …`, `/status` showing the session, peers in the footer.
-   Stop the master: within about 2–4 s (2 s poll plus up to 2 s probe timeout) the shell says `the session master at … went away`, header
-   `no session`.
+   Stop the master: within about 2–4 s (2 s poll plus up to 2 s probe timeout) the shell says
+   `the session master at … went away`, header `no session`.
+8. Repo mismatch: join from a checkout of a different repo name, send an intent on the master.
+   Expect `no connected peer works on repo <repo> (peer-N <device>: repo <other>)`.
 9. **B1 (master replacement):** with the shell attached as in 7, stop that master and start
    another one (ideally `--repo other`) in the other terminal *before* typing anything. Type an
    intent: expect `the session master on this device changed (was …); the intent was not sent`
    and `now showing …`. The new master's `skep session status` shows no intent. Typing again
-   sends to the new master.
-10. **B2 (rejected self-join):** with the shell attached as in 7, `/join` and answer `n` on the
-    master's prompt. Expect the rejection, then the header back to `master (other process)`
+   sends to the new master. The 2 s poll may switch the header to the new master first; then
+   the intent goes there on purpose (the header already shows it). To hit the race reliably,
+   stop the poll by typing while the old master is still shown.
+10. **B2 (rejected self-join):** start the external master *without* `--yes`
+    (`skep session start`), attach the shell as in 7, `/join`, and answer `n` at the master's
+    prompt in its terminal. Expect the rejection, then the header back to `master (other process)`
     without `/status`. Repeat with `y`, then kill the self-join's link (or wait for a timeout):
     the shell returns to `master (other process)`.
 11. **B3:** while attached, run `/status` several times quickly while the master is slow or
     briefly stopped/restarted; the header must end in the state the last answer reported.
-8. Repo mismatch: join from a checkout of a different repo name, send an intent on the master.
-   Expect `no connected peer works on repo <repo> (peer-N <device>: repo <other>)`.
 
 ## Open questions / residual risks
 
