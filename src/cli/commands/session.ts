@@ -375,26 +375,25 @@ export function parseHostPort(value: string): HostPort | null {
 }
 
 /**
- * `host:port` naming one address: `--listen` binds it, `--advertise` is what peers dial. The host
- * must be a hostname, an IPv4 address or a bracketed IPv6 literal; wildcards and stray text
- * (spaces, `*`, quotes) are refused before any master starts.
+ * `host:port` naming one address: `--listen` binds it, `--advertise` is what peers dial. The one
+ * check for both, run before any master starts.
  */
 function concreteHostPort(flag: string, value: string): HostPort {
   const parsed = parseHostPort(value);
   if (parsed === null) {
     throw new CliError("bad_listen", `${flag} must be host:port, got ${value}`, EXIT.usage);
   }
-  // A wildcard bind would expose the join handshake and control port on every interface, and a
-  // wildcard advertise is no address a peer can dial.
-  if (isWildcard(parsed.host)) {
+  const problem = hostProblem(parsed.host);
+  if (problem === "wildcard") {
+    // A wildcard bind would expose the join handshake and control port on every interface, and
+    // a wildcard advertise is no address a peer can dial.
     throw new CliError(
       "bad_listen",
       `${flag} must name one interface address, not a wildcard`,
       EXIT.usage,
     );
   }
-  const host = parsed.host.includes(":") ? IPV6_HOST_RE : NAME_HOST_RE;
-  if (!host.test(parsed.host)) {
+  if (problem === "malformed") {
     throw new CliError(
       "bad_listen",
       `${flag} must name a hostname or IP address, got ${JSON.stringify(parsed.host)}`,
@@ -404,13 +403,36 @@ function concreteHostPort(flag: string, value: string): HostPort {
   return parsed;
 }
 
-/** A hostname or IPv4 address: DNS label characters, not starting with `-` or `.`. */
-const NAME_HOST_RE = /^[A-Za-z0-9_][A-Za-z0-9._-]*$/;
-/** An IPv6 literal (from `[v6]:port`), optionally with a zone id. */
-const IPV6_HOST_RE = /^[0-9A-Fa-f:.]+(%[A-Za-z0-9._-]+)?$/;
+/** One DNS label: 1..63 characters, no leading or trailing `-` (`_` tolerated, as resolvers do). */
+const DNS_LABEL_RE = /^[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?$/;
+/** An IPv6 zone id (`fe80::1%eth0`). */
+const ZONE_RE = /^[A-Za-z0-9._-]+$/;
 
-function isWildcard(host: string): boolean {
-  return host === "*" || host === "0.0.0.0" || host === "::" || /^[0:]+$/.test(host);
+/** Unspecified addresses: binding one means every interface, and nobody can dial one. */
+const UNSPECIFIED = new net.BlockList();
+UNSPECIFIED.addAddress("0.0.0.0", "ipv4");
+UNSPECIFIED.addAddress("::", "ipv6");
+UNSPECIFIED.addAddress("::ffff:0.0.0.0", "ipv6");
+
+/**
+ * Why `host` is not one concrete address, or null. IPs are checked by Node's own parser, not by
+ * character classes; an IPv6 zone id is split off first, so `[::%eth0]` is still a wildcard.
+ */
+function hostProblem(host: string): "wildcard" | "malformed" | null {
+  if (host === "*") return "wildcard";
+  if (host.includes(":")) {
+    // Only a bracketed `[v6]:port` yields a host with colons (see parseHostPort).
+    const at = host.indexOf("%");
+    const address = at < 0 ? host : host.slice(0, at);
+    if (at >= 0 && !ZONE_RE.test(host.slice(at + 1))) return "malformed";
+    if (!net.isIPv6(address)) return "malformed";
+    return UNSPECIFIED.check(address, "ipv6") ? "wildcard" : null;
+  }
+  if (net.isIPv4(host)) return UNSPECIFIED.check(host, "ipv4") ? "wildcard" : null;
+  // Digits and dots that are no valid IPv4 (`0`, `999.1.1.1`, `1.2.3`) are not a hostname either.
+  if (/^[\d.]+$/.test(host)) return /^0+$/.test(host) ? "wildcard" : "malformed";
+  if (host.length > 253) return "malformed";
+  return host.split(".").every((label) => DNS_LABEL_RE.test(label)) ? null : "malformed";
 }
 
 /**

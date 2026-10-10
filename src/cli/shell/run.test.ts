@@ -343,6 +343,12 @@ describe("unified shell", () => {
     expect(h.scrollback()).toContain("--advertise must name one interface address, not a wildcard");
     await h.shell.submit('/start --yes --repo app --advertise " :7419"');
     expect(h.scrollback()).toContain('--advertise must name a hostname or IP address, got " "');
+    await h.shell.submit("/start --yes --repo app --advertise [1:::2]:7419");
+    expect(h.scrollback()).toContain('--advertise must name a hostname or IP address, got "1:::2"');
+    await h.shell.submit("/start --yes --repo app --advertise [::%eth0]:7419");
+    await h.shell.submit("/start --yes --repo app --advertise a..b:7419");
+    expect(h.scrollback()).toContain('--advertise must name a hostname or IP address, got "a..b"');
+    expect(h.scrollback().match(/not a wildcard/g)).toHaveLength(2);
     expect(h.fake.calls.master).toHaveLength(0);
     await h.shell.quit();
   });

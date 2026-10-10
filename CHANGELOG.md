@@ -27,8 +27,9 @@ protocol rules ([`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §4.4) apply to t
   back to the same values. A repo with control characters is left out, with a note.
 * `--advertise <host:port>` on `/start` and `skep session start`: the address peers dial (NAT,
   public IP, relay). The paste line uses it; `--listen` stays the bind address. Both must name
-  a hostname, IPv4 or bracketed IPv6 address; wildcards (`*`, `0.0.0.0`, `::`), blank or
-  malformed hosts are refused before any master starts.
+  a valid hostname (no empty labels), IPv4 or bracketed IPv6 address, checked with Node's IP
+  parser; wildcards and unspecified addresses (`*`, `0.0.0.0`, `::`, also with a zone id),
+  blank or malformed hosts are refused before any master starts.
 * Peer control mode. A join is **auto** by default: master-driven items run without a skep
   prompt; only the submit policy may still ask (`--submit` / `device.toml` `submit.method`).
   `/join … --manual` and `skep session join --manual` opt out: each item is confirmed

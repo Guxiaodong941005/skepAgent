@@ -49,9 +49,11 @@ The peer's own "left the session" line cannot know the master's new code. It pri
 `/start --advertise <host:port>` and `skep session start --advertise <host:port>` set the address
 **peers dial**. `--listen` stays the **bind** address. The paste line uses advertise when it is
 set, else listen; the banner adds `peers dial <advertise>` only when the two differ. Advertise is
-validated exactly as `--listen` by `concreteHostPort`, before any master starts: host:port; the
-host a hostname, IPv4 or bracketed IPv6 literal; no wildcard (`*`, `0.0.0.0`, `::`), blank or
-stray text. It is kept on
+validated exactly as `--listen` by `concreteHostPort` / `hostProblem`, before any master
+starts: host:port, where the host is an IP that Node's `net.isIPv4` / `net.isIPv6` accepts, or
+a hostname whose dot-separated labels are each valid DNS labels (no empty labels). An IPv6
+zone id is split off first, and unspecified addresses (`0.0.0.0`, `::` in any spelling, also
+`::ffff:0.0.0.0`, with or without a zone) are refused as wildcards, as is `*`. It is kept on
 `MasterFlow.advertise`, so rotation lines and `noPeersText` stay correct. `--machine` output
 reports `advertise` in the `started` event.
 

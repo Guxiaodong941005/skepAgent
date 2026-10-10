@@ -359,6 +359,18 @@ describe("session start", () => {
     "-x:7419",
     "host:0",
     "host",
+    // Fix round 2: structure, not characters.
+    "[1:::2]:7419",
+    "[::%eth0]:7419",
+    "[0:0:0:0:0:0:0:0%eth0]:7419",
+    "[::ffff:0.0.0.0]:7419",
+    "[fe80::1%]:7419",
+    "a..b:7419",
+    ".a:7419",
+    "a.:7419",
+    "a-.b:7419",
+    "999.1.1.1:7419",
+    "0:7419",
   ])("--advertise %j never reaches startMaster", async (advertise) => {
     const fake = fakeApi("10.1.2.3:7500");
     const c = capture(await home(), { sessionApi: fake.api });
@@ -366,6 +378,35 @@ describe("session start", () => {
     expect(await runCli([...argv, `--advertise=${advertise}`], c.ctx)).toBe(2);
     expect(JSON.parse(c.stdout).error.message).toMatch(/^--advertise must/);
     expect(fake.calls.master).toHaveLength(0);
+  });
+
+  it.each([
+    ["[1:::2]:7419", /must name a hostname or IP address/],
+    ["[::%eth0]:7419", /not a wildcard/],
+    ["a..b:7419", /must name a hostname or IP address/],
+  ])("--listen %j is refused like --advertise", async (listen, problem) => {
+    const fake = fakeApi("10.1.2.3:7500");
+    const c = capture(await home(), { sessionApi: fake.api });
+    const argv = ["--machine", "session", "start", "--yes", "--repo", "app"];
+    expect(await runCli([...argv, `--listen=${listen}`], c.ctx)).toBe(2);
+    expect(JSON.parse(c.stdout).error.message).toMatch(problem);
+    expect(fake.calls.master).toHaveLength(0);
+  });
+
+  it.each([
+    ["mac.local:7419", "mac.local:7419"],
+    ["203.0.113.7:7419", "203.0.113.7:7419"],
+    ["[2001:db8::7]:7419", "[2001:db8::7]:7419"],
+    ["[fe80::1%eth0]:7419", "[fe80::1%eth0]:7419"],
+  ])("--advertise %j is accepted", async (advertise, shown) => {
+    const fake = fakeApi("10.1.2.3:7500");
+    const c = capture(await home(), { sessionApi: fake.api });
+    const argv = ["--machine", "session", "start", "--yes", "--repo", "app"];
+    const run = runCli([...argv, `--advertise=${advertise}`], c.ctx);
+    await vi.waitFor(() => expect(c.stdout).toContain('"started"'));
+    expect(JSON.parse(c.stdout.split("\n")[0] ?? "").result.advertise).toBe(shown);
+    fake.closed.resolve();
+    expect(await run).toBe(0);
   });
 
   it("--listen gets the same host checks", async () => {
