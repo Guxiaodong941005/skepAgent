@@ -259,3 +259,82 @@ complete gate where loopback listeners and subprocess output work, and perform t
 two-device checks after fixing R1. No release action is authorized by this review.
 
 **Fix verdict: FAIL.**
+
+## Fix round 2 (R1)
+
+Date: October 10, 2026. Reviewer: My Codex. Reviewed `30ba79b..a011670` on
+`feat/tui-session-reliability`, including `2f8db19` and `a011670`, against the R1 finding above.
+This appendix is the only repository change; no source edits, merge, publication, or version
+bump.
+
+### R1 — FIXED
+
+- `ControlConnectionError.requestSent` distinguishes failure before the socket write from an
+  uncertain outcome after it (`src/cli/commands/session.ts:258`). Close, transport error, and
+  reply timeout retain that distinction; malformed frames, JSON, and control-results are also
+  treated conservatively (`src/cli/commands/session.ts:273`). For intents, post-send failures
+  become `intent_outcome_unknown`, not `session_unreachable`
+  (`src/cli/commands/session.ts:2362`). An `ok` result with an unreadable intent ID also takes
+  the uncertainty path (`src/cli/commands/session.ts:2432`). Read-only status failures remain
+  ordinary reachability errors.
+- The shell handles the unknown outcome before its known-non-delivery branch
+  (`src/cli/shell/run.ts:383`). It says **“it may have been accepted”**, warns **“sending it
+  again could start the same work twice”**, and re-probes without retrying the intent. An
+  unchanged endpoint/token says **“the master is still …”** and points to `/status`; a gone
+  or replacement master retains uncertainty about the previous master
+  (`src/cli/shell/run.ts:399`). None of those cases claims “not sent”, an identity change for
+  the unchanged master, or a safe resend.
+- Known pre-send replacement, refused connection, and explicit `bad_token` still take the
+  non-delivery path and say **“the intent was not sent”** (`src/cli/shell/run.ts:375`,
+  `src/cli/shell/run.ts:388`). A resend hint remains confined to that known-failure path.
+- The added shell regression records one received intent, drops its reply, and asserts the
+  uncertainty warning, unchanged identity, `/status` guidance, and absence of “not sent”,
+  “changed”, and “resend” (`src/cli/shell/run.test.ts:610`). The new control-client tests cover
+  refused connection, post-write close, malformed successful ID, token rejection, and lost
+  status reply (`src/cli/commands/session.control.test.ts:46`). READY and CHANGELOG now
+  distinguish known non-delivery from lost acknowledgements rather than promising that every
+  unreachable master received nothing.
+
+### B1–B3 preservation
+
+- **B1 remains FIXED:** the published endpoint/token pre-check and submission to the captured
+  displayed endpoint remain intact (`src/cli/shell/run.ts:375`). Existing replacement/token
+  tests are preserved (`src/cli/shell/run.test.ts:576`, `src/cli/shell/run.test.ts:598`).
+  Independent checks confirm no accepted intent on either master for pre-send replacement,
+  refusal, or token rejection, and no automatic submission to a replacement after a lost reply.
+- **B2 remains FIXED:** failed/ended join and ended own-master recovery still trigger fresh
+  discovery (`src/cli/shell/run.ts:634`, `src/cli/shell/run.ts:697`,
+  `src/cli/shell/run.ts:733`); those paths and their regressions are unchanged by this diff.
+- **B3 remains FIXED:** controller generations, ownership/shutdown invalidation, and the guarded
+  production probe are unchanged (`src/cli/shell/run.ts:802`). The focused controller suite
+  passes both stale-result orders and ownership/shutdown cases
+  (`src/cli/shell/session-controller.test.ts:164`).
+
+### Validation and notes
+
+- `npm run lint && npm test`: lint **PASS**; full suite **FAIL** in this sandbox: **25 test
+  files passed / 6 failed; 480 tests passed / 58 failed; 19 unhandled errors**. Loopback
+  listeners fail with `listen EPERM: operation not permitted 127.0.0.1`, blocking the seven
+  external-shell tests and all seven new control-client tests. The previously observed
+  subprocess-output and CLI work-item failures also recur. This is not a green release gate,
+  but these environment failures do not establish an R1 regression.
+- Focused controller/parser/model tests: **34/34 PASS**. Shell tests excluding listener-dependent
+  cases: **16 PASS / 7 skipped**.
+- Independent, inline in-memory checks: **16/16 PASS** through production `Shell`, control
+  client, `startMaster`, and `connectSub`. Nine accepted-intent cases cover lost reply with
+  unchanged/gone/replacement discovery, post-write transport error, reply timeout, malformed
+  JSON/frame/control-result, and malformed successful ID. Each leaves exactly one additional
+  planned intent and one delivered sub work item, with uncertainty wording and no automatic
+  retry. Three known-non-delivery cases accept no intent; direct-client checks confirm unknown
+  outcome, refused connection, token rejection, and subsequent readable status. Only transport,
+  session-file reads, and clocks are faked; no kernel listener or filesystem write is involved.
+- Non-blocking follow-up: make timeout, malformed wire reply, and gone/replacement unknown-outcome
+  cases permanent regression tests. Re-run the complete gate where loopback and subprocess
+  output work, then perform the READY two-device checks; no Mac/LAN or real agent CLI trial was
+  performed here. Idempotent retry remains outside this fix, not an implied guarantee.
+
+R1's false non-delivery assurance is resolved, with B1–B3 preserved. The notes concern validation
+limits and durable coverage, not an outstanding R1 correctness blocker. No release action is
+authorized by this review.
+
+**Fix verdict: PASS_WITH_NOTES.**
