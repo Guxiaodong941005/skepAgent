@@ -1,5 +1,6 @@
 /**
- * `skep` with no subcommand, and `skep tui`, open the agent installed on this device.
+ * `skep tui` opens the raw TUI of the agent installed on this device. It is the advanced escape
+ * hatch: plain `skep` opens Skep's own shell (`src/cli/shell/run.ts`) and never this.
  *
  * Order: claude, then codex, then pi. The human's words go to that agent as its initial prompt.
  * Skep's own guide is appended to the agent's system prompt, not a replacement for it. The agent
@@ -75,7 +76,7 @@ export async function whichOnPath(name: string, env: NodeJS.ProcessEnv): Promise
 export function register(program: Command, ctx: CliContext): void {
   program
     .command("tui")
-    .description("Open the agent installed on this device (claude, then codex, then pi)")
+    .description("Open the raw agent TUI (claude, then codex, then pi); advanced")
     .argument("[prompt...]", "what to ask the agent")
     .option("--agent <name>", "claude, codex or pi (default: the first one installed)")
     .action(async (words: string[], opts: { agent?: string }) => {

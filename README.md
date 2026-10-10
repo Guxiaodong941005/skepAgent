@@ -3,8 +3,8 @@
 **Cross-device collaboration for AI coding agents via live join-code sessions.**
 
 Skep lets AI coding agents on different machines (laptop, GPU rig, always-on server) work together
-through an encrypted session channel. Bare `skep` opens your local agent CLI. Credentials never
-leave the device that owns them.
+through an encrypted session channel. Bare `skep` opens the Skep shell. Credentials never leave
+the device that owns them.
 
 > **v0.1.5 — session / TUI only.** Peers now see each other's progress in the session screen.
 > The signed git blackboard and `skepd` daemon were removed in 0.1.2; multi-device work uses
@@ -20,14 +20,25 @@ Requires Node.js ≥ 22.12 (macOS & Linux).
 
 ## Quick start
 
-```bash
-# in any git checkout — opens the local agent (claude / codex / pi)
-skep
+```text
+$ skep                      # in any git checkout: the Skep shell (logo, scrollback, input)
+> /start                    # master: prints the join code into the scrollback
+> /join <code> --host <ip:port>   # in `skep` on another device or directory
+> refactor the auth middleware    # with a master here: sent as an intent
+> /quit
+```
 
-# multi-device session
+Type `/` for the command menu (`/start`, `/join`, `/status`, `/intent`, `/agent`, `/help`,
+`/quit`). Peer progress (the bee strips) shows under the input while a session is live. Item
+output from the agents appears in the scrollback; plain `skep` never hands the terminal to an
+agent's own TUI. `skep tui` still opens the raw agent TUI (claude / codex / pi) when you want it.
+
+Scripts and the old flow keep working:
+
+```bash
 skep session start          # master: prints join code
-skep session join <code>    # peer on another device or directory
-skep ui                     # full-screen session TUI
+skep session join --code <code>   # peer on another device or directory
+skep ui                     # full-screen session monitor
 ```
 
 Same-machine peers: start a master in one project directory, join with the code from another.

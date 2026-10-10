@@ -11,6 +11,24 @@ protocol rules ([`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §4.4) apply to t
 
 ## [Unreleased]
 
+### Added
+
+* Unified Skep shell: bare `skep` opens one screen with a header (logo, version, device, cwd,
+  session state), a scrollback of session events, an input box with a `/` command menu, and the
+  bee strips of peer progress under the input. Commands: `/start`, `/join [code] [--host]`,
+  `/status`, `/intent`, `/agent`, `/help`, `/quit` (`/exit`). Text without `/` goes to this
+  device's session master as an intent. Join prompts and submit choices are answered in the
+  input box. Item agent states and output tails appear in the scrollback.
+* `startMasterFlow`, `joinSessionFlow`, `submitIntent` and `fetchSessionStatus` in
+  `src/cli/commands/session.ts`: the bodies of `skep session start|join|intent|status` without
+  Commander, signals or blocking, so the shell runs the same code paths as the CLI.
+
+### Changed
+
+* Bare `skep` no longer launches the agent's own fullscreen TUI, and no longer takes a prompt
+  argument (`skep some words` is now a usage error). `skep tui [prompt]` still opens the raw
+  agent TUI as the explicit escape hatch.
+
 ## [0.1.5] - 2026-10-09
 
 Peer progress and a redesigned session screen. Versions 0.1.3 and 0.1.4 were never released.

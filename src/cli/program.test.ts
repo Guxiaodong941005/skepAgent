@@ -29,6 +29,33 @@ describe("program session-only surface", () => {
     expect(code).toBe(2);
   });
 
+  it("no subcommand opens the shell, not the raw agent", async () => {
+    const c = ctx();
+    const opened: CliContext[] = [];
+    const code = await runCli([], {
+      ...c,
+      shell: async (shellCtx) => {
+        opened.push(shellCtx);
+      },
+    });
+    expect(code).toBe(0);
+    expect(opened).toHaveLength(1);
+    // The preAction hook resolved the home before the shell opened.
+    expect(opened[0]?.paths?.home).toBe("/tmp/skep-test-home-program");
+  });
+
+  it("rejects stray words instead of sending them to an agent", async () => {
+    let opened = false;
+    const code = await runCli(["fix", "the", "bug"], {
+      ...ctx(),
+      shell: async () => {
+        opened = true;
+      },
+    });
+    expect(code).toBe(2);
+    expect(opened).toBe(false);
+  });
+
   it("buildProgram registers expected names", () => {
     const program = buildProgram(ctx());
     const names = program.commands.map((c) => c.name()).sort();
