@@ -1,0 +1,82 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`shell frames > joined, with a healthy and a quiet peer 1`] = `
+"  skep   session joined 192.168.1.20:7419 as peer-3 · coding         v0.0.0-test
+  device  laptop | cwd  ~/app | peers 2 | master hb 2s
+
+
+
+
+
+
+
+
+
+
+
+
+  Welcome. Type a goal, or / for commands.
+  /start        start a local session master
+  /join [code]  join a session (same machine or --host)
+  /help         list commands
+  Input stays available | output appears here
+> _
+  ------------------------------------------------------------------------------
+  mac     coding  .    [........] 0% 0/0 idle  hb 2s
+  vps     web     .    [........] 0% 0/0 idle  quiet 24s
+  / commands | enter send | pgup/pgdn scroll | ctrl+c clear | /quit"
+`;
+
+exports[`shell frames > master with no peers 1`] = `
+"  skep   session master · code 1234-5678-9012 · 192.168.1.20:7419    v0.0.0-test
+  device  laptop | cwd  ~/app | peers 0
+
+
+
+
+
+
+
+
+
+
+
+
+
+  Welcome. Type a goal, or / for commands.
+  /start        start a local session master
+  /join [code]  join a session (same machine or --host)
+  /help         list commands
+  Input stays available | output appears here
+> _
+  ------------------------------------------------------------------------------
+  (no peers yet)
+  / commands | enter send | pgup/pgdn scroll | ctrl+c clear | /quit"
+`;
+
+exports[`shell frames > no session: no peer rows, ever 1`] = `
+"  skep                                                               v0.0.0-test
+  device  laptop | cwd  ~/app | no session
+
+
+
+
+
+
+
+
+
+
+
+
+
+  Welcome. Type a goal, or / for commands.
+  /start        start a local session master
+  /join [code]  join a session (same machine or --host)
+  /help         list commands
+  Input stays available | output appears here
+> _
+  ------------------------------------------------------------------------------
+  (no session — /start or /join)
+  / commands | enter send | pgup/pgdn scroll | ctrl+c clear | /quit"
+`;

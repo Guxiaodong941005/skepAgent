@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -17,6 +17,8 @@ import {
 } from "../commands/session.js";
 import { parseFlags, Shell, type ShellCliContext } from "./run.js";
 
+type MasterPeer = ReturnType<MasterHandle["status"]>["peers"][number];
+
 const roots: string[] = [];
 const servers: net.Server[] = [];
 const SGR = new RegExp(`${String.fromCharCode(27)}\\[[0-9;?]*[A-Za-z]`, "g");
@@ -26,16 +28,20 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
-/** A control port on loopback that answers every request with `reply`. */
-async function controlServer(reply: unknown): Promise<{ port: number; requests: unknown[] }> {
+/** A control port on loopback that answers every request with `reply(request)`. */
+async function controlServer(
+  reply: (request: { op?: string }) => unknown,
+): Promise<{ port: number; requests: unknown[] }> {
   const requests: unknown[] = [];
   const server = net.createServer((socket) => {
     const decoder = new FrameDecoder();
     socket.on("data", (chunk) => {
       const [frame] = decoder.push(chunk);
       if (frame === undefined) return;
-      requests.push(JSON.parse(frame.toString("utf8")));
-      socket.end(encodeFrame(Buffer.from(JSON.stringify(reply))));
+      const request = JSON.parse(frame.toString("utf8"));
+      requests.push(request);
+      const answer = reply(request);
+      socket.end(encodeFrame(Buffer.from(JSON.stringify(answer))));
     });
   });
   servers.push(server);
@@ -78,7 +84,14 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
 function fakeApi(address = { host: "192.168.1.20", port: 7419 }) {
   const masterClosed = deferred<void>();
   const subClosed = deferred<{ reason: string }>();
-  const calls: { master: MasterOptions[]; sub: SubOptions[] } = { master: [], sub: [] };
+  const calls: { master: MasterOptions[]; sub: SubOptions[]; intents: string[] } = {
+    master: [],
+    sub: [],
+    intents: [],
+  };
+  /** Peers the fake master reports in `status()`; tests push into it. */
+  const peers: MasterPeer[] = [];
+  let intentError: Error | null = null;
   const api: SessionApi = {
     async startMaster(options): Promise<MasterHandle> {
       calls.master.push(options);
@@ -92,10 +105,15 @@ function fakeApi(address = { host: "192.168.1.20", port: 7419 }) {
           repo: "app",
           joinCode: "1234-5678-9012",
           joinCodeExpiresAtMs: null,
-          peers: [],
+          peers: peers.map((peer) => ({ ...peer })),
           intents: [],
         }),
-        submitIntent: async () => ({ intentId: "N-1" }),
+        submitIntent: async (text) => {
+          calls.intents.push(text);
+          if (intentError !== null) throw intentError;
+          return { intentId: "N-1" };
+        },
+        presence: () => peers.map((peer) => ({ peerId: peer.peerId, silentMs: 25_000 })),
         attach: () => {
           throw new Error("fake master has no attach");
         },
@@ -114,12 +132,26 @@ function fakeApi(address = { host: "192.168.1.20", port: 7419 }) {
       };
     },
   };
-  return { api, calls };
+  return {
+    api,
+    calls,
+    peers,
+    failIntents(error: Error) {
+      intentError = error;
+    },
+    endSub(reason: string) {
+      subClosed.resolve({ reason });
+    },
+  };
 }
 
-async function harness(masterAddress?: { host: string; port: number }) {
+async function harness(
+  masterAddress?: { host: string; port: number },
+  prepare?: (dir: string) => Promise<void>,
+) {
   const dir = await mkdtemp(path.join(tmpdir(), "skep-shell-"));
   roots.push(dir);
+  await prepare?.(dir);
   const stdin = new FakeStdin();
   let screen = "";
   const stderr: string[] = [];
@@ -208,7 +240,7 @@ describe("unified shell", () => {
     const h = await harness();
     h.stdin.type("/jo");
     expect(h.shell.model.menu.map((command) => command.name)).toEqual(["join"]);
-    expect(h.frame()).toContain("/join <code>");
+    expect(h.frame()).toContain("/join [<code>]");
     // Tab accepts with a trailing space because /join takes arguments.
     h.stdin.type("\t");
     expect(h.shell.model.input).toBe("/join ");
@@ -224,7 +256,7 @@ describe("unified shell", () => {
     await h.shell.submit("/nope");
     expect(h.scrollback()).toContain("unknown command: /nope — try /help");
     await h.shell.submit("refactor the auth middleware");
-    expect(h.scrollback()).toContain("no session — /start or /join first");
+    expect(h.scrollback()).toContain("no session on this device — /start a master or /join one");
     await h.shell.quit();
   });
 
@@ -234,7 +266,7 @@ describe("unified shell", () => {
     expect(h.fake.calls.master).toHaveLength(1);
     expect(h.scrollback()).toContain("join code: 1234-5678-9012");
     expect(h.scrollback()).toContain("/join 1234-5678-9012 --host 192.168.1.20:7419");
-    expect(h.frame()).toContain("session live");
+    expect(h.frame()).toContain("master · code 1234-5678-9012");
     expect(h.frame()).toContain("(no peers yet)");
     const written = JSON.parse(await readFile(path.join(h.dir, "session.json"), "utf8"));
     expect(written.listen).toBe("192.168.1.20:7419");
@@ -290,22 +322,185 @@ describe("unified shell", () => {
     expect(h.scrollback()).toContain("left the session (left)");
   });
 
-  it("sends free text as an intent to this device's master", async () => {
-    const control = await controlServer({
-      type: "control-result",
-      ok: true,
-      result: { intentId: "N-7" },
-    });
-    const h = await harness({ host: "127.0.0.1", port: control.port });
+  it("sends free text as an intent to its own master once a peer joined", async () => {
+    const h = await harness();
     await h.shell.submit("/start --yes --repo app");
+    h.fake.peers.push(peer("peer-1", "vps", "app"));
     await h.shell.submit("add a health check");
-    expect(control.requests).toEqual([
+    expect(h.fake.calls.intents).toEqual(["add a health check"]);
+    expect(h.scrollback()).toContain("intent N-1 routed: add a health check");
+    await h.shell.quit();
+  });
+
+  it("refuses an intent while no peer joined, without recording it on the master", async () => {
+    const h = await harness();
+    await h.shell.submit("/start --yes --repo app");
+    await h.shell.submit("/intent add a health check");
+    expect(h.fake.calls.intents).toEqual([]);
+    expect(h.scrollback()).toContain("no peers joined yet");
+    expect(h.scrollback()).toContain("/join 1234-5678-9012 --host 192.168.1.20:7419");
+    await h.shell.quit();
+  });
+
+  it("explains a no_match by naming each peer's repo", async () => {
+    const h = await harness();
+    await h.shell.submit("/start --yes --repo app");
+    h.fake.peers.push(peer("peer-1", "vps", "api"));
+    h.fake.failIntents(Object.assign(new Error("none"), { name: "NoMatchError" }));
+    await h.shell.submit("add a health check");
+    expect(h.scrollback()).toContain("no connected peer works on repo app (peer-1 vps: repo api)");
+    await h.shell.quit();
+  });
+
+  it("shows presence on the master's footer and flags a quiet peer", async () => {
+    const h = await harness();
+    await h.shell.submit("/start --yes --repo app");
+    h.fake.peers.push(peer("peer-1", "vps", "app"));
+    h.shell.sync();
+    expect(h.frame()).toContain("quiet 25s");
+    expect(h.frame()).toMatch(/peers 1/);
+    await h.shell.quit();
+  });
+
+  it("logs a peer that left with its device, the reason and how to rejoin", async () => {
+    const h = await harness();
+    await h.shell.submit("/start --yes --repo app");
+    h.fake.calls.master[0]?.onEvent?.({
+      kind: "left",
+      message: "Peer peer-2 (mac) left: heartbeat_timeout",
+    });
+    expect(h.scrollback()).toContain(
+      "Peer peer-2 (mac) left: heartbeat_timeout: no heartbeat for 30 s",
+    );
+    expect(h.scrollback()).toContain("it can rejoin with the current code: /join 1234-5678-9012");
+    // Routine progress events never reach the scrollback.
+    h.fake.calls.master[0]?.onEvent?.({ kind: "progress", message: "peer-2" });
+    expect(h.scrollback()).not.toMatch(/^progress/m);
+    await h.shell.quit();
+  });
+
+  it("accepts /join <host:port> <code> and refuses free text on a peer", async () => {
+    const h = await harness();
+    await h.shell.submit("/join 192.168.30.182:7419 8632-1727-0308 --repo app");
+    expect(h.fake.calls.sub[0]?.code).toBe("863217270308");
+    expect(h.fake.calls.sub[0]?.target).toEqual({ host: "192.168.30.182", port: 7419 });
+    expect(h.frame()).toContain("joined 192.168.30.182:7419 as peer-1");
+    await h.shell.submit("add a health check");
+    expect(h.scrollback()).toContain("this device is a peer of 192.168.30.182:7419");
+    await h.shell.submit("/status");
+    expect(h.scrollback()).toContain("joined 192.168.30.182:7419 as peer-1 (role coding)");
+    await h.shell.quit();
+  });
+
+  it("rejects a malformed /join with the accepted forms", async () => {
+    const h = await harness();
+    await h.shell.submit("/join 192.168.30.182:7419 nope");
+    expect(h.fake.calls.sub).toHaveLength(0);
+    expect(h.scrollback()).toContain("/join: nope is neither a 12-digit join code nor host:port");
+    expect(h.scrollback()).toContain("/join <host:port> <NNNN-NNNN-NNNN>");
+    await h.shell.quit();
+  });
+
+  it("drops the peer strip and says why when the join ends, ignoring late rosters", async () => {
+    const h = await harness();
+    await h.shell.submit("/join 1234-5678-9012 --host 192.168.1.20:7419 --repo app");
+    const sub = h.fake.calls.sub[0];
+    const vps = {
+      peerId: "peer-2",
+      device: "vps",
+      role: "frontend",
+      phase: "idle" as const,
+      done: 0,
+      total: 0,
+      failed: 0,
+      percent: 0,
+      summary: "",
+      self: false,
+    };
+    sub?.onProgress?.(vps);
+    expect(h.shell.model.peers.map((p) => p.peerId)).toContain("peer-2");
+    h.fake.endSub("heartbeat_timeout");
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(h.scrollback()).toContain("left the session (heartbeat_timeout: no heartbeat for 30 s");
+    expect(h.scrollback()).toContain("/join again with the master's current code");
+    expect(h.shell.model.peers).toEqual([]);
+    expect(h.shell.model.header.session).toBe("no session");
+    // A late relay from the dead flow must not bring the row back.
+    sub?.onProgress?.({ ...vps, phase: "working" });
+    expect(h.shell.model.peers).toEqual([]);
+    expect(h.frame()).not.toMatch(/vps\s+frontend/);
+    await h.shell.quit();
+  });
+
+  it("attaches to a master running in another process on this device", async () => {
+    const status = {
+      sessionId: "S-9",
+      listen: "127.0.0.1:7419",
+      repo: "app",
+      joinCode: "111122223333",
+      joinCodeExpiresAtMs: null,
+      peers: [
+        {
+          peerId: "peer-2",
+          device: "mac",
+          address: "192.168.1.30",
+          family: "IPv4",
+          repo: "app",
+          head: null,
+          role: "coding",
+          progress: {
+            phase: "idle",
+            done: 0,
+            total: 0,
+            failed: 0,
+            percent: 0,
+            summary: "",
+          },
+        },
+      ],
+      intents: [],
+    };
+    const control = await controlServer((request) =>
+      request.op === "status"
+        ? { type: "control-result", ok: true, result: status }
+        : { type: "control-result", ok: true, result: { intentId: "N-7" } },
+    );
+    const h = await harness(undefined, async (dir) => {
+      const token = "0".repeat(32);
+      await writeFile(
+        path.join(dir, "session.json"),
+        `${JSON.stringify({ listen: `127.0.0.1:${control.port}`, token })}\n`,
+      );
+    });
+    await waitFor(() => h.shell.model.sessionLive);
+    expect(h.frame()).toContain("master (other process) · code 1111-2222-3333");
+    expect(h.frame()).toMatch(/mac\s+coding/);
+    await h.shell.submit("add a health check");
+    expect(control.requests).toContainEqual(
       expect.objectContaining({ op: "intent", text: "add a health check" }),
-    ]);
-    expect(h.scrollback()).toContain("intent N-7: add a health check");
+    );
+    expect(h.scrollback()).toContain("intent N-7 routed: add a health check");
     await h.shell.quit();
   });
 });
+
+function peer(peerId: string, device: string, repo: string): MasterPeer {
+  return {
+    peerId,
+    device,
+    address: "10.0.0.2",
+    family: "IPv4",
+    repo,
+    head: null,
+    role: "coding",
+    progress: { phase: "idle", done: 0, total: 0, failed: 0, percent: 0, summary: "" },
+  };
+}
+
+async function waitFor(check: () => boolean): Promise<void> {
+  for (let i = 0; i < 200 && !check(); i++) await new Promise((r) => setTimeout(r, 5));
+  expect(check()).toBe(true);
+}
 
 describe("parseFlags", () => {
   it("reads values, switches and positionals", () => {

@@ -21,6 +21,7 @@ import {
 } from "../tui.js";
 import { SKEP_VERSION } from "../version.js";
 import { logoLine, welcomeLines } from "./logo.js";
+import { QUIET_AFTER_MS } from "./session-controller.js";
 import type { SlashCommand } from "./slash.js";
 
 export const SCROLLBACK_CAP = 1_000;
@@ -30,7 +31,8 @@ export const MAX_MENU_ROWS = 6;
 export const SHELL_MIN_ROWS = Math.min(10, MIN_ROWS);
 
 export type ShellTone = "info" | "event" | "error" | "muted";
-export type ShellPeer = JoinViewModel["peers"][number];
+/** A footer row; `silentMs` is the time since the peer was last heard from, when known. */
+export type ShellPeer = JoinViewModel["peers"][number] & { silentMs?: number };
 
 export interface ShellHeader {
   device: string;
@@ -56,6 +58,8 @@ export class ShellModel {
   menuIndex = 0;
   peers: ShellPeer[] = [];
   sessionLive = false;
+  /** A joined shell's link to its master, e.g. `master heard 3s ago`. */
+  link: string | null = null;
   glyphs: Glyphs = "nerd";
   beat = 0;
   /** A pending question takes the input; the prompt shows it. */
@@ -106,6 +110,7 @@ export class ShellModel {
       `device  ${this.header.device}`,
       `cwd  ${this.header.cwd}`,
       ...(this.sessionLive ? [`peers ${this.peers.length}`] : ["no session"]),
+      ...(this.sessionLive && this.link !== null ? [this.link] : []),
     ];
     const lines: Line[] = [
       logoLine(columns, this.glyphs, context, this.version),
@@ -173,7 +178,9 @@ export class ShellModel {
   }
 
   private beeRows(columns: number): Line[] {
-    if (!this.sessionLive) return [{ spans: [fg("on-surface-variant", "  (no peers yet)")] }];
+    if (!this.sessionLive) {
+      return [{ spans: [fg("on-surface-variant", "  (no session — /start or /join)")] }];
+    }
     if (this.peers.length === 0) return [{ spans: [fg("on-surface-variant", "  (no peers yet)")] }];
     const overflow = this.peers.length > MAX_BEE_ROWS;
     const shown = this.peers.slice(0, overflow ? MAX_BEE_ROWS - 1 : MAX_BEE_ROWS);
@@ -191,7 +198,7 @@ export class ShellModel {
         fg("primary", `${beeLane(phase, this.beat, this.glyphs)} `),
       ];
       if (progress === undefined) {
-        spans.push(chip(peer.state));
+        spans.push(chip(peer.state), { text: "  " }, ...this.presence(peer));
       } else {
         const failed = progress.phase === "done" && progress.failed > 0;
         if (columns >= 60) {
@@ -206,6 +213,7 @@ export class ShellModel {
           spans.push(fg("on-surface-variant", ` ${progress.done}/${progress.total}`));
         }
         spans.push({ text: " " }, chip(phase), { text: "  " });
+        spans.push(...this.presence(peer));
         if (failed) spans.push(fg("error", `(${progress.failed} failed)  `));
         spans.push({ text: progress.summary });
       }
@@ -217,6 +225,14 @@ export class ShellModel {
       });
     }
     return lines;
+  }
+
+  /** Heartbeat display: when the peer was last heard from; quiet links are flagged. */
+  private presence(peer: ShellPeer): Span[] {
+    if (peer.silentMs === undefined) return [];
+    const seconds = Math.floor(peer.silentMs / 1000);
+    if (peer.silentMs >= QUIET_AFTER_MS) return [fg("error", `quiet ${seconds}s  `)];
+    return [fg("on-surface-variant", `${this.glyphs === "nerd" ? "♥" : "hb"} ${seconds}s  `)];
   }
 
   private hintLine(): Line {
