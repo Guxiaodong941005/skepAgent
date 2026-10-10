@@ -68,8 +68,8 @@ and running items never asked. Auto mode is therefore the existing behaviour, no
 announced:
 
 * **auto** (default): master-driven items run without a skep prompt. Submit asks only when the
-  policy (`--submit`, else `device.toml` `submit.method`, default `ask`, now `none`: see
-  [submit-none-summary](submit-none-summary.md)) says `ask`.
+  policy (`--submit`, else `device.toml` `submit.method`, default `none`: see
+  [submit-none-summary](submit-none-summary.md)) is `ask`.
 * **manual** (`/join … --manual`, `skep session join --manual`): before each item is checked out,
   the peer is asked `Run item I-1 (app): <title>? [Y/n]`. Empty or `y` runs it. `n` or no answer
   (EOF, `/clean`) declines it. A declined item is reported to the master with
@@ -80,9 +80,9 @@ announced:
   next queued one into an idle shell.
 
 The joined line names the mode, e.g.
-`joined session S-1 at host:port as peer-2 (auto: master drives work; submit still asks unless
---submit / device policy says otherwise)`. The `--machine` `joined` event carries `control` and
-`submit`.
+`joined session S-1 at host:port as peer-2 (auto: master drives work; submit: none)`; with an
+`ask` policy the note reads `submit: ask after each item that changed the repo`. The `--machine`
+`joined` event carries `control` and `submit`.
 
 `/join` also gained `--submit pr|mr|push|none|ask`, so the hint in that line can be acted on in
 the shell.
