@@ -719,18 +719,19 @@ const HOST_ENV_KEYS = [
  */
 const SubmitPolicySchema = z
   .strictObject({
-    method: z.enum(SUBMIT_METHODS).default("ask"),
+    method: z.enum(SUBMIT_METHODS).default("none"),
     host: z.enum(["github", "gitlab", "git"]).default("github"),
   })
-  .default({ method: "ask", host: "github" });
+  .default({ method: "none", host: "github" });
 export type SubmitPolicy = z.infer<typeof SubmitPolicySchema>;
 const DevicePolicyFileSchema = z.object({ submit: SubmitPolicySchema });
 
-const DEFAULT_POLICY: SubmitPolicy = { method: "ask", host: "github" };
+const DEFAULT_POLICY: SubmitPolicy = { method: "none", host: "github" };
 
 /**
  * Submit policy from `device.toml`. A missing file, a missing key, or a file that does not parse
- * all mean `ask`: the human decides. A plain git host has no PR/MR concept, so it forces `push`.
+ * all mean `none`: the work stays committed locally and nobody is prompted after every item
+ * (`ask` is opt-in). A plain git host has no PR/MR concept, so it forces `push`.
  */
 export async function loadSubmitPolicy(
   file: string,
@@ -748,7 +749,7 @@ export async function loadSubmitPolicy(
     policy = parseTomlConfig(DevicePolicyFileSchema, text, file).submit;
   } catch (error) {
     if (!(error instanceof ConfigError)) throw error;
-    warn(`ignoring submit policy (${error.message}); falling back to ask`);
+    warn(`ignoring submit policy (${error.message}); falling back to none`);
     return DEFAULT_POLICY;
   }
   return policy.host === "git" ? { ...policy, method: "push" } : policy;
@@ -1750,7 +1751,7 @@ export function register(program: Command, ctx: CliContext): void {
     .addOption(
       new Option(
         "--submit <method>",
-        "how finished items are submitted (default: device policy)",
+        "how finished items are submitted (default: device policy, else none)",
       ).choices(SUBMIT_METHODS),
     )
     .addOption(
@@ -1761,7 +1762,7 @@ export function register(program: Command, ctx: CliContext): void {
     )
     .option("--role-dir <dir>", "directory holding this device's AGENT.md (default: cwd)")
     .option("--ui", "use the full-screen view")
-    .option("--manual", "confirm each item before it runs (default: auto, only submit may ask)")
+    .option("--manual", "confirm each item before it runs (default: auto, no skep prompt)")
     .action(async (opts: JoinOptions) => {
       await joinCommand(sctx, opts);
     });
@@ -2160,7 +2161,7 @@ async function restoreSessionFile(
 
 /**
  * How much a joined device asks its human. `auto` (the default): master-driven items run without
- * a skep prompt; only the submit policy may ask. `manual`: each item is confirmed first. Neither
+ * a skep prompt; only an explicit `ask` submit policy may still ask. `manual`: each item is confirmed first. Neither
  * touches the agent CLI's own approval UI (D29).
  */
 export type JoinControl = "auto" | "manual";
@@ -2168,9 +2169,7 @@ export type JoinControl = "auto" | "manual";
 /** The join line's note on what this device will still ask. */
 export function controlText(control: JoinControl, method: SubmitMethod): string {
   const submit =
-    method === "ask"
-      ? "submit still asks unless --submit / device policy says otherwise"
-      : `submit: ${method}`;
+    method === "ask" ? "submit: ask after each item that changed the repo" : `submit: ${method}`;
   return control === "auto"
     ? `auto: master drives work; ${submit}`
     : `manual: you confirm each item before it runs; ${submit}`;

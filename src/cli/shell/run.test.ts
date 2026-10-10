@@ -473,6 +473,19 @@ describe("unified shell", () => {
     await h.shell.quit();
   });
 
+  it("logs an accepted result's summary as an event and a rejected result as an error", async () => {
+    const h = await harness();
+    await h.shell.submit("/start --yes --repo app");
+    const onEvent = h.fake.calls.master[0]?.onEvent;
+    onEvent?.({ kind: "progress", message: "peer-2" });
+    onEvent?.({ kind: "item-result", message: "I-4: added /healthz\ntests pass" });
+    onEvent?.({ kind: "result-reject", message: "I-5: stale_epoch" });
+    expect(h.scrollback()).toContain("item I-4: added /healthz\ntests pass");
+    expect(h.scrollback()).toContain("result rejected I-5: stale_epoch");
+    expect(h.scrollback()).not.toMatch(/^progress/m);
+    await h.shell.quit();
+  });
+
   it("accepts /join <host:port> <code> and refuses free text on a peer", async () => {
     const h = await harness();
     await h.shell.submit("/join 192.168.30.182:7419 8632-1727-0308 --repo app");
@@ -489,9 +502,7 @@ describe("unified shell", () => {
   it("joins in auto mode by default and says so; --manual opts out", async () => {
     const h = await harness();
     await h.shell.submit("/join --host 192.168.1.20:7419 --code 1234-5678-9012 --repo app");
-    expect(h.scrollback()).toContain(
-      "as peer-1 (auto: master drives work; submit still asks unless --submit / device policy says otherwise)",
-    );
+    expect(h.scrollback()).toContain("as peer-1 (auto: master drives work; submit: none)");
     await h.shell.submit("/clean");
     await h.shell.submit(
       "/join --host 192.168.1.20:7419 --code 1234-5678-9012 --repo app --manual --submit none",

@@ -16,7 +16,8 @@ export const JOIN_USAGE = [
   "       /join <NNNN-NNNN-NNNN> [--host host:port]",
   "       /join <host:port> <NNNN-NNNN-NNNN>",
   "       /join            (this device's own master)",
-  "options: --manual (confirm each item; default auto), --submit pr|mr|push|none|ask,",
+  "options: --manual (confirm each item; default auto),",
+  "         --submit pr|mr|push|none|ask (default: device.toml, else none),",
   "         --role <role>, --agent <view>, --device <name>",
 ].join("\n");
 

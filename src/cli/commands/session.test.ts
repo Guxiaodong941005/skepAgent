@@ -1079,6 +1079,29 @@ describe("session join works items", () => {
     }
   });
 
+  it("without device.toml or --submit, defaults to none: local, no submit prompt", async () => {
+    const box = await sandbox();
+    const stdin = new PassThrough();
+    stdin.end();
+    const { item, run } = await joinAndWork(box, [], stdin);
+    const branch = "skep/session/I-1-e1";
+    expect(item.result?.submit).toEqual({ method: "none", state: "local", branch });
+    expect(run.stderr).not.toContain("Submit this item?");
+    expect(await remoteHas(box, branch)).toBeNull();
+  });
+
+  it("device.toml method ask still asks", async () => {
+    const box = await sandbox();
+    const skepHome = path.join(box.home, "skep");
+    await mkdir(skepHome, { recursive: true });
+    await writeFile(path.join(skepHome, "device.toml"), '[submit]\nmethod = "ask"\n');
+    const stdin = new PassThrough();
+    stdin.end();
+    const { item, run } = await joinAndWork(box, [], stdin);
+    expect(run.stderr).toContain("Submit this item? [pr/mr/push/none/skip]");
+    expect(item.result?.submit).toMatchObject({ method: "ask", state: "skipped" });
+  });
+
   it("ask: prints branch and sha, then a typed answer submits", async () => {
     const box = await sandbox();
     const stdin = new PassThrough();
@@ -1093,7 +1116,7 @@ describe("session join works items", () => {
     const box = await sandbox();
     const stdin = new PassThrough();
     stdin.end();
-    const { item } = await joinAndWork(box, [], stdin);
+    const { item } = await joinAndWork(box, ["--submit", "ask"], stdin);
     const branch = "skep/session/I-1-e1";
     expect(item.result?.submit).toEqual({ method: "ask", state: "skipped", branch });
     expect(await remoteHas(box, branch)).toBeNull();
@@ -1171,12 +1194,12 @@ describe("session join works items", () => {
 });
 
 describe("session submit policy and materialize fallback", () => {
-  it("defaults to ask; reads method; host git forces push; a bad file falls back", async () => {
+  it("defaults to none; reads method; host git forces push; a bad file falls back", async () => {
     const dir = await home();
     const file = path.join(dir, "device.toml");
-    expect(await loadSubmitPolicy(file)).toEqual({ method: "ask", host: "github" });
+    expect(await loadSubmitPolicy(file)).toEqual({ method: "none", host: "github" });
     await writeFile(file, 'schema = "skep.device/v1"\n');
-    expect(await loadSubmitPolicy(file)).toEqual({ method: "ask", host: "github" });
+    expect(await loadSubmitPolicy(file)).toEqual({ method: "none", host: "github" });
     await writeFile(file, '[submit]\nmethod = "mr"\nhost = "gitlab"\n');
     expect(await loadSubmitPolicy(file)).toEqual({ method: "mr", host: "gitlab" });
     await writeFile(file, '[submit]\nhost = "git"\n');
@@ -1184,10 +1207,18 @@ describe("session submit policy and materialize fallback", () => {
     const warnings: string[] = [];
     await writeFile(file, '[submit]\nmethod = "fax"\n');
     expect(await loadSubmitPolicy(file, (w) => warnings.push(w))).toEqual({
-      method: "ask",
+      method: "none",
       host: "github",
     });
     expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("falling back to none");
+    await writeFile(file, "[submit\n");
+    expect(await loadSubmitPolicy(file, (w) => warnings.push(w))).toEqual({
+      method: "none",
+      host: "github",
+    });
+    await writeFile(file, '[submit]\nmethod = "ask"\n');
+    expect(await loadSubmitPolicy(file)).toEqual({ method: "ask", host: "github" });
   });
 
   it("falls back to a local clone and fetches the branch back", async () => {
