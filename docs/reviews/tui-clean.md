@@ -240,3 +240,58 @@ complete gates in an environment that permits loopback listeners and subprocess 
 - A `link` test seam on `ClearStaleOptions` injects the failure. Regressions: C published during
   a failed restore with `EOPNOTSUPP`, `EPERM` and `EXDEV` survives byte-for-byte with no leftover
   file; a failed restore with nothing published retains the moved file and names it in the error.
+
+## Fix round 2 (Codex re-review of `828a5c4`)
+
+Date: October 10, 2026. Reviewed `0906f2e..828a5c4`, including the implementation,
+new regression tests, plan update, and fix note above. Only this appendix was added during
+the review; no source files were edited and no commit was made.
+
+### B3 remaining — FIXED
+
+`restoreSessionFile()` no longer renames a saved file over `session.json`
+(`src/cli/commands/session.ts:1974`). Its only restoration operation is a hard link, which
+creates the destination exclusively. If another publication exists when restoration fails,
+the helper removes only the older saved file. If no destination exists after a non-`EEXIST`
+failure, it keeps the saved bytes and throws the typed `session_file_retained` error with
+the recovery path (`src/cli/commands/session.ts:1984`). The existence check now decides
+whether to retain the saved file; it is not followed by an overwriting operation.
+
+The three new publication regressions cover `EOPNOTSUPP`, `EPERM`, and `EXDEV`
+(`src/cli/commands/session.control.test.ts:198`). Each passes and verifies the newest
+publication's exact contents and the absence of leftover saved files. The fourth regression
+passes and verifies retained bytes plus an actionable error when restoration cannot succeed
+(`src/cli/commands/session.control.test.ts:218`).
+
+Independently reran the previous real-file reproduction through the default production link
+path, injecting only the built-in hard-link failure and publishing both replacement masters
+with production `atomicWrite`. For all three error codes, the newest master C now survives
+and only `session.json` remains. With no C publication, B's bytes remain in the saved file
+and the error names that file. A production-shell check also confirms that `/clean` surfaces
+this recovery error and leaves the shell usable for `/help`. Temporary directories were
+created inside the repository and removed after the checks.
+
+B1 and B2 remain **FIXED**: their shell/controller implementation is unchanged, and the
+prompt-cancellation and held-handshake queue regressions still pass. No remaining blocking
+finding was identified in this fix round.
+
+### Validation and notes
+
+- `git diff --check main..HEAD`: **PASS**.
+- Focused file-cleanup checks: **7 PASS / 12 skipped**, including all four new B3 regressions,
+  absent/corrupt-file cleanup, and replacement after a corrupt read.
+- Six listener-independent cleanup shell cases: **6 PASS / 25 skipped**, including B1 and B2.
+- Independent real-file and production-shell checks described above: **5/5 PASS**.
+- `npm run lint && npm test`: lint **PASS**; full suite **FAIL** in this sandbox:
+  **25 files passed / 6 failed; 495 tests passed / 65 failed; 26 unhandled errors**.
+  Loopback listeners still fail with `listen EPERM: operation not permitted 127.0.0.1`, and
+  the previously documented subprocess-output and CLI work-item failures recur. The new
+  failure-path regressions pass; these environment failures do not establish a regression
+  in this fix. The full green gate and real network behavior remain unverified here.
+- No dependency changes, version bump, publication actions, or secrets were found in the
+  fix diff. Changes remain within the planned session implementation/tests and documentation.
+
+The remaining notes concern validation limits. Rerun the complete gate where loopback
+listeners and subprocess output work before release.
+
+**Fix verdict: PASS_WITH_NOTES.**
