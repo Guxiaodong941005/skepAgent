@@ -48,8 +48,12 @@ export class ListenAddressError extends Error {
 export class NoMatchError extends Error {
   override readonly name = "NoMatchError";
   readonly code = "no_match";
-  constructor() {
-    super("No connected sub matches the requested repositories");
+  constructor(repos: readonly string[], peers: number) {
+    super(
+      peers === 0
+        ? "No peers have joined the session, so nothing can take the intent"
+        : `None of the ${peers} connected peer(s) works on repo ${repos.join(", ")}`,
+    );
   }
 }
 
@@ -221,6 +225,13 @@ class SessionMaster implements MasterHandle {
     });
   }
 
+  presence(): { peerId: string; silentMs: number }[] {
+    return [...this.peers.values()].map((peer) => ({
+      peerId: peer.peerId,
+      silentMs: peer.wire.silenceMs(),
+    }));
+  }
+
   submitIntent(text: string, repos?: string[]): Promise<{ intentId: string }> {
     if (this.stopped) return Promise.reject(new ChannelError("Master session is closed"));
     const input = IntentInputSchema.parse({ text, ...(repos ? { repos } : {}) });
@@ -309,10 +320,10 @@ class SessionMaster implements MasterHandle {
                   if (wire.active)
                     wire.finish(
                       "control_error",
-                      controlError(
-                        error instanceof NoMatchError ? "no_match" : "bad_request",
-                        "Unable to route the session intent",
-                      ),
+                      // NoMatchError text names repos and counts only; other errors stay generic.
+                      error instanceof NoMatchError
+                        ? controlError("no_match", error.message)
+                        : controlError("bad_request", "Unable to route the session intent"),
                     );
                 });
             }
@@ -432,8 +443,14 @@ class SessionMaster implements MasterHandle {
       (reason) => {
         this.wires.delete(wire);
         this.unauthenticated.delete(wire);
-        if (peer) this.dropPeer(peer);
-        this.event("disconnected", reason);
+        if (peer) {
+          this.dropPeer(peer);
+          this.event("left", `Peer ${peer.peerId} (${peer.device}) left: ${reason}`);
+        } else if (phase !== "control") {
+          // A finished control request is routine; a join that never completed is not.
+          const who = challenge === null ? path.address : `${challenge.device} (${path.address})`;
+          this.event("join-failed", `Join from ${who} ended: ${reason}`);
+        }
       },
     );
     const rejectJoin = (reason: JoinRejectReason) =>
@@ -533,7 +550,7 @@ class SessionMaster implements MasterHandle {
     }
     if (!intent.requests.length) {
       intent.state = "no_match";
-      intent.reject(new NoMatchError());
+      intent.reject(new NoMatchError(intent.repos, this.peers.size));
       return;
     }
     for (const request of intent.requests) {

@@ -11,6 +11,42 @@ protocol rules ([`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §4.4) apply to t
 
 ## [Unreleased]
 
+### Fixed
+
+* Shell session state has one source of truth (`SessionController`): the header, peer footer,
+  slash gating, `/status` and intents read the same snapshot. Peer rows from a join that ended
+  are dropped, and a session master running in another process on the same device is detected
+  and used instead of reporting `no session`.
+* A master in another process is bound by identity (its control endpoint and token). An intent
+  typed in the shell goes only to the master it shows: if another master is published, the
+  endpoint refuses the connection, or it rejects the token, the intent is not delivered and the
+  shell says which master it shows now. If the intent was sent but no reply came back (connection
+  lost, timeout, malformed reply), the shell says it **may have been accepted**, points at
+  `/status`, and warns that sending it again could duplicate the work.
+* `skep session intent` reports a lost reply as `intent_outcome_unknown` (the intent may exist)
+  instead of `session_unreachable`, which now means the request never reached the master.
+* A failed or ended join (and an ended own master) re-discovers a master still running in
+  another process instead of falling back to `no session`. Only the newest discovery applies,
+  so an older, slower probe can no longer clear or resurrect the master shown.
+* `/join` rejects a repeated `--host` or `--code` instead of using the last one.
+* `/join` accepts `/join <host:port> <code>` (either order), `/join <code> --host <host:port>`,
+  `/join --host <host:port> --code <code>` and `/join <code>`; other forms are rejected with the
+  list of accepted forms instead of `--code must be 12 digits`.
+* Intents with no joined peer are refused in the shell with the `/join` command to share,
+  instead of being recorded as `no_match` with `Unable to route the session intent`. A
+  `no_match` now says which repo no peer works on (shell, `skep session intent`).
+* `skep session intent` waits up to 40 s for the master's answer, which may itself wait 30 s
+  for peers' capabilities; it no longer reports a live master as unreachable.
+* The master names the peer, device and reason when a peer leaves (`Peer peer-2 (mac) left:
+  heartbeat_timeout`) and no longer logs a `disconnected` event for every control request. A
+  joined shell shows sub-side errors and why it left, with how to rejoin.
+
+### Added
+
+* Heartbeat display in the shell: per-peer time since last heard on a master, master link age on
+  a peer, flagged `quiet Ns` after 20 s of silence (`MasterHandle.presence()`,
+  `SubHandle.silenceMs()`).
+
 ## [0.1.6] - 2026-10-10
 
 Unified Skep shell (Grok Build–style): one screen for every open, slash commands, bee progress under the input. Codex UI chrome merged in.

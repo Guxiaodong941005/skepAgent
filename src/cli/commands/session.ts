@@ -57,6 +57,11 @@ const SESSION_FILE = "session.json";
 /** A stale `session.json` must not hang `start`; a live master answers well within this. */
 const PROBE_TIMEOUT_MS = 2_000;
 const CONTROL_TIMEOUT_MS = 10_000;
+/**
+ * An `intent` op is answered only after routing, which may wait out the master's 30 s datalist
+ * timeout for capabilities; a shorter wait reports a live master as unreachable.
+ */
+const INTENT_CONTROL_TIMEOUT_MS = 40_000;
 const MAX_FRAME_BYTES = 65_536;
 const MAX_INTENT_TEXT = 4_000;
 const MAX_INTENT_REPOS = 16;
@@ -251,9 +256,16 @@ export class FrameDecoder {
 // Control client.
 
 export class ControlConnectionError extends Error {
-  constructor(target: string, reason: string, options?: ErrorOptions) {
+  /**
+   * True once the request was handed to the socket: the master may have acted on it even though
+   * no reply arrived (closed after write, timeout, malformed reply). False means it never left.
+   */
+  readonly requestSent: boolean;
+
+  constructor(target: string, reason: string, options?: ErrorOptions & { requestSent?: boolean }) {
     super(`session master at ${target}: ${reason}`, options);
     this.name = "ControlConnectionError";
+    this.requestSent = options?.requestSent ?? false;
   }
 }
 
@@ -270,6 +282,7 @@ export function controlRequest(
     const decoder = new FrameDecoder();
     const socket = net.connect({ host: target.host, port: target.port });
     let settled = false;
+    let written = false;
     const finish = (error: Error | null, reply?: ControlResult): void => {
       if (settled) return;
       settled = true;
@@ -279,11 +292,17 @@ export function controlRequest(
       else if (reply !== undefined) resolve(reply);
     };
     clock.sleep(timeoutMs, timer.signal).then(
-      () => finish(new ControlConnectionError(label, `no reply within ${timeoutMs} ms`)),
+      () =>
+        finish(
+          new ControlConnectionError(label, `no reply within ${timeoutMs} ms`, {
+            requestSent: written,
+          }),
+        ),
       // Aborted because the exchange finished first.
       () => undefined,
     );
     socket.on("connect", () => {
+      written = true;
       socket.write(encodeFrame(Buffer.from(JSON.stringify(request), "utf8")));
     });
     socket.on("data", (chunk: Buffer) => {
@@ -292,19 +311,32 @@ export function controlRequest(
         if (frame === undefined) return;
         const parsed = ControlResultSchema.safeParse(JSON.parse(frame.toString("utf8")));
         if (!parsed.success) {
-          finish(new ControlConnectionError(label, "malformed control-result"));
+          finish(
+            new ControlConnectionError(label, "malformed control-result", { requestSent: true }),
+          );
           return;
         }
         finish(null, parsed.data);
       } catch (error) {
-        finish(new ControlConnectionError(label, errorMessage(error), { cause: error }));
+        finish(
+          new ControlConnectionError(label, errorMessage(error), {
+            cause: error,
+            requestSent: true,
+          }),
+        );
       }
     });
     socket.on("error", (error) => {
-      finish(new ControlConnectionError(label, error.message, { cause: error }));
+      finish(
+        new ControlConnectionError(label, error.message, { cause: error, requestSent: written }),
+      );
     });
     socket.on("close", () => {
-      finish(new ControlConnectionError(label, "connection closed before a reply"));
+      finish(
+        new ControlConnectionError(label, "connection closed before a reply", {
+          requestSent: written,
+        }),
+      );
     });
   });
 }
@@ -2002,6 +2034,12 @@ export async function joinSessionFlow(
       random: cryptoRandom,
       onFingerprint: showFingerprint,
       onProgress,
+      // A sub that hangs up on purpose (a failed describe/datalist callback) says so here;
+      // otherwise the human only sees the close reason.
+      onEvent: ({ kind, message }) => {
+        if (kind !== "error") return;
+        say({ event: "session-error", message }, () => `session: ${message}\n`);
+      },
       describe: async () => ({
         repo,
         role,
@@ -2272,25 +2310,62 @@ async function submitCommand(
   ctx.output().result(data, human);
 }
 
+/** An intent request left this device but no usable reply came back (see `controlAt`). */
+export const INTENT_OUTCOME_UNKNOWN = "intent_outcome_unknown";
+
+/**
+ * A master's control endpoint as published in `session.json`. The token is random per master, so
+ * an endpoint also identifies *which* master: a replacement master never accepts an old token.
+ */
+export interface ControlEndpoint {
+  listen: string;
+  token: string;
+}
+
+/** This device's published master endpoint, or null when no `session.json` exists. */
+export async function readControlEndpoint(ctx: CliContext): Promise<ControlEndpoint | null> {
+  const local = await readSessionFile(sessionFilePath(ctx));
+  return local === null ? null : { listen: local.listen, token: local.token };
+}
+
 /** Sends one control op to the master named in `session.json` and returns its `result`. */
 async function control(ctx: SessionCliContext, op: Record<string, unknown>): Promise<unknown> {
-  const file = sessionFilePath(ctx);
-  const local = await readSessionFile(file);
+  const local = await readControlEndpoint(ctx);
   if (local === null) {
+    const file = sessionFilePath(ctx);
     throw new CliError("no_session", `no session master is running (${file} not found)`);
   }
-  const target = parseHostPort(local.listen);
+  return controlAt(local, op);
+}
+
+/** Sends one control op to exactly `endpoint`, without re-reading `session.json`. */
+async function controlAt(
+  endpoint: ControlEndpoint,
+  op: Record<string, unknown>,
+  timeoutMs?: number,
+): Promise<unknown> {
+  const target = parseHostPort(endpoint.listen);
   if (target === null) {
-    throw new CliError("bad_session_file", `${file} has an invalid listen address`);
+    throw new CliError("bad_session_file", `invalid control listen address ${endpoint.listen}`);
   }
   let reply: ControlResult;
   try {
     reply = await controlRequest(
       target,
-      { type: "control", v: 1, token: local.token, ...op },
+      { type: "control", v: 1, token: endpoint.token, ...op },
       systemClock,
+      timeoutMs ?? (op.op === "intent" ? INTENT_CONTROL_TIMEOUT_MS : CONTROL_TIMEOUT_MS),
     );
   } catch (error) {
+    // A lost reply to an intent is not a refusal: the master starts routing before it answers,
+    // so the intent may exist. Read-only ops (status) are simply unreachable either way.
+    if (error instanceof ControlConnectionError && error.requestSent && op.op === "intent") {
+      throw new CliError(
+        INTENT_OUTCOME_UNKNOWN,
+        `${error.message}; the intent was sent and may have been accepted — ` +
+          "check `skep session status` before sending it again",
+      );
+    }
     if (error instanceof ControlConnectionError) {
       throw new CliError("session_unreachable", error.message);
     }
@@ -2337,19 +2412,50 @@ export async function submitIntent(
   repos?: string[],
 ): Promise<{ intentId: string }> {
   checkIntent(text, repos);
-  const result = await control(ctx, {
-    op: "intent",
-    text,
-    ...(repos === undefined ? {} : { repos }),
-  });
+  return parseIntentResult(
+    await control(ctx, { op: "intent", text, ...(repos === undefined ? {} : { repos }) }),
+  );
+}
+
+/** Sends an intent to exactly `endpoint` (a master the caller already identified). */
+export async function submitIntentAt(
+  endpoint: ControlEndpoint,
+  text: string,
+  repos?: string[],
+): Promise<{ intentId: string }> {
+  checkIntent(text, repos);
+  return parseIntentResult(
+    await controlAt(endpoint, { op: "intent", text, ...(repos === undefined ? {} : { repos }) }),
+  );
+}
+
+function parseIntentResult(result: unknown): { intentId: string } {
   const parsed = IntentResultSchema.safeParse(result);
-  if (!parsed.success) throw badReply("intent", parsed.error);
+  if (!parsed.success) {
+    // `ok: true` came back, so the master took the intent; only its id is unreadable.
+    throw new CliError(
+      INTENT_OUTCOME_UNKNOWN,
+      `session master accepted the intent but sent a malformed id (${parsed.error.message}); ` +
+        "check `skep session status` before sending it again",
+    );
+  }
   return parsed.data;
 }
 
 /** Status of the master named in `session.json`. */
 export async function fetchSessionStatus(ctx: SessionCliContext): Promise<SessionStatus> {
-  const result = await control(ctx, { op: "status" });
+  return parseStatus(await control(ctx, { op: "status" }));
+}
+
+/** Status of exactly `endpoint`; `timeoutMs` bounds discovery probes. */
+export async function fetchSessionStatusAt(
+  endpoint: ControlEndpoint,
+  timeoutMs?: number,
+): Promise<SessionStatus> {
+  return parseStatus(await controlAt(endpoint, { op: "status" }, timeoutMs));
+}
+
+function parseStatus(result: unknown): SessionStatus {
   const parsed = SessionStatusSchema.safeParse(result);
   if (!parsed.success) throw badReply("status", parsed.error);
   return parsed.data;

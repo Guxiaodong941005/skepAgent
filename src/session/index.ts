@@ -43,6 +43,11 @@ export interface MasterHandle {
   readonly sessionId: string;
   status(): SessionStatus;
   submitIntent(text: string, repos?: string[]): Promise<{ intentId: string }>;
+  /**
+   * Milliseconds since each connected peer was last heard from (heartbeats included). Optional
+   * only so hand-written test doubles still type; `startMaster` always provides it.
+   */
+  presence?(): { peerId: string; silentMs: number }[];
   attach(stream: Duplex, path: PeerPath): void;
   close(): Promise<void>;
   readonly closed: Promise<void>;
@@ -84,6 +89,8 @@ export interface SubHandle {
    * `connectSub` always provides it.
    */
   reportAgent?(itemId: string, state: AgentProgressState): void;
+  /** Milliseconds since the master was last heard from. Optional like `reportAgent`. */
+  silenceMs?(): number;
 }
 
 export { JoinRejectedError, normalizeJoinCode } from "./handshake.js";
