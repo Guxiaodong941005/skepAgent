@@ -1,6 +1,6 @@
 {
   "name": "@skepagent/skep",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Cross-device collaboration for AI coding agents via live join-code sessions.",
   "license": "MIT",
   "type": "module",

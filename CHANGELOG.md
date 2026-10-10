@@ -11,6 +11,10 @@ protocol rules ([`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §4.4) apply to t
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-10-10
+
+Unified Skep shell (Grok Build–style): one screen for every open, slash commands, bee progress under the input. Codex UI chrome merged in.
+
 ### Added
 
 * Unified Skep shell: bare `skep` opens one screen with a header (logo, version, device, cwd,
@@ -238,6 +242,7 @@ creates the npm org `skepagent` and explicitly says go. See [`docs/RELEASE.md`](
   merges.
 
 [Unreleased]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.5...HEAD
+[0.1.6]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.2...v0.1.5
 [0.1.2]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.0...v0.1.1
