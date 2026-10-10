@@ -88,3 +88,28 @@ and rejected results emit only the short reason. The hook is restored after the 
 3. **Validation follow-up.** Re-run the focused command and `npm run lint && npm test` where
    loopback listeners and subprocess output are available before treating the test gate as green.
 
+## Fix round
+
+Date: 2026-10-10. Reviewed `a686ad1..6a7b2ab` for the N1 documentation correction.
+
+**N1 is resolved.** `docs/plans/join-paste-auto.md:71` now states `default none` directly.
+The joined-line example at line 83 shows `submit: none`, and the explicit ask example uses
+`submit: ask after each item that changed the repo`. Both match the production `controlText`.
+The obsolete joined-line text and transitional default wording are gone.
+
+The commit changes two files: the requested plan and the original 90-line review report,
+which it adds to version control. Consequently, the brief's literal plan-only scope assertion
+is not met. The additional file is the existing review artifact; runtime code, tests,
+dependencies, configuration and version are unchanged. No blocking implementation issue was
+found in this fix round.
+
+Documentation assertions and the plan's `git diff --check` pass. The committed range also
+reports a trailing blank line in the carried-over review; this appended section uses that
+line as its separator. Public-repository hygiene checks pass for the review. Runtime suites
+were not rerun for this documentation correction; the earlier test counts and sandbox
+limitations remain applicable, and N2's pre-existing fixture cleanup remains outstanding.
+
+Only this section was appended during re-review. No implementation file, index or branch
+commit was changed, and the appendix is left uncommitted.
+
+**Fix verdict: PASS_WITH_NOTES.**
