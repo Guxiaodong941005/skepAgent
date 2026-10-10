@@ -195,6 +195,43 @@ describe("clearStaleSessionFile", () => {
     expect(await readdir(path.dirname(file))).toEqual(["session.json"]);
   });
 
+  for (const code of ["EOPNOTSUPP", "EPERM", "EXDEV"]) {
+    it(`keeps a master published while a link restore fails with ${code} (review B3)`, async () => {
+      const { ctx, file } = await home("{not json");
+      const moved = `${JSON.stringify({ listen: "127.0.0.1:7419", token: "b".repeat(32) })}\n`;
+      const newest = `${JSON.stringify({ listen: "127.0.0.1:7420", token: "e".repeat(32) })}\n`;
+      const result = await clearStaleSessionFile(ctx, systemClock, {
+        // B replaces the corrupt file after the read, so B is moved aside and must go back.
+        beforeRemove: () => writeFile(file, moved),
+        // C is published while restoring B, and hard links are not available.
+        link: async () => {
+          await writeFile(file, newest);
+          throw Object.assign(new Error(`link: ${code}`), { code });
+        },
+      });
+      expect(result).toEqual({ kind: "replaced" });
+      expect(await readFile(file, "utf8")).toBe(newest);
+      expect(await readdir(path.dirname(file))).toEqual(["session.json"]);
+    });
+  }
+
+  it("retains a moved-aside file it cannot link back, without guessing", async () => {
+    const { ctx, file } = await home("{not json");
+    const moved = `${JSON.stringify({ listen: "127.0.0.1:7419", token: "b".repeat(32) })}\n`;
+    const error = await clearStaleSessionFile(ctx, systemClock, {
+      beforeRemove: () => writeFile(file, moved),
+      link: async () => {
+        throw Object.assign(new Error("link: EOPNOTSUPP"), { code: "EOPNOTSUPP" });
+      },
+    }).catch((e: unknown) => e);
+    expect((error as { code?: string }).code).toBe("session_file_retained");
+    const left = await readdir(path.dirname(file));
+    expect(left).toHaveLength(1);
+    expect(left[0]).toMatch(/^session\.json\.[0-9a-f]+\.removing$/);
+    expect((error as Error).message).toContain(left[0]);
+    expect(await readFile(path.join(path.dirname(file), left[0] ?? ""), "utf8")).toBe(moved);
+  });
+
   it("keeps the file of an endpoint that answers with a malformed reply", async () => {
     const port = await server((socket) => socket.end(encodeFrame(Buffer.from("not json"))));
     const listen = `127.0.0.1:${port}`;

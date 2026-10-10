@@ -30,7 +30,8 @@ In order:
    * absent → nothing to do;
    * corrupt, or its endpoint refuses the connection (the request never left) → the file is
      removed. It is renamed aside first and only deleted if the moved bytes are exactly the ones
-     judged stale; anything else is linked back, so a master publishing meanwhile keeps its file;
+     judged stale; anything else is hard-linked back, which never replaces a newer publication.
+     Without hard links the moved file is kept beside `session.json` and `/clean` reports it;
    * an endpoint that accepts the request but replies late, malformed or not at all is treated
      as live (kept);
    * a master answers → it is a **live master in another process**. `/clean` never stops another

@@ -1862,6 +1862,8 @@ export interface ClearStaleOptions {
   beforeRemove?(): Promise<void>;
   /** Test seam: runs after the file was moved aside, before its content is checked. */
   afterMoveAside?(): Promise<void>;
+  /** Test seam: replaces the hard link that restores a moved-aside file. */
+  link?(existing: string, created: string): Promise<void>;
 }
 
 /**
@@ -1909,11 +1911,7 @@ export async function clearStaleSessionFile(
     }
   }
   await options.beforeRemove?.();
-  const outcome = await removeSessionFileIf(
-    file,
-    (current) => current === raw,
-    options.afterMoveAside,
-  );
+  const outcome = await removeSessionFileIf(file, (current) => current === raw, options);
   if (outcome === "absent") return { kind: "none" };
   if (outcome === "kept") return { kind: "replaced" };
   return { kind: "removed", listen: existing?.listen ?? null };
@@ -1934,14 +1932,14 @@ async function removeOwnSessionFile(file: string, token: string): Promise<void> 
 /**
  * Removes `file` only while it holds what `matches` accepts. A read followed by an unlink would
  * delete a publication that lands in between, so the file is renamed aside first (atomic: what
- * is moved is exactly what gets checked). A file that does not match is linked back; if an even
- * newer publication already took its place (`EEXIST`), that newer one wins, as it would have by
- * overwriting. Masters publish with an atomic rename, so the file is never seen half-written.
+ * is moved is exactly what gets checked). A file that does not match is put back without ever
+ * replacing a newer publication (see `restoreSessionFile`). Masters publish with an atomic
+ * rename, so the file is never seen half-written.
  */
 async function removeSessionFileIf(
   file: string,
   matches: (raw: string) => boolean,
-  afterMoveAside?: () => Promise<void>,
+  seams: Pick<ClearStaleOptions, "afterMoveAside" | "link"> = {},
 ): Promise<"removed" | "kept" | "absent"> {
   const aside = `${file}.${Buffer.from(cryptoRandom.bytes(6)).toString("hex")}.removing`;
   try {
@@ -1950,32 +1948,45 @@ async function removeSessionFileIf(
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return "absent";
     throw error;
   }
-  await afterMoveAside?.();
+  await seams.afterMoveAside?.();
   let raw: string;
   try {
     raw = await readFile(aside, "utf8");
   } catch (error) {
-    await restoreSessionFile(aside, file);
+    await restoreSessionFile(aside, file, seams.link ?? link);
     throw error;
   }
   if (matches(raw)) {
     await rm(aside, { force: true });
     return "removed";
   }
-  await restoreSessionFile(aside, file);
+  await restoreSessionFile(aside, file, seams.link ?? link);
   return "kept";
 }
 
-/** Puts a moved-aside file back unless a newer publication already exists. */
-async function restoreSessionFile(aside: string, file: string): Promise<void> {
+/**
+ * Puts a moved-aside file back with a hard link, which fails with `EEXIST` instead of replacing
+ * a publication that landed meanwhile; that newer one wins, as it would have by overwriting.
+ * Node has no other create-if-absent rename, and a `rename` onto the path would silently replace
+ * a newer master's file, so when linking is impossible the moved file is retained beside
+ * `session.json` and the caller is told where it is.
+ */
+async function restoreSessionFile(
+  aside: string,
+  file: string,
+  linkFile: (existing: string, created: string) => Promise<void>,
+): Promise<void> {
   try {
-    await link(aside, file);
+    await linkFile(aside, file);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
-    if (code !== "EEXIST") {
-      // No hard links on this filesystem: put it back by rename (may race a newer publication).
-      await rename(aside, file);
-      return;
+    // A newer publication exists: the moved-aside one is older and is dropped, never restored.
+    if (code !== "EEXIST" && !(await exists(file))) {
+      throw new CliError(
+        "session_file_retained",
+        `could not put ${file} back (${code ?? errorMessage(error)}); it is kept at ${aside} — ` +
+          `rename it to ${path.basename(file)} if its master still runs`,
+      );
     }
   }
   await rm(aside, { force: true });
