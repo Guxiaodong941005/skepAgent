@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { skepPaths } from "../../config/paths.js";
+import { ListenAddressError } from "../../session/index.js";
 import type { Clock } from "../../util/clock.js";
 import {
   encodeFrame,
@@ -335,6 +336,25 @@ describe("unified shell", () => {
     expect(h.scrollback()).toContain("--advertise must be host:port, got nope");
     expect(h.fake.calls.master).toHaveLength(0);
     await h.shell.quit();
+  });
+
+  it("/start explains how to select an unused port after a bind collision", async () => {
+    const h = await harness();
+    h.fake.api.startMaster = async () => {
+      throw new ListenAddressError("Unable to bind session listener", {
+        cause: Object.assign(new Error("address in use"), { code: "EADDRINUSE" }),
+      });
+    };
+    try {
+      await h.shell.submit("/start --yes --repo proj-b --listen 127.0.0.1:7420");
+      expect(h.scrollback()).toContain("127.0.0.1:7420 is already in use");
+      expect(h.scrollback()).toContain("--listen <host:unused-port>");
+      expect(h.scrollback()).toContain("separate SKEP_HOME");
+      expect(h.shell.session.snapshot().mode).toBe("none");
+      await expect(readFile(path.join(h.dir, "session.json"))).rejects.toThrow(/ENOENT/);
+    } finally {
+      await h.shell.quit();
+    }
   });
 
   it("/start never starts a master on a wildcard or blank --advertise host", async () => {
@@ -718,6 +738,30 @@ async function waitFor(check: () => boolean): Promise<void> {
 }
 
 describe("external master identity and discovery (review B1-B3)", () => {
+  it.each(["", " --listen 127.0.0.1:7420"])(
+    "/start for another project explains isolation and preserves the live master (%j)",
+    async (listenFlag) => {
+      const a = await externalMaster("A", "proj-a");
+      const h = await harness(undefined, a.publish);
+      try {
+        await waitFor(() => h.shell.session.externalStatus !== null);
+        const file = path.join(h.dir, "session.json");
+        const before = await readFile(file, "utf8");
+        await h.shell.submit(`/start --yes --repo proj-b${listenFlag}`);
+        expect(h.scrollback()).toContain("one session per SKEP_HOME");
+        expect(h.scrollback()).toContain("skep --home <separate-dir>");
+        expect(h.scrollback()).toContain("/start --listen <host:unused-port>");
+        expect(h.fake.calls.master).toHaveLength(0);
+        expect(h.shell.session.snapshot().mode).toBe("external");
+        expect(h.shell.session.externalStatus?.repo).toBe("proj-a");
+        expect(await readFile(file, "utf8")).toBe(before);
+        expect(a.intents()).toEqual([]);
+      } finally {
+        await h.shell.quit();
+      }
+    },
+  );
+
   it("never sends an intent to a replacement master while showing the old one", async () => {
     const a = await externalMaster("A", "app-a");
     const b = await externalMaster("B", "app-b");

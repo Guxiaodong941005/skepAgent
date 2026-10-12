@@ -7,7 +7,7 @@ import { PassThrough } from "node:stream";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Notification } from "../../notify/ntfy.js";
-import { startMaster } from "../../session/index.js";
+import { ListenAddressError, startMaster } from "../../session/index.js";
 import type { ItemStatus } from "../../session/messages.js";
 import { runCli } from "../program.js";
 import {
@@ -18,6 +18,7 @@ import {
   encodeFrame,
   expandStartWithMaster,
   FrameDecoder,
+  fetchSessionStatus,
   formatJoinCli,
   herdrAgentName,
   type ItemWorker,
@@ -462,15 +463,142 @@ describe("session start", () => {
     expect(await run).toBe(0);
   });
 
-  it("refuses to start when the recorded master still answers", async () => {
+  it.each([{ listenArgs: [] }, { listenArgs: ["--listen", "127.0.0.1:7420"] }])(
+    "explains home and port isolation when another project's master answers (%j)",
+    async ({ listenArgs }) => {
+      const dir = await home();
+      const mock = await mockMaster({
+        type: "control-result",
+        ok: true,
+        result: { ...STATUS, repo: "proj-a" },
+      });
+      await writeSessionFile(dir, mock.listen);
+      const before = await readFile(path.join(dir, "session.json"), "utf8");
+      const fake = fakeApi();
+      const c = capture(dir, { sessionApi: fake.api, cwd: path.join(dir, "proj-b") });
+      expect(
+        await runCli(["--machine", "session", "start", "--repo", "proj-b", ...listenArgs], c.ctx),
+      ).toBe(1);
+      const error = JSON.parse(c.stdout).error;
+      expect(error.code).toBe("session_running");
+      expect(error.message).toContain(mock.listen);
+      expect(error.message).toContain("one session per SKEP_HOME");
+      expect(error.message).toContain("skep --home <separate-dir>");
+      expect(error.message).toContain("/start --listen <host:unused-port>");
+      expect(fake.calls.master).toHaveLength(0);
+      expect(mock.requests).toEqual([{ type: "control", v: 1, token: TOKEN, op: "status" }]);
+      expect(await readFile(path.join(dir, "session.json"), "utf8")).toBe(before);
+    },
+  );
+
+  it("explains a port collision even when the second master has a separate home", async () => {
     const dir = await home();
     const mock = await mockMaster({ type: "control-result", ok: true, result: STATUS });
     await writeSessionFile(dir, mock.listen);
+    const before = await readFile(path.join(dir, "session.json"), "utf8");
+    const separate = await home();
+    const c = capture(dir);
+    expect(
+      await runCli(
+        [
+          "--machine",
+          "--home",
+          separate,
+          "session",
+          "start",
+          "--repo",
+          "proj-b",
+          "--listen",
+          mock.listen,
+        ],
+        c.ctx,
+      ),
+    ).toBe(1);
+    const error = JSON.parse(c.stdout).error;
+    expect(error.code).toBe("session_port_in_use");
+    expect(error.message).toContain(mock.listen);
+    expect(error.message).toContain("--listen <host:unused-port>");
+    expect(error.message).toContain("separate SKEP_HOME");
+    expect(await readFile(path.join(dir, "session.json"), "utf8")).toBe(before);
+    await expect(stat(path.join(separate, "session.json"))).rejects.toThrow(/ENOENT/);
+    expect(mock.requests).toEqual([]);
+  });
+
+  it("preserves bind errors that are not port collisions", async () => {
     const fake = fakeApi();
-    const c = capture(dir, { sessionApi: fake.api });
+    const failure = new ListenAddressError("listener permission denied", {
+      cause: Object.assign(new Error("permission denied"), { code: "EACCES" }),
+    });
+    fake.api.startMaster = async () => {
+      throw failure;
+    };
+    const c = capture(await home(), { sessionApi: fake.api });
     expect(await runCli(["--machine", "session", "start", "--repo", "app"], c.ctx)).toBe(1);
-    expect(JSON.parse(c.stdout).error.code).toBe("session_running");
-    expect(fake.calls.master).toHaveLength(0);
+    expect(JSON.parse(c.stdout).error).toEqual({
+      code: "error",
+      message: "listener permission denied",
+    });
+  });
+
+  it("keeps two concurrent masters isolated with SKEP_HOME and --home", async () => {
+    const firstHome = await home();
+    const secondHome = await home();
+    const masters: MasterHandle[] = [];
+    const options: MasterOptions[] = [];
+    const runs: Promise<number>[] = [];
+    const api: SessionApi = {
+      ...fakeApi().api,
+      async startMaster(opts) {
+        options.push(opts);
+        // Ephemeral loopback ports avoid reserving fixed ports on the test machine.
+        const master = await startMaster({ ...opts, listen: { host: "127.0.0.1", port: 0 } });
+        masters.push(master);
+        return master;
+      },
+    };
+    const first = capture(firstHome, { sessionApi: api, cwd: path.join(firstHome, "proj-a") });
+    const second = capture(firstHome, { sessionApi: api, cwd: path.join(secondHome, "proj-b") });
+    try {
+      runs.push(runCli(["--machine", "session", "start", "--repo", "proj-a", "--yes"], first.ctx));
+      await vi.waitFor(() => expect(first.stdout).toContain('"started"'));
+      runs.push(
+        runCli(
+          [
+            "--machine",
+            "--home",
+            secondHome,
+            "session",
+            "start",
+            "--repo",
+            "proj-b",
+            "--yes",
+            "--listen",
+            "127.0.0.1:7420",
+          ],
+          second.ctx,
+        ),
+      );
+      await vi.waitFor(() => expect(second.stdout).toContain('"started"'));
+      expect(options[0]?.listen?.port).toBe(7419);
+      expect(options[1]?.listen).toEqual({ host: "127.0.0.1", port: 7420 });
+      expect(first.ctx.paths?.home).toBe(firstHome);
+      expect(second.ctx.paths?.home).toBe(secondHome);
+      const a = await fetchSessionStatus(first.ctx);
+      const b = await fetchSessionStatus(second.ctx);
+      expect(a.repo).toBe("proj-a");
+      expect(b.repo).toBe("proj-b");
+      expect(a.sessionId).not.toBe(b.sessionId);
+      expect(a.listen).not.toBe(b.listen);
+      await masters[0]?.close();
+      expect(await runs[0]).toBe(0);
+      await expect(stat(path.join(firstHome, "session.json"))).rejects.toThrow(/ENOENT/);
+      expect((await fetchSessionStatus(second.ctx)).sessionId).toBe(b.sessionId);
+    } finally {
+      await Promise.all(masters.map((master) => master.close()));
+      await Promise.all(runs);
+    }
+    expect(await Promise.all(runs)).toEqual([0, 0]);
+    await expect(stat(path.join(secondHome, "session.json"))).rejects.toThrow(/ENOENT/);
   });
 });
 

@@ -32,6 +32,7 @@ import type { ProcessExit } from "../../runtime/types.js";
 import {
   connectSub,
   type DatalistEntry,
+  ListenAddressError,
   type MasterHandle,
   type MasterOptions,
   type PeerPhase,
@@ -1868,17 +1869,37 @@ export async function startMasterFlow(
     if (started) opts.onJoinCode?.(code, codeExpiresAtMs);
   };
 
-  const handle = await api.startMaster({
-    listen: target,
-    repo,
-    device,
-    controlToken: token,
-    clock: systemClock,
-    random: cryptoRandom,
-    onJoinCode,
-    acceptJoin: (request) => (opts.yes === true ? Promise.resolve(true) : opts.acceptJoin(request)),
-    ...(opts.onEvent === undefined ? {} : { onEvent: opts.onEvent }),
-  });
+  let handle: MasterHandle;
+  try {
+    handle = await api.startMaster({
+      listen: target,
+      repo,
+      device,
+      controlToken: token,
+      clock: systemClock,
+      random: cryptoRandom,
+      onJoinCode,
+      acceptJoin: (request) =>
+        opts.yes === true ? Promise.resolve(true) : opts.acceptJoin(request),
+      ...(opts.onEvent === undefined ? {} : { onEvent: opts.onEvent }),
+    });
+  } catch (error) {
+    if (
+      error instanceof ListenAddressError &&
+      error.cause instanceof Error &&
+      "code" in error.cause &&
+      error.cause.code === "EADDRINUSE"
+    ) {
+      throw new CliError(
+        "session_port_in_use",
+        `the session listen address ${formatHostPort(target)} is already in use; ` +
+          "choose an unused port with --listen <host:unused-port> " +
+          "(/start in the skep shell, or skep session start in a terminal). " +
+          "Independent sessions also need a separate SKEP_HOME or skep --home <separate-dir>",
+      );
+    }
+    throw error;
+  }
   const closed = handle.closed.then(
     () => removeOwnSessionFile(file, token),
     async (error: unknown) => {
@@ -2012,7 +2033,11 @@ async function refuseIfRunning(file: string): Promise<void> {
   }
   throw new CliError(
     "session_running",
-    `a session master is already running at ${existing.listen} (${file})`,
+    `a session master is already running at ${existing.listen} (${file})\n` +
+      "Project directories share one session per SKEP_HOME. For an independent session, " +
+      "launch skep --home <separate-dir> (or set SKEP_HOME), then " +
+      "/start --listen <host:unused-port>; from a terminal: " +
+      "skep --home <separate-dir> session start --listen <host:unused-port>",
   );
 }
 
