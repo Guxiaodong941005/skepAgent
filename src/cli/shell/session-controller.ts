@@ -8,7 +8,7 @@
  */
 
 import type { ControlEndpoint, JoinFlow, MasterFlow, SessionStatus } from "../commands/session.js";
-import { formatJoinCode, joinHint } from "../commands/session.js";
+import { formatJoinCode, joinHint, repoLabel } from "../commands/session.js";
 import { quoteSlashWord } from "./flags.js";
 import type { ShellPeer } from "./model.js";
 
@@ -304,7 +304,7 @@ export class SessionController {
 export function noPeersText(host: string, joinCode: string | null, repo: string): string {
   const hint =
     joinCode === null
-      ? `on another device: /join --host ${host} --code <code> --repo ${quoteSlashWord(repo)}`
+      ? `on another device, from a checkout of ${repoLabel(repo)}: /join <code> ${quoteSlashWord(host)}`
       : joinHint({ host, code: joinCode, repo });
   return `no peers joined yet — nothing can take this intent\n${hint}`;
 }

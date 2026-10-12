@@ -17,17 +17,19 @@ import { parseFlags } from "./flags.js";
 
 /**
  * Codes are one word: `8632-1727-0308` or `863217270308` (arguments split on whitespace). The
- * first form is the line the master prints to paste (docs/plans/join-paste-auto.md).
+ * first form is the line the master prints to paste (docs/plans/join-slim.md).
  */
 export const JOIN_USAGE = [
-  "usage: /join --host <host:port> --code <NNNN-NNNN-NNNN> --repo <repo>",
-  "       /join <NNNN-NNNN-NNNN> [--host host:port]",
+  "usage: /join <NNNN-NNNN-NNNN> <host:port>",
+  "       /join --code <NNNN-NNNN-NNNN> --host <host:port>",
   "       /join <host:port> <NNNN-NNNN-NNNN>",
   "       /join            (this device's own master)",
-  "options: --agent claude|codex|pi (default: /agent, SKEP_AGENT_CLI, AGENT.md, else PATH),",
-  "         --manual (confirm each item; default auto),",
-  "         --submit commit|push|pr|mr|none|ask (default: device.toml, else none),",
-  "         --view native|pty|herdr|dry, --role <role>, --device <name>",
+  "repo and device default to this checkout's directory name and this hostname",
+  "optional: --repo <name>, --device <name>, --role <role>,",
+  "          --agent claude|codex|pi (default: /agent, SKEP_AGENT_CLI, AGENT.md, else PATH),",
+  "          --view native|pty|herdr|dry,",
+  "          --submit commit|push|pr|mr|none|ask (default: device.toml, else none),",
+  "          --manual (confirm each item; default auto)",
 ].join("\n");
 
 export interface JoinArgs {
