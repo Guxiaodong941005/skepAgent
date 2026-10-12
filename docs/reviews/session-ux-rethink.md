@@ -247,3 +247,34 @@ tests were added because this review was authorized to change only this report.
 
 The branch is ready for a fix round, not merge approval. Re-review the corrected findings and
 rerun the required gates before changing this verdict.
+
+## Fix round
+
+Date: 2026-10-12. Implementer: Claude, on `feat/session-ux-rethink`. The PASS items were not
+reopened; the wire (`src/session/messages.ts`), `src/core`, package files and configs are
+unchanged. `npm run lint` passes, and `npm test` passes 32 files / 721 tests (was 693).
+
+| # | Fix | Regression tests |
+| --- | --- | --- |
+| R1 | Undo no longer uses `safeJoin` for the leaf. `entryPath` resolves the root and checks that every existing parent is a plain directory, refusing a symlinked or replaced parent before changing anything. The leaf is never followed: `lstat` for state, `unlink` removes a link itself, and a regular-file restore first unlinks a link in the way. The record keeps `beforeLink`/`afterLink`. A committed symlink (mode 120000) is read as a link, not as a file holding its target text. A directory or special file at a recorded path is refused, even with `--force`. Missing or damaged blobs are now checked before any mutation. | `session-delta.test.ts`: new link to another project file (Git and non-Git); a link retargeted later, then `--force`; a modified committed link restored to its old target; a file replaced by a link to another project file; a parent turned into a symlink. In each, the targets keep their content. |
+| R2 | Every run writes its item's record when it starts, before the abort/decline checks. A later run that changes nothing, is declined, is skipped or fails early therefore leaves an empty record. Undo and submit refuse it ("the latest run of I-1 (session …) changed no files"). Records carry `sessionId`, and messages name the run. If the start record cannot be written, the item fails instead of running unrecorded. | `session.test.ts` "R2": session A's `I-1` changes files; session B's `I-1` ends with no changes, declined, skipped before start or no agent. In every case undo and `submit commit` are refused and A's files stay uncommitted. |
+| R3 | `submitDelta` takes the record. Before any staging, commit, branch or push it runs `driftedFiles`: every recorded path must still have its after hash, or the submit fails with the drifted files and what to do. Nothing is staged, committed, branched or pushed. | "R3": a hand edit after the item, for `commit`, `push` and `pr`; HEAD, index, `skep/*` branches and origin are unchanged. A second item touches the same file: submitting `I-1` is refused, while `I-2` submits. |
+| R4 | `workItem` resolves the master's `pending` result at once but keeps the serial slot until the blocked herdr agent settles. It polls `backend.wait` with the injected `Clock`, never sends input, and is aborted when the join closes. When the agent settles, the delta is measured again against the run's snapshot and the record is rewritten, so undo and submit cover the edits made after the answer. | "R4": the first agent blocks; the second item does not start; the human answers; the first agent writes `resumed.txt` and finishes. Only then does the second start, and its delta excludes `resumed.txt`. Undo of `I-1` removes it. |
+| R5 | `commitDelta` checks `git status` for the selected paths. If nothing is left, it returns null, and `push` continues to push the branch. `commit` reports `submit commit local <HEAD> on <branch>` with "already committed". | "R5": an agent commits its own change with `--submit push`, and origin gets the commit. Also `none`, then `submit commit`, then `submit push`, then a repeat `commit`. |
+| R6 | `itemVerdict` classifies each item as done, failed, submit-failed, pending, declined or running. `intentRollup` counts them apart. The final event is `intent-done` only when every item succeeded, `intent-failed` on any agent or submit failure, and `intent-waiting` while one is pending. Item events are `item-failed` for submit failures and `item-pending` for waits. The peer turns a failed submit into a `FAILED` status line with `cause:`/`fix:` (the exact `skep session submit` command) and a last-error log. `itemBlock` renders it uncapped as `SUBMIT FAILED`. The shell logs failed items and intents as errors and waiting ones as warnings; the peer shell treats a failed submit as an error. | `master.progress.test.ts`: verdicts and roll-up counts; uncapped SUBMIT FAILED block; a two-peer intent where one peer's submit failed or is pending, so no `intent-done`, exactly one `intent-failed` or `intent-waiting`. `session.test.ts` "R6": failed push → FAILED with cause/fix; status rendering of failed and pending results. |
+| R7 | `ShellModel` stores the width and body height of the last frame. `scrollBy` clamps to rendered rows at that width; `frame` re-clamps on resize. Appending while scrolled up moves the view by the rendered rows that were added. PgUp/PgDn call `scrollBy`. | `run.test.ts`: a 500-word error through real PgUp/PgDn keys. Every word is reached, none is duplicated within a frame, and PgDn returns to the bottom. `model.test.ts`: top reachable at 40/80/120 columns, resize clamping, append anchoring. |
+| R8 | `sessionStatusSections` splits status into info text and one section per item result. Results use `itemBlock(..., { full: true })`, so the 8-line/600-character event cap no longer applies to status. The shell's `/status` (own or external master) logs failed results with the error tone and others with the warn tone; both wrap. Ordinary info lines and the event cap are unchanged. | `run.test.ts`: `/status` through the shell with a 70-word failed cause and a summary over 600 characters. Both are fully present in the frame at 80 columns, every row ≤ 80, with tones error and warn. `session.test.ts`: `renderSessionStatus` keeps a summary over 600 characters whole and names submit-failed/pending. |
+
+Leftover risks and notes:
+
+- The real herdr `wait` semantics for an already-blocked agent are not in this branch: the
+  runtime module is loaded dynamically. The hold therefore sleeps 2 s between waits (Clock) so
+  it cannot spin if `wait` returns `blocked` at once. A blocked agent the human never answers
+  keeps the peer's queue until the join closes, which is intended (R4).
+- After a blocked run settles, the master is not told: the wire has no second result. The peer
+  prints the final delta and the `skep session submit` command; the master's roll-up stays
+  `waiting for you`.
+- The drift check compares content hashes. A file the item changed and that was then changed
+  back to the same content by hand counts as unchanged. Pre-existing edits in a changed file
+  are still submitted whole (N4, unchanged).
+- R1 still trusts the project root itself: a root that is a symlink is resolved once, as before.
