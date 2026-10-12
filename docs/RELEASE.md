@@ -2,8 +2,34 @@
 
 This document records the package-name decision (v0.1.0), the npm registry re-check, the
 v0.1.0 checklist, the v0.1.1 session-TUI notes, the v0.1.5 peer-progress and TUI notes, the
-v0.1.8 join-UX notes, the v0.1.9 per-project isolation notes, the v0.1.10 SAME-CB notes, the v0.1.11 SESSION-UX notes, and the steps the orchestrator runs. Task agents must not `git push`,
+v0.1.8 join-UX notes, the v0.1.9 per-project isolation notes, the v0.1.10 SAME-CB notes, the v0.1.11 SESSION-UX notes, the v0.1.12 JOIN-SLIM notes, and the steps the orchestrator runs. Task agents must not `git push`,
 create tags, or `npm publish`.
+
+## v0.1.12 — slim join paste (2026-10-12)
+
+The human ordered **merge → publish** after Codex review **PASS_WITH_NOTES** (N1 is a
+docs-only note on the brief, non-blocking). Package name stays **`@skepagent/skep`**
+(public). The published bin is `skep`.
+
+What this tag adds on top of v0.1.11 (details in [`../CHANGELOG.md`](../CHANGELOG.md)):
+
+* **Slim `/join` paste**: the master prints only the code and the host,
+  `/join 1234-5678-9012 203.0.113.7:7419`; the CLI twin is
+  `skep session join --code … --host …`. The master's repo is named in prose.
+* **Optional overrides**: the peer's repo defaults to its git top level's directory name and
+  its device to the hostname; `--repo`, `--device`, `--role`, `--agent`, `--view`,
+  `--submit` and `--manual` stay optional. Old `/join --host … --code … --repo …` lines
+  still parse.
+
+Compatibility: upgrade both devices. Wire protocol unchanged.
+
+Install:
+
+```bash
+npm install -g @skepagent/skep@0.1.12
+```
+
+---
 
 ## v0.1.11 — session UX rethink (2026-10-12)
 

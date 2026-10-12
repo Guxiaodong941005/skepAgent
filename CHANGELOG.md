@@ -11,6 +11,8 @@ protocol rules ([`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §4.4) apply to t
 
 ## [Unreleased]
 
+## [0.1.12] - 2026-10-12
+
 ### Changed
 
 * **Slim join paste (JOIN-SLIM).** The line a master prints is now just the code and the host,

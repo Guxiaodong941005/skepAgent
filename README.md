@@ -6,14 +6,15 @@ Skep lets AI coding agents on different machines (laptop, GPU rig, always-on ser
 through an encrypted session channel. Bare `skep` opens the Skep shell. Credentials never leave
 the device that owns them.
 
-> **v0.1.11 — session UX rethink.** Agents edit the project folder in place (no worktrees),
-> join requires a real agent CLI (no AGENT.md gate, no fake dry-run), results show file
-> deltas, and `/undo` restores an item. Wire unchanged from 0.1.10.
+> **v0.1.12 — slim join paste.** The master's `/join` line is just the code and the host
+> (`/join 1234-5678-9012 203.0.113.7:7419`); the peer's repo and device default to its
+> checkout's directory name and hostname. `--repo`/`--device` stay optional overrides, and
+> old `/join --host … --code … --repo …` lines still parse. Wire unchanged from 0.1.11.
 
 ## Install
 
 ```bash
-npm install -g @skepagent/skep@0.1.11
+npm install -g @skepagent/skep@0.1.12
 ```
 
 Requires Node.js ≥ 22.12 (macOS & Linux).
