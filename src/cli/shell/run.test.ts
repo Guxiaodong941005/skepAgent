@@ -7,6 +7,7 @@ import { Duplex, PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { skepHome, skepPaths } from "../../config/paths.js";
 import { connectSub, ListenAddressError, startMaster } from "../../session/index.js";
+import type { SessionStatus } from "../../session/messages.js";
 import type { Clock } from "../../util/clock.js";
 import { execFileChecked } from "../../util/exec.js";
 import {
@@ -99,6 +100,8 @@ function fakeApi(address = { host: "192.168.1.20", port: 7419 }) {
   };
   /** Peers the fake master reports in `status()`; tests push into it. */
   const peers: MasterPeer[] = [];
+  /** Intents the fake master reports in `status()`; tests push into it. */
+  const intents: SessionStatus["intents"] = [];
   let intentError: Error | null = null;
   let subError: Error | null = null;
   /** While set, `connectSub` waits for it: a join stuck in its handshake. */
@@ -121,7 +124,7 @@ function fakeApi(address = { host: "192.168.1.20", port: 7419 }) {
           joinCode: "1234-5678-9012",
           joinCodeExpiresAtMs: null,
           peers: peers.map((peer) => ({ ...peer })),
-          intents: [],
+          intents: intents.map((intent) => ({ ...intent })),
         }),
         submitIntent: async (text) => {
           calls.intents.push(text);
@@ -156,6 +159,7 @@ function fakeApi(address = { host: "192.168.1.20", port: 7419 }) {
     api,
     calls,
     peers,
+    intents,
     failIntents(error: Error) {
       intentError = error;
     },
@@ -184,6 +188,18 @@ async function harness(
 ) {
   const dir = await mkdtemp(path.join(tmpdir(), "skep-shell-"));
   roots.push(dir);
+  // Only a stub agent and a logging git: a real agent CLI on this machine is never found.
+  const bin = path.join(dir, "bin");
+  await mkdir(bin);
+  await writeFile(path.join(bin, "claude"), '#!/bin/sh\necho "stub claude"\n', { mode: 0o755 });
+  const realGit = (
+    await execFileChecked("sh", ["-c", "command -v git"], { env: { PATH: process.env.PATH ?? "" } })
+  ).stdout.trim();
+  await writeFile(
+    path.join(bin, "git"),
+    `#!/bin/sh\nprintf "%s\\n" "$*" >> "${path.join(dir, "git.log")}"\nexec "${realGit}" "$@"\n`,
+    { mode: 0o755 },
+  );
   const prepared = await prepare?.(dir);
   const stdin = new FakeStdin();
   let screen = "";
@@ -198,6 +214,7 @@ async function harness(
       SKEP_TUI_ANIMATE: "0",
       NO_COLOR: "1",
       HOME: dir,
+      PATH: bin,
     },
     output: () => {
       throw new Error("the shell must not use the Commander output");
@@ -533,9 +550,14 @@ describe("unified shell", () => {
     await h.shell.submit("/start --yes --repo app");
     const onEvent = h.fake.calls.master[0]?.onEvent;
     onEvent?.({ kind: "progress", message: "peer-2" });
-    onEvent?.({ kind: "item-result", message: "I-4: added /healthz\ntests pass" });
+    onEvent?.({ kind: "item-result", message: "I-4 done · mac (app)\n  added /healthz" });
+    onEvent?.({ kind: "item-failed", message: "I-6 FAILED · mac (app)\n  cause: agent exited 3" });
+    onEvent?.({ kind: "intent-done", message: "intent-1 done: x\n  1 done · 1 failed" });
     onEvent?.({ kind: "result-reject", message: "I-5: stale_epoch" });
-    expect(h.scrollback()).toContain("item I-4: added /healthz\ntests pass");
+    expect(h.scrollback()).toContain("I-4 done · mac (app)\n  added /healthz");
+    expect(h.scrollback()).toContain("intent-1 done: x\n  1 done · 1 failed");
+    const failed = h.shell.model.scrollback.find((line) => line.text.startsWith("I-6 FAILED"));
+    expect(failed?.tone).toBe("error");
     expect(h.scrollback()).toContain("result rejected I-5: stale_epoch");
     expect(h.scrollback()).not.toMatch(/^progress/m);
     await h.shell.quit();
@@ -677,8 +699,16 @@ describe("unified shell", () => {
       expect(master.status().intents[0]?.items[0]).toMatchObject({
         assignee: "peer-2",
         datalistEntries: 0,
-        result: { checks: [{ name: "git", status: "fail" }], submit: { state: "failed" } },
+        // A non-git folder now runs the agent in place; this stub changes nothing.
+        result: {
+          checks: [{ name: "none", status: "skip" }],
+          submit: { method: "none", state: "skipped" },
+        },
       });
+      expect(master.status().intents[0]?.items[0]?.result?.summary).toContain("\nno changes");
+      expect(peer.scrollback()).toContain(
+        `agent: claude (found on PATH) · mode: edits this folder directly (${path.join(peer.dir, "proj-b")})`,
+      );
       expect(peer.shell.session.snapshot().mode).toBe("joined");
       expect(peer.scrollback()).toContain("cannot read this directory's Git HEAD");
       expect(peer.scrollback()).toContain("sending an empty datalist");
@@ -1194,6 +1224,161 @@ describe("/clean", () => {
     );
     expect(h.shell.session.snapshot().mode).toBe("external");
     expect(await readFile(path.join(h.dir, "session.json"), "utf8")).toContain(`${other.port}`);
+    await h.shell.quit();
+  });
+});
+
+describe("SESSION-UX shell copy", () => {
+  it("/join names the agent, says it edits the folder, and /clean leaves nothing on disk", async () => {
+    const h = await harness();
+    await h.shell.submit("/join --host 192.168.1.20:7419 --code 1234-5678-9012 --repo app");
+    expect(h.scrollback()).toContain(
+      `agent: claude (found on PATH) · mode: edits this folder directly (${h.dir})`,
+    );
+    const log = path.join(h.dir, "git.log");
+    const before = await readFile(log, "utf8").catch(() => "");
+    await h.shell.submit("/clean");
+    expect(h.scrollback()).toContain(
+      "nothing left on disk: no worktrees or session branches; edits stay in your folder",
+    );
+    // /clean only ends connection state: it never runs git.
+    expect(await readFile(log, "utf8").catch(() => "")).toBe(before);
+    await h.shell.quit();
+  });
+
+  it("a /join without any agent fails with one cause and one fix, and stays unjoined", async () => {
+    const h = await harness();
+    await rm(path.join(h.dir, "bin", "claude"));
+    await h.shell.submit("/join --host 192.168.1.20:7419 --code 1234-5678-9012 --repo app");
+    expect(h.scrollback()).toContain(
+      "join failed: no agent CLI found (looked for claude, codex, pi on PATH)\n" +
+        "fix: install one, or pass --agent <claude|codex|pi> (in the skep shell: /agent <cli>)",
+    );
+    expect(h.scrollback()).toContain(`full text: ${path.join(h.dir, "session", "last-error.log")}`);
+    expect(h.fake.calls.sub).toHaveLength(0);
+    expect(h.shell.session.snapshot().mode).toBe("none");
+    await h.shell.quit();
+  });
+
+  it("/agent persists the CLI in device.toml and the next /join uses it", async () => {
+    const h = await harness();
+    await h.shell.submit("/agent");
+    expect(h.scrollback()).toContain("agent: not set; /join uses --agent, SKEP_AGENT_CLI");
+    await h.shell.submit("/agent codex");
+    const toml = path.join(h.dir, "device.toml");
+    expect(h.scrollback()).toContain(`session items will run codex; saved in ${toml}`);
+    expect(await readFile(toml, "utf8")).toBe('[agent]\ncli = "codex"\n');
+    await h.shell.submit("/agent");
+    expect(h.scrollback()).toContain(`agent: codex (saved in ${toml})`);
+    await writeFile(path.join(h.dir, "bin", "codex"), "#!/bin/sh\n", { mode: 0o755 });
+    await h.shell.submit("/join --host 192.168.1.20:7419 --code 1234-5678-9012 --repo app");
+    expect(h.scrollback()).toContain("agent: codex (from /agent) · mode: edits this folder");
+    await h.shell.submit("/clean");
+    // The pre-SESSION-UX spelling is refused with its replacement.
+    await h.shell.submit(
+      "/join --host 192.168.1.20:7419 --code 1234-5678-9012 --repo app --agent pty",
+    );
+    expect(h.scrollback()).toContain("--agent pty is now --view pty");
+    await h.shell.quit();
+  });
+
+  it("/undo refuses an unknown item with where it looked", async () => {
+    const h = await harness();
+    await h.shell.submit("/undo I-4");
+    expect(h.scrollback()).toContain("no recorded changes for I-4 in this project");
+    await h.shell.submit("/undo");
+    expect(h.scrollback()).toContain("usage: /undo <item> [--force]");
+    await h.shell.quit();
+  });
+});
+
+describe("long results in the shell (SESSION-UX R7, R8)", () => {
+  function frameText(h: Awaited<ReturnType<typeof harness>>, columns: number, rows: number) {
+    return h.shell.model
+      .frame(columns, rows)
+      .map((line) => (typeof line === "string" ? line : line.spans.map((s) => s.text).join("")))
+      .join("\n");
+  }
+
+  it("PgUp reaches the first word of an error longer than the body", async () => {
+    const h = await harness();
+    const words = Array.from({ length: 500 }, (_, n) => `e${String(n).padStart(3, "0")}`);
+    h.shell.log(words.join(" "), "error");
+    h.shell.log("a later info line");
+    const seen = new Set<string>();
+    const collect = () => {
+      const shown = frameText(h, 80, 24).match(/e\d{3}/g) ?? [];
+      // A frame never shows a word twice.
+      expect(new Set(shown).size).toBe(shown.length);
+      for (const word of shown) seen.add(word);
+    };
+    collect();
+    for (let i = 0; i < 100 && !seen.has("e000"); i++) {
+      h.stdin.type("\x1b[5~");
+      collect();
+    }
+    // Every word was on screen at some point, in order.
+    expect([...seen].sort()).toEqual(words);
+    // Further PgUp stays at the start; PgDn comes back to the bottom.
+    h.stdin.type("\x1b[5~");
+    expect(frameText(h, 80, 24)).toContain("e000");
+    for (let i = 0; i < 100 && h.shell.model.scroll > 0; i++) h.stdin.type("\x1b[6~");
+    expect(frameText(h, 80, 24)).toContain("a later info line");
+    expect(frameText(h, 80, 24)).toContain("e499");
+    await h.shell.quit();
+  });
+
+  it("/status wraps a long failed cause and a success summary over 600 characters", async () => {
+    const h = await harness();
+    await h.shell.submit("/start --yes --repo app");
+    h.fake.peers.push(peer("peer-1", "vps", "app"));
+    const cause = Array.from({ length: 70 }, (_, n) => `c${String(n).padStart(2, "0")}`);
+    const said = Array.from({ length: 120 }, (_, n) => `s${String(n).padStart(3, "0")}`);
+    const item = (itemId: string, summary: string, check: "pass" | "fail") => ({
+      itemId,
+      repo: "app",
+      assignee: "peer-1",
+      epoch: 1,
+      title: "t",
+      datalistEntries: 0,
+      state: "done" as const,
+      result: {
+        itemId,
+        epoch: 1,
+        repo: "app",
+        baseSha: "a".repeat(40),
+        headSha: "b".repeat(40),
+        checks: [{ name: "agent", status: check }],
+        submit: { method: "none" as const, state: "local" as const, branch: "main" },
+        summary,
+      },
+    });
+    const ok = [
+      "submit none local",
+      "done · claude · 3s",
+      ...Array.from({ length: 12 }, (_, n) => `line ${n} ${"x".repeat(40)}`),
+      `summary: ${said.join(" ")}`,
+    ].join("\n");
+    expect(ok.length).toBeGreaterThan(600);
+    h.fake.intents.push({
+      intentId: "intent-1",
+      text: "ship it",
+      state: "planned",
+      items: [
+        item("I-1", `submit none local\nFAILED · claude · 1s\ncause: ${cause.join(" ")}`, "fail"),
+        item("I-2", ok, "pass"),
+      ],
+    });
+    await h.shell.submit("/status");
+    const failed = h.shell.model.scrollback.find((e) => e.text.includes("I-1 FAILED"));
+    const done = h.shell.model.scrollback.find((e) => e.text.includes("I-2 done"));
+    expect(failed?.tone).toBe("error");
+    expect(done?.tone).toBe("warn");
+    const frame = frameText(h, 80, 400);
+    expect(frame.match(/c\d{2}/g)).toEqual(cause);
+    expect(frame.match(/s\d{3}/g)).toEqual(said);
+    expect(frame).toContain("line 11");
+    for (const row of frame.split("\n")) expect(row.length).toBeLessThanOrEqual(80);
     await h.shell.quit();
   });
 });

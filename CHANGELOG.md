@@ -11,6 +11,71 @@ protocol rules ([`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §4.4) apply to t
 
 ## [Unreleased]
 
+Session UX rethink (SESSION-UX, [`docs/plans/session-ux-rethink.md`](docs/plans/session-ux-rethink.md)):
+a peer's agent edits the project folder directly, the agent is found at `/join` or the join
+fails, and the master shows what changed instead of a branch name. No session wire change.
+
+### Changed
+
+* **No worktrees, clones or session branches.** Items run in the peer's project root (the git
+  top level of the joined directory, or the directory itself) and strictly one at a time per
+  peer. `<home>/session/worktrees` is no longer created.
+* **No AGENT.md requirement.** The agent CLI is resolved once at `/join`: `--agent
+  <claude|codex|pi>`, then `/agent` (saved in this project's `device.toml` `[agent] cli`), then
+  `SKEP_AGENT_CLI`, then an `AGENT.md` that happens to exist, then the first of `claude`,
+  `codex`, `pi` on `PATH`. If none is found the join fails with one cause and one fix.
+  `--role-dir` is accepted and ignored.
+* **`--agent` takes the agent CLI; `--view native|pty|herdr|dry` takes the run view** (default
+  `native`). The old `--agent pty|native|herdr|dry` values are refused with the replacement
+  flag. `SKEP_SESSION_EXEC` no longer does anything; `SKEP_SESSION_VIEW` still sets the view.
+* **Results are deltas.** Each item reports the files whose content changed during the run,
+  a diffstat and the agent's own closing summary (`I-1 done · mac (app) · claude · 2m 14s`).
+  A dirty tree is never stashed, reset or cleaned; files that were already modified are
+  annotated `(was already modified)`.
+* **Submit modes work on the delta.** `none` (default) leaves the edits in the folder; new
+  `commit` commits only the item's files on the current branch; `push` also pushes that
+  branch; `pr`/`mr` copy the files onto a new `skep/<item>-<slug>` branch (created only then),
+  push it and open the PR/MR without touching the working tree or the checked-out branch.
+  `skep session submit` works on the recorded delta; a legacy `skep/session/*` branch gets a
+  clear "use git directly" message and is never deleted.
+* `/clean` says that nothing is left on disk; there is no git state to clean.
+* `/status` shows a roll-up per intent (`2 done · 1 failed · 4 files changed`) and each
+  item's full result, wrapped, never cut; the master prints one final block per intent:
+  `intent-done` only when everything succeeded, `intent-failed` when an agent or a submit
+  failed, `intent-waiting` while a herdr agent waits for the human. Failed submits, waiting
+  agents and declined items are counted apart from `done`.
+* A blocked herdr agent keeps its place in the item queue until it finishes or the join
+  closes; the next item starts only after it, and its record covers what it wrote afterwards.
+* `skep session submit` refuses, changing nothing, when a recorded file changed after the
+  item (a later item or a hand edit); changes the agent already committed still push.
+
+### Added
+
+* `skep session undo <item> [--force]` and `/undo <item>`: put the files an item changed back
+  to their content from before it. Refuses, changing nothing, when a file changed again after
+  the item, unless `--force`. Symlinks are removed or recreated as links, never written
+  through, and only recorded paths are touched. Every run of an item id replaces its record,
+  so a later session's `I-1` that changed nothing never undoes an earlier session's `I-1`.
+
+### Removed
+
+* The dry-run marker commit (`.skep-session-item`). `--view dry` runs nothing, commits
+  nothing and reports a failed-class `DRY RUN: no agent ran, nothing changed`.
+
+### Fixed
+
+* A second session on the same device no longer fails with `materialize: … already exists;
+  submit or delete it first` (item ids restart per session).
+* Errors are readable: error and warning lines in the shell wrap with a hanging indent
+  instead of being cut at the terminal edge; failed items show one cause and one fix, the
+  master never caps a `FAILED` block, and the full text is written to
+  `<home>/session/last-error.log`.
+
+### Upgrading from 0.1.x
+
+* Worktrees and `skep/session/*` branches left by earlier versions are yours: run
+  `git worktree prune` once and delete old branches with git if you no longer need them.
+
 ## [0.1.10] - 2026-10-12
 
 Peers on the same machine stay connected through intents even when the join directory has

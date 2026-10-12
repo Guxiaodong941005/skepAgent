@@ -21,9 +21,21 @@ describe("parseJoinArgs", () => {
     ["8632-1727-0308 192.168.30.182:7419", { code: "8632-1727-0308", host: "192.168.30.182:7419" }],
     ["[fe80::1]:7419 863217270308", { code: "863217270308", host: "[fe80::1]:7419" }],
     [
-      "mac.local:7419 8632-1727-0308 --role web --agent pty",
-      { code: "8632-1727-0308", host: "mac.local:7419", role: "web", agent: "pty" },
+      "mac.local:7419 8632-1727-0308 --role web --agent codex",
+      { code: "8632-1727-0308", host: "mac.local:7419", role: "web", agent: "codex" },
     ],
+    [
+      "8632-1727-0308 --agent pi --view herdr",
+      { code: "8632-1727-0308", agent: "pi", view: "herdr" },
+    ],
+    [
+      "8632-1727-0308 --role-dir ./role",
+      {
+        code: "8632-1727-0308",
+        notes: ["--role-dir is ignored; AGENT.md is no longer required"],
+      },
+    ],
+    ["8632-1727-0308 --submit commit", { code: "8632-1727-0308", submit: "commit" }],
     [
       "--host 203.0.113.7:7419 --code 8632-1727-0308 --repo app",
       { code: "8632-1727-0308", host: "203.0.113.7:7419", repo: "app" },
@@ -50,7 +62,13 @@ describe("parseJoinArgs", () => {
     ["--host a:7419 --host b:7419 --code 123456789012", /--host given twice/],
     ["--code 123456789012 --code 111122223333", /--code given twice/],
     ["--code 1234 5678 9012", /--code must be 12 digits/],
-    ["--code 123456789012 --submit yolo", /--submit must be pr, mr, push, none, ask, got yolo/],
+    [
+      "--code 123456789012 --submit yolo",
+      /--submit must be commit, pr, mr, push, none, ask, got yolo/,
+    ],
+    ["--code 123456789012 --agent gpt", /--agent must be claude, codex, pi/],
+    ["--code 123456789012 --agent pty", /--agent pty is now --view pty/],
+    ["--code 123456789012 --view tmux", /--view must be dry, pty, herdr, native, got tmux/],
   ])("rejects %j with the accepted forms", (args, problem) => {
     let message = "";
     try {
