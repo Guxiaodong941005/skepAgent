@@ -11,10 +11,21 @@ protocol rules ([`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §4.4) apply to t
 
 ## [Unreleased]
 
+### Added
+
+* Automatic project isolation: default state lives in `~/.skep/projects/<projectId>`, where
+  the ID hashes the canonical Git toplevel (or cwd outside Git). Same-project terminals keep
+  local discovery and bare `/join`; peers in other checkouts use the master's full join line.
+  Explicit `--home` / `SKEP_HOME` remain exact. The legacy global home is not auto-migrated;
+  select `SKEP_HOME="$HOME/.skep"` or `--home "$HOME/.skep"` to keep using it.
+* Session starts without `--listen` try LAN IPv4 port 7419, then available ports through 7519
+  when busy. Advertise and pasteable joins use the actual bound port; explicit `--listen`
+  addresses are never silently changed.
+
 ### Fixed
 
-* Session start errors explain separate `SKEP_HOME`/`--home` directories and unused `--listen`
-  ports for independent projects on one machine; port conflicts name the attempted address.
+* Session start errors explain automatic project defaults, shared-home overrides, and explicit
+  port collisions or exhaustion of the automatic port range.
 
 ## [0.1.8] - 2026-10-10
 

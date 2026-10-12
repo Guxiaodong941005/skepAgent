@@ -6,6 +6,7 @@ import path from "node:path";
 import { PassThrough } from "node:stream";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { skepHome, skepPaths } from "../../config/paths.js";
 import type { Notification } from "../../notify/ntfy.js";
 import { ListenAddressError, startMaster } from "../../session/index.js";
 import type { ItemStatus } from "../../session/messages.js";
@@ -15,6 +16,7 @@ import {
   AgentRuntimeUnavailableError,
   type AgentSessionBackend,
   type AgentView,
+  DEFAULT_PORT,
   encodeFrame,
   expandStartWithMaster,
   FrameDecoder,
@@ -24,6 +26,7 @@ import {
   type ItemWorker,
   type JoinView,
   type JoinViewModel,
+  LAST_AUTO_PORT,
   loadSubmitPolicy,
   type MasterHandle,
   type MasterOptions,
@@ -34,6 +37,7 @@ import {
   type PtyRunResult,
   parseHostPort,
   pickListenHost,
+  readControlEndpoint,
   renderSessionStatus,
   type SessionApi,
   type SessionCliContext,
@@ -284,6 +288,139 @@ describe("listen host", () => {
 });
 
 describe("session start", () => {
+  it.each([undefined, "203.0.113.7:8500"])(
+    "retries busy default ports and prints the bound or explicit advertise address (%j)",
+    async (advertise) => {
+      const fake = fakeApi(`192.168.1.20:${DEFAULT_PORT + 2}`);
+      const bind = fake.api.startMaster;
+      const attempts: MasterOptions[] = [];
+      fake.api.startMaster = async (options) => {
+        attempts.push(options);
+        if (attempts.length <= 2) {
+          throw new ListenAddressError("Unable to bind session listener", {
+            cause: Object.assign(new Error("address in use"), { code: "EADDRINUSE" }),
+          });
+        }
+        return bind(options);
+      };
+      const dir = await home();
+      const c = capture(dir, { sessionApi: fake.api });
+      const run = runCli(
+        [
+          "session",
+          "start",
+          "--yes",
+          "--repo",
+          "app",
+          ...(advertise ? ["--advertise", advertise] : []),
+        ],
+        c.ctx,
+      );
+      try {
+        await vi.waitFor(() => expect(c.stdout).toContain("join code:"));
+        expect(attempts.map((options) => options.listen)).toEqual([
+          { host: "192.168.1.20", port: DEFAULT_PORT },
+          { host: "192.168.1.20", port: DEFAULT_PORT + 1 },
+          { host: "192.168.1.20", port: DEFAULT_PORT + 2 },
+        ]);
+        expect(new Set(attempts.map((options) => options.controlToken)).size).toBe(1);
+        const dial = advertise ?? `192.168.1.20:${DEFAULT_PORT + 2}`;
+        expect(c.stdout).toContain(`/join --host ${dial} --code 1234-5678-9012 --repo app`);
+        expect(JSON.parse(await readFile(path.join(dir, "session.json"), "utf8")).listen).toBe(
+          `192.168.1.20:${DEFAULT_PORT + 2}`,
+        );
+        attempts.at(-1)?.onJoinCode({ code: "999988887777", expiresAtMs: 1_800_000_600_000 });
+        expect(c.stdout).toContain(`/join --host ${dial} --code 9999-8888-7777 --repo app`);
+      } finally {
+        fake.closed.resolve();
+        await run;
+      }
+      expect(await run).toBe(0);
+    },
+  );
+
+  it("bounds automatic port retries and never publishes a pointer on exhaustion", async () => {
+    const dir = await home();
+    const fake = fakeApi();
+    const bind = vi.fn(async () => {
+      throw new ListenAddressError("Unable to bind session listener", {
+        cause: Object.assign(new Error("address in use"), { code: "EADDRINUSE" }),
+      });
+    });
+    fake.api.startMaster = bind;
+    const c = capture(dir, { sessionApi: fake.api });
+    expect(await runCli(["--machine", "session", "start", "--repo", "app"], c.ctx)).toBe(1);
+    expect(bind).toHaveBeenCalledTimes(LAST_AUTO_PORT - DEFAULT_PORT + 1);
+    expect(bind).toHaveBeenLastCalledWith(
+      expect.objectContaining({ listen: { host: "192.168.1.20", port: LAST_AUTO_PORT } }),
+    );
+    const error = JSON.parse(c.stdout).error;
+    expect(error.code).toBe("session_port_in_use");
+    expect(error.message).toContain(`${DEFAULT_PORT}–${LAST_AUTO_PORT}`);
+    expect(error.message).toContain("--listen <host:unused-port>");
+    await expect(stat(path.join(dir, "session.json"))).rejects.toThrow(/ENOENT/);
+  });
+
+  it("never retries an explicit busy listen address", async () => {
+    const dir = await home();
+    const fake = fakeApi();
+    const bind = vi.fn(async () => {
+      throw new ListenAddressError("Unable to bind session listener", {
+        cause: Object.assign(new Error("address in use"), { code: "EADDRINUSE" }),
+      });
+    });
+    fake.api.startMaster = bind;
+    const c = capture(dir, { sessionApi: fake.api });
+    expect(
+      await runCli(
+        ["--machine", "session", "start", "--repo", "app", "--listen", "127.0.0.1:7420"],
+        c.ctx,
+      ),
+    ).toBe(1);
+    expect(bind).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(c.stdout).error).toMatchObject({ code: "session_port_in_use" });
+    expect(JSON.parse(c.stdout).error.message).toContain("127.0.0.1:7420 is already in use");
+    await expect(stat(path.join(dir, "session.json"))).rejects.toThrow(/ENOENT/);
+  });
+
+  it("retries an actual bind collision using injected ephemeral loopback targets", async () => {
+    const busy = await mockMaster({ type: "control-result", ok: true, result: STATUS });
+    const attempts: MasterOptions[] = [];
+    const masters: MasterHandle[] = [];
+    const api: SessionApi = {
+      ...fakeApi().api,
+      async startMaster(options) {
+        attempts.push(options);
+        const master = await startMaster({
+          ...options,
+          listen:
+            attempts.length === 1
+              ? (parseHostPort(busy.listen) ?? undefined)
+              : { host: "127.0.0.1", port: 0 },
+        });
+        masters.push(master);
+        return master;
+      },
+    };
+    const dir = await home();
+    const c = capture(dir, { sessionApi: api });
+    const run = runCli(["session", "start", "--repo", "app", "--yes"], c.ctx);
+    try {
+      await vi.waitFor(() => expect(c.stdout).toContain("join code:"));
+      expect(attempts.map((options) => options.listen?.port)).toEqual([
+        DEFAULT_PORT,
+        DEFAULT_PORT + 1,
+      ]);
+      const pointer = JSON.parse(await readFile(path.join(dir, "session.json"), "utf8"));
+      expect(pointer.listen).not.toBe(busy.listen);
+      expect(c.stdout).toContain(`/join --host ${pointer.listen} --code `);
+    } finally {
+      await Promise.all(masters.map((master) => master.close()));
+      await run;
+    }
+    expect(await run).toBe(0);
+  });
+
   it("writes session.json while running and removes it after closed", async () => {
     const dir = await home();
     const fake = fakeApi("10.1.2.3:7500");
@@ -464,7 +601,7 @@ describe("session start", () => {
   });
 
   it.each([{ listenArgs: [] }, { listenArgs: ["--listen", "127.0.0.1:7420"] }])(
-    "explains home and port isolation when another project's master answers (%j)",
+    "refuses a live master when explicit overrides share the home (%j)",
     async ({ listenArgs }) => {
       const dir = await home();
       const mock = await mockMaster({
@@ -482,9 +619,10 @@ describe("session start", () => {
       const error = JSON.parse(c.stdout).error;
       expect(error.code).toBe("session_running");
       expect(error.message).toContain(mock.listen);
-      expect(error.message).toContain("one session per SKEP_HOME");
+      expect(error.message).toContain("one session per home");
       expect(error.message).toContain("skep --home <separate-dir>");
-      expect(error.message).toContain("/start --listen <host:unused-port>");
+      expect(error.message).toContain("omit the override");
+      expect(error.message).toContain("ports automatically");
       expect(fake.calls.master).toHaveLength(0);
       expect(mock.requests).toEqual([{ type: "control", v: 1, token: TOKEN, op: "status" }]);
       expect(await readFile(path.join(dir, "session.json"), "utf8")).toBe(before);
@@ -518,7 +656,7 @@ describe("session start", () => {
     expect(error.code).toBe("session_port_in_use");
     expect(error.message).toContain(mock.listen);
     expect(error.message).toContain("--listen <host:unused-port>");
-    expect(error.message).toContain("separate SKEP_HOME");
+    expect(error.message).toContain("available ports automatically");
     expect(await readFile(path.join(dir, "session.json"), "utf8")).toBe(before);
     await expect(stat(path.join(separate, "session.json"))).rejects.toThrow(/ENOENT/);
     expect(mock.requests).toEqual([]);
@@ -599,6 +737,112 @@ describe("session start", () => {
     }
     expect(await Promise.all(runs)).toEqual([0, 0]);
     await expect(stat(path.join(secondHome, "session.json"))).rejects.toThrow(/ENOENT/);
+  });
+
+  it("isolates concurrent default project homes and shares same-root discovery", async () => {
+    const userHome = await home();
+    const firstProject = path.join(userHome, "first", "app");
+    const secondProject = path.join(userHome, "second", "app");
+    await mkdir(firstProject, { recursive: true });
+    await mkdir(secondProject, { recursive: true });
+    const env = { HOME: userHome, PATH: process.env.PATH };
+    await gitIn(firstProject, ["init", "--quiet"], env);
+    const nested = path.join(firstProject, "src");
+    await mkdir(nested);
+    const firstFake = fakeApi();
+    const secondFake = fakeApi(`192.168.1.20:${DEFAULT_PORT + 1}`);
+    const bind = secondFake.api.startMaster;
+    secondFake.api.startMaster = async (options) => {
+      if (options.listen?.port === DEFAULT_PORT) {
+        throw new ListenAddressError("Unable to bind session listener", {
+          cause: Object.assign(new Error("address in use"), { code: "EADDRINUSE" }),
+        });
+      }
+      return bind(options);
+    };
+    const first = capture(userHome, { env, cwd: firstProject, sessionApi: firstFake.api });
+    const second = capture(userHome, { env, cwd: secondProject, sessionApi: secondFake.api });
+    const firstRun = runCli(["session", "start", "--repo", "app", "--yes"], first.ctx);
+    const secondRun = runCli(["session", "start", "--repo", "app", "--yes"], second.ctx);
+    try {
+      await vi.waitFor(() => expect(first.stdout).toContain("join code:"));
+      await vi.waitFor(() => expect(second.stdout).toContain("join code:"));
+      const firstHome = await skepHome(env, firstProject);
+      const secondHome = await skepHome(env, secondProject);
+      expect(firstHome).not.toBe(secondHome);
+      expect(first.ctx.paths?.home).toBe(firstHome);
+      expect(second.ctx.paths?.home).toBe(secondHome);
+      const peer = capture(userHome, { env, cwd: nested });
+      peer.ctx.paths = skepPaths(await skepHome(env, nested));
+      expect(await readControlEndpoint(peer.ctx)).toEqual(await readControlEndpoint(first.ctx));
+      expect(await readControlEndpoint(second.ctx)).not.toEqual(
+        await readControlEndpoint(first.ctx),
+      );
+      expect(second.stdout).toContain(`/join --host 192.168.1.20:${DEFAULT_PORT + 1} --code `);
+      firstFake.closed.resolve();
+      expect(await firstRun).toBe(0);
+      await expect(stat(path.join(firstHome, "session.json"))).rejects.toThrow(/ENOENT/);
+      expect(await readControlEndpoint(second.ctx)).not.toBeNull();
+      await expect(stat(path.join(userHome, ".skep", "session.json"))).rejects.toThrow(/ENOENT/);
+    } finally {
+      firstFake.closed.resolve();
+      secondFake.closed.resolve();
+      await Promise.all([firstRun, secondRun]);
+    }
+    expect(await secondRun).toBe(0);
+    expect(await readControlEndpoint(second.ctx)).toBeNull();
+  });
+
+  it("scopes real master status, live guards, and cleanup to default project homes", async () => {
+    const userHome = await home();
+    const projects = [path.join(userHome, "proj-a"), path.join(userHome, "proj-b")];
+    await Promise.all(projects.map((project) => mkdir(project)));
+    const env = { HOME: userHome, PATH: process.env.PATH };
+    const masters: MasterHandle[] = [];
+    const api: SessionApi = {
+      ...fakeApi().api,
+      async startMaster(options) {
+        const master = await startMaster({ ...options, listen: { host: "127.0.0.1", port: 0 } });
+        masters.push(master);
+        return master;
+      },
+    };
+    const first = capture(userHome, { env, cwd: projects[0], sessionApi: api });
+    const second = capture(userHome, { env, cwd: projects[1], sessionApi: api });
+    const runs: Promise<number>[] = [];
+    try {
+      runs.push(runCli(["--machine", "session", "start", "--repo", "proj-a", "--yes"], first.ctx));
+      await vi.waitFor(() => expect(first.stdout).toContain('"started"'));
+      const peer = capture(userHome, { env, cwd: projects[0] });
+      expect(await runCli(["--machine", "session", "status"], peer.ctx)).toBe(0);
+      expect(JSON.parse(peer.stdout).result.repo).toBe("proj-a");
+      const duplicateFake = fakeApi();
+      const duplicate = capture(userHome, { env, cwd: projects[0], sessionApi: duplicateFake.api });
+      expect(
+        await runCli(["--machine", "session", "start", "--repo", "proj-a"], duplicate.ctx),
+      ).toBe(1);
+      expect(JSON.parse(duplicate.stdout).error.code).toBe("session_running");
+      expect(duplicateFake.calls.master).toHaveLength(0);
+      // Another project cannot discover the first pointer, even before it has its own master.
+      expect(await runCli(["--machine", "session", "status"], second.ctx)).toBe(1);
+      expect(JSON.parse(second.stdout).error.code).toBe("no_session");
+      runs.push(runCli(["--machine", "session", "start", "--repo", "proj-b", "--yes"], second.ctx));
+      await vi.waitFor(() => expect(masters).toHaveLength(2));
+      await vi.waitFor(async () => expect(await readControlEndpoint(second.ctx)).not.toBeNull());
+      expect((await fetchSessionStatus(first.ctx)).repo).toBe("proj-a");
+      const b = await fetchSessionStatus(second.ctx);
+      expect(b.repo).toBe("proj-b");
+      expect(first.ctx.paths?.home).not.toBe(second.ctx.paths?.home);
+      await masters[0]?.close();
+      expect(await runs[0]).toBe(0);
+      expect(await readControlEndpoint(first.ctx)).toBeNull();
+      expect((await fetchSessionStatus(second.ctx)).sessionId).toBe(b.sessionId);
+    } finally {
+      await Promise.all(masters.map((master) => master.close()));
+      await Promise.all(runs);
+    }
+    expect(await Promise.all(runs)).toEqual([0, 0]);
+    expect(await readControlEndpoint(second.ctx)).toBeNull();
   });
 });
 

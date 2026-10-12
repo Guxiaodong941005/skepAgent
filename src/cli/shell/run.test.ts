@@ -1,12 +1,13 @@
 import { EventEmitter } from "node:events";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { skepPaths } from "../../config/paths.js";
+import { skepHome, skepPaths } from "../../config/paths.js";
 import { ListenAddressError } from "../../session/index.js";
 import type { Clock } from "../../util/clock.js";
+import { execFileChecked } from "../../util/exec.js";
 import {
   encodeFrame,
   FrameDecoder,
@@ -114,7 +115,7 @@ function fakeApi(address = { host: "192.168.1.20", port: 7419 }) {
         sessionId: "S-1",
         status: () => ({
           sessionId: "S-1",
-          listen: "192.168.1.20:7419",
+          listen: `${address.host}:${address.port}`,
           repo: "app",
           joinCode: "1234-5678-9012",
           joinCodeExpiresAtMs: null,
@@ -178,11 +179,11 @@ function fakeApi(address = { host: "192.168.1.20", port: 7419 }) {
 
 async function harness(
   masterAddress?: { host: string; port: number },
-  prepare?: (dir: string) => Promise<void>,
+  prepare?: (dir: string) => Promise<void> | Promise<Partial<ShellCliContext>>,
 ) {
   const dir = await mkdtemp(path.join(tmpdir(), "skep-shell-"));
   roots.push(dir);
-  await prepare?.(dir);
+  const prepared = await prepare?.(dir);
   const stdin = new FakeStdin();
   let screen = "";
   const stderr: string[] = [];
@@ -229,6 +230,7 @@ async function harness(
     shellHooks: { on: () => undefined, off: () => undefined },
     clock: parkedClock,
     hostname: () => "laptop",
+    ...(prepared ?? {}),
   };
   const shell = new Shell(ctx);
   const running = shell.run();
@@ -328,6 +330,38 @@ describe("unified shell", () => {
     await h.shell.quit();
   });
 
+  it("/start auto-picks a free port for the paste line and /clean removes its pointer", async () => {
+    const h = await harness({ host: "192.168.1.20", port: 7420 });
+    const bind = h.fake.api.startMaster;
+    const ports: number[] = [];
+    h.fake.api.startMaster = async (options) => {
+      ports.push(options.listen?.port ?? 0);
+      if (options.listen?.port === 7419) {
+        throw new ListenAddressError("Unable to bind session listener", {
+          cause: Object.assign(new Error("address in use"), { code: "EADDRINUSE" }),
+        });
+      }
+      return bind(options);
+    };
+    try {
+      await h.shell.submit("/start --yes --repo app");
+      expect(ports).toEqual([7419, 7420]);
+      expect(h.scrollback()).toContain("session master listening on 192.168.1.20:7420");
+      expect(h.scrollback()).toContain(
+        "/join --host 192.168.1.20:7420 --code 1234-5678-9012 --repo app",
+      );
+      h.fake.calls.master[0]?.onJoinCode?.({ code: "999988887777", expiresAtMs: 0 });
+      expect(h.scrollback()).toContain(
+        "/join --host 192.168.1.20:7420 --code 9999-8888-7777 --repo app",
+      );
+      await h.shell.submit("/clean");
+      expect(h.shell.session.snapshot().mode).toBe("none");
+      await expect(readFile(path.join(h.dir, "session.json"))).rejects.toThrow(/ENOENT/);
+    } finally {
+      await h.shell.quit();
+    }
+  });
+
   it("/start rejects a wildcard or malformed --advertise", async () => {
     const h = await harness();
     await h.shell.submit("/start --yes --repo app --advertise 0.0.0.0:7419");
@@ -349,7 +383,7 @@ describe("unified shell", () => {
       await h.shell.submit("/start --yes --repo proj-b --listen 127.0.0.1:7420");
       expect(h.scrollback()).toContain("127.0.0.1:7420 is already in use");
       expect(h.scrollback()).toContain("--listen <host:unused-port>");
-      expect(h.scrollback()).toContain("separate SKEP_HOME");
+      expect(h.scrollback()).toContain("available ports automatically");
       expect(h.shell.session.snapshot().mode).toBe("none");
       await expect(readFile(path.join(h.dir, "session.json"))).rejects.toThrow(/ENOENT/);
     } finally {
@@ -505,6 +539,74 @@ describe("unified shell", () => {
     expect(h.scrollback()).not.toMatch(/^progress/m);
     await h.shell.quit();
   });
+
+  it.each(["own", "other process"])(
+    "bare /join discovers the %s master in the same default project home",
+    async (owner) => {
+      let externalPort = 0;
+      const external =
+        owner === "other process"
+          ? await controlServer(() => ({
+              type: "control-result",
+              ok: true,
+              result: {
+                sessionId: "S-1",
+                listen: `127.0.0.1:${externalPort}`,
+                repo: "app",
+                joinCode: "123456789012",
+                joinCodeExpiresAtMs: null,
+                peers: [],
+                intents: [],
+              },
+            }))
+          : undefined;
+      externalPort = external?.port ?? 0;
+      let projectHome = "";
+      const h = await harness(undefined, async (dir) => {
+        const repo = path.join(dir, "app");
+        const nested = path.join(repo, "src");
+        await mkdir(nested, { recursive: true });
+        const env = { HOME: dir, PATH: process.env.PATH, SKEP_TUI_ANIMATE: "0", NO_COLOR: "1" };
+        await execFileChecked("git", ["init", "--quiet", repo]);
+        projectHome = await skepHome(env, repo);
+        expect(await skepHome(env, nested)).toBe(projectHome);
+        if (external !== undefined) {
+          await mkdir(projectHome, { recursive: true });
+          await writeFile(
+            path.join(projectHome, "session.json"),
+            JSON.stringify({
+              listen: `127.0.0.1:${external.port}`,
+              token: "0".repeat(32),
+            }),
+          );
+        }
+        return { env, cwd: nested, paths: skepPaths(projectHome) };
+      });
+      try {
+        if (owner === "own") await h.shell.submit("/start --yes");
+        await h.shell.submit("/join");
+        expect(h.fake.calls.sub).toHaveLength(1);
+        expect(h.fake.calls.sub[0]?.code).toBe("123456789012");
+        expect(h.fake.calls.sub[0]?.target).toEqual(
+          external === undefined
+            ? { host: "192.168.1.20", port: 7419 }
+            : { host: "127.0.0.1", port: external.port },
+        );
+        expect(h.scrollback()).toContain("auto: master drives work; submit: none");
+        await h.shell.submit("/clean");
+        expect(h.fake.subCloses).toHaveLength(1);
+        if (owner === "own") {
+          await expect(readFile(path.join(projectHome, "session.json"))).rejects.toThrow(/ENOENT/);
+        } else {
+          expect(
+            JSON.parse(await readFile(path.join(projectHome, "session.json"), "utf8")).listen,
+          ).toBe(`127.0.0.1:${external?.port}`);
+        }
+      } finally {
+        await h.shell.quit();
+      }
+    },
+  );
 
   it("accepts /join <host:port> <code> and refuses free text on a peer", async () => {
     const h = await harness();
@@ -739,7 +841,7 @@ async function waitFor(check: () => boolean): Promise<void> {
 
 describe("external master identity and discovery (review B1-B3)", () => {
   it.each(["", " --listen 127.0.0.1:7420"])(
-    "/start for another project explains isolation and preserves the live master (%j)",
+    "/start with a shared home explains overrides and preserves the live master (%j)",
     async (listenFlag) => {
       const a = await externalMaster("A", "proj-a");
       const h = await harness(undefined, a.publish);
@@ -748,9 +850,10 @@ describe("external master identity and discovery (review B1-B3)", () => {
         const file = path.join(h.dir, "session.json");
         const before = await readFile(file, "utf8");
         await h.shell.submit(`/start --yes --repo proj-b${listenFlag}`);
-        expect(h.scrollback()).toContain("one session per SKEP_HOME");
+        expect(h.scrollback()).toContain("one session per home");
         expect(h.scrollback()).toContain("skep --home <separate-dir>");
-        expect(h.scrollback()).toContain("/start --listen <host:unused-port>");
+        expect(h.scrollback()).toContain("omit the override");
+        expect(h.scrollback()).toContain("ports automatically");
         expect(h.fake.calls.master).toHaveLength(0);
         expect(h.shell.session.snapshot().mode).toBe("external");
         expect(h.shell.session.externalStatus?.repo).toBe("proj-a");
