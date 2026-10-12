@@ -1290,8 +1290,8 @@ type Executed = (
   | { status: "failed"; cause: string; fix: string }
   | {
       status: "blocked";
-      /** Resolves with the agent's state once it is no longer blocked; rejects when aborted. */
-      settle?: () => Promise<AgentViewState>;
+      /** Resolves with how the agent ended once it is no longer blocked; rejects when aborted. */
+      settle?: () => Promise<string>;
     }
 ) & {
   summary: string;
@@ -1308,7 +1308,7 @@ interface AgentRun {
   blocked?: {
     name: string;
     focusCommand: readonly string[];
-    settle: () => Promise<AgentViewState>;
+    settle: () => Promise<string>;
   };
 }
 
@@ -1409,13 +1409,27 @@ async function runHerdr(run: RunContext, runtime: AgentRuntime): Promise<AgentRu
     const signal = run.worker.signal;
     // The agent still owns the folder: the human may answer it and it resumes editing. This
     // only watches it; it never answers (D29). A closing join aborts the watch (R4).
-    const settle = async (): Promise<AgentViewState> => {
+    const settle = async (): Promise<string> => {
       for (;;) {
         await clock.sleep(BLOCKED_POLL_MS, signal);
-        const next = await backend.wait(handle, {
-          timeoutMs: HERDR_WAIT_MS,
-          ...(signal === undefined ? {} : { signal }),
-        });
+        let next: AgentViewState;
+        try {
+          next = await backend.wait(handle, {
+            timeoutMs: HERDR_WAIT_MS,
+            ...(signal === undefined ? {} : { signal }),
+          });
+        } catch (error) {
+          if (signal?.aborted === true) throw error;
+          // A failed or timed-out wait is not completion: the agent may still be editing the
+          // folder. Only a confirmed pane close releases the queue; until then keep holding and
+          // retry, so the next item never runs beside it (R10).
+          const closed = await backend
+            .close(handle)
+            .then(() => true)
+            .catch(() => false);
+          if (closed) return `lost (${errorMessage(error)}); skep closed its pane`;
+          continue;
+        }
         if (next !== "blocked") return next;
       }
     };
@@ -2369,7 +2383,7 @@ async function workItemRun(
    * Waits for a blocked agent to finish in its pane, then records everything it changed since
    * the run began, so undo and a later submit cover the whole run.
    */
-  async function settleBlocked(settle: () => Promise<AgentViewState>): Promise<void> {
+  async function settleBlocked(settle: () => Promise<string>): Promise<void> {
     let state: string;
     try {
       state = await settle();
@@ -2383,7 +2397,9 @@ async function workItemRun(
     let changedNow: string;
     try {
       const after = await computeDelta(before, io);
-      if (after.files.length > 0) await record(after, await deviceHead());
+      // Always replaced, even when empty: an agent that reverted its interim edits leaves
+      // nothing for undo or submit to act on (R11).
+      await record(after, await deviceHead());
       changedNow = changedLine(after);
     } catch (error) {
       changedNow = `could not record the changes: ${errorMessage(error)}`;

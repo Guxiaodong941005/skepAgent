@@ -289,6 +289,60 @@ describe("recorded delta and undo", () => {
     expect(await readFile(path.join(root, "elsewhere", "f.txt"), "utf8")).toBe("keep\n");
   });
 
+  it.each([false, true])(
+    "undo recreates every missing ancestor of a deleted nested file at its own path (git %s)",
+    async (git) => {
+      const root = git ? await gitRepo() : await temp();
+      const home = await temp();
+      const files = {
+        "a/b/c/file.txt": "deep\n",
+        "a/x/file.txt": "sibling\n",
+        "a/file.txt": "shallow\n",
+        "d/e/file.txt": "other tree\n",
+      };
+      for (const [rel, text] of Object.entries(files)) {
+        await mkdir(path.dirname(path.join(root, rel)), { recursive: true });
+        await writeFile(path.join(root, rel), text);
+      }
+      if (git) {
+        await io().git(["add", "."], root);
+        await io().git(
+          ["-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "tree"],
+          root,
+        );
+      }
+      const record = await recordRun(root, home, async () => {
+        await rm(path.join(root, "a"), { recursive: true });
+        await rm(path.join(root, "d"), { recursive: true });
+      });
+      expect(record.files.map((f) => f.path).sort()).toEqual(Object.keys(files).sort());
+
+      const outcome = await undoDelta(home, "I-1", { nowMs: 2_000 });
+      expect(outcome.restored.sort()).toEqual(Object.keys(files).sort());
+      for (const [rel, text] of Object.entries(files)) {
+        expect(await readFile(path.join(root, rel), "utf8")).toBe(text);
+      }
+      // Nothing landed on a collapsed path such as a/file.txt for a/b/c/file.txt or d/file.txt.
+      await expect(lstat(path.join(root, "d", "file.txt"))).rejects.toThrow();
+      await expect(lstat(path.join(root, "a", "c"))).rejects.toThrow();
+      if (git) expect(await io().git(["status", "--porcelain"], root)).toBe("");
+    },
+  );
+
+  it("still refuses a parent symlink above a missing directory, changing nothing", async () => {
+    const root = await temp();
+    const home = await temp();
+    await mkdir(path.join(root, "dir", "sub"), { recursive: true });
+    await mkdir(path.join(root, "elsewhere"));
+    await writeFile(path.join(root, "dir", "sub", "f.txt"), "old\n");
+    await recordRun(root, home, () => rm(path.join(root, "dir"), { recursive: true }));
+    await symlink("elsewhere", path.join(root, "dir"));
+    await expect(undoDelta(home, "I-1", { force: true, nowMs: 2_000 })).rejects.toThrow(
+      /dir \(a parent of dir\/sub\/f.txt\) is no longer a plain directory/,
+    );
+    await expect(lstat(path.join(root, "elsewhere", "sub"))).rejects.toThrow();
+  });
+
   it("a record without changes refuses undo and reports no drift", async () => {
     const root = await temp();
     const home = await temp();

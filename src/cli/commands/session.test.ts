@@ -59,6 +59,7 @@ import {
   undoItem,
   workItem,
 } from "./session.js";
+import { readDeltaRecord } from "./session-delta.js";
 
 const roots: string[] = [];
 const servers: net.Server[] = [];
@@ -3135,5 +3136,152 @@ describe("SESSION-UX fix round (R2-R5)", () => {
     expect(result.summary).toContain("cause: submit push failed: ");
     expect(result.summary).toContain("fix: the edits stay in");
     expect(result.summary).toContain("skep session submit I-1 --epoch 1 --method push");
+  });
+});
+
+describe("SESSION-UX fix round 2 (R10-R11)", () => {
+  // Yields to timers between polls, so a watch that keeps retrying never starves the test.
+  const yieldingClock = {
+    monotonicMs: () => 0,
+    nowMs: () => 1_000,
+    sleep: (_ms: number, signal?: AbortSignal) =>
+      new Promise<void>((resolve, reject) => {
+        if (signal?.aborted === true) return reject(new Error("aborted"));
+        setTimeout(resolve, 1);
+      }),
+  };
+  const I1 = { ...ITEM, itemId: "I-1" };
+  const tick = () => new Promise((r) => setTimeout(r, 50));
+
+  function ctxFor(box: Sandbox) {
+    return capture(box.home, {
+      env: box.env,
+      cwd: box.repo,
+      paths: skepPaths(box.env.SKEP_HOME ?? ""),
+    });
+  }
+
+  /** I-1 blocks, then every later wait on it fails as a timeout; I-2 finishes at once. */
+  function timingOut(box: Sandbox, order: string[], close: () => Promise<void>) {
+    let waits = 0;
+    return fakeRuntime({
+      herdr: {
+        start: async (start: { name: string }) => {
+          order.push(`start ${start.name}`);
+          return {
+            name: start.name,
+            paneId: "p",
+            focusCommand: ["herdr", "agent", "focus", start.name],
+          };
+        },
+        wait: async (handle: { name: string }) => {
+          if (handle.name === "skep-i-2-e1") return "done";
+          waits += 1;
+          if (waits === 1) return "blocked";
+          // The agent is still live and editing while the watch loses track of it.
+          await writeFile(path.join(box.repo, "late.txt"), `write ${waits}\n`);
+          throw new Error("herdr agent wait timed out");
+        },
+        close: async (handle: { name: string }) => {
+          order.push(`close ${handle.name}`);
+          await close();
+        },
+      },
+    });
+  }
+
+  it("R10: a wait timeout holds the queue until skep has closed the agent's pane", async () => {
+    const box = await sandbox();
+    const c = ctxFor(box);
+    const order: string[] = [];
+    const closing = deferred();
+    const fake = timingOut(box, order, () => closing.promise);
+    const worker = itemWorker(box, c, "herdr", fake, {
+      method: "none",
+      serial: serialQueue(),
+      clock: yieldingClock,
+    });
+    const first = workItem(worker, I1);
+    const second = workItem(worker, { ...ITEM, itemId: "I-2" });
+    expect((await first).submit?.state).toBe("pending");
+    await tick();
+    // The wait failed and a close is in flight, but nothing confirmed the agent stopped.
+    expect(order).toEqual(["start skep-i-1-e1", "close skep-i-1-e1"]);
+    closing.resolve();
+    await second;
+    expect(order).toEqual(["start skep-i-1-e1", "close skep-i-1-e1", "start skep-i-2-e1"]);
+    expect(c.stderr).toContain(
+      "item I-1: the agent lost (herdr agent wait timed out); skep closed its pane; " +
+        "changed 1 file (+1 −0): late.txt",
+    );
+  });
+
+  it("R10: when the pane cannot be closed, no later item starts until the join closes", async () => {
+    const box = await sandbox();
+    const c = ctxFor(box);
+    const order: string[] = [];
+    const fake = timingOut(box, order, async () => {
+      throw new Error("herdr is gone");
+    });
+    const abort = new AbortController();
+    const worker = itemWorker(box, c, "herdr", fake, {
+      method: "none",
+      serial: serialQueue(),
+      clock: yieldingClock,
+      signal: abort.signal,
+    });
+    const first = workItem(worker, I1);
+    const second = workItem(worker, { ...ITEM, itemId: "I-2" });
+    expect((await first).submit?.state).toBe("pending");
+    await tick();
+    const closes = order.filter((entry) => entry === "close skep-i-1-e1").length;
+    expect(closes).toBeGreaterThan(1);
+    expect(order).not.toContain("start skep-i-2-e1");
+    // Closing the join cancels the watch; the queued item then never runs beside the agent.
+    abort.abort();
+    await second;
+    expect(order).not.toContain("start skep-i-2-e1");
+    expect(c.stderr).not.toContain("item I-1: the agent");
+  });
+
+  it("R11: a blocked agent that reverts its interim edit leaves an empty record", async () => {
+    const box = await sandbox();
+    const c = ctxFor(box);
+    let waits = 0;
+    const fake = fakeRuntime({
+      herdr: {
+        wait: async () => {
+          waits += 1;
+          if (waits === 1) {
+            await writeFile(path.join(box.repo, "notes.txt"), "interim\n");
+            return "blocked";
+          }
+          await writeFile(path.join(box.repo, "notes.txt"), "one\ntwo\n");
+          return "done";
+        },
+      },
+    });
+    const serial = serialQueue();
+    const worker = itemWorker(box, c, "herdr", fake, {
+      method: "none",
+      serial,
+      clock: yieldingClock,
+    });
+    const pending = await workItem(worker, I1);
+    expect(pending.summary).toContain("notes.txt");
+    await serial(async () => undefined);
+    expect(c.stderr).toContain("item I-1: the agent done; no changes");
+    const recorded = await readDeltaRecord(box.env.SKEP_HOME ?? "", "I-1");
+    expect(recorded?.files).toEqual([]);
+
+    const head = await gitIn(box.repo, ["rev-parse", "HEAD"], box.env);
+    await expect(undoItem(c.ctx, "I-1")).rejects.toThrow(/latest run of I-1 .*changed no files/);
+    const out = ctxFor(box);
+    const exit = await runCli(["session", "submit", "I-1", "--method", "commit"], out.ctx);
+    expect(exit).not.toBe(0);
+    expect(out.stderr).toMatch(/latest run of I-1 .*changed no files/);
+    expect(await readFile(path.join(box.repo, "notes.txt"), "utf8")).toBe("one\ntwo\n");
+    expect(await gitIn(box.repo, ["status", "--porcelain"], box.env)).toBe("");
+    expect(await gitIn(box.repo, ["rev-parse", "HEAD"], box.env)).toBe(head);
   });
 });

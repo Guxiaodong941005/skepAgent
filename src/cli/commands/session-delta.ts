@@ -516,7 +516,9 @@ export async function entryPath(root: string, rel: string): Promise<string> {
       if (error.code === "ENOENT") return null;
       throw error;
     });
-    if (info === null) break;
+    // Below a missing directory nothing exists to be a link, so the rest of the path is kept as
+    // recorded: dropping components would restore to a different file (R9).
+    if (info === null) return path.join(at, ...parts.slice(index + 1));
     if (!info.isDirectory()) {
       const parent = parts.slice(0, index + 1).join("/");
       throw new UndoRefusedError(
