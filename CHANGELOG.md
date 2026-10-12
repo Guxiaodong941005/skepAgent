@@ -11,6 +11,8 @@ protocol rules ([`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §4.4) apply to t
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-10-12
+
 Session UX rethink (SESSION-UX, [`docs/plans/session-ux-rethink.md`](docs/plans/session-ux-rethink.md)):
 a peer's agent edits the project folder directly, the agent is found at `/join` or the join
 fails, and the master shows what changed instead of a branch name. No session wire change.

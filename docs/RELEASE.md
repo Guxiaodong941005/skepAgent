@@ -2,8 +2,36 @@
 
 This document records the package-name decision (v0.1.0), the npm registry re-check, the
 v0.1.0 checklist, the v0.1.1 session-TUI notes, the v0.1.5 peer-progress and TUI notes, the
-v0.1.8 join-UX notes, the v0.1.9 per-project isolation notes, the v0.1.10 SAME-CB notes, and the steps the orchestrator runs. Task agents must not `git push`,
+v0.1.8 join-UX notes, the v0.1.9 per-project isolation notes, the v0.1.10 SAME-CB notes, the v0.1.11 SESSION-UX notes, and the steps the orchestrator runs. Task agents must not `git push`,
 create tags, or `npm publish`.
+
+## v0.1.11 — session UX rethink (2026-10-12)
+
+The human ordered **review → merge → publish** after Codex fix-round-2 re-review **PASS**
+(R9–R11 resolved; Phase 1 + Phase 2 + Phase 3 undo). Package name stays
+**`@skepagent/skep`** (public). The published bin is `skep`.
+
+What this tag adds on top of v0.1.10 (details in [`../CHANGELOG.md`](../CHANGELOG.md)):
+
+* **In-place edits**: no worktrees, clones, or default session branches; agent cwd is the
+  project root; items on one peer run serially.
+* **Agent at join**: resolve CLI or fail (no AGENT.md requirement, no dry-run fake success).
+  `--agent` takes the CLI name; `--view` takes native/pty/herdr/dry. `/agent` persists in
+  `device.toml`.
+* **Delta results + submit**: changed files / diffstat on the master; submit modes act on the
+  recorded delta; legacy `skep/session/*` branches get a clear message and are never deleted.
+* **`/undo`**: restore an item's files; refuse on drift unless `--force`.
+* Errors wrap fully; failed blocks are uncapped.
+
+Compatibility: upgrade both devices. Wire protocol unchanged.
+
+Install:
+
+```bash
+npm install -g @skepagent/skep@0.1.11
+```
+
+---
 
 ## v0.1.10 — same-machine peer without Git HEAD (2026-10-12)
 
