@@ -216,6 +216,12 @@ cd ~/skep/myapp/coding && skep agent start      # registers slot "<device>.codin
 
 YAML front-matter (machine-readable, validated) + English body (instructions given to the model). AGENT.md is **trusted local policy**: it lives outside any code worktree and is not writable by the agent user.
 
+> **Session mode (SESSION-UX).** `skep session` / the skep shell do **not** require AGENT.md or
+> session branches. A joined peer's agent CLI is resolved at join (`--agent`, `/agent`,
+> `SKEP_AGENT_CLI`, AGENT.md if present, else PATH) and items run in the peer's project folder;
+> see ARCHITECTURE D31 and `docs/plans/session-ux-rethink.md`. This section applies to the
+> daemon agent slots only.
+
 ```markdown
 ---
 schema: skep.agent/v1

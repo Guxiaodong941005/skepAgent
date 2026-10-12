@@ -3,6 +3,9 @@
 Status: **plan → implementation on `feat/tui-session-reliability`.** No version bump, no publish,
 no merge to `main`. Brief: `docs/plans/tui-session-reliability-BRIEF.md`.
 
+> **Superseded in part by SESSION-UX** (`docs/plans/session-ux-rethink.md`): items no longer use
+> worktrees or session branches, the agent is resolved at `/join`, and error lines wrap.
+
 Code read for this plan (0.1.6 @ `d4095f9`): `src/cli/shell/{run,model,slash,input}.ts`,
 `src/cli/commands/session.ts` (flows, control, status), `src/session/{master,sub,channel,index}.ts`,
 `docs/plans/unified-tui-shell.md`.
