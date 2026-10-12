@@ -40,13 +40,22 @@ fails, and the master shows what changed instead of a branch name. No session wi
   clear "use git directly" message and is never deleted.
 * `/clean` says that nothing is left on disk; there is no git state to clean.
 * `/status` shows a roll-up per intent (`2 done · 1 failed · 4 files changed`) and each
-  item's full result; the master prints one `intent-done` block when an intent finishes.
+  item's full result, wrapped, never cut; the master prints one final block per intent:
+  `intent-done` only when everything succeeded, `intent-failed` when an agent or a submit
+  failed, `intent-waiting` while a herdr agent waits for the human. Failed submits, waiting
+  agents and declined items are counted apart from `done`.
+* A blocked herdr agent keeps its place in the item queue until it finishes or the join
+  closes; the next item starts only after it, and its record covers what it wrote afterwards.
+* `skep session submit` refuses, changing nothing, when a recorded file changed after the
+  item (a later item or a hand edit); changes the agent already committed still push.
 
 ### Added
 
 * `skep session undo <item> [--force]` and `/undo <item>`: put the files an item changed back
   to their content from before it. Refuses, changing nothing, when a file changed again after
-  the item, unless `--force`.
+  the item, unless `--force`. Symlinks are removed or recreated as links, never written
+  through, and only recorded paths are touched. Every run of an item id replaces its record,
+  so a later session's `I-1` that changed nothing never undoes an earlier session's `I-1`.
 
 ### Removed
 

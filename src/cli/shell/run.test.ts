@@ -7,6 +7,7 @@ import { Duplex, PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { skepHome, skepPaths } from "../../config/paths.js";
 import { connectSub, ListenAddressError, startMaster } from "../../session/index.js";
+import type { SessionStatus } from "../../session/messages.js";
 import type { Clock } from "../../util/clock.js";
 import { execFileChecked } from "../../util/exec.js";
 import {
@@ -99,6 +100,8 @@ function fakeApi(address = { host: "192.168.1.20", port: 7419 }) {
   };
   /** Peers the fake master reports in `status()`; tests push into it. */
   const peers: MasterPeer[] = [];
+  /** Intents the fake master reports in `status()`; tests push into it. */
+  const intents: SessionStatus["intents"] = [];
   let intentError: Error | null = null;
   let subError: Error | null = null;
   /** While set, `connectSub` waits for it: a join stuck in its handshake. */
@@ -121,7 +124,7 @@ function fakeApi(address = { host: "192.168.1.20", port: 7419 }) {
           joinCode: "1234-5678-9012",
           joinCodeExpiresAtMs: null,
           peers: peers.map((peer) => ({ ...peer })),
-          intents: [],
+          intents: intents.map((intent) => ({ ...intent })),
         }),
         submitIntent: async (text) => {
           calls.intents.push(text);
@@ -156,6 +159,7 @@ function fakeApi(address = { host: "192.168.1.20", port: 7419 }) {
     api,
     calls,
     peers,
+    intents,
     failIntents(error: Error) {
       intentError = error;
     },
@@ -1284,6 +1288,97 @@ describe("SESSION-UX shell copy", () => {
     expect(h.scrollback()).toContain("no recorded changes for I-4 in this project");
     await h.shell.submit("/undo");
     expect(h.scrollback()).toContain("usage: /undo <item> [--force]");
+    await h.shell.quit();
+  });
+});
+
+describe("long results in the shell (SESSION-UX R7, R8)", () => {
+  function frameText(h: Awaited<ReturnType<typeof harness>>, columns: number, rows: number) {
+    return h.shell.model
+      .frame(columns, rows)
+      .map((line) => (typeof line === "string" ? line : line.spans.map((s) => s.text).join("")))
+      .join("\n");
+  }
+
+  it("PgUp reaches the first word of an error longer than the body", async () => {
+    const h = await harness();
+    const words = Array.from({ length: 500 }, (_, n) => `e${String(n).padStart(3, "0")}`);
+    h.shell.log(words.join(" "), "error");
+    h.shell.log("a later info line");
+    const seen = new Set<string>();
+    const collect = () => {
+      const shown = frameText(h, 80, 24).match(/e\d{3}/g) ?? [];
+      // A frame never shows a word twice.
+      expect(new Set(shown).size).toBe(shown.length);
+      for (const word of shown) seen.add(word);
+    };
+    collect();
+    for (let i = 0; i < 100 && !seen.has("e000"); i++) {
+      h.stdin.type("\x1b[5~");
+      collect();
+    }
+    // Every word was on screen at some point, in order.
+    expect([...seen].sort()).toEqual(words);
+    // Further PgUp stays at the start; PgDn comes back to the bottom.
+    h.stdin.type("\x1b[5~");
+    expect(frameText(h, 80, 24)).toContain("e000");
+    for (let i = 0; i < 100 && h.shell.model.scroll > 0; i++) h.stdin.type("\x1b[6~");
+    expect(frameText(h, 80, 24)).toContain("a later info line");
+    expect(frameText(h, 80, 24)).toContain("e499");
+    await h.shell.quit();
+  });
+
+  it("/status wraps a long failed cause and a success summary over 600 characters", async () => {
+    const h = await harness();
+    await h.shell.submit("/start --yes --repo app");
+    h.fake.peers.push(peer("peer-1", "vps", "app"));
+    const cause = Array.from({ length: 70 }, (_, n) => `c${String(n).padStart(2, "0")}`);
+    const said = Array.from({ length: 120 }, (_, n) => `s${String(n).padStart(3, "0")}`);
+    const item = (itemId: string, summary: string, check: "pass" | "fail") => ({
+      itemId,
+      repo: "app",
+      assignee: "peer-1",
+      epoch: 1,
+      title: "t",
+      datalistEntries: 0,
+      state: "done" as const,
+      result: {
+        itemId,
+        epoch: 1,
+        repo: "app",
+        baseSha: "a".repeat(40),
+        headSha: "b".repeat(40),
+        checks: [{ name: "agent", status: check }],
+        submit: { method: "none" as const, state: "local" as const, branch: "main" },
+        summary,
+      },
+    });
+    const ok = [
+      "submit none local",
+      "done · claude · 3s",
+      ...Array.from({ length: 12 }, (_, n) => `line ${n} ${"x".repeat(40)}`),
+      `summary: ${said.join(" ")}`,
+    ].join("\n");
+    expect(ok.length).toBeGreaterThan(600);
+    h.fake.intents.push({
+      intentId: "intent-1",
+      text: "ship it",
+      state: "planned",
+      items: [
+        item("I-1", `submit none local\nFAILED · claude · 1s\ncause: ${cause.join(" ")}`, "fail"),
+        item("I-2", ok, "pass"),
+      ],
+    });
+    await h.shell.submit("/status");
+    const failed = h.shell.model.scrollback.find((e) => e.text.includes("I-1 FAILED"));
+    const done = h.shell.model.scrollback.find((e) => e.text.includes("I-2 done"));
+    expect(failed?.tone).toBe("error");
+    expect(done?.tone).toBe("warn");
+    const frame = frameText(h, 80, 400);
+    expect(frame.match(/c\d{2}/g)).toEqual(cause);
+    expect(frame.match(/s\d{3}/g)).toEqual(said);
+    expect(frame).toContain("line 11");
+    for (const row of frame.split("\n")) expect(row.length).toBeLessThanOrEqual(80);
     await h.shell.quit();
   });
 });

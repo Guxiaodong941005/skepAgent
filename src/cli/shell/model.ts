@@ -59,7 +59,7 @@ const TONE_ROLES: Record<ShellTone, Role> = {
 export class ShellModel {
   header: ShellHeader = { device: "-", cwd: "-", session: "no session" };
   scrollback: { text: string; tone: ShellTone }[] = [];
-  /** Lines scrolled up from the bottom (PgUp/PgDn). */
+  /** Rendered rows scrolled up from the bottom (PgUp/PgDn); see {@link scrollBy}. */
   scroll = 0;
   input = "";
   menu: SlashCommand[] = [];
@@ -73,16 +73,36 @@ export class ShellModel {
   /** A pending question takes the input; the prompt shows it. */
   question: string | null = null;
   version: string | null = SKEP_VERSION;
+  /**
+   * Width and body height of the last frame. A wrapped entry spans several rows, so scrolling is
+   * counted in rows at the current width, not in entries (SESSION-UX R7).
+   */
+  private width = 80;
+  private bodyHeight = 0;
 
   /** Appends one or more lines; a multi-line text becomes several scrollback lines. */
   append(text: string, tone: ShellTone = "info"): void {
-    for (const line of text.replace(/\n+$/, "").split("\n")) {
-      this.scrollback.push({ text: line, tone });
-    }
+    const added: { text: string; tone: ShellTone }[] = [];
+    for (const line of text.replace(/\n+$/, "").split("\n")) added.push({ text: line, tone });
+    this.scrollback.push(...added);
     if (this.scrollback.length > SCROLLBACK_CAP) {
       this.scrollback.splice(0, this.scrollback.length - SCROLLBACK_CAP);
     }
-    if (this.scroll > 0) this.scroll = Math.min(this.scroll + 1, this.scrollback.length);
+    // A reader scrolled up keeps looking at the same rows while new ones arrive below.
+    if (this.scroll > 0) {
+      const rows = added.reduce((sum, entry) => sum + this.entryRows(entry, this.width).length, 0);
+      this.scrollBy(rows);
+    }
+  }
+
+  /** Moves the view by `rows` rendered rows (positive is up), within the scrollback. */
+  scrollBy(rows: number): void {
+    this.scroll = Math.min(Math.max(0, this.scroll + rows), this.maxScroll());
+  }
+
+  /** The largest scroll: the first rendered row at the top of the body. */
+  maxScroll(): number {
+    return Math.max(0, this.sourceLines(this.width).length - this.bodyHeight);
   }
 
   animating(): boolean {
@@ -132,6 +152,10 @@ export class ShellModel {
       spans: [fg("outline", `  ${g.rule.repeat(Math.max(0, columns - 2))}`)],
     };
     const bodyRows = Math.max(0, rows - lines.length - 1 - 1 - bee.length - 1);
+    this.width = columns;
+    this.bodyHeight = bodyRows;
+    // A resize changes how many rows the scrollback wraps into.
+    this.scroll = Math.min(this.scroll, this.maxScroll());
     const body = this.bodyLines(bodyRows, columns);
     const menu = bodyRows === 0 ? [] : this.menuLines().slice(-bodyRows);
     body.splice(body.length - menu.length, menu.length, ...menu);
@@ -143,17 +167,22 @@ export class ShellModel {
     );
   }
 
+  private entryRows(entry: { text: string; tone: ShellTone }, columns: number): string[] {
+    return WRAPPED_TONES.has(entry.tone)
+      ? wrapLine(`  ${entry.text}`, columns, `  ${HANGING_INDENT}`)
+      : [`  ${entry.text}`];
+  }
+
+  private sourceLines(columns: number): Line[] {
+    if (this.scrollback.length === 0) return welcomeLines(this.glyphs);
+    return this.scrollback.flatMap((entry) => {
+      const role = TONE_ROLES[entry.tone];
+      return this.entryRows(entry, columns).map((row) => ({ spans: [fg(role, row)] }));
+    });
+  }
+
   private bodyLines(count: number, columns: number): Line[] {
-    const source: Line[] =
-      this.scrollback.length === 0
-        ? welcomeLines(this.glyphs)
-        : this.scrollback.flatMap((entry) => {
-            const role = TONE_ROLES[entry.tone];
-            const rows = WRAPPED_TONES.has(entry.tone)
-              ? wrapLine(`  ${entry.text}`, columns, `  ${HANGING_INDENT}`)
-              : [`  ${entry.text}`];
-            return rows.map((row) => ({ spans: [fg(role, row)] }));
-          });
+    const source = this.sourceLines(columns);
     const end = Math.max(0, source.length - this.scroll);
     const visible = source.slice(Math.max(0, end - count), end);
     return [...Array<Line>(Math.max(0, count - visible.length)).fill(""), ...visible];

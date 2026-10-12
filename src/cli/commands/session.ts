@@ -48,7 +48,7 @@ import {
   type SubResult,
   startMaster,
 } from "../../session/index.js";
-import { intentRollup, itemBlock, itemFailed } from "../../session/master.js";
+import { intentRollup, itemBlock, itemVerdict } from "../../session/master.js";
 import { type Clock, isoUtc, systemClock } from "../../util/clock.js";
 import { execFileChecked } from "../../util/exec.js";
 import { atomicWrite, safeJoin } from "../../util/fs.js";
@@ -60,8 +60,11 @@ import {
   changedLine,
   computeDelta,
   DeltaError,
+  type DeltaRecord,
+  driftedFiles,
   type ItemDelta,
   readDeltaRecord,
+  runLabel,
   type SnapshotIo,
   snapshotTree,
   type TreeSnapshot,
@@ -1061,6 +1064,8 @@ export const NATIVE_ARGV: Readonly<Record<AgentCli, readonly string[]>> = {
 
 /** A herdr run waits for the human-paced agent far longer than a non-interactive one. */
 const HERDR_WAIT_MS = 4 * 60 * 60_000;
+/** Pause between checks on a blocked herdr agent that still holds the item queue. */
+const BLOCKED_POLL_MS = 2_000;
 const HERDR_READ_LINES = 200;
 /** Only this much of a transcript is cleaned for the summary; the file keeps everything. */
 const TAIL_WINDOW = 64 * 1024;
@@ -1283,7 +1288,11 @@ type Executed = (
   | { status: "ok" }
   | { status: "dry" }
   | { status: "failed"; cause: string; fix: string }
-  | { status: "blocked" }
+  | {
+      status: "blocked";
+      /** Resolves with the agent's state once it is no longer blocked; rejects when aborted. */
+      settle?: () => Promise<AgentViewState>;
+    }
 ) & {
   summary: string;
   full: string;
@@ -1296,7 +1305,11 @@ interface AgentRun {
   ok: boolean;
   status: string;
   tail: string;
-  blocked?: { name: string; focusCommand: readonly string[] };
+  blocked?: {
+    name: string;
+    focusCommand: readonly string[];
+    settle: () => Promise<AgentViewState>;
+  };
 }
 
 interface RunContext {
@@ -1392,11 +1405,25 @@ async function runHerdr(run: RunContext, runtime: AgentRuntime): Promise<AgentRu
     .catch((error: unknown) => `(could not read the agent's output: ${errorMessage(error)})`);
   await writePrivate(run.transcript, tail);
   if (state === "blocked") {
+    const clock = run.worker.clock ?? systemClock;
+    const signal = run.worker.signal;
+    // The agent still owns the folder: the human may answer it and it resumes editing. This
+    // only watches it; it never answers (D29). A closing join aborts the watch (R4).
+    const settle = async (): Promise<AgentViewState> => {
+      for (;;) {
+        await clock.sleep(BLOCKED_POLL_MS, signal);
+        const next = await backend.wait(handle, {
+          timeoutMs: HERDR_WAIT_MS,
+          ...(signal === undefined ? {} : { signal }),
+        });
+        if (next !== "blocked") return next;
+      }
+    };
     return {
       ok: false,
       status: "blocked",
       tail,
-      blocked: { name: handle.name, focusCommand: handle.focusCommand },
+      blocked: { name: handle.name, focusCommand: handle.focusCommand, settle },
     };
   }
   const ok = state === "done" || state === "idle";
@@ -1503,6 +1530,7 @@ async function executeItem(
     report("blocked", agent.blocked.focusCommand);
     return {
       status: "blocked",
+      settle: agent.blocked.settle,
       summary: `${note}${waiting}\nfinish in the pane; its edits land in ${dir} directly\n${tail}`,
       full,
       said,
@@ -1653,6 +1681,14 @@ async function commitDelta(
 ): Promise<string | null> {
   const files = await stageablePaths(ctx, dir, paths);
   if (files.length === 0) return null;
+  // The agent (or an earlier `submit commit`) may have committed them already: a commit would
+  // fail with "nothing to commit" and stop a requested push (R5).
+  const pending = await git(
+    ctx,
+    ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ...files],
+    dir,
+  );
+  if (pending === "") return null;
   await git(ctx, ["add", "-A", "--", ...files], dir);
   const identity = await commitIdentity(ctx, dir);
   await git(
@@ -1740,6 +1776,11 @@ export interface SubmitDeltaOptions {
   paths: readonly string[];
   title: string;
   body: string;
+  /**
+   * The recorded delta the paths come from. Every file must still hold the content the item
+   * left, or nothing is staged, committed or published (R3).
+   */
+  record?: DeltaRecord;
 }
 
 export interface SubmittedDelta {
@@ -1770,6 +1811,21 @@ export async function submitDelta(
     detail,
   });
   if (method === "none") return done(outcome("none", "local", current));
+  const wire = method === "commit" ? "none" : method;
+  if (opts.record !== undefined) {
+    const drifted = await driftedFiles(opts.record).catch((error: unknown) => [
+      `(could not read the files: ${errorMessage(error)})`,
+    ]);
+    if (drifted.length > 0) {
+      return done(
+        outcome(wire, "failed", current),
+        `${drifted.join(", ")} changed after ${runLabel(opts.record)} (by a later item or by ` +
+          "hand), so its content is no longer the item's; nothing was staged, committed or " +
+          "pushed. Commit those files with git yourself, or submit the item that changed them last",
+        method,
+      );
+    }
+  }
   const message = opts.title === "" ? `session ${opts.itemId}` : opts.title;
   const fullMessage = opts.body === "" ? message : `${message}\n\n${opts.body}`;
   try {
@@ -1777,7 +1833,14 @@ export async function submitDelta(
       const sha = await commitDelta(ctx, dir, opts.paths, fullMessage);
       if (method === "commit") {
         const submit = outcome("none", "local", current);
-        if (sha === null) return done(submit, "nothing left to commit", "commit");
+        if (sha === null) {
+          const head = (await git(ctx, ["rev-parse", "--short=7", "HEAD"], dir)).trim();
+          return {
+            submit,
+            line: `submit commit local ${head} on ${current}`,
+            detail: "nothing left to commit: the item's changes are already committed",
+          };
+        }
         return { submit, line: `submit commit local ${sha.slice(0, 7)} on ${current}`, detail: "" };
       }
       if (current === "HEAD") {
@@ -1813,7 +1876,6 @@ export async function submitDelta(
     if (opened === null) return done(outcome(method, "pushed", branch));
     return done(outcome(method, "opened", branch, opened));
   } catch (error) {
-    const wire = method === "commit" ? "none" : method;
     return done(outcome(wire, "failed", current), errorMessage(error), method);
   }
 }
@@ -1865,6 +1927,8 @@ export interface ItemWorker {
   /** Aborted when the join is closing; stops a running PTY or herdr wait. */
   signal?: AbortSignal;
   onAgentState?(itemId: string, state: JoinAgentState): void;
+  /** The joined session, recorded with each item's delta so undo/submit name the run (R2). */
+  sessionId?: () => string | undefined;
   /** Measures item duration (default: the system clock). */
   clock?: Clock;
 }
@@ -1924,13 +1988,45 @@ function said(executed: Executed): { said?: string } {
 const DELTA_ASK = "Submit this item? [commit/push/pr/mr/none/skip] ";
 const ASK_CHOICES = ["commit", ...DIRECT_METHODS] as const;
 
-/** Everything a sub does for one item. Never throws: a failure is a result with `failed`. */
+/**
+ * Everything a sub does for one item. Never throws: a failure is a result with `failed`.
+ *
+ * A blocked herdr agent's result (`pending`) goes to the master at once, but the agent can still
+ * edit the folder once the human answers it. The item keeps its place in the serial queue until
+ * that agent settles or the join closes, so the next item never runs beside it (R4).
+ */
 export async function workItem(worker: ItemWorker, item: PlanItem): Promise<SubResult> {
-  const run = (): Promise<SubResult> => workItemNow(worker, item);
-  return worker.serial === undefined ? run() : worker.serial(run);
+  const { serial } = worker;
+  if (serial === undefined) {
+    const { result, hold } = await workItemNow(worker, item);
+    void hold.catch(() => undefined);
+    return result;
+  }
+  return new Promise<SubResult>((resolve, reject) => {
+    serial(async () => {
+      const { result, hold } = await workItemNow(worker, item);
+      resolve(result);
+      await hold;
+    }).catch(reject);
+  });
 }
 
-async function workItemNow(worker: ItemWorker, item: PlanItem): Promise<SubResult> {
+async function workItemNow(
+  worker: ItemWorker,
+  item: PlanItem,
+): Promise<{ result: SubResult; hold: Promise<void> }> {
+  let hold: Promise<void> = Promise.resolve();
+  const result = await workItemRun(worker, item, (settled) => {
+    hold = settled;
+  });
+  return { result, hold };
+}
+
+async function workItemRun(
+  worker: ItemWorker,
+  item: PlanItem,
+  holdUntil: (settled: Promise<void>) => void,
+): Promise<SubResult> {
   const { ctx } = worker;
   const clock = worker.clock ?? systemClock;
   const started = clock.monotonicMs();
@@ -2013,6 +2109,34 @@ async function workItemNow(worker: ItemWorker, item: PlanItem): Promise<SubResul
   const home = ctx.paths?.home;
   const failLog = async (text: string): Promise<string | undefined> =>
     home === undefined ? undefined : writeLastError(home, text).catch(() => undefined);
+  const meta = {
+    itemId: item.itemId,
+    epoch: item.epoch,
+    title: item.title,
+    sessionId: worker.sessionId?.() ?? null,
+    root: dir,
+  };
+  const record = (delta: ItemDelta, head: string | null): Promise<DeltaRecord> | null =>
+    home === undefined ? null : writeDeltaRecord(home, { ...meta, head }, delta, clock.nowMs());
+
+  // This run replaces any earlier record of the id before anything else happens: an id from an
+  // earlier session must never be undone or submitted in this run's name (R2).
+  try {
+    await record({ files: [], partial: false }, baseSha);
+  } catch (error) {
+    agentState = "failed";
+    const cause = `could not record this run for undo: ${errorMessage(error)}`;
+    const fix = "check that the skep home is writable on this device, then send the intent again";
+    return result(
+      {
+        baseSha,
+        headSha: baseSha,
+        checks: [{ name: "peer", status: "fail" }],
+        submit: outcome(wireMethod, "failed", branch),
+      },
+      { word: "FAILED", cause, fix },
+    );
+  }
 
   if (worker.signal?.aborted === true) {
     agentState = "failed";
@@ -2081,14 +2205,10 @@ async function workItemNow(worker: ItemWorker, item: PlanItem): Promise<SubResul
     deltaProblem = `could not compare the files after the run: ${errorMessage(error)}`;
   }
   const headSha = await deviceHead();
-  if (delta.files.length > 0 && home !== undefined) {
+  let recorded: DeltaRecord | null = null;
+  if (delta.files.length > 0) {
     try {
-      await writeDeltaRecord(
-        home,
-        { itemId: item.itemId, epoch: item.epoch, title: item.title, root: dir, head: headSha },
-        delta,
-        clock.nowMs(),
-      );
+      recorded = await record(delta, headSha);
     } catch (error) {
       deltaProblem = `could not record the changes for undo: ${errorMessage(error)}`;
     }
@@ -2113,6 +2233,8 @@ async function workItemNow(worker: ItemWorker, item: PlanItem): Promise<SubResul
   if (executed.status === "blocked") {
     // Nothing is checked or submitted; the edits stay in the folder (D29).
     agentState = "blocked";
+    const { settle } = executed;
+    if (settle !== undefined) holdUntil(settleBlocked(settle));
     return result(
       {
         baseSha,
@@ -2209,7 +2331,28 @@ async function workItemNow(worker: ItemWorker, item: PlanItem): Promise<SubResul
     paths,
     title: item.title,
     body: clean(executed.said ?? ""),
+    ...(recorded === null ? {} : { record: recorded }),
   });
+  if (submitted.submit.state === "failed") {
+    // The agent's work is in the folder; only the submit failed. Say why and what to do (R6).
+    const cause = `submit ${method} failed: ${submitted.detail || "no detail"}`;
+    const fix =
+      `the edits stay in ${dir}; fix the cause, then run: skep session submit ` +
+      `${item.itemId} --epoch ${item.epoch} --method ${method}`;
+    return result(
+      { baseSha, headSha: await deviceHead(), checks, submit: submitted.submit },
+      {
+        word: "FAILED",
+        submitLine: submitted.line,
+        changed,
+        cause,
+        fix,
+        log: await failLog(`${item.itemId} (epoch ${item.epoch}) in ${dir}\n${cause}\nfix: ${fix}`),
+        ...said(executed),
+        body: executed.summary,
+      },
+    );
+  }
   const detail = submitted.detail === "" ? "" : `${submitted.detail}\n`;
   return result(
     { baseSha, headSha: await deviceHead(), checks, submit: submitted.submit },
@@ -2221,6 +2364,34 @@ async function workItemNow(worker: ItemWorker, item: PlanItem): Promise<SubResul
       body: detail + executed.summary,
     },
   );
+
+  /**
+   * Waits for a blocked agent to finish in its pane, then records everything it changed since
+   * the run began, so undo and a later submit cover the whole run.
+   */
+  async function settleBlocked(settle: () => Promise<AgentViewState>): Promise<void> {
+    let state: string;
+    try {
+      state = await settle();
+    } catch (error) {
+      state =
+        worker.signal?.aborted === true
+          ? "no longer watched (the session closed)"
+          : `lost (${errorMessage(error)})`;
+    }
+    let changedNow: string;
+    try {
+      const after = await computeDelta(before, io);
+      if (after.files.length > 0) await record(after, await deviceHead());
+      changedNow = changedLine(after);
+    } catch (error) {
+      changedNow = `could not record the changes: ${errorMessage(error)}`;
+    }
+    ctx.stderr.write(
+      `item ${item.itemId}: the agent ${state}; ${changedNow}\n` +
+        `submit it with: skep session submit ${item.itemId} --epoch ${item.epoch} --method <commit|push|pr|mr>\n`,
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2940,6 +3111,7 @@ export async function joinSessionFlow(
     serial: serialQueue(),
     signal: abort.signal,
     onAgentState: (id, state) => subHandle?.reportAgent?.(id, state),
+    sessionId: () => subHandle?.sessionId,
   };
 
   const roster = new Map<string, JoinViewModel["peers"][number]>();
@@ -3301,7 +3473,14 @@ async function submitCommand(
     );
   }
   if (record.undoneAtMs !== undefined) {
-    throw new CliError("undone", `${itemId} was undone; there is nothing to submit`);
+    throw new CliError("undone", `${runLabel(record)} was undone; there is nothing to submit`);
+  }
+  if (record.files.length === 0) {
+    throw new CliError(
+      "no_delta",
+      `the latest run of ${runLabel(record)} changed no files; there is nothing to submit. ` +
+        `Earlier runs of ${itemId} are not submitted by skep; use git for those`,
+    );
   }
   const paths = record.files.map((file) => file.path);
   let submitted: SubmittedDelta;
@@ -3317,6 +3496,7 @@ async function submitCommand(
       paths,
       title: record.title,
       body: "",
+      record,
     });
   }
   const { submit, detail, line } = submitted;
@@ -3551,13 +3731,33 @@ function table(rows: string[][]): string {
     .join("\n");
 }
 
+/**
+ * A part of `skep session status`. Item results are their own parts so the shell can wrap them
+ * (with the tone of their outcome) instead of cutting them like an info line (R8).
+ */
+export interface StatusSection {
+  text: string;
+  kind: "info" | "result" | "failed";
+}
+
 export function renderSessionStatus(status: SessionStatus): string {
+  return `${sessionStatusSections(status)
+    .map((section) => section.text)
+    .join("\n")}\n`;
+}
+
+export function sessionStatusSections(status: SessionStatus): StatusSection[] {
+  const sections: StatusSection[] = [];
   const code = status.joinCode === null ? "none" : formatJoinCode(status.joinCode);
-  const lines = [
+  let lines = [
     `session ${status.sessionId}  listen ${status.listen}  repo ${status.repo}`,
     `join code: ${code}${expiryText(status.joinCodeExpiresAtMs)}`,
     "",
   ];
+  const flush = (): void => {
+    if (lines.length > 0) sections.push({ text: lines.join("\n"), kind: "info" });
+    lines = [];
+  };
   if (status.peers.length === 0) {
     lines.push("peers: none");
   } else {
@@ -3585,31 +3785,42 @@ export function renderSessionStatus(status: SessionStatus): string {
     const devices = new Map(status.peers.map((peer) => [peer.peerId, peer.device]));
     for (const intent of status.intents) {
       lines.push(`  ${intent.intentId}  ${intent.state}  ${intent.text}`);
-      if (intent.items.length > 0) {
-        lines.push(`    ${intentRollup(intent.items)}`);
-        lines.push(
-          table(
-            intent.items.map((item) => [
+      if (intent.items.length === 0) continue;
+      lines.push(`    ${intentRollup(intent.items)}`);
+      lines.push(
+        table(
+          intent.items.map((item) => {
+            const verdict = itemVerdict(item);
+            return [
               `  ${item.itemId}`,
-              item.state === "done" && itemFailed(item) ? "failed" : item.state,
+              verdict === "running" ? item.state : verdict,
               item.repo,
               item.assignee,
               item.result?.submit === undefined
                 ? "-"
                 : `${item.result.submit.method}:${item.result.submit.state}`,
               item.title,
-            ]),
-          ),
-        );
-        // The last result of each item in full: the shell wraps it rather than cutting it.
-        for (const item of intent.items) {
-          if (item.result === undefined) continue;
-          const where = { device: devices.get(item.assignee) ?? item.assignee, repo: item.repo };
-          const block = itemBlock(item.itemId, where, item.result.summary, itemFailed(item));
-          lines.push(...block.split("\n").map((line) => `    ${line}`));
-        }
+            ];
+          }),
+        ),
+      );
+      // The last result of each item in full, never the event cap: the shell wraps it (§2.1).
+      for (const item of intent.items) {
+        if (item.result === undefined) continue;
+        const where = { device: devices.get(item.assignee) ?? item.assignee, repo: item.repo };
+        const verdict = itemVerdict(item);
+        const block = itemBlock(item.itemId, where, item.result.summary, verdict, { full: true });
+        flush();
+        sections.push({
+          text: block
+            .split("\n")
+            .map((line) => `    ${line}`)
+            .join("\n"),
+          kind: verdict === "failed" || verdict === "submit-failed" ? "failed" : "result",
+        });
       }
     }
   }
-  return `${lines.join("\n")}\n`;
+  flush();
+  return sections;
 }

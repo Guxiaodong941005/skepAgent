@@ -28,10 +28,10 @@ import {
   loadAgentSetting,
   type MasterFlow,
   readControlEndpoint,
-  renderSessionStatus,
   type SessionCliContext,
   type SessionStatus,
   saveAgentSetting,
+  sessionStatusSections,
   startedText,
   startMasterFlow,
   submitIntentAt,
@@ -66,7 +66,7 @@ import {
 
 export { parseFlags } from "./flags.js";
 
-/** Lines PgUp/PgDn move the scrollback. */
+/** Rendered rows PgUp/PgDn move the scrollback. */
 const PAGE_LINES = 10;
 const SUBMIT_CHOICES = ["commit", "push", "pr", "mr", "none"] as const;
 /** A master in another process is re-read every this many ticks (2 s at 250 ms). */
@@ -245,10 +245,10 @@ export class Shell {
         if (model.input === "") void this.quit();
         return;
       case "pageUp":
-        model.scroll = Math.min(model.scroll + PAGE_LINES, model.scrollback.length);
+        model.scrollBy(PAGE_LINES);
         break;
       case "pageDown":
-        model.scroll = Math.max(0, model.scroll - PAGE_LINES);
+        model.scrollBy(-PAGE_LINES);
         break;
       default:
         return;
@@ -472,8 +472,9 @@ export class Shell {
     const view = this.session.snapshot();
     const own = this.session.ownMaster;
     if (own !== null) {
-      const joined = view.join === null ? "" : `\nthis shell is also joined as ${view.join.peerId}`;
-      return { type: "ok", message: `${renderSessionStatus(own.handle.status())}${joined}` };
+      this.logStatus(own.handle.status());
+      if (view.join !== null) this.log(`this shell is also joined as ${view.join.peerId}`);
+      return { type: "ok" };
     }
     if (view.mode === "joined" || view.mode === "joining")
       return { type: "ok", message: this.joinStatus() };
@@ -483,10 +484,21 @@ export class Shell {
     if (status === null) {
       return { type: "ok", message: "no session on this device — /start a master or /join one" };
     }
-    return {
-      type: "ok",
-      message: `master runs in another process on this device\n${renderSessionStatus(status)}`,
-    };
+    this.log("master runs in another process on this device");
+    this.logStatus(status);
+    return { type: "ok" };
+  }
+
+  /**
+   * `/status` promises each item's full last result (SESSION-UX §2.1): result blocks are logged
+   * with a wrapping tone, failures as errors, so nothing is cut at the terminal width (R8).
+   */
+  private logStatus(status: SessionStatus): void {
+    for (const section of sessionStatusSections(status)) {
+      const tone =
+        section.kind === "failed" ? "error" : section.kind === "result" ? "warn" : "info";
+      this.log(section.text, tone);
+    }
   }
 
   private joinStatus(): string {
@@ -674,6 +686,14 @@ export class Shell {
         break;
       case "item-failed":
         // Uncapped and wrapped: the cause and fix are the point (SESSION-UX §3.4).
+        this.log(message, "error");
+        break;
+      case "item-pending":
+      case "intent-waiting":
+        // An agent waits for a human in its pane: not finished, and the focus command matters.
+        this.log(message, "warn");
+        break;
+      case "intent-failed":
         this.log(message, "error");
         break;
       case "intent-done":
@@ -1202,14 +1222,21 @@ function sameEndpoint(left: ControlEndpoint, right: ControlEndpoint): boolean {
   return left.listen === right.listen && left.token === right.token;
 }
 
-/** A finished item the peer's own scrollback shows as an error (it carries cause and fix). */
+/**
+ * A finished item the peer's own scrollback shows as an error (it carries cause and fix): a
+ * failing check, the agent's included, or a submit that failed after the agent succeeded.
+ */
 function failedItem(data: unknown): boolean {
   if (typeof data !== "object" || data === null) return false;
-  const event = data as { event?: unknown; checks?: { status?: unknown }[] };
+  const event = data as {
+    event?: unknown;
+    checks?: { status?: unknown }[];
+    submit?: { state?: unknown };
+  };
   return (
     event.event === "item-result" &&
-    Array.isArray(event.checks) &&
-    event.checks.some((check) => check.status === "fail")
+    ((Array.isArray(event.checks) && event.checks.some((check) => check.status === "fail")) ||
+      event.submit?.state === "failed")
   );
 }
 

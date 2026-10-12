@@ -71,7 +71,13 @@ export function scrollbackSummary(summary: string, opts: { failed?: boolean } = 
 /** The item fields a roll-up reads; also satisfied by the CLI's parsed status. */
 export interface ItemOutcome {
   state: string;
-  result?: { checks: readonly { status: string }[]; summary: string } | undefined;
+  result?:
+    | {
+        checks: readonly { status: string }[];
+        summary: string;
+        submit?: { state: string } | undefined;
+      }
+    | undefined;
 }
 
 /** A finished item counts as failed: dropped assignee, or a failing check (also the agent's). */
@@ -82,22 +88,58 @@ export function itemFailed(item: ItemOutcome): boolean {
 const PEER_STATUS_RE = /^(done|FAILED|blocked|declined|skipped|DRY RUN) · (.+)$/;
 
 /**
+ * How an item ended, as the operator must read it (SESSION-UX §2.3, R6). A result is not success
+ * just because it was accepted: the agent may have failed, the submit may have failed after the
+ * agent succeeded, the agent may still be waiting for a human in its pane (submit `pending`), or
+ * nothing ran because the peer declined or skipped it.
+ */
+export type ItemVerdict = "done" | "failed" | "submit-failed" | "pending" | "declined" | "running";
+
+export function itemVerdict(item: ItemOutcome): ItemVerdict {
+  if (itemFailed(item)) return "failed";
+  if (item.state !== "done" || item.result === undefined) return "running";
+  const submit = item.result.submit?.state;
+  if (submit === "failed") return "submit-failed";
+  if (submit === "pending") return "pending";
+  const lines = item.result.summary.split(/\r?\n/).filter((line) => line.trim() !== "");
+  const status = PEER_STATUS_RE.exec(
+    (lines[0]?.startsWith("submit ") === true ? lines[1] : lines[0]) ?? "",
+  );
+  if (status?.[1] === "declined" || status?.[1] === "skipped") return "declined";
+  return "done";
+}
+
+/** Verdicts whose whole summary is shown: the cause of a failure is usually the long part. */
+const UNCAPPED: ReadonlySet<ItemVerdict> = new Set(["failed", "submit-failed"]);
+
+/**
  * One finished item as the operator reads it (SESSION-UX §2.3):
  * `I-1 done · mac (app) · claude · 2m 14s` then the indented summary lines. The peer's leading
  * `submit …` line moves to the end; its status line is folded into the headline. Older peers
- * without a status line still render, just with fewer fields.
+ * without a status line still render, just with fewer fields. `full` (used by `/status`) never
+ * applies the event cap of a successful item.
  */
 export function itemBlock(
   itemId: string,
   where: { device: string; repo: string },
   summary: string,
-  failed: boolean,
+  verdict: ItemVerdict,
+  opts: { full?: boolean } = {},
 ): string {
-  const lines = scrollbackSummary(summary, { failed }).split("\n");
+  const lines = scrollbackSummary(summary, {
+    failed: opts.full === true || UNCAPPED.has(verdict),
+  }).split("\n");
   const submit = lines[0]?.startsWith("submit ") === true ? lines.shift() : undefined;
   const status = PEER_STATUS_RE.exec(lines[0] ?? "");
   if (status !== null) lines.shift();
-  const word = failed ? "FAILED" : (status?.[1] ?? "done");
+  const word =
+    verdict === "failed"
+      ? "FAILED"
+      : verdict === "submit-failed"
+        ? "SUBMIT FAILED"
+        : verdict === "pending"
+          ? "WAITING"
+          : (status?.[1] ?? "done");
   const tail = status?.[2] === undefined ? "" : ` · ${status[2]}`;
   const body = [...lines, ...(submit === undefined ? [] : [submit])].filter(
     (line) => line !== "(no summary)",
@@ -108,19 +150,34 @@ export function itemBlock(
   ].join("\n");
 }
 
-/** `2 done · 1 failed · 4 files changed` over an intent's finished items. */
+/**
+ * `2 done · 1 failed · 4 files changed` over an intent's items. Failed submits, agents waiting for
+ * a human and declined items are counted apart, never as done (R6).
+ */
 export function intentRollup(items: readonly ItemOutcome[]): string {
-  const finished = items.filter((item) => item.state === "done" || item.state === "failed");
-  const failed = finished.filter(itemFailed).length;
+  const count: Record<ItemVerdict, number> = {
+    done: 0,
+    failed: 0,
+    "submit-failed": 0,
+    pending: 0,
+    declined: 0,
+    running: 0,
+  };
   let files = 0;
-  for (const item of finished) {
+  for (const item of items) {
+    const verdict = itemVerdict(item);
+    count[verdict] += 1;
+    if (verdict === "running") continue;
     files += Number(/^changed (\d+) files?\b/m.exec(item.result?.summary ?? "")?.[1] ?? 0);
   }
-  const open = items.length - finished.length;
+  const optional = (n: number, label: string): string[] => (n === 0 ? [] : [`${n} ${label}`]);
   return [
-    `${finished.length - failed} done`,
-    `${failed} failed`,
-    ...(open === 0 ? [] : [`${open} running`]),
+    `${count.done} done`,
+    `${count.failed} failed`,
+    ...optional(count["submit-failed"], "submit failed"),
+    ...optional(count.pending, "waiting for you"),
+    ...optional(count.declined, "declined"),
+    ...optional(count.running, "running"),
     `${files} ${files === 1 ? "file" : "files"} changed`,
   ].join(" · ");
 }
@@ -610,14 +667,18 @@ class SessionMaster implements MasterHandle {
       if (change.reply.type === "result-ack" && message.type === "result") {
         // The operator reads the peer agent's outcome here instead of on the peer's machine.
         const stored = change.items.find((item) => item.itemId === message.itemId);
-        const failed = stored === undefined ? false : itemFailed(stored);
+        const verdict = stored === undefined ? "done" : itemVerdict(stored);
         this.event(
-          failed ? "item-failed" : "item-result",
+          verdict === "failed" || verdict === "submit-failed"
+            ? "item-failed"
+            : verdict === "pending"
+              ? "item-pending"
+              : "item-result",
           itemBlock(
             message.itemId,
             { device: peer.device, repo: message.repo },
             stored?.result?.summary ?? "",
-            failed,
+            verdict,
           ),
         );
         if (intent) this.intentFinished(intent);
@@ -863,17 +924,29 @@ class SessionMaster implements MasterHandle {
   }
 
   /**
-   * Once every item of a planned intent finished, one roll-up across its peers:
-   * `intent-1 done: <text>` then `2 done · 1 failed · 4 files changed` (SESSION-UX Phase 2).
+   * Once every item of a planned intent settled, one roll-up across its peers:
+   * `intent-1 done: <text>` then `2 done · 0 failed · 4 files changed` (SESSION-UX Phase 2).
+   * Only an all-successful intent is `intent-done`. A failed agent or submit makes it
+   * `intent-failed`; an agent still waiting for a human makes it `intent-waiting`, never a final
+   * success: its edits are not finished (R6).
    */
   private intentFinished(intent: Intent): void {
     if (intent.finished === true || intent.state !== "planned" || intent.items.length === 0) return;
-    if (!intent.items.every((item) => item.state === "done" || item.state === "failed")) return;
+    const verdicts = intent.items.map(itemVerdict);
+    if (verdicts.includes("running")) return;
     intent.finished = true;
-    this.event(
-      "intent-done",
-      `${intent.intentId} done: ${intent.text}\n  ${intentRollup(intent.items)}`,
-    );
+    const rollup = intentRollup(intent.items);
+    if (verdicts.some((v) => v === "failed" || v === "submit-failed")) {
+      this.event("intent-failed", `${intent.intentId} failed: ${intent.text}\n  ${rollup}`);
+    } else if (verdicts.includes("pending")) {
+      this.event(
+        "intent-waiting",
+        `${intent.intentId} waiting for you: ${intent.text}\n  ${rollup}\n` +
+          "  an agent is blocked in its pane on the peer; answer it there",
+      );
+    } else {
+      this.event("intent-done", `${intent.intentId} done: ${intent.text}\n  ${rollup}`);
+    }
   }
 
   private event(kind: string, message: string): void {

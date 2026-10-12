@@ -88,6 +88,43 @@ describe("scrollback wrapping (SESSION-UX §3.4)", () => {
     expect(text(shell)).toMatchSnapshot();
   });
 
+  it("scrolls by rendered rows: the start of a long error is reachable at any width", () => {
+    const shell = model();
+    const words = Array.from({ length: 500 }, (_, n) => `e${String(n).padStart(3, "0")}`);
+    shell.append(words.join(" "), "error");
+    shell.append("tail info");
+    const at = (columns: number) =>
+      shell
+        .frame(columns, 24)
+        .map((line) => (typeof line === "string" ? line : line.spans.map((s) => s.text).join("")))
+        .join("\n");
+    for (const columns of [80, 40, 120]) {
+      at(columns);
+      shell.scrollBy(Number.MAX_SAFE_INTEGER);
+      const top = at(columns);
+      expect(top).toContain("e000");
+      expect(top).not.toContain("tail info");
+      shell.scrollBy(-Number.MAX_SAFE_INTEGER);
+      expect(at(columns)).toContain("tail info");
+    }
+    // Resizing narrower while scrolled to the top keeps the view inside the scrollback.
+    at(120);
+    shell.scrollBy(Number.MAX_SAFE_INTEGER);
+    const before = shell.scroll;
+    at(40);
+    expect(shell.scroll).toBe(before);
+    at(200);
+    expect(shell.scroll).toBe(shell.maxScroll());
+    expect(at(200)).toContain("e000");
+    // New lines below keep a scrolled-up reader on the same rows.
+    at(80);
+    shell.scrollBy(-Number.MAX_SAFE_INTEGER);
+    shell.scrollBy(5);
+    const view = at(80);
+    shell.append("x ".repeat(300).trim(), "error");
+    expect(at(80)).toBe(view);
+  });
+
   it("wrapLine breaks inside a word only when nothing else fits", () => {
     expect(wrapLine("  abc def", 80, "    ")).toEqual(["  abc def"]);
     expect(wrapLine(`  ${"x".repeat(30)}`, 12, "    ")).toEqual([

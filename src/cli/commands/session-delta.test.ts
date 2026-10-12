@@ -1,5 +1,14 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readlink,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -7,6 +16,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   changedLine,
   computeDelta,
+  driftedFiles,
   lineStat,
   parsePorcelain,
   readDeltaRecord,
@@ -130,7 +140,7 @@ describe("recorded delta and undo", () => {
     await mkdir(path.join(root, "sub"));
     await writeFile(path.join(root, "sub", "b.txt"), "new\n");
     const delta = await computeDelta(before, io());
-    const meta = { itemId: "I-2", epoch: 1, title: "t", root, head: null };
+    const meta = { itemId: "I-2", epoch: 1, title: "t", sessionId: "s-1", root, head: null };
     await writeDeltaRecord(home, meta, delta, 1_000);
     expect((await readDeltaRecord(home, "I-2"))?.files.map((f) => f.path)).toEqual([
       "a.txt",
@@ -170,12 +180,135 @@ describe("recorded delta and undo", () => {
     };
     await writeDeltaRecord(
       home,
-      { itemId: "I-1", epoch: 1, title: "", root, head: null },
+      { itemId: "I-1", epoch: 1, title: "", sessionId: null, root, head: null },
       delta,
       0,
     );
     await expect(undoDelta(home, "I-1", { force: true, nowMs: 1 })).rejects.toThrow(
       /too large to keep/,
     );
+  });
+
+  async function gitRepo(): Promise<string> {
+    const root = await temp();
+    const run = (args: string[]) => io().git(args, root);
+    await run(["init", "--quiet", "-b", "main"]);
+    await writeFile(path.join(root, "valuable.txt"), "precious\n");
+    await writeFile(path.join(root, "other.txt"), "other\n");
+    await symlink("valuable.txt", path.join(root, "link.txt"));
+    await run(["add", "."]);
+    await run(["-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "init"]);
+    return root;
+  }
+
+  async function recordRun(root: string, home: string, change: () => Promise<void>) {
+    const before = await snapshotTree(root, io());
+    await change();
+    const delta = await computeDelta(before, io());
+    const meta = { itemId: "I-1", epoch: 1, title: "t", sessionId: "s-1", root, head: null };
+    return writeDeltaRecord(home, meta, delta, 1_000);
+  }
+
+  it.each([false, true])("undo removes a new symlink, never its target (git %s)", async (git) => {
+    const root = git ? await gitRepo() : await temp();
+    const home = await temp();
+    if (!git) await writeFile(path.join(root, "valuable.txt"), "precious\n");
+    const record = await recordRun(root, home, () =>
+      symlink("valuable.txt", path.join(root, "new-link.txt")),
+    );
+    expect(record.files).toEqual([
+      expect.objectContaining({ path: "new-link.txt", before: null, afterLink: "valuable.txt" }),
+    ]);
+    // No drift: the link itself is compared, not the file it points to.
+    const outcome = await undoDelta(home, "I-1", { nowMs: 2_000 });
+    expect(outcome).toMatchObject({ removed: ["new-link.txt"], overwritten: [] });
+    await expect(lstat(path.join(root, "new-link.txt"))).rejects.toThrow();
+    expect(await readFile(path.join(root, "valuable.txt"), "utf8")).toBe("precious\n");
+  });
+
+  it("force removes only the recorded link even when it was retargeted later", async () => {
+    const root = await gitRepo();
+    const home = await temp();
+    await recordRun(root, home, () => symlink("valuable.txt", path.join(root, "new-link.txt")));
+    await rm(path.join(root, "new-link.txt"));
+    await symlink("other.txt", path.join(root, "new-link.txt"));
+    await expect(undoDelta(home, "I-1", { nowMs: 2_000 })).rejects.toThrow(/changed again/);
+    await undoDelta(home, "I-1", { force: true, nowMs: 2_000 });
+    await expect(lstat(path.join(root, "new-link.txt"))).rejects.toThrow();
+    expect(await readFile(path.join(root, "valuable.txt"), "utf8")).toBe("precious\n");
+    expect(await readFile(path.join(root, "other.txt"), "utf8")).toBe("other\n");
+  });
+
+  it("undo restores a modified committed symlink as a link to its old project file", async () => {
+    const root = await gitRepo();
+    const home = await temp();
+    const record = await recordRun(root, home, async () => {
+      await rm(path.join(root, "link.txt"));
+      await symlink("other.txt", path.join(root, "link.txt"));
+    });
+    expect(record.files).toEqual([
+      expect.objectContaining({
+        path: "link.txt",
+        beforeLink: "valuable.txt",
+        afterLink: "other.txt",
+        restorable: true,
+      }),
+    ]);
+    const outcome = await undoDelta(home, "I-1", { nowMs: 2_000 });
+    expect(outcome).toMatchObject({ restored: ["link.txt"], overwritten: [] });
+    expect(await readlink(path.join(root, "link.txt"))).toBe("valuable.txt");
+    expect(await readFile(path.join(root, "valuable.txt"), "utf8")).toBe("precious\n");
+    expect(await readFile(path.join(root, "other.txt"), "utf8")).toBe("other\n");
+  });
+
+  it("undo of a file replaced by a symlink to another project file writes the entry, not the target", async () => {
+    const root = await gitRepo();
+    const home = await temp();
+    await recordRun(root, home, async () => {
+      await rm(path.join(root, "other.txt"));
+      await symlink("valuable.txt", path.join(root, "other.txt"));
+    });
+    await undoDelta(home, "I-1", { nowMs: 2_000 });
+    expect((await lstat(path.join(root, "other.txt"))).isFile()).toBe(true);
+    expect(await readFile(path.join(root, "other.txt"), "utf8")).toBe("other\n");
+    expect(await readFile(path.join(root, "valuable.txt"), "utf8")).toBe("precious\n");
+  });
+
+  it("refuses a recorded path whose parent became a symlink, changing nothing", async () => {
+    const root = await temp();
+    const home = await temp();
+    await mkdir(path.join(root, "dir"));
+    await mkdir(path.join(root, "elsewhere"));
+    await writeFile(path.join(root, "elsewhere", "f.txt"), "keep\n");
+    await recordRun(root, home, () => writeFile(path.join(root, "dir", "f.txt"), "new\n"));
+    await rm(path.join(root, "dir"), { recursive: true });
+    await symlink("elsewhere", path.join(root, "dir"));
+    await expect(undoDelta(home, "I-1", { force: true, nowMs: 2_000 })).rejects.toThrow(
+      /dir \(a parent of dir\/f.txt\) is no longer a plain directory/,
+    );
+    expect(await readFile(path.join(root, "elsewhere", "f.txt"), "utf8")).toBe("keep\n");
+  });
+
+  it("a record without changes refuses undo and reports no drift", async () => {
+    const root = await temp();
+    const home = await temp();
+    const record = await recordRun(root, home, async () => {});
+    expect(record.files).toEqual([]);
+    expect(await driftedFiles(record)).toEqual([]);
+    await expect(undoDelta(home, "I-1", { nowMs: 1 })).rejects.toThrow(
+      /latest run of I-1 \(session s-1\) changed no files/,
+    );
+  });
+
+  it("driftedFiles names files changed after the item", async () => {
+    const root = await temp();
+    const home = await temp();
+    const record = await recordRun(root, home, async () => {
+      await writeFile(path.join(root, "a.txt"), "item\n");
+      await writeFile(path.join(root, "b.txt"), "item\n");
+    });
+    expect(await driftedFiles(record)).toEqual([]);
+    await writeFile(path.join(root, "b.txt"), "human\n");
+    expect(await driftedFiles(record)).toEqual(["b.txt"]);
   });
 });

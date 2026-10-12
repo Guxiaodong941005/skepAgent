@@ -11,15 +11,30 @@
 
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { lstat, mkdir, readdir, readFile, readlink, rm, unlink, writeFile } from "node:fs/promises";
+import {
+  lstat,
+  mkdir,
+  readdir,
+  readFile,
+  readlink,
+  realpath,
+  rm,
+  symlink,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
-import { atomicWrite, safeJoin } from "../../util/fs.js";
+import { atomicWrite } from "../../util/fs.js";
 
-/** `null` hash: the path does not exist. `content` is null when it was not kept (size cap). */
+/**
+ * `null` hash: the path does not exist. `content` is null when it was not kept (size cap) and for
+ * a symlink, whose target is `link` instead: undo recreates the link, never writes through it.
+ */
 export interface FileState {
   hash: string | null;
   content: Buffer | null;
+  link?: string;
 }
 
 export interface TreeSnapshot {
@@ -78,6 +93,11 @@ function sha256(data: Buffer): string {
   return createHash("sha256").update(data).digest("hex");
 }
 
+/** A symlink is identified by its target text, never by what it points to. */
+function linkHash(link: string): string {
+  return sha256(Buffer.from(`symlink:${link}`, "utf8"));
+}
+
 const ABSENT: FileState = { hash: null, content: null };
 
 /** A regular file's bytes, a symlink's target, or absent. Directories count as absent. */
@@ -91,8 +111,8 @@ async function readState(file: string): Promise<FileState> {
     throw error;
   }
   if (info.isSymbolicLink()) {
-    const target = Buffer.from(`symlink:${await readlink(file)}`, "utf8");
-    return { hash: sha256(target), content: null };
+    const link = await readlink(file);
+    return { hash: linkHash(link), content: null, link };
   }
   if (!info.isFile()) return ABSENT;
   const content = await readFile(file);
@@ -145,8 +165,21 @@ async function dirtyPaths(io: SnapshotIo, root: string): Promise<string[]> {
   return parsePorcelain(out).filter((rel) => !excluded(root, rel, io.exclude));
 }
 
-/** One blob of `rev`, byte-exact (execFileChecked decodes to text). Absent when not in `rev`. */
-function blobAt(io: SnapshotIo, root: string, rev: string, rel: string): Promise<FileState> {
+/**
+ * One path of `rev`, byte-exact (execFileChecked decodes to text). Absent when not in `rev`. A
+ * committed symlink (mode 120000) is a link state, so undo recreates the link (R1).
+ */
+async function blobAt(io: SnapshotIo, root: string, rev: string, rel: string): Promise<FileState> {
+  const entry = await io.git(["ls-tree", "-z", rev, "--", rel], root);
+  const state = await rawBlobAt(io, root, rev, rel);
+  if (entry.startsWith("120000 ") && state.content !== null) {
+    const link = state.content.toString("utf8");
+    return { hash: linkHash(link), content: null, link };
+  }
+  return state;
+}
+
+function rawBlobAt(io: SnapshotIo, root: string, rev: string, rel: string): Promise<FileState> {
   return new Promise((resolve, reject) => {
     execFile(
       "git",
@@ -333,7 +366,9 @@ export function changedLine(delta: ItemDelta): string {
 
 // ---------------------------------------------------------------------------------------------
 // The recorded delta: `<home>/session/deltas/<itemId>/` holds `delta.json` and the before content
-// of each changed file. Item ids restart in every session, so the latest run of an id wins.
+// of each changed file. Item ids restart in every session, so the latest run of an id wins: every
+// run writes its record when it starts, so a later run that changes nothing, is declined or fails
+// early leaves an empty record and can never select an earlier session's files (R2).
 
 const HashSchema = z
   .string()
@@ -345,6 +380,8 @@ export const DeltaRecordSchema = z.strictObject({
   itemId: z.string().regex(/^I-\d+$/),
   epoch: z.number().int().min(1),
   title: z.string().max(200),
+  /** The session the run belonged to; null when unknown (a record from before R2). */
+  sessionId: z.string().min(1).nullable().optional(),
   root: z.string().min(1),
   recordedAtMs: z.number().int().nonnegative(),
   /** HEAD after the item ran; null outside Git or on an unborn branch. */
@@ -355,6 +392,9 @@ export const DeltaRecordSchema = z.strictObject({
       path: z.string().min(1),
       before: HashSchema,
       after: HashSchema,
+      /** Symlink targets: a link is restored as a link, never written through (R1). */
+      beforeLink: z.string().min(1).optional(),
+      afterLink: z.string().min(1).optional(),
       /** False when the before content was too large to keep: undo cannot restore it. */
       restorable: z.boolean(),
       wasDirty: z.boolean(),
@@ -372,7 +412,14 @@ export function deltaDir(home: string, itemId: string): string {
 /** Replaces any earlier record of `itemId` with this run's delta. */
 export async function writeDeltaRecord(
   home: string,
-  meta: { itemId: string; epoch: number; title: string; root: string; head: string | null },
+  meta: {
+    itemId: string;
+    epoch: number;
+    title: string;
+    sessionId: string | null;
+    root: string;
+    head: string | null;
+  },
   delta: ItemDelta,
   nowMs: number,
 ): Promise<DeltaRecord> {
@@ -381,7 +428,8 @@ export async function writeDeltaRecord(
   await mkdir(path.join(dir, "blobs"), { recursive: true, mode: 0o700 });
   const files: DeltaRecord["files"] = [];
   for (const file of delta.files) {
-    const restorable = file.before.hash === null || file.before.content !== null;
+    const restorable =
+      file.before.hash === null || file.before.content !== null || file.before.link !== undefined;
     if (file.before.hash !== null && file.before.content !== null) {
       await writeFile(path.join(dir, "blobs", file.before.hash), file.before.content, {
         mode: 0o600,
@@ -391,6 +439,8 @@ export async function writeDeltaRecord(
       path: file.path,
       before: file.before.hash,
       after: file.after.hash,
+      ...(file.before.link === undefined ? {} : { beforeLink: file.before.link }),
+      ...(file.after.link === undefined ? {} : { afterLink: file.after.link }),
       restorable,
       wasDirty: file.wasDirty,
       added: file.added,
@@ -437,6 +487,78 @@ export class UndoRefusedError extends Error {
   }
 }
 
+/** Who ran a record: `I-1 (session s-1)`, or just the id for a record without a session. */
+export function runLabel(record: DeltaRecord): string {
+  const session = record.sessionId ?? null;
+  return session === null ? record.itemId : `${record.itemId} (session ${session})`;
+}
+
+/**
+ * The directory entry `rel` names under `root`, without following it. Every existing parent must
+ * be a plain directory (never a symlink), so a restore or removal acts on exactly the recorded
+ * entry and on nothing a link points to (R1). Missing parents are created on restore.
+ */
+export async function entryPath(root: string, rel: string): Promise<string> {
+  const parts = rel.split("/");
+  if (
+    rel.includes("\0") ||
+    path.isAbsolute(rel) ||
+    parts.some((part) => part === "" || part === "." || part === "..")
+  ) {
+    throw new UndoRefusedError(
+      `refusing the recorded path ${JSON.stringify(rel)}: not a plain path`,
+    );
+  }
+  let at = await realpath(root);
+  for (const [index, part] of parts.slice(0, -1).entries()) {
+    at = path.join(at, part);
+    const info = await lstat(at).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+    if (info === null) break;
+    if (!info.isDirectory()) {
+      const parent = parts.slice(0, index + 1).join("/");
+      throw new UndoRefusedError(
+        `${parent} (a parent of ${rel}) is no longer a plain directory; ` +
+          "move it out of the way and try again. Nothing was changed",
+      );
+    }
+  }
+  return path.join(at, parts.at(-1) ?? "");
+}
+
+/** The entry's state without following a leaf symlink; a directory or special file throws. */
+async function entryState(target: string, rel: string): Promise<FileState> {
+  const info = await lstat(target).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  if (info !== null && !info.isFile() && !info.isSymbolicLink()) {
+    throw new UndoRefusedError(
+      `${rel} is now a directory or special file; skep only restores files and links. ` +
+        "Nothing was changed",
+    );
+  }
+  return readState(target);
+}
+
+/**
+ * The recorded files whose working-tree entry no longer has the content the item left (a later
+ * item or a human changed it). A deferred submit refuses these: it would commit or publish
+ * content the item never produced (R3).
+ */
+export async function driftedFiles(record: DeltaRecord): Promise<string[]> {
+  const drifted: string[] = [];
+  for (const file of record.files) {
+    const now = await entryState(await entryPath(record.root, file.path), file.path).catch(
+      () => null,
+    );
+    if (now === null || now.hash !== file.after) drifted.push(file.path);
+  }
+  return drifted;
+}
+
 export interface UndoOutcome {
   record: DeltaRecord;
   restored: string[];
@@ -448,7 +570,8 @@ export interface UndoOutcome {
 /**
  * Puts every file of the item back to its content from before the run. Refuses, changing
  * nothing, when a file was modified again after the item (unless `force`), when a before
- * content was not kept, or when the item was already undone.
+ * content was not kept, when the latest run of the id changed nothing, or when it was already
+ * undone. Only recorded entries are touched; a symlink is removed or recreated as a link.
  */
 export async function undoDelta(
   home: string,
@@ -463,47 +586,80 @@ export async function undoDelta(
     );
   }
   if (record.undoneAtMs !== undefined) {
-    throw new UndoRefusedError(`${itemId} was already undone; nothing changed`);
+    throw new UndoRefusedError(`${runLabel(record)} was already undone; nothing changed`);
+  }
+  if (record.files.length === 0) {
+    throw new UndoRefusedError(
+      `the latest run of ${runLabel(record)} changed no files; there is nothing to undo. ` +
+        `Earlier runs of ${itemId} cannot be undone by skep; use git or your editor`,
+    );
   }
   const dir = deltaDir(home, itemId);
-  const plan: { rel: string; target: string; before: string | null; drifted: boolean }[] = [];
+  const plan: {
+    rel: string;
+    target: string;
+    before: string | null;
+    beforeLink: string | undefined;
+    exists: boolean;
+    drifted: boolean;
+  }[] = [];
   const lost: string[] = [];
   for (const file of record.files) {
-    const target = await safeJoin(record.root, file.path);
-    const now = await readState(target);
-    if (!file.restorable) lost.push(file.path);
-    plan.push({ rel: file.path, target, before: file.before, drifted: now.hash !== file.after });
+    const target = await entryPath(record.root, file.path);
+    const now = await entryState(target, file.path);
+    if (!file.restorable || (file.before !== null && !(await restorable(dir, file)))) {
+      lost.push(file.path);
+    }
+    plan.push({
+      rel: file.path,
+      target,
+      before: file.before,
+      beforeLink: file.beforeLink,
+      exists: now.hash !== null,
+      drifted: now.hash !== file.after,
+    });
   }
   if (lost.length > 0) {
     throw new UndoRefusedError(
-      `cannot undo ${itemId}: the earlier content of ${lost.join(", ")} was too large to keep; ` +
-        "restore it with git or your editor. Nothing was changed",
+      `cannot undo ${runLabel(record)}: the earlier content of ${lost.join(", ")} was too large to keep ` +
+        "or is damaged; restore it with git or your editor. Nothing was changed",
     );
   }
   const drifted = plan.filter((entry) => entry.drifted).map((entry) => entry.rel);
   if (drifted.length > 0 && opts.force !== true) {
     throw new UndoRefusedError(
-      `cannot undo ${itemId}: ${drifted.join(", ")} changed again after the item. ` +
+      `cannot undo ${runLabel(record)}: ${drifted.join(", ")} changed again after the item. ` +
         `Nothing was changed; pass --force to overwrite them with their content from before ${itemId}`,
     );
   }
   const outcome: UndoOutcome = { record, restored: [], removed: [], overwritten: drifted };
   for (const entry of plan) {
-    if (entry.before === null) {
+    // unlink removes the entry itself: a symlink goes, the file it points to stays.
+    const clear = async (): Promise<void> => {
+      if (!entry.exists) return;
       await unlink(entry.target).catch((error: NodeJS.ErrnoException) => {
         if (error.code !== "ENOENT") throw error;
       });
+    };
+    if (entry.before === null) {
+      await clear();
       outcome.removed.push(entry.rel);
+      continue;
+    }
+    await mkdir(path.dirname(entry.target), { recursive: true });
+    if (entry.beforeLink !== undefined) {
+      await clear();
+      await symlink(entry.beforeLink, entry.target);
+      outcome.restored.push(entry.rel);
       continue;
     }
     const content = await readFile(path.join(dir, "blobs", entry.before));
     if (sha256(content) !== entry.before) {
       throw new DeltaError(`the recorded content of ${entry.rel} is damaged (${dir})`);
     }
-    await mkdir(path.dirname(entry.target), { recursive: true });
-    // A symlink or directory left in the way must not redirect the write.
+    // Writing to an existing link would change its target's content instead of the entry.
     const info = await lstat(entry.target).catch(() => null);
-    if (info !== null && !info.isFile()) await rm(entry.target, { recursive: true, force: true });
+    if (info?.isSymbolicLink() === true) await clear();
     await writeFile(entry.target, content);
     outcome.restored.push(entry.rel);
   }
@@ -513,4 +669,11 @@ export async function undoDelta(
     { mode: 0o600 },
   );
   return outcome;
+}
+
+/** A recorded before state undo can put back: a link target, or an intact kept blob. */
+async function restorable(dir: string, file: DeltaRecord["files"][number]): Promise<boolean> {
+  if (file.beforeLink !== undefined) return linkHash(file.beforeLink) === file.before;
+  const content = await readFile(path.join(dir, "blobs", file.before ?? "")).catch(() => null);
+  return content !== null && sha256(content) === file.before;
 }

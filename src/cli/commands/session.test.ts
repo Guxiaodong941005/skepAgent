@@ -53,6 +53,7 @@ import {
   type SubOptions,
   saveAgentSetting,
   selectAgentView,
+  serialQueue,
   setJoinViewFactory,
   summaryTail,
   undoItem,
@@ -1146,6 +1147,71 @@ describe("session join", () => {
 });
 
 describe("control commands", () => {
+  it("status shows each last result whole: no event cap, failed submits and waits named", () => {
+    const words = Array.from({ length: 150 }, (_, n) => `w${String(n).padStart(3, "0")}`);
+    const long = [
+      "submit none local",
+      "done · claude · 3s",
+      ...Array.from({ length: 10 }, (_, n) => `line ${n}`),
+      `summary: ${words.join(" ")}`,
+    ].join("\n");
+    expect(long.length).toBeGreaterThan(600);
+    const item = (itemId: string, summary: string, state: "local" | "failed" | "pending") => ({
+      itemId,
+      repo: "app",
+      assignee: "P-1",
+      epoch: 1,
+      title: "t",
+      datalistEntries: 0,
+      state: "done" as const,
+      result: {
+        itemId,
+        epoch: 1,
+        repo: "app",
+        baseSha: "a".repeat(40),
+        headSha: "b".repeat(40),
+        checks: [{ name: "agent", status: "skip" as const }],
+        submit: {
+          method: state === "local" ? ("none" as const) : ("push" as const),
+          state,
+          branch: "main",
+        },
+        summary,
+      },
+    });
+    const status: SessionStatus = {
+      ...STATUS,
+      intents: [
+        {
+          intentId: "intent-1",
+          text: "ship it",
+          state: "planned",
+          items: [
+            item("I-1", long, "local"),
+            item(
+              "I-2",
+              "submit push failed\nFAILED · claude · 1s\ncause: submit push failed: no",
+              "failed",
+            ),
+            item(
+              "I-3",
+              "submit push pending\nblocked · claude · 1s\nagent x is waiting",
+              "pending",
+            ),
+          ],
+        },
+      ],
+    };
+    const text = renderSessionStatus(SessionStatusSchema.parse(status));
+    expect(text.match(/w\d{3}/g)).toEqual(words);
+    expect(text).toContain("line 9");
+    expect(text).toContain("1 done · 0 failed · 1 submit failed · 1 waiting for you");
+    expect(text).toMatch(/I-2\s+submit-failed/);
+    expect(text).toMatch(/I-3\s+pending/);
+    expect(text).toContain("I-2 SUBMIT FAILED · laptop (app) · claude · 1s");
+    expect(text).toContain("I-3 WAITING · laptop (app) · claude · 1s");
+  });
+
   it("accepts status with and without progress and renders its column", () => {
     expect(SessionStatusSchema.parse(STATUS)).toEqual(STATUS);
     expect(renderSessionStatus(STATUS)).toContain("PROGRESS");
@@ -1425,7 +1491,8 @@ async function joinAndWork(
     await vi.waitFor(() => expect(master.status().intents[0]?.items[0]?.state).toBe("done"), {
       timeout: 10_000,
     });
-    await vi.waitFor(() => expect(events.some((e) => e.kind === "intent-done")).toBe(true));
+    // One final roll-up, whatever the outcome: done, failed or waiting for the human.
+    await vi.waitFor(() => expect(events.some((e) => e.kind.startsWith("intent-"))).toBe(true));
     const item = master.status().intents[0]?.items[0];
     if (item === undefined) throw new Error("no item");
     await master.close();
@@ -1538,7 +1605,7 @@ describe("session join works items in the project folder", () => {
     expect(block.length).toBeGreaterThan(600);
     expect(block).toContain("trace line 39");
     expect(events.some((e) => e.kind === "item-result")).toBe(false);
-    expect(events.find((e) => e.kind === "intent-done")?.message).toContain("0 done · 1 failed");
+    expect(events.find((e) => e.kind === "intent-failed")?.message).toContain("0 done · 1 failed");
   });
 
   it("a missing agent binary at run time names the CLI and the fix", async () => {
@@ -2186,7 +2253,7 @@ describe("session undo", () => {
     // Undoing twice is refused: there is nothing recorded to put back any more.
     const again = capture(box.home, { env: box.env, cwd: box.repo, paths: c.ctx.paths });
     expect(await runCli(["session", "undo", "I-1"], again.ctx)).not.toBe(0);
-    expect(again.stderr).toContain("I-1 was already undone");
+    expect(again.stderr).toMatch(/I-1 \(session session-[0-9a-f]+\) was already undone/);
   });
 
   it("refuses when a file changed again after the item, unless --force", async () => {
@@ -2197,7 +2264,9 @@ describe("session undo", () => {
     const paths = skepPaths(box.env.SKEP_HOME ?? "");
     const c = capture(box.home, { env: box.env, cwd: box.repo, paths });
     expect(await runCli(["session", "undo", "I-1"], c.ctx)).not.toBe(0);
-    expect(c.stderr).toContain("cannot undo I-1: health.txt changed again after the item");
+    expect(c.stderr).toMatch(
+      /cannot undo I-1 \(session \S+\): health.txt changed again after the item/,
+    );
     expect(c.stderr).toContain("Nothing was changed; pass --force");
     expect(await readFile(path.join(box.repo, "health.txt"), "utf8")).toBe(
       "edited after the item\n",
@@ -2379,6 +2448,11 @@ function recordingView(choice: "commit" | "pr" | "mr" | "push" | "none" | null =
   };
 }
 
+const workerAborts: AbortController[] = [];
+afterEach(() => {
+  for (const abort of workerAborts.splice(0)) abort.abort();
+});
+
 function itemWorker(
   box: Sandbox,
   c: ReturnType<typeof capture>,
@@ -2387,9 +2461,13 @@ function itemWorker(
   extra: Partial<ItemWorker> = {},
 ): ItemWorker & { notes: Notification[] } {
   const notes: Notification[] = [];
+  // Ends a blocked agent's background watch with the test (R4).
+  const abort = new AbortController();
+  workerAborts.push(abort);
   return {
     ctx: c.ctx,
     dir: box.repo,
+    signal: abort.signal,
     method: "push",
     ask: async () => null,
     agent: {
@@ -2832,5 +2910,220 @@ describe("session join with a live agent", () => {
     // The full-screen view owns the terminal: no line output and no stdin question.
     expect(run.stdout).toBe("");
     expect(run.stderr).not.toContain("Submit this item?");
+  });
+});
+
+describe("SESSION-UX fix round (R2-R5)", () => {
+  const instantClock = { monotonicMs: () => 0, nowMs: () => 1_000, sleep: async () => {} };
+
+  function ctxFor(box: Sandbox) {
+    return capture(box.home, {
+      env: box.env,
+      cwd: box.repo,
+      paths: skepPaths(box.env.SKEP_HOME ?? ""),
+    });
+  }
+
+  async function submitCli(box: Sandbox, itemId: string, method: string) {
+    const c = ctxFor(box);
+    const exit = await runCli(["session", "submit", itemId, "--method", method], c.ctx);
+    return { exit, c };
+  }
+
+  const I1 = { ...ITEM, itemId: "I-1" };
+
+  it.each(["no changes", "declined", "skipped before start", "failed before running"] as const)(
+    "R2: a later session's I-1 (%s) can neither undo nor submit the earlier session's files",
+    async (second) => {
+      const box = await sandbox();
+      const c = ctxFor(box);
+      const first = itemWorker(box, c, "native", fakeRuntime(), {
+        method: "none",
+        sessionId: () => "session-a",
+      });
+      await workItem(first, I1);
+      expect(await readFile(path.join(box.repo, "health.txt"), "utf8")).toBe("ok\n");
+
+      await stubAgent(box, "claude", 'echo "nothing to do"');
+      const abort = new AbortController();
+      if (second === "skipped before start") abort.abort();
+      const later = itemWorker(box, c, "native", fakeRuntime(), {
+        method: "none",
+        sessionId: () => "session-b",
+        signal: abort.signal,
+        ...(second === "declined" ? { confirmItems: true, ask: async () => "n" } : {}),
+      });
+      if (second === "failed before running") delete later.agent;
+      const result = await workItem(later, I1);
+      if (second === "no changes") expect(result.summary).toContain("no changes");
+
+      await expect(undoItem(c.ctx, "I-1")).rejects.toThrow(
+        /latest run of I-1 \(session session-b\) changed no files/,
+      );
+      const { exit, c: out } = await submitCli(box, "I-1", "commit");
+      expect(exit).not.toBe(0);
+      expect(out.stderr).toContain("latest run of I-1 (session session-b) changed no files");
+      // Session A's work is untouched and uncommitted.
+      expect(await readFile(path.join(box.repo, "health.txt"), "utf8")).toBe("ok\n");
+      expect(await gitIn(box.repo, ["status", "--porcelain"], box.env)).toBe(
+        "M notes.txt\n?? health.txt",
+      );
+    },
+  );
+
+  it.each(["commit", "push", "pr"] as const)(
+    "R3: deferred submit %s refuses a file edited by hand after the item",
+    async (method) => {
+      const box = await sandbox();
+      await writeFile(path.join(box.bin, "gh"), "#!/bin/sh\necho https://github.com/o/r/pull/1\n", {
+        mode: 0o755,
+      });
+      const c = ctxFor(box);
+      await workItem(itemWorker(box, c, "native", fakeRuntime(), { method: "none" }), I1);
+      await writeFile(path.join(box.repo, "notes.txt"), "later human edit\n");
+      const base = await gitIn(box.repo, ["rev-parse", "HEAD"], box.env);
+      const { exit, c: out } = await submitCli(box, "I-1", method);
+      expect(exit).not.toBe(0);
+      expect(out.stderr).toContain("notes.txt changed after I-1");
+      expect(out.stderr).toContain("nothing was staged, committed or pushed");
+      expect(await gitIn(box.repo, ["rev-parse", "HEAD"], box.env)).toBe(base);
+      expect(await gitIn(box.repo, ["diff", "--cached", "--name-only"], box.env)).toBe("");
+      expect(await gitIn(box.repo, ["branch", "--list", "skep/*"], box.env)).toBe("");
+      expect(await remoteHas(box, "main")).toBe(base);
+      expect(await readFile(path.join(box.repo, "notes.txt"), "utf8")).toBe("later human edit\n");
+    },
+  );
+
+  it("R3: an earlier item is not submitted with a later item's edit of the same file", async () => {
+    const box = await sandbox();
+    const c = ctxFor(box);
+    await workItem(itemWorker(box, c, "native", fakeRuntime(), { method: "none" }), I1);
+    await stubAgent(box, "claude", 'printf "second item\\n" > notes.txt');
+    await workItem(itemWorker(box, c, "native", fakeRuntime(), { method: "none" }), {
+      ...ITEM,
+      itemId: "I-2",
+    });
+    const base = await gitIn(box.repo, ["rev-parse", "HEAD"], box.env);
+    const refused = await submitCli(box, "I-1", "push");
+    expect(refused.exit).not.toBe(0);
+    expect(refused.c.stderr).toContain("notes.txt changed after I-1");
+    expect(await remoteHas(box, "main")).toBe(base);
+    // The later item is what the folder holds now: it submits.
+    const ok = await submitCli(box, "I-2", "push");
+    expect(ok.exit).toBe(0);
+    expect(await gitIn(box.repo, ["show", "HEAD:notes.txt"], box.env)).toBe("second item");
+  });
+
+  it("R4: a blocked agent keeps the queue until it resumes; the next item never sees its edits", async () => {
+    const box = await sandbox();
+    const c = ctxFor(box);
+    const answered = deferred();
+    const order: string[] = [];
+    let waits = 0;
+    const fake = fakeRuntime({
+      herdr: {
+        start: async (start: { name: string }) => {
+          order.push(`start ${start.name}`);
+          return {
+            name: start.name,
+            paneId: "p",
+            focusCommand: ["herdr", "agent", "focus", start.name],
+          };
+        },
+        wait: async (handle: { name: string }) => {
+          if (handle.name === "skep-i-2-e1") {
+            await writeFile(path.join(box.repo, "second.txt"), "2\n");
+            return "done";
+          }
+          waits += 1;
+          if (waits === 1) return "blocked";
+          // The human answers in the pane; the agent goes on editing, then finishes.
+          await answered.promise;
+          await writeFile(path.join(box.repo, "resumed.txt"), "after the answer\n");
+          order.push("I-1 resumed and wrote");
+          return "done";
+        },
+      },
+    });
+    const serial = serialQueue();
+    const worker = itemWorker(box, c, "herdr", fake, {
+      method: "none",
+      serial,
+      clock: instantClock,
+    });
+    const first = workItem(worker, I1);
+    const second = workItem(worker, { ...ITEM, itemId: "I-2" });
+    const pending = await first;
+    expect(pending.submit?.state).toBe("pending");
+    await new Promise((r) => setTimeout(r, 50));
+    expect(order).toEqual(["start skep-i-1-e1"]);
+    answered.resolve();
+    const next = await second;
+    expect(order).toEqual(["start skep-i-1-e1", "I-1 resumed and wrote", "start skep-i-2-e1"]);
+    expect(next.summary).toContain("changed 1 file (+1 −0): second.txt");
+    expect(next.summary).not.toContain("resumed.txt");
+    // The blocked run's record covers what it wrote after the answer, so undo reverts it.
+    expect(c.stderr).toContain("item I-1: the agent done; changed 1 file (+1 −0): resumed.txt");
+    await undoItem(c.ctx, "I-1");
+    await expect(stat(path.join(box.repo, "resumed.txt"))).rejects.toThrow();
+    expect(await readFile(path.join(box.repo, "second.txt"), "utf8")).toBe("2\n");
+  });
+
+  it("R5: an agent that committed its own change still gets the requested push", async () => {
+    const box = await sandbox();
+    await stubAgent(
+      box,
+      "claude",
+      'printf "agent\\n" > notes.txt\n' +
+        "git -c user.name=a -c user.email=a@example.invalid commit -qam agent-commit",
+    );
+    const c = ctxFor(box);
+    const base = await gitIn(box.repo, ["rev-parse", "HEAD"], box.env);
+    const result = await workItem(
+      itemWorker(box, c, "native", fakeRuntime(), { method: "push" }),
+      I1,
+    );
+    const head = await gitIn(box.repo, ["rev-parse", "HEAD"], box.env);
+    expect(head).not.toBe(base);
+    expect(result.summary).toContain("changed 1 file (+1 −2): notes.txt");
+    expect(result.submit).toEqual({ method: "push", state: "pushed", branch: "main" });
+    expect(await remoteHas(box, "main")).toBe(head);
+  });
+
+  it("R5: none, then submit commit, then submit push publishes the commit", async () => {
+    const box = await sandbox();
+    const c = ctxFor(box);
+    await workItem(itemWorker(box, c, "native", fakeRuntime(), { method: "none" }), I1);
+    const base = await gitIn(box.repo, ["rev-parse", "HEAD"], box.env);
+    expect((await submitCli(box, "I-1", "commit")).exit).toBe(0);
+    const committed = await gitIn(box.repo, ["rev-parse", "HEAD"], box.env);
+    expect(committed).not.toBe(base);
+    const push = await submitCli(box, "I-1", "push");
+    expect(push.exit).toBe(0);
+    expect(push.c.stdout).toContain("submit push pushed");
+    expect(await gitIn(box.repo, ["rev-parse", "HEAD"], box.env)).toBe(committed);
+    expect(await remoteHas(box, "main")).toBe(committed);
+    // A second commit has nothing left and says so honestly.
+    const again = await submitCli(box, "I-1", "commit");
+    expect(again.exit).toBe(0);
+    expect(again.c.stdout).toContain(`submit commit local ${committed.slice(0, 7)} on main`);
+    expect(again.c.stdout).toContain("already committed");
+  });
+
+  it("R6: a failed push is a FAILED result with cause and fix, not done", async () => {
+    const box = await sandbox();
+    await rm(box.bare, { recursive: true, force: true });
+    const c = ctxFor(box);
+    const result = await workItem(
+      itemWorker(box, c, "native", fakeRuntime(), { method: "push" }),
+      I1,
+    );
+    expect(result.submit).toMatchObject({ method: "push", state: "failed" });
+    const lines = result.summary.split("\n");
+    expect(lines[0]).toBe("submit push failed");
+    expect(lines[1]).toMatch(/^FAILED · claude · /);
+    expect(result.summary).toContain("cause: submit push failed: ");
+    expect(result.summary).toContain("fix: the edits stay in");
+    expect(result.summary).toContain("skep session submit I-1 --epoch 1 --method push");
   });
 });
