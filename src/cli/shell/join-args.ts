@@ -24,7 +24,7 @@ export const JOIN_USAGE = [
   "       /join <NNNN-NNNN-NNNN> [--host host:port]",
   "       /join <host:port> <NNNN-NNNN-NNNN>",
   "       /join            (this device's own master)",
-  "options: --agent claude|codex|pi (default: /agent, SKEP_AGENT_CLI, else found on PATH),",
+  "options: --agent claude|codex|pi (default: /agent, SKEP_AGENT_CLI, AGENT.md, else PATH),",
   "         --manual (confirm each item; default auto),",
   "         --submit commit|push|pr|mr|none|ask (default: device.toml, else none),",
   "         --view native|pty|herdr|dry, --role <role>, --device <name>",
@@ -36,7 +36,7 @@ export interface JoinArgs {
   role?: string;
   /** The agent CLI. */
   agent?: AgentCli;
-  /** How the agent runs; also set by a legacy `--agent pty|native|herdr|dry`. */
+  /** How the agent runs: native (default), pty, herdr, or dry (reports failed). */
   view?: AgentView;
   repo?: string;
   device?: string;
@@ -70,10 +70,9 @@ export function parseJoinArgs(args: string): JoinArgs {
   } catch (error) {
     throw usage(error instanceof Error ? error.message : String(error));
   }
-  if (choice.notice !== undefined) notes.push(choice.notice);
   const viewFlag = flags.values.view;
-  const view = AGENT_VIEWS.find((value) => value === viewFlag) ?? choice.view;
-  if (viewFlag !== undefined && view !== viewFlag) {
+  const view = AGENT_VIEWS.find((value) => value === viewFlag);
+  if (viewFlag !== undefined && view === undefined) {
     throw usage(`--view must be ${AGENT_VIEWS.join(", ")}, got ${viewFlag}`);
   }
   // Tolerated so old paste lines still work; AGENT.md is no longer required (SESSION-UX §3.2).

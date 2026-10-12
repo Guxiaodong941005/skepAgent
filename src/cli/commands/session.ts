@@ -1066,18 +1066,17 @@ const HERDR_READ_LINES = 200;
 const TAIL_WINDOW = 64 * 1024;
 
 /**
- * `--view` wins; then the deprecated `SKEP_SESSION_EXEC=1` (pty, or herdr with
- * `SKEP_SESSION_VIEW=herdr`); then `SKEP_SESSION_VIEW`; otherwise native. A real agent run is the
- * default: there is no silent dry fallback any more (SESSION-UX §3.2).
+ * `--view` wins, then `SKEP_SESSION_VIEW`, otherwise native. A real agent run is the default:
+ * there is no silent dry fallback, and `SKEP_SESSION_EXEC` no longer switches anything on
+ * (SESSION-UX §3.2, Phase 2).
  */
 export function selectAgentView(flag: AgentView | undefined, env: NodeJS.ProcessEnv): AgentView {
   if (flag !== undefined) return flag;
-  const fromEnv = AGENT_VIEWS.find((view) => view === env.SKEP_SESSION_VIEW);
-  if (env.SKEP_SESSION_EXEC === "1") return fromEnv === "herdr" ? "herdr" : "pty";
-  return fromEnv ?? "native";
+  return AGENT_VIEWS.find((view) => view === env.SKEP_SESSION_VIEW) ?? "native";
 }
 
-export const AGENT_CLIS = ["claude", "codex", "pi"] as const satisfies readonly AgentCli[];
+const AGENT_CLIS_ENUM = ["claude", "codex", "pi"] as const;
+export const AGENT_CLIS = AGENT_CLIS_ENUM satisfies readonly AgentCli[];
 
 function isAgentCli(value: string | undefined): value is AgentCli {
   return AGENT_CLIS.some((cli) => cli === value);
@@ -1088,18 +1087,19 @@ function isAgentView(value: string | undefined): value is AgentView {
 }
 
 /**
- * Splits a `--agent` value: a CLI name is the agent, a legacy view name (`pty`, `native`,
- * `herdr`, `dry`) still selects the view during the deprecation window and says so once.
+ * A `--agent` value: the agent CLI. The pre-SESSION-UX view names (`pty`, `native`, `herdr`,
+ * `dry`) are refused with the flag that replaced them, so an old command line fails loudly
+ * instead of silently running something else.
  */
-export function parseAgentFlag(value: string | undefined): {
-  cli?: AgentCli;
-  view?: AgentView;
-  notice?: string;
-} {
+export function parseAgentFlag(value: string | undefined): { cli?: AgentCli } {
   if (value === undefined) return {};
   if (isAgentCli(value)) return { cli: value };
   if (isAgentView(value)) {
-    return { view: value, notice: `--agent ${value} is now --view ${value}` };
+    throw new CliError(
+      "bad_agent",
+      `--agent ${value} is now --view ${value}; --agent takes the agent CLI (${AGENT_CLIS.join(", ")})`,
+      EXIT.usage,
+    );
   }
   throw new CliError(
     "bad_agent",
@@ -1108,8 +1108,67 @@ export function parseAgentFlag(value: string | undefined): {
   );
 }
 
-/** Where the agent CLI of a join came from, in resolution order (SESSION-UX §3.2). */
+/**
+ * Where the agent CLI of a join came from, in resolution order (SESSION-UX §3.2). `/agent` is
+ * this device's setting: `device.toml` `[agent] cli`, which the shell's `/agent` writes.
+ */
 export type AgentSource = "--agent" | "/agent" | "SKEP_AGENT_CLI" | "AGENT.md" | "PATH";
+
+const AgentSettingFileSchema = z.object({
+  agent: z.object({ cli: z.enum(AGENT_CLIS_ENUM) }).optional(),
+});
+
+/**
+ * This device's agent CLI from `device.toml` `[agent] cli`, read as loosely as the submit policy:
+ * no file or no key is no setting; a value that does not parse is a warning, never a block.
+ */
+export async function loadAgentSetting(
+  file: string,
+  warn: (message: string) => void = () => {},
+): Promise<AgentCli | undefined> {
+  let text: string;
+  try {
+    text = await readFile(file, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+  try {
+    return parseTomlConfig(AgentSettingFileSchema, text, file).agent?.cli;
+  } catch (error) {
+    if (!(error instanceof ConfigError)) throw error;
+    warn(`ignoring the [agent] setting (${error.message})`);
+    return undefined;
+  }
+}
+
+/**
+ * Writes `[agent] cli = "<cli>"` into `device.toml`, keeping every other line as it was: the
+ * key is replaced inside an existing `[agent]` table, added to it, or the table is appended.
+ */
+export async function saveAgentSetting(file: string, cli: AgentCli): Promise<void> {
+  let text = "";
+  try {
+    text = await readFile(file, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  const lines = text === "" ? [] : text.replace(/\n$/, "").split("\n");
+  const entry = `cli = "${cli}"`;
+  const header = lines.findIndex((line) => /^\s*\[agent\]\s*(#.*)?$/.test(line));
+  if (header < 0) {
+    if (lines.length > 0 && lines.at(-1)?.trim() !== "") lines.push("");
+    lines.push("[agent]", entry);
+  } else {
+    let end = lines.findIndex((line, i) => i > header && /^\s*\[/.test(line));
+    if (end < 0) end = lines.length;
+    const key = lines.findIndex((line, i) => i > header && i < end && /^\s*cli\s*=/.test(line));
+    if (key >= 0) lines[key] = entry;
+    else lines.splice(header + 1, 0, entry);
+  }
+  await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+  await atomicWrite(file, `${lines.join("\n")}\n`, { mode: 0o600 });
+}
 
 export interface ResolvedAgent {
   cli: AgentCli;
@@ -1133,15 +1192,22 @@ export const NO_AGENT_MESSAGE =
 export async function resolveAgentCli(input: {
   flag?: AgentCli;
   setting?: AgentCli;
+  /** `device.toml`, read for `[agent] cli` when no `setting` was passed. */
+  deviceToml?: string;
   env: NodeJS.ProcessEnv;
   /** Where an AGENT.md might be. */
   dir: string;
   warn(message: string): void;
 }): Promise<ResolvedAgent> {
   const { env } = input;
+  const setting =
+    input.setting ??
+    (input.flag === undefined && input.deviceToml !== undefined
+      ? await loadAgentSetting(input.deviceToml, input.warn)
+      : undefined);
   let chosen: ResolvedAgent | null = null;
   if (input.flag !== undefined) chosen = { cli: input.flag, source: "--agent" };
-  else if (input.setting !== undefined) chosen = { cli: input.setting, source: "/agent" };
+  else if (setting !== undefined) chosen = { cli: setting, source: "/agent" };
   else if (env.SKEP_AGENT_CLI !== undefined && env.SKEP_AGENT_CLI !== "") {
     if (!isAgentCli(env.SKEP_AGENT_CLI)) {
       throw new CliError(
@@ -2250,15 +2316,12 @@ export function register(program: Command, ctx: CliContext): void {
     .action(async (opts: Omit<JoinOptions, "agent"> & { agent?: string; roleDir?: string }) => {
       const { agent, roleDir, ...rest } = opts;
       const choice = parseAgentFlag(agent);
-      if (choice.notice !== undefined) sctx.stderr.write(`skep: ${choice.notice}\n`);
       if (roleDir !== undefined) {
         sctx.stderr.write("skep: --role-dir is ignored; AGENT.md is no longer required\n");
       }
-      const view = rest.view ?? choice.view;
       await joinCommand(sctx, {
         ...rest,
         ...(choice.cli === undefined ? {} : { agent: choice.cli }),
-        ...(view === undefined ? {} : { view }),
       });
     });
 
@@ -2840,6 +2903,7 @@ export async function joinSessionFlow(
       : await resolveAgentCli({
           ...(opts.agent === undefined ? {} : { flag: opts.agent }),
           ...(opts.cli === undefined ? {} : { setting: opts.cli }),
+          deviceToml: paths.deviceToml,
           env: ctx.env,
           dir,
           warn,

@@ -31,6 +31,7 @@ import {
   type JoinViewModel,
   joinSessionFlow,
   LAST_AUTO_PORT,
+  loadAgentSetting,
   loadSubmitPolicy,
   type MasterHandle,
   type MasterOptions,
@@ -50,6 +51,7 @@ import {
   SessionStatusSchema,
   type SubHandle,
   type SubOptions,
+  saveAgentSetting,
   selectAgentView,
   setJoinViewFactory,
   summaryTail,
@@ -1791,15 +1793,55 @@ describe("agent resolution at join", () => {
     );
   });
 
-  it("legacy --agent pty still joins, as --view pty, with a one-line notice", async () => {
+  it("legacy --agent pty is refused with its replacement, before connecting", async () => {
     const box = await sandbox();
     const fake = fakeApi();
     const c = capture(box.home, { env: box.env, cwd: box.repo, sessionApi: fake.api });
     const argv = ["session", "join", "--code", "123456789012", "--host", "h:1", "--repo", "app"];
-    expect(await runCli([...argv, "--agent", "pty", "--role-dir", "/x"], c.ctx)).toBe(0);
-    expect(c.stderr).toContain("skep: --agent pty is now --view pty\n");
-    expect(c.stderr).toContain("skep: --role-dir is ignored; AGENT.md is no longer required\n");
-    expect(c.stdout).toContain("agent: claude (found on PATH) (pty view)");
+    expect(await runCli([...argv, "--agent", "pty"], c.ctx)).toBe(2);
+    expect(c.stderr).toContain("--agent pty is now --view pty; --agent takes the agent CLI");
+    expect(fake.calls.sub).toHaveLength(0);
+    // --role-dir is still tolerated: old paste lines keep working.
+    const ok = capture(box.home, { env: box.env, cwd: box.repo, sessionApi: fake.api });
+    expect(await runCli([...argv, "--view", "pty", "--role-dir", "/x"], ok.ctx)).toBe(0);
+    expect(ok.stderr).toContain("skep: --role-dir is ignored; AGENT.md is no longer required\n");
+    expect(ok.stdout).toContain("agent: claude (found on PATH) (pty view)");
+  });
+
+  it("device.toml [agent] cli is the /agent setting: after --agent, before SKEP_AGENT_CLI", async () => {
+    const bin = await home();
+    for (const name of ["claude", "codex", "pi"]) {
+      await writeFile(path.join(bin, name), "#!/bin/sh\n", { mode: 0o755 });
+    }
+    const dir = await home();
+    const toml = path.join(dir, "device.toml");
+    const env = { PATH: bin, SKEP_AGENT_CLI: "codex" };
+    const warn = vi.fn();
+    await writeFile(toml, 'schema = "skep.device/v1"\n\n[submit]\nmethod = "none"\n');
+    expect(await resolveAgentCli({ deviceToml: toml, env, dir, warn })).toEqual({
+      cli: "codex",
+      source: "SKEP_AGENT_CLI",
+    });
+    await saveAgentSetting(toml, "pi");
+    expect(await readFile(toml, "utf8")).toBe(
+      'schema = "skep.device/v1"\n\n[submit]\nmethod = "none"\n\n[agent]\ncli = "pi"\n',
+    );
+    expect(await resolveAgentCli({ deviceToml: toml, env, dir, warn })).toEqual({
+      cli: "pi",
+      source: "/agent",
+    });
+    expect(await resolveAgentCli({ flag: "claude", deviceToml: toml, env, dir, warn })).toEqual({
+      cli: "claude",
+      source: "--agent",
+    });
+    // Saving again replaces the key in place; the submit policy still parses.
+    await saveAgentSetting(toml, "claude");
+    expect(await loadAgentSetting(toml)).toBe("claude");
+    expect((await readFile(toml, "utf8")).match(/\[agent\]/g)).toHaveLength(1);
+    expect(await loadSubmitPolicy(toml)).toEqual({ method: "none", host: "github" });
+    await writeFile(toml, '[agent]\ncli = "gpt"\n');
+    expect(await loadAgentSetting(toml, warn)).toBeUndefined();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("ignoring the [agent] setting"));
   });
 
   it("--view dry runs nothing, commits nothing and reports a failed-class DRY RUN", async () => {
@@ -2363,14 +2405,11 @@ function itemWorker(
 }
 
 describe("agent strategy selection", () => {
-  it("native by default; --view wins; SKEP_SESSION_EXEC/VIEW still honoured", () => {
+  it("native by default; --view wins; SKEP_SESSION_VIEW honoured; SKEP_SESSION_EXEC gone", () => {
     expect(selectAgentView(undefined, {})).toBe("native");
     expect(selectAgentView(undefined, { SKEP_SESSION_VIEW: "herdr" })).toBe("herdr");
     expect(selectAgentView(undefined, { SKEP_SESSION_VIEW: "nonsense" })).toBe("native");
-    expect(selectAgentView(undefined, { SKEP_SESSION_EXEC: "1" })).toBe("pty");
-    expect(selectAgentView(undefined, { SKEP_SESSION_EXEC: "1", SKEP_SESSION_VIEW: "herdr" })).toBe(
-      "herdr",
-    );
+    expect(selectAgentView(undefined, { SKEP_SESSION_EXEC: "1" })).toBe("native");
     for (const flag of ["dry", "pty", "herdr", "native"] as const) {
       expect(selectAgentView(flag, { SKEP_SESSION_EXEC: "1", SKEP_SESSION_VIEW: "herdr" })).toBe(
         flag,
@@ -2378,13 +2417,10 @@ describe("agent strategy selection", () => {
     }
   });
 
-  it("--agent takes a CLI; legacy view names map to --view with a notice", () => {
+  it("--agent takes a CLI; legacy view names are refused with their replacement", () => {
     expect(parseAgentFlag(undefined)).toEqual({});
     expect(parseAgentFlag("codex")).toEqual({ cli: "codex" });
-    expect(parseAgentFlag("native")).toEqual({
-      view: "native",
-      notice: "--agent native is now --view native",
-    });
+    expect(() => parseAgentFlag("native")).toThrow(/--agent native is now --view native/);
     expect(() => parseAgentFlag("gpt")).toThrow(/--agent must be claude, codex, pi/);
   });
 
@@ -2694,9 +2730,9 @@ async function joinWith(
 describe("session join with a live agent", () => {
   afterEach(() => setJoinViewFactory(null));
 
-  it("SKEP_SESSION_EXEC=1 selects pty with the CLI from an AGENT.md that happens to exist", async () => {
+  it("SKEP_SESSION_VIEW=pty selects pty with the CLI from an AGENT.md that happens to exist", async () => {
     const box = await sandbox();
-    box.env = { ...box.env, SKEP_SESSION_EXEC: "1" };
+    box.env = { ...box.env, SKEP_SESSION_VIEW: "pty" };
     await stubAgent(box, "pi");
     await writeFile(path.join(box.repo, "AGENT.md"), AGENT_MD("pi"));
     const fake = fakeRuntime();

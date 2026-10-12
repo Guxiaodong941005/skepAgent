@@ -28,11 +28,6 @@ describe("parseJoinArgs", () => {
       "8632-1727-0308 --agent pi --view herdr",
       { code: "8632-1727-0308", agent: "pi", view: "herdr" },
     ],
-    // Legacy view names on --agent still join, as --view, with a one-line notice.
-    [
-      "8632-1727-0308 --agent pty",
-      { code: "8632-1727-0308", view: "pty", notes: ["--agent pty is now --view pty"] },
-    ],
     [
       "8632-1727-0308 --role-dir ./role",
       {
@@ -72,6 +67,7 @@ describe("parseJoinArgs", () => {
       /--submit must be commit, pr, mr, push, none, ask, got yolo/,
     ],
     ["--code 123456789012 --agent gpt", /--agent must be claude, codex, pi/],
+    ["--code 123456789012 --agent pty", /--agent pty is now --view pty/],
     ["--code 123456789012 --view tmux", /--view must be dry, pty, herdr, native, got tmux/],
   ])("rejects %j with the accepted forms", (args, problem) => {
     let message = "";

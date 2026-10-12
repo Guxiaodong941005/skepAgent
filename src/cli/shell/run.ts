@@ -25,11 +25,13 @@ import {
   type JoinView,
   type JoinViewModel,
   joinSessionFlow,
+  loadAgentSetting,
   type MasterFlow,
   readControlEndpoint,
   renderSessionStatus,
   type SessionCliContext,
   type SessionStatus,
+  saveAgentSetting,
   startedText,
   startMasterFlow,
   submitIntentAt,
@@ -107,7 +109,6 @@ export class Shell {
   private readonly io: ScreenIo;
   private readonly clock: Clock;
   private readonly animate: boolean;
-  private agentCli: AgentCli | null = null;
   private readonly questions: Question[] = [];
   private ticker: AbortController | null = null;
   private ticks = 0;
@@ -740,7 +741,6 @@ export class Shell {
       ...(parsed.manual === true ? { manual: true } : {}),
       ...(parsed.agent === undefined ? {} : { agent: parsed.agent }),
       ...(parsed.view === undefined ? {} : { view: parsed.view }),
-      ...(this.agentCli === null ? {} : { cli: this.agentCli }),
     };
     const generation = this.session.beginJoin(host ?? "this device's master");
     this.sync();
@@ -891,28 +891,36 @@ export class Shell {
     return { type: "ok", message: lines.join("\n") };
   }
 
-  private agentCommand(args: string): SlashResult {
+  /**
+   * `/agent` shows or sets this device's agent CLI. It is persisted in this project's
+   * `device.toml` `[agent] cli`, so it is a real setting rather than a session-only override
+   * (SESSION-UX §2.1).
+   */
+  private async agentCommand(args: string): Promise<SlashResult> {
     const name = args.trim();
+    const file = this.ctx.paths?.deviceToml;
+    if (file === undefined) return { type: "error", message: "skep home is not resolved" };
     if (name === "") {
       const join = this.session.ownJoin;
+      const saved = await loadAgentSetting(file, (message) => this.log(`skep: ${message}`, "warn"));
       const current =
         join?.agent != null
-          ? `this join runs ${join.agent.cli}`
-          : this.agentCli !== null
-            ? `the next /join runs ${this.agentCli}`
+          ? `this join runs ${join.agent.cli}${saved === undefined ? "" : `; saved: ${saved}`}`
+          : saved !== undefined
+            ? `${saved} (saved in ${file})`
             : "not set; /join uses --agent, SKEP_AGENT_CLI, AGENT.md if present, else the first of " +
               `${AGENT_ORDER.join(", ")} on PATH`;
       return {
         type: "ok",
-        message: `agent: ${current}\n/agent ${AGENT_ORDER.join("|")} sets it for this device`,
+        message: `agent: ${current}\n/agent ${AGENT_ORDER.join("|")} sets it for this project`,
       };
     }
     if (!AGENT_ORDER.includes(name as AgentCli)) {
       return { type: "error", message: `/agent takes ${AGENT_ORDER.join(", ")}` };
     }
-    this.agentCli = name as AgentCli;
+    await saveAgentSetting(file, name as AgentCli);
     const note = this.session.ownJoin === null ? "" : " (applies from the next /join)";
-    return { type: "ok", message: `session items will run ${name}${note}` };
+    return { type: "ok", message: `session items will run ${name}${note}; saved in ${file}` };
   }
 
   private async undoCommand(args: string): Promise<SlashResult> {

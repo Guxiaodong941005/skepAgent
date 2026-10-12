@@ -1256,20 +1256,25 @@ describe("SESSION-UX shell copy", () => {
     await h.shell.quit();
   });
 
-  it("legacy --agent pty joins with a notice; /agent shows and sets the CLI", async () => {
+  it("/agent persists the CLI in device.toml and the next /join uses it", async () => {
     const h = await harness();
     await h.shell.submit("/agent");
     expect(h.scrollback()).toContain("agent: not set; /join uses --agent, SKEP_AGENT_CLI");
     await h.shell.submit("/agent codex");
-    expect(h.scrollback()).toContain("session items will run codex");
+    const toml = path.join(h.dir, "device.toml");
+    expect(h.scrollback()).toContain(`session items will run codex; saved in ${toml}`);
+    expect(await readFile(toml, "utf8")).toBe('[agent]\ncli = "codex"\n');
+    await h.shell.submit("/agent");
+    expect(h.scrollback()).toContain(`agent: codex (saved in ${toml})`);
     await writeFile(path.join(h.dir, "bin", "codex"), "#!/bin/sh\n", { mode: 0o755 });
+    await h.shell.submit("/join --host 192.168.1.20:7419 --code 1234-5678-9012 --repo app");
+    expect(h.scrollback()).toContain("agent: codex (from /agent) · mode: edits this folder");
+    await h.shell.submit("/clean");
+    // The pre-SESSION-UX spelling is refused with its replacement.
     await h.shell.submit(
       "/join --host 192.168.1.20:7419 --code 1234-5678-9012 --repo app --agent pty",
     );
-    expect(h.scrollback()).toContain("skep: --agent pty is now --view pty");
-    expect(h.scrollback()).toContain("agent: codex (from /agent) (pty view)");
-    await h.shell.submit("/agent");
-    expect(h.scrollback()).toContain("agent: this join runs codex");
+    expect(h.scrollback()).toContain("--agent pty is now --view pty");
     await h.shell.quit();
   });
 
