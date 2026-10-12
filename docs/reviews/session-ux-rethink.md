@@ -387,3 +387,51 @@ Each new regression fails on `c2a5e57` and passes on `914d426`. Validation: `npm
 PASS (84 files); `npm test` PASS, 32 files / 727 tests (721 + 6 new), on two consecutive runs.
 Limit: closing the pane after a wait failure ends the human's view of that agent; it is the
 only termination signal the herdr backend contract offers.
+
+## Fix round 2 re-review
+
+Date: 2026-10-12. Reviewer: Codex. Branch: `feat/session-ux-rethink`.
+Reviewed HEAD: `e188d15`, including implementation commit `914d426` and its fix report.
+Comparison: `git diff c2a5e57..HEAD`.
+
+R9, R10 and R11 are resolved for the reported cases. No new blocking finding was found.
+The prior resolved R1-R8 findings remain resolved; R10/R11 close the remaining R4 follow-ups.
+All earlier review text and non-blocking notes are retained.
+
+Read the prior findings and both fix reports, the complete comparison, the affected production
+helpers and regression tests, and the SESSION-UX plan/BRIEF/READY, ARCHITECTURE D27-D31 and
+the PRD session amendment. Checked the SK-620 wait/close contract and join abort/serial-queue
+wiring. Scope remains Phase 1, Phase 2 and Phase 3 undo only.
+
+| Finding | Disposition | Evidence and limits |
+| --- | --- | --- |
+| R9 | Resolved | `session-delta.ts:521` retains all remaining validated components after the first missing parent. Undo creates the complete parent path and restores the recorded destination. Git and non-Git regressions restore four equal leaf names in distinct subdirectories with their own bytes, reject collapsed destinations, and leave Git clean. Existing ancestors still undergo `lstat` checks; the added parent-symlink regression refuses forced undo without writing through the link. |
+| R10 | Resolved against the backend contract | `session.ts:1421-1431` catches blocked-watch wait errors without releasing ownership. It awaits `backend.close`; a pending close holds the serial slot, and a rejected close retries through the injected Clock. The regressions show I-2 starts only after close succeeds, late I-1 edits appear in its final delta, and repeated close failures never start I-2. Join abort skips queued execution and settle output. No approval input or native replay is sent. Real pane termination remains the integration limit below. |
+| R11 | Resolved | `session.ts:2399-2402` always replaces the final record after a successful comparison, including an empty delta, before releasing the queue. The edit-then-revert regression verifies an empty stored record, no-change refusals from both undo and deferred commit, original file content, a clean Git status and unchanged HEAD. The abort checks from `c2a5e57` remain before settle writes/output. |
+
+Validation from the supplied worktree:
+
+| Command/check | Result |
+| --- | --- |
+| `npm run lint && npm test` | PASS: Biome checked 84 files without fixes; TypeScript no-emit passed; 32 test files / 727 tests passed, duration 13.82 s. This includes the earlier R1-R8 regressions. |
+| Focused round-2 regressions on HEAD | PASS: all six cases passed across session-delta.test.ts and session.test.ts; 164 unrelated cases skipped. |
+| Independent baseline negative control | Supplied the two production modules from `c2a5e57` through an in-memory Vitest load hook, keeping current tests and leaving source files untouched. Five defect reproductions failed as expected: both missing-parent cases, both timeout/close cases, and the stale final-record case. The parent-symlink preservation test passed. |
+| `git diff --check c2a5e57..HEAD` | PASS. |
+| Wire/core/package/config comparison | No changes to messages.ts, src/core, package.json, package-lock.json, tsconfig.json or biome.json. No new dependency or version bump. |
+
+The negative control qualifies the fix report's statement that "each new regression fails"
+on the baseline: five reproduce defects; the sixth preserves already-correct parent-symlink
+refusal. All six pass on the reviewed tip, so this does not affect the fix verdict.
+
+Existing limits remain unchanged. This branch lacks the dynamically loaded herdr runtime;
+R10 therefore verifies queue fencing against the specified backend with fakes, not that a real
+herdr pane close terminates its agent process. Closing after a wait failure also removes the
+human's pane. The unchanged wire leaves the master pending after local settlement, and the
+prior content-hash/whole-file attribution limits and N1-N5 still apply.
+
+Only this section was appended, with the review file committed locally. Implementation and
+tests were not modified. The pre-existing untracked node_modules entry is retained. No real
+agent CLI, provider connection, external network, merge, push, publication or version bump
+was used.
+
+**Fix verdict: PASS.**
