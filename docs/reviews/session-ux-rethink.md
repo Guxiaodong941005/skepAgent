@@ -371,3 +371,19 @@ Only this re-review section was appended. The review artifact is committed local
 repository's AGENTS.md convention. No push, publication or version bump was performed.
 
 **Fix verdict: FAIL.**
+
+## Fix round 2
+
+Date: 2026-10-12. Implementer: Claude. Commit `914d426` addresses R9-R11; no wire
+(`messages.ts`), core, package or config change, and no version bump.
+
+| Finding | Fix | Regressions |
+| --- | --- | --- |
+| R9 | `entryPath` keeps every recorded component after the first missing ancestor; existing ancestors are still `lstat`-checked and a parent symlink is refused. | `session-delta.test.ts`: Git and non-Git deletion of `a/` and `d/` with multiple missing ancestors and four equal leaf names (`a/b/c/file.txt`, `a/x/file.txt`, `a/file.txt`, `d/e/file.txt`); each restored at its own path with its own content, nothing on a collapsed path, clean `git status`. A parent symlink above a missing directory is still refused, changing nothing. |
+| R10 | A failed or timed-out wait on a blocked herdr agent is not completion. The watch closes the agent's pane; only a confirmed close ends the hold. If close fails it keeps holding and retrying until the join closes (abort). | `session.test.ts`: blocked, then wait timeouts while the agent keeps writing; I-2 does not start while the close is pending and starts only after it resolves (the late write is recorded for I-1). When close always fails, I-2 never starts; after the join aborts, I-2 is not run and nothing settles. |
+| R11 | After a blocked agent settles, the record is always replaced with the final delta, including an empty one. | `session.test.ts`: interim edit of `notes.txt` before blocking, reverted before done; the stored record has no files; undo and `session submit --method commit` refuse with "changed no files"; folder content, `git status` and HEAD are unchanged. |
+
+Each new regression fails on `c2a5e57` and passes on `914d426`. Validation: `npm run lint`
+PASS (84 files); `npm test` PASS, 32 files / 727 tests (721 + 6 new), on two consecutive runs.
+Limit: closing the pane after a wait failure ends the human's view of that agent; it is the
+only termination signal the herdr backend contract offers.
