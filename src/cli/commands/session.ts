@@ -495,25 +495,16 @@ export interface JoinTarget {
   /** `host:port` peers dial (the master's advertise address, else its listen address). */
   host: string;
   code: string;
-  repo: string;
 }
 
 /**
- * A repo the paste line can carry. Control characters (a newline would submit the input early)
- * cannot be typed into the shell's input box, so such a repo is left out and named instead.
+ * The one line a peer pastes into its skep shell to join (docs/plans/join-slim.md): just the code
+ * and the host. The joiner's repo and device default to its own checkout and hostname, so they are
+ * not part of the paste. Each value is quoted for the slash grammar, so `parseJoinArgs` reads
+ * back exactly these values.
  */
-function pasteableRepo(repo: string): boolean {
-  // biome-ignore lint/suspicious/noControlCharactersInRegex: control characters are the point.
-  return !/[\u0000-\u001f\u007f]/.test(repo);
-}
-
-/**
- * The one line a peer pastes into its skep shell to join (docs/plans/join-paste-auto.md). Each
- * value is quoted for the slash grammar, so `parseJoinArgs` reads back exactly these values.
- */
-export function formatJoinPaste({ host, code, repo }: JoinTarget): string {
-  const base = `/join --host ${quoteSlashWord(host)} --code ${formatJoinCode(code)}`;
-  return pasteableRepo(repo) ? `${base} --repo ${quoteSlashWord(repo)}` : base;
+export function formatJoinPaste({ host, code }: JoinTarget): string {
+  return `/join ${formatJoinCode(code)} ${quoteSlashWord(host)}`;
 }
 
 /** A POSIX shell word: bare when safe, else single-quoted. */
@@ -523,25 +514,25 @@ export function quoteShellWord(value: string): string {
 }
 
 /** The same join for a plain shell; every argument is shell-quoted. */
-export function formatJoinCli({ host, code, repo }: JoinTarget): string {
-  return [
-    "skep session join --host",
-    quoteShellWord(host),
-    "--code",
-    formatJoinCode(code),
-    "--repo",
-    quoteShellWord(repo),
-  ].join(" ");
+export function formatJoinCli({ host, code }: JoinTarget): string {
+  return ["skep session join --code", formatJoinCode(code), "--host", quoteShellWord(host)].join(
+    " ",
+  );
 }
 
-/** What a master prints so a peer can join: the paste line first, then its CLI twin. */
-export function joinHint(target: JoinTarget): string {
-  const note = pasteableRepo(target.repo)
-    ? ""
-    : `\n(repo ${JSON.stringify(target.repo)} cannot be pasted: join from that checkout, ` +
-      "whose directory name is the default --repo)";
+/** A repo name for prose: bare when plain, else JSON-quoted so odd characters stay visible. */
+export function repoLabel(repo: string): string {
+  return /^[A-Za-z0-9._-]+$/.test(repo) ? repo : JSON.stringify(repo);
+}
+
+/**
+ * What a master prints so a peer can join: the paste line first, then its CLI twin. The repo is
+ * prose, not a flag: routing matches the joiner's own checkout (JOIN-SLIM).
+ */
+export function joinHint(target: JoinTarget & { repo: string }): string {
   return (
-    `on another device, paste into skep: ${formatJoinPaste(target)}${note}\n` +
+    `on another device, from a checkout of ${repoLabel(target.repo)}, ` +
+    `paste into skep: ${formatJoinPaste(target)}\n` +
     `or from a shell: ${formatJoinCli(target)}`
   );
 }
@@ -2745,7 +2736,7 @@ async function startCommand(ctx: SessionCliContext, opts: StartOptions): Promise
           { event: "join-code", joinCode, joinCodeExpiresAtMs: expiresAtMs },
           () =>
             `join code: ${joinCode}${expiryText(expiresAtMs)}\n` +
-            `${formatJoinPaste({ host: flow.advertise, code: joinCode, repo: flow.repo })}\n`,
+            `${formatJoinPaste({ host: flow.advertise, code: joinCode })}\n`,
         ),
     });
   } catch (error) {

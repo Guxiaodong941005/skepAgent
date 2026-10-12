@@ -535,7 +535,7 @@ export class Shell {
       {
         name: "join",
         description: "join a session (same machine or --host)",
-        usage: "--host h:p --code c --repo r [--manual]",
+        usage: "<code> <host:port> [--manual]",
         run: (_ctx, args) => this.joinCommand(args),
       },
       {
@@ -629,9 +629,7 @@ export class Shell {
         // A rotated code invalidates the line pasted earlier, so the new one is printed in full.
         const own = this.session.ownMaster;
         const paste =
-          own === null
-            ? ""
-            : `\npaste: ${formatJoinPaste({ host: own.advertise, code, repo: own.repo })}`;
+          own === null ? "" : `\npaste: ${formatJoinPaste({ host: own.advertise, code })}`;
         this.log(`join code: ${code}${expiry(expiresAtMs)}${paste}`, "event");
         this.sync();
       },
@@ -663,7 +661,7 @@ export class Shell {
         const rejoin =
           own === null || own.joinCode === null
             ? "/join <code>"
-            : formatJoinPaste({ host: own.advertise, code: own.joinCode, repo: own.repo });
+            : formatJoinPaste({ host: own.advertise, code: own.joinCode });
         this.log(`${text}\nit can rejoin with the current code: ${rejoin}`, "error");
         break;
       }
@@ -824,7 +822,7 @@ export class Shell {
     const rejoin =
       this.quitting === null && reason !== "sub_closed"
         ? "\nthe join code is single-use: ask the master for its current code, then\n" +
-          `/join --host ${flow.target} --code <code> --repo ${quoteSlashWord(flow.repo)}`
+          `/join <code> ${quoteSlashWord(flow.target)}`
         : "";
     this.log(`left the session (${explainReason(reason)})${rejoin}`, "event");
     this.sync();

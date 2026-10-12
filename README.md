@@ -23,7 +23,7 @@ Requires Node.js ≥ 22.12 (macOS & Linux).
 ```text
 $ skep                      # in any git checkout: the Skep shell (logo, scrollback, input)
 > /start                    # master: prints the join code into the scrollback
-> /join <code> --host <ip:port>   # in `skep` on another device or directory
+> /join <code> <ip:port>   # in `skep` on another device or directory (any checkout)
 > refactor the auth middleware    # with a master here: sent as an intent
 > /quit
 ```
@@ -37,11 +37,16 @@ Scripts and the old flow keep working:
 
 ```bash
 skep session start          # master: prints join code
-skep session join --code <code>   # peer on another device or directory
+skep session join --code <code> --host <ip:port>   # peer on another device or directory
 skep ui                     # full-screen session monitor
 ```
 
 Same-machine peers: start a master in one project directory, join with the code from another.
+
+The master prints the exact line to paste, e.g. `/join 1234-5678-9012 203.0.113.7:7419`. Join
+from a checkout of the master's repo: the peer's repo defaults to its git top level's
+directory name and its device to the hostname. `--repo`, `--device`, `--role`, `--agent`,
+`--view`, `--submit` and `--manual` are optional overrides.
 
 ## Session screen
 

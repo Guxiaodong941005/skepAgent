@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
-import { tmpdir } from "node:os";
+import os, { tmpdir } from "node:os";
 import path from "node:path";
 import { Duplex, PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -291,7 +291,7 @@ describe("unified shell", () => {
     const h = await harness();
     h.stdin.type("/jo");
     expect(h.shell.model.menu.map((command) => command.name)).toEqual(["join"]);
-    expect(h.frame()).toContain("/join --host h:p --code c --repo r [--manual]");
+    expect(h.frame()).toContain("/join <code> <host:port> [--manual]");
     // Tab accepts with a trailing space because /join takes arguments.
     h.stdin.type("\t");
     expect(h.shell.model.input).toBe("/join ");
@@ -316,11 +316,9 @@ describe("unified shell", () => {
     await h.shell.submit("/start --yes --repo app");
     expect(h.fake.calls.master).toHaveLength(1);
     expect(h.scrollback()).toContain("join code: 1234-5678-9012");
+    expect(h.scrollback()).toContain("paste into skep: /join 1234-5678-9012 192.168.1.20:7419");
     expect(h.scrollback()).toContain(
-      "paste into skep: /join --host 192.168.1.20:7419 --code 1234-5678-9012 --repo app",
-    );
-    expect(h.scrollback()).toContain(
-      "skep session join --host 192.168.1.20:7419 --code 1234-5678-9012 --repo app",
+      "skep session join --code 1234-5678-9012 --host 192.168.1.20:7419",
     );
     expect(h.scrollback()).not.toContain("peers dial");
     expect(h.frame()).toContain("master · code 1234-5678-9012");
@@ -337,14 +335,10 @@ describe("unified shell", () => {
     await h.shell.submit("/start --yes --repo app --advertise 203.0.113.7:7419");
     expect(h.scrollback()).toContain("session master listening on 192.168.1.20:7419 (repo app)");
     expect(h.scrollback()).toContain("peers dial 203.0.113.7:7419");
-    expect(h.scrollback()).toContain(
-      "paste into skep: /join --host 203.0.113.7:7419 --code 1234-5678-9012 --repo app",
-    );
+    expect(h.scrollback()).toContain("paste into skep: /join 1234-5678-9012 203.0.113.7:7419");
     // A rotated code comes with a fresh paste line on the advertise address.
     h.fake.calls.master[0]?.onJoinCode?.({ code: "999988887777", expiresAtMs: 0 });
-    expect(h.scrollback()).toContain(
-      "paste: /join --host 203.0.113.7:7419 --code 9999-8888-7777 --repo app",
-    );
+    expect(h.scrollback()).toContain("paste: /join 9999-8888-7777 203.0.113.7:7419");
     await h.shell.quit();
   });
 
@@ -365,13 +359,9 @@ describe("unified shell", () => {
       await h.shell.submit("/start --yes --repo app");
       expect(ports).toEqual([7419, 7420]);
       expect(h.scrollback()).toContain("session master listening on 192.168.1.20:7420");
-      expect(h.scrollback()).toContain(
-        "/join --host 192.168.1.20:7420 --code 1234-5678-9012 --repo app",
-      );
+      expect(h.scrollback()).toContain("/join 1234-5678-9012 192.168.1.20:7420");
       h.fake.calls.master[0]?.onJoinCode?.({ code: "999988887777", expiresAtMs: 0 });
-      expect(h.scrollback()).toContain(
-        "/join --host 192.168.1.20:7420 --code 9999-8888-7777 --repo app",
-      );
+      expect(h.scrollback()).toContain("/join 9999-8888-7777 192.168.1.20:7420");
       await h.shell.submit("/clean");
       expect(h.shell.session.snapshot().mode).toBe("none");
       await expect(readFile(path.join(h.dir, "session.json"))).rejects.toThrow(/ENOENT/);
@@ -425,11 +415,18 @@ describe("unified shell", () => {
     await h.shell.quit();
   });
 
-  it("pastes a repo with spaces as one quoted word that /join reads back", async () => {
+  it("names a repo with spaces as prose and still takes it as a quoted --repo override", async () => {
     const h = await harness();
     await h.shell.submit('/start --yes --repo "my app"');
-    expect(h.scrollback()).toContain('--code 1234-5678-9012 --repo "my app"');
-    expect(h.scrollback()).toContain("--repo 'my app'");
+    // The repo is prose now; the paste line carries only the code and the host.
+    expect(h.scrollback()).toContain(
+      'from a checkout of "my app", paste into skep: /join 1234-5678-9012 192.168.1.20:7419',
+    );
+    const printed = h
+      .scrollback()
+      .split("\n")
+      .filter((line) => !line.startsWith("> "));
+    expect(printed.join("\n")).not.toContain("--repo");
     await h.shell.submit("/clean");
     await h.shell.submit('/join --host 192.168.1.20:7419 --code 1234-5678-9012 --repo "my app"');
     expect(h.fake.calls.sub[0]?.code).toBe("123456789012");
@@ -501,7 +498,7 @@ describe("unified shell", () => {
     expect(h.fake.calls.intents).toEqual([]);
     expect(h.scrollback()).toContain("no peers joined yet");
     expect(h.scrollback()).toMatch(
-      /nothing can take this intent\n.*\/join --host 192\.168\.1\.20:7419 --code 1234-5678-9012 --repo app/,
+      /nothing can take this intent\n.*\/join 1234-5678-9012 192\.168\.1\.20:7419/,
     );
     await h.shell.quit();
   });
@@ -537,7 +534,7 @@ describe("unified shell", () => {
       "Peer peer-2 (mac) left: heartbeat_timeout: no heartbeat for 30 s",
     );
     expect(h.scrollback()).toContain(
-      "it can rejoin with the current code: /join --host 192.168.1.20:7419 --code 1234-5678-9012 --repo app",
+      "it can rejoin with the current code: /join 1234-5678-9012 192.168.1.20:7419",
     );
     // Routine progress events never reach the scrollback.
     h.fake.calls.master[0]?.onEvent?.({ kind: "progress", message: "peer-2" });
@@ -721,13 +718,35 @@ describe("unified shell", () => {
     }
   });
 
+  it("joins with just the slim paste: repo and device come from the checkout and hostname", async () => {
+    const hostname = vi.spyOn(os, "hostname").mockReturnValue("Kris-MacBook.local");
+    let checkout = "";
+    const h = await harness(undefined, async (dir) => {
+      checkout = path.join(dir, "my-repo");
+      await mkdir(checkout);
+      await execFileChecked("git", ["init", "--quiet", checkout]);
+      return { cwd: checkout };
+    });
+    try {
+      await h.shell.submit("/join 1234-5678-9012 192.168.1.20:7419");
+      const sub = h.fake.calls.sub[0];
+      expect(sub?.code).toBe("123456789012");
+      expect(sub?.target).toEqual({ host: "192.168.1.20", port: 7419 });
+      expect(sub?.device).toBe("kris-macbook-local");
+      expect((await sub?.describe())?.repo).toBe("my-repo");
+    } finally {
+      hostname.mockRestore();
+      await h.shell.quit();
+    }
+  });
+
   it("joins in auto mode by default and says so; --manual opts out", async () => {
     const h = await harness();
-    await h.shell.submit("/join --host 192.168.1.20:7419 --code 1234-5678-9012 --repo app");
+    await h.shell.submit("/join 1234-5678-9012 192.168.1.20:7419 --repo app");
     expect(h.scrollback()).toContain("as peer-1 (auto: master drives work; submit: none)");
     await h.shell.submit("/clean");
     await h.shell.submit(
-      "/join --host 192.168.1.20:7419 --code 1234-5678-9012 --repo app --manual --submit none",
+      "/join 1234-5678-9012 192.168.1.20:7419 --repo app --manual --submit none",
     );
     expect(h.scrollback()).toContain(
       "as peer-1 (manual: you confirm each item before it runs; submit: none)",
@@ -738,7 +757,7 @@ describe("unified shell", () => {
   it("/clean drops manual item questions, also the one queued behind the first", async () => {
     const h = await harness();
     await h.shell.submit(
-      "/join --host 192.168.1.20:7419 --code 1234-5678-9012 --repo app --manual --submit none",
+      "/join 1234-5678-9012 192.168.1.20:7419 --repo app --manual --submit none",
     );
     const sub = h.fake.calls.sub[0];
     if (sub === undefined) throw new Error("no join");
@@ -799,7 +818,7 @@ describe("unified shell", () => {
     await new Promise((resolve) => setImmediate(resolve));
     expect(h.scrollback()).toContain("left the session (heartbeat_timeout: no heartbeat for 30 s");
     expect(h.scrollback()).toContain("ask the master for its current code");
-    expect(h.scrollback()).toContain("/join --host 192.168.1.20:7419 --code <code> --repo app");
+    expect(h.scrollback()).toContain("/join <code> 192.168.1.20:7419");
     expect(h.shell.model.peers).toEqual([]);
     expect(h.shell.model.header.session).toBe("no session");
     // A late relay from the dead flow must not bring the row back.
@@ -1231,7 +1250,7 @@ describe("/clean", () => {
 describe("SESSION-UX shell copy", () => {
   it("/join names the agent, says it edits the folder, and /clean leaves nothing on disk", async () => {
     const h = await harness();
-    await h.shell.submit("/join --host 192.168.1.20:7419 --code 1234-5678-9012 --repo app");
+    await h.shell.submit("/join 1234-5678-9012 192.168.1.20:7419 --repo app");
     expect(h.scrollback()).toContain(
       `agent: claude (found on PATH) · mode: edits this folder directly (${h.dir})`,
     );
@@ -1249,7 +1268,7 @@ describe("SESSION-UX shell copy", () => {
   it("a /join without any agent fails with one cause and one fix, and stays unjoined", async () => {
     const h = await harness();
     await rm(path.join(h.dir, "bin", "claude"));
-    await h.shell.submit("/join --host 192.168.1.20:7419 --code 1234-5678-9012 --repo app");
+    await h.shell.submit("/join 1234-5678-9012 192.168.1.20:7419 --repo app");
     expect(h.scrollback()).toContain(
       "join failed: no agent CLI found (looked for claude, codex, pi on PATH)\n" +
         "fix: install one, or pass --agent <claude|codex|pi> (in the skep shell: /agent <cli>)",
@@ -1271,13 +1290,11 @@ describe("SESSION-UX shell copy", () => {
     await h.shell.submit("/agent");
     expect(h.scrollback()).toContain(`agent: codex (saved in ${toml})`);
     await writeFile(path.join(h.dir, "bin", "codex"), "#!/bin/sh\n", { mode: 0o755 });
-    await h.shell.submit("/join --host 192.168.1.20:7419 --code 1234-5678-9012 --repo app");
+    await h.shell.submit("/join 1234-5678-9012 192.168.1.20:7419 --repo app");
     expect(h.scrollback()).toContain("agent: codex (from /agent) · mode: edits this folder");
     await h.shell.submit("/clean");
     // The pre-SESSION-UX spelling is refused with its replacement.
-    await h.shell.submit(
-      "/join --host 192.168.1.20:7419 --code 1234-5678-9012 --repo app --agent pty",
-    );
+    await h.shell.submit("/join 1234-5678-9012 192.168.1.20:7419 --agent pty");
     expect(h.scrollback()).toContain("--agent pty is now --view pty");
     await h.shell.quit();
   });

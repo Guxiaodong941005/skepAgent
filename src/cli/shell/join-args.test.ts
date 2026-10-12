@@ -81,44 +81,46 @@ describe("parseJoinArgs", () => {
   });
 
   it("leads its usage with the line a master prints to paste", () => {
-    expect(JOIN_USAGE.split("\n")[0]).toBe(
-      "usage: /join --host <host:port> --code <NNNN-NNNN-NNNN> --repo <repo>",
+    const lines = JOIN_USAGE.split("\n");
+    expect(lines[0]).toBe("usage: /join <NNNN-NNNN-NNNN> <host:port>");
+    expect(lines[1]).toBe("       /join --code <NNNN-NNNN-NNNN> --host <host:port>");
+    // --repo and --device are optional overrides, never part of a usage form.
+    expect(lines.filter((line) => line.includes("/join")).join("\n")).not.toMatch(
+      /--repo|--device/,
     );
+    expect(JOIN_USAGE).toMatch(/optional: --repo <name>, --device <name>/);
   });
 });
 
 describe("the pasteable /join line round-trips", () => {
-  it.each([
-    "app",
-    "my app",
-    "app --submit push",
-    "app; false",
-    "it's $(rm -rf) `x` | y & z",
-    'quote " and back\\slash',
-    "--manual",
-    "-x",
-    "naïve 名前",
-    "  padded  ",
-  ])("repo %j", (repo) => {
-    const line = formatJoinPaste({ host: "[fe80::1]:7419", code: "863217270308", repo });
-    expect(line.startsWith("/join ")).toBe(true);
-    expect(parseJoinArgs(line.slice("/join ".length))).toEqual({
-      host: "[fe80::1]:7419",
-      code: "8632-1727-0308",
-      repo,
-    });
-  });
+  it.each(["h:1", "203.0.113.7:7419", "[fe80::1]:7419", "[::1]:7419", "master.lan:7419"])(
+    "host %j",
+    (host) => {
+      const line = formatJoinPaste({ host, code: "863217270308" });
+      expect(line.startsWith("/join ")).toBe(true);
+      expect(parseJoinArgs(line.slice("/join ".length))).toEqual({
+        host,
+        code: "8632-1727-0308",
+      });
+    },
+  );
 
-  it("keeps a plain repo bare", () => {
-    expect(formatJoinPaste({ host: "h:1", code: "863217270308", repo: "skep-agent" })).toBe(
-      "/join --host h:1 --code 8632-1727-0308 --repo skep-agent",
+  it("is just the code and the host: repo and device come from the joiner", () => {
+    expect(formatJoinPaste({ host: "203.0.113.7:7419", code: "863217270308" })).toBe(
+      "/join 8632-1727-0308 203.0.113.7:7419",
     );
   });
 
-  it("leaves out a repo the input box cannot take, and says why", () => {
-    const target = { host: "h:1", code: "863217270308", repo: "a\nb" };
-    expect(formatJoinPaste(target)).toBe("/join --host h:1 --code 8632-1727-0308");
-    expect(joinHint(target)).toContain('(repo "a\\nb" cannot be pasted: join from that checkout');
+  it("names the master's repo as prose, never as a --repo flag", () => {
+    const hint = joinHint({ host: "h:1", code: "863217270308", repo: "skep-agent" });
+    expect(hint).toBe(
+      "on another device, from a checkout of skep-agent, paste into skep: " +
+        "/join 8632-1727-0308 h:1\n" +
+        "or from a shell: skep session join --code 8632-1727-0308 --host h:1",
+    );
+    const odd = joinHint({ host: "h:1", code: "863217270308", repo: "a\nb" });
+    expect(odd).toContain('from a checkout of "a\\nb"');
+    expect(odd).not.toContain("--repo");
   });
 
   it("refuses an unterminated quote", () => {

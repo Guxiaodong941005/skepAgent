@@ -108,7 +108,7 @@ describe("SessionController", () => {
     const refused = session.intentRoute();
     expect(refused.kind).toBe("refused");
     expect(refused.kind === "refused" && refused.message).toContain(
-      "/join --host 192.168.1.20:7419 --code 1234-5678-9012 --repo app",
+      "/join 1234-5678-9012 192.168.1.20:7419",
     );
     peers.push(vps);
     expect(session.snapshot().peers).toEqual([
@@ -231,15 +231,15 @@ describe("texts", () => {
     expect(noMatchText(status(), ["app"])).toContain("no peers joined yet");
   });
 
-  it("gives the pasteable /join line, with the repo, when no peer joined", () => {
+  it("gives the slim /join line, naming the repo as prose, when no peer joined", () => {
     const text = noPeersText("203.0.113.7:7419", "123456789012", "app");
-    expect(text).toContain(
-      "paste into skep: /join --host 203.0.113.7:7419 --code 1234-5678-9012 --repo app",
+    expect(text).toContain("paste into skep: /join 1234-5678-9012 203.0.113.7:7419");
+    expect(text).toContain("skep session join --code 1234-5678-9012 --host 203.0.113.7:7419");
+    expect(text).toContain("from a checkout of app,");
+    expect(text).not.toContain("--repo");
+    expect(noPeersText("h:1", null, "app")).toContain(
+      "on another device, from a checkout of app: /join <code> h:1",
     );
-    expect(text).toContain(
-      "skep session join --host 203.0.113.7:7419 --code 1234-5678-9012 --repo app",
-    );
-    expect(noPeersText("h:1", null, "app")).toContain("/join --host h:1 --code <code> --repo app");
   });
 
   it("refuses an intent without peers with the advertise address, not the bind", () => {
@@ -248,9 +248,7 @@ describe("texts", () => {
     const route = session.intentRoute();
     expect(route.kind).toBe("refused");
     if (route.kind !== "refused") return;
-    expect(route.message).toContain(
-      "/join --host 203.0.113.7:7419 --code 1234-5678-9012 --repo app",
-    );
+    expect(route.message).toContain("/join 1234-5678-9012 203.0.113.7:7419");
     expect(route.message).not.toContain("192.168.1.20");
   });
 });

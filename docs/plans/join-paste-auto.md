@@ -2,6 +2,9 @@
 
 Status: implemented on `feat/join-paste-auto`. Target release: next patch (do **not** bump yet).
 
+> The paste-line format below is superseded by [`join-slim.md`](join-slim.md): the line is now
+> `/join <code> <host:port>`, without `--repo`.
+
 ## Problem
 
 Trial use showed two gaps.
