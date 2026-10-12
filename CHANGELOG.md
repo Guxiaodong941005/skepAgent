@@ -11,6 +11,11 @@ protocol rules ([`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §4.4) apply to t
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-10-12
+
+Per-project session isolation and automatic port picking so several projects can run
+skep on the same machine without sharing `~/.skep` or colliding on port 7419.
+
 ### Added
 
 * Automatic project isolation: default state lives in `~/.skep/projects/<projectId>`, where
@@ -342,7 +347,8 @@ creates the npm org `skepagent` and explicitly says go. See [`docs/RELEASE.md`](
 * Manual lease revoke; no auto-merge. The human holds plan approval, escalation decisions and
   merges.
 
-[Unreleased]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.8...HEAD
+[Unreleased]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.9...HEAD
+[0.1.9]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.5...v0.1.6

@@ -2,8 +2,35 @@
 
 This document records the package-name decision (v0.1.0), the npm registry re-check, the
 v0.1.0 checklist, the v0.1.1 session-TUI notes, the v0.1.5 peer-progress and TUI notes, the
-v0.1.8 join-UX notes, and the steps the orchestrator runs. Task agents must not `git push`,
+v0.1.8 join-UX notes, the v0.1.9 per-project isolation notes, and the steps the orchestrator runs. Task agents must not `git push`,
 create tags, or `npm publish`.
+
+## v0.1.9 — per-project isolation (2026-10-12)
+
+The human ordered this release as **0.1.9**. Package name stays **`@skepagent/skep`**
+(public). The published bin is `skep`.
+
+What this tag adds on top of v0.1.8 (details in [`../CHANGELOG.md`](../CHANGELOG.md)):
+
+* **Per-project session home**: default state lives in `~/.skep/projects/<projectId>`, hashed
+  from the canonical Git toplevel (or cwd outside Git). Same-project terminals keep local
+  discovery and bare `/join`. Explicit `--home` / `SKEP_HOME` remain exact. The legacy global
+  home is not auto-migrated.
+* **Automatic port picking**: starts without `--listen` try LAN IPv4 port 7419, then available
+  ports through 7519. Advertise and pasteable joins use the actual bound port; explicit
+  `--listen` is never silently changed.
+* **Clearer start errors** when a shared home or port collides.
+
+Compatibility: upgrade both devices. Wire protocol unchanged; state paths and default ports
+differ per project directory.
+
+Install:
+
+```bash
+npm install -g @skepagent/skep@0.1.9
+```
+
+---
 
 ## v0.1.8 — join UX, clean, submit none, summary (2026-10-10)
 
