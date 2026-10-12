@@ -3,9 +3,10 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { Duplex, PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { skepHome, skepPaths } from "../../config/paths.js";
-import { ListenAddressError } from "../../session/index.js";
+import { connectSub, ListenAddressError, startMaster } from "../../session/index.js";
 import type { Clock } from "../../util/clock.js";
 import { execFileChecked } from "../../util/exec.js";
 import {
@@ -619,6 +620,75 @@ describe("unified shell", () => {
     await h.shell.submit("/status");
     expect(h.scrollback()).toContain("joined 192.168.30.182:7419 as peer-1 (role coding)");
     await h.shell.quit();
+  });
+
+  it("keeps peer-2 joined after an intent with the same device name and a non-git cwd", async () => {
+    const master = await startMaster({
+      device: "mac",
+      repo: "proj-a",
+      controlToken: "0".repeat(32),
+      acceptJoin: async () => true,
+      onJoinCode: () => {},
+    });
+    const connectPeer: SessionApi["connectSub"] = ({ target: _target, ...options }) => {
+      const toMaster = new PassThrough();
+      const toPeer = new PassThrough();
+      master.attach(Duplex.from({ readable: toMaster, writable: toPeer }), {
+        address: "127.0.0.1",
+        family: "IPv4",
+      });
+      return connectSub({
+        ...options,
+        stream: Duplex.from({ readable: toPeer, writable: toMaster }),
+        progressIntervalMs: 0,
+      });
+    };
+    let first: SubHandle | undefined;
+    let h: Awaited<ReturnType<typeof harness>> | undefined;
+    try {
+      const code = master.status().joinCode;
+      if (code === null) throw new Error("master has no join code");
+      first = await connectPeer({
+        code,
+        device: "mac",
+        describe: async () => ({ repo: "proj-c", role: "coding", head: "a".repeat(40) }),
+        collectDatalist: async () => [],
+        onItem: async () => null,
+      });
+      h = await harness(undefined, async (dir) => {
+        const peerDir = path.join(dir, "proj-b");
+        await mkdir(peerDir);
+        return { cwd: peerDir, sessionApi: { startMaster, connectSub: connectPeer } };
+      });
+      const peer = h;
+      const currentCode = master.status().joinCode;
+      if (currentCode === null) throw new Error("master has no join code");
+      await peer.shell.submit(
+        `/join --host example.com:7419 --code ${currentCode} --repo proj-a --device mac`,
+      );
+      expect(peer.shell.session.snapshot().join?.peerId).toBe("peer-2");
+      await peer.shell.submit("add a health check");
+      expect(peer.scrollback()).toContain("type intents in the master's shell");
+      await expect(master.submitIntent("add a health check")).resolves.toEqual({
+        intentId: "intent-1",
+      });
+      await vi.waitFor(() => expect(master.status().intents[0]?.items[0]?.state).toBe("done"));
+      expect(master.status().peers).toHaveLength(2);
+      expect(master.status().intents[0]?.items[0]).toMatchObject({
+        assignee: "peer-2",
+        datalistEntries: 0,
+        result: { checks: [{ name: "git", status: "fail" }], submit: { state: "failed" } },
+      });
+      expect(peer.shell.session.snapshot().mode).toBe("joined");
+      expect(peer.scrollback()).toContain("cannot read this directory's Git HEAD");
+      expect(peer.scrollback()).toContain("sending an empty datalist");
+      expect(peer.scrollback()).not.toContain("callback_error");
+      expect(peer.scrollback()).not.toContain("left the session");
+    } finally {
+      await h?.shell.quit();
+      await first?.close();
+      await master.close();
+    }
   });
 
   it("joins in auto mode by default and says so; --manual opts out", async () => {
