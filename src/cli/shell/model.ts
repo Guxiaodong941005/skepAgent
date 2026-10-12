@@ -39,7 +39,15 @@ const WRAPPED_TONES: ReadonlySet<ShellTone> = new Set(["warn", "error"]);
 /** Continuation rows of a wrapped line sit this much deeper than its first row. */
 const HANGING_INDENT = "    ";
 /** A footer row; `silentMs` is the time since the peer was last heard from, when known. */
-export type ShellPeer = JoinViewModel["peers"][number] & { silentMs?: number };
+/** `repo` is known only for a master's own roster (from its status), never for a joined shell. */
+export type ShellPeer = JoinViewModel["peers"][number] & { silentMs?: number; repo?: string };
+
+/** The multi-peer picker shown after an intent when several peers could take it (INTENT-PEER). */
+export interface ShellPicker {
+  title: string;
+  rows: { label: string; selected: boolean }[];
+  cursor: number;
+}
 
 export interface ShellHeader {
   device: string;
@@ -72,6 +80,8 @@ export class ShellModel {
   beat = 0;
   /** A pending question takes the input; the prompt shows it. */
   question: string | null = null;
+  /** While set, the picker takes the keys and replaces the command menu above the input. */
+  picker: ShellPicker | null = null;
   version: string | null = SKEP_VERSION;
   /**
    * Width and body height of the last frame. A wrapped entry spans several rows, so scrolling is
@@ -157,7 +167,8 @@ export class ShellModel {
     // A resize changes how many rows the scrollback wraps into.
     this.scroll = Math.min(this.scroll, this.maxScroll());
     const body = this.bodyLines(bodyRows, columns);
-    const menu = bodyRows === 0 ? [] : this.menuLines().slice(-bodyRows);
+    const overlay = this.picker === null ? this.menuLines() : this.pickerLines(this.picker);
+    const menu = bodyRows === 0 ? [] : overlay.slice(-bodyRows);
     body.splice(body.length - menu.length, menu.length, ...menu);
     const out = [...lines, ...body, input, rule, ...bee, hint];
     return out.map((line) =>
@@ -203,6 +214,18 @@ export class ShellModel {
         fill: true,
       };
     });
+  }
+
+  private pickerLines(picker: ShellPicker): Line[] {
+    const mark = (selected: boolean) => (selected ? "[x]" : "[ ]");
+    return [
+      { spans: [bold(`  ${picker.title}`, "primary")] },
+      ...picker.rows.map((row, index) => ({
+        spans: [{ text: `  ${mark(row.selected)} ${row.label}` }],
+        selected: index === picker.cursor,
+        fill: true,
+      })),
+    ];
   }
 
   private inputLine(columns: number, prompt: string): Line {
@@ -279,15 +302,22 @@ export class ShellModel {
   private hintLine(): Line {
     const separator = chrome(this.glyphs).sep;
     const keys =
-      this.question !== null
-        ? ["enter answer", "ctrl+c clear"]
-        : this.menu.length > 0
-          ? [
-              this.glyphs === "nerd" ? "↑↓ select" : "up/down select",
-              "tab/enter accept",
-              "esc close",
-            ]
-          : ["/ commands", "enter send", "pgup/pgdn scroll", "ctrl+c clear", "/quit"];
+      this.picker !== null
+        ? [
+            this.glyphs === "nerd" ? "↑↓ move" : "up/down move",
+            "space toggle",
+            "enter send",
+            "esc cancel",
+          ]
+        : this.question !== null
+          ? ["enter answer", "ctrl+c clear"]
+          : this.menu.length > 0
+            ? [
+                this.glyphs === "nerd" ? "↑↓ select" : "up/down select",
+                "tab/enter accept",
+                "esc close",
+              ]
+            : ["/ commands", "enter send", "pgup/pgdn scroll", "ctrl+c clear", "/quit"];
     return { spans: [fg("on-surface-variant", `  ${keys.join(separator)}`)] };
   }
 }

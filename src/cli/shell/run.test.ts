@@ -19,7 +19,7 @@ import {
   type SubHandle,
   type SubOptions,
 } from "../commands/session.js";
-import { parseFlags, Shell, type ShellCliContext } from "./run.js";
+import { parseFlags, parseIntentArgs, Shell, type ShellCliContext } from "./run.js";
 
 type MasterPeer = ReturnType<MasterHandle["status"]>["peers"][number];
 
@@ -93,10 +93,16 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
 function fakeApi(address = { host: "192.168.1.20", port: 7419 }) {
   let masterClosed = deferred<void>();
   const subClosed = deferred<{ reason: string }>();
-  const calls: { master: MasterOptions[]; sub: SubOptions[]; intents: string[] } = {
+  const calls: {
+    master: MasterOptions[];
+    sub: SubOptions[];
+    intents: string[];
+    intentRepos: (string[] | undefined)[];
+  } = {
     master: [],
     sub: [],
     intents: [],
+    intentRepos: [],
   };
   /** Peers the fake master reports in `status()`; tests push into it. */
   const peers: MasterPeer[] = [];
@@ -126,8 +132,9 @@ function fakeApi(address = { host: "192.168.1.20", port: 7419 }) {
           peers: peers.map((peer) => ({ ...peer })),
           intents: intents.map((intent) => ({ ...intent })),
         }),
-        submitIntent: async (text) => {
+        submitIntent: async (text, repos) => {
           calls.intents.push(text);
+          calls.intentRepos.push(repos);
           if (intentError !== null) throw intentError;
           return { intentId: "N-1" };
         },
@@ -488,6 +495,76 @@ describe("unified shell", () => {
     await h.shell.submit("add a health check");
     expect(h.fake.calls.intents).toEqual(["add a health check"]);
     expect(h.scrollback()).toContain("intent N-1 routed: add a health check");
+    await h.shell.quit();
+  });
+
+  it("passes /intent --repo to the master as the intent's repos (INTENT-PEER)", async () => {
+    const h = await harness();
+    await h.shell.submit("/start --yes --repo futrobomower");
+    h.fake.peers.push(peer("peer-1", "vps", "skepAgent"));
+    await h.shell.submit("/intent --repo skepAgent hello");
+    expect(h.fake.calls.intents).toEqual(["hello"]);
+    expect(h.fake.calls.intentRepos).toEqual([["skepAgent"]]);
+    expect(h.scrollback()).toContain("intent N-1 routed: hello (repo skepAgent)");
+    await h.shell.quit();
+  });
+
+  it("sends a bare intent to a lone peer without asking which peer", async () => {
+    const h = await harness();
+    await h.shell.submit("/start --yes --repo futrobomower");
+    h.fake.peers.push(peer("peer-1", "vps", "skepAgent"));
+    await h.shell.submit("/intent view branch");
+    await h.shell.submit("view branch --repo x");
+    // Free text is never flag-parsed.
+    expect(h.fake.calls.intents).toEqual(["view branch", "view branch --repo x"]);
+    expect(h.fake.calls.intentRepos).toEqual([undefined, undefined]);
+    expect(h.shell.model.picker).toBeNull();
+    await h.shell.quit();
+  });
+
+  it("asks which peers take an intent when several are connected", async () => {
+    const h = await harness();
+    await h.shell.submit("/start --yes --repo app");
+    h.fake.peers.push(peer("peer-1", "vps", "api"), peer("peer-2", "mac", "web"));
+    const sent = h.shell.submit("add a health check");
+    await vi.waitFor(() => expect(h.shell.model.picker).not.toBeNull());
+    expect(h.frame()).toMatch(/\[ \] peer-1\s+vps\s+api/);
+    expect(h.frame()).toMatch(/\[ \] peer-2\s+mac\s+web/);
+    // Enter with nothing selected does nothing.
+    h.stdin.type("\r");
+    expect(h.shell.model.picker).not.toBeNull();
+    h.stdin.type(" ");
+    h.stdin.type("\x1b[B");
+    h.stdin.type(" ");
+    expect(h.frame()).toMatch(/\[x\] peer-2/);
+    h.stdin.type("\r");
+    await sent;
+    expect(h.shell.model.picker).toBeNull();
+    expect(h.fake.calls.intents).toEqual(["add a health check"]);
+    expect(h.fake.calls.intentRepos).toEqual([["api", "web"]]);
+    await h.shell.quit();
+  });
+
+  it("sends nothing when the peer picker is cancelled", async () => {
+    const h = await harness();
+    await h.shell.submit("/start --yes --repo app");
+    h.fake.peers.push(peer("peer-1", "vps", "api"), peer("peer-2", "mac", "web"));
+    const sent = h.shell.submit("/intent add a health check");
+    await vi.waitFor(() => expect(h.shell.model.picker).not.toBeNull());
+    h.stdin.type(" ");
+    h.stdin.type("\x1b");
+    await sent;
+    expect(h.fake.calls.intents).toEqual([]);
+    expect(h.scrollback()).toContain("intent cancelled");
+    await h.shell.quit();
+  });
+
+  it("skips the picker when /intent names its repos", async () => {
+    const h = await harness();
+    await h.shell.submit("/start --yes --repo app");
+    h.fake.peers.push(peer("peer-1", "vps", "api"), peer("peer-2", "mac", "web"));
+    await h.shell.submit("/intent --repo web add a health check");
+    expect(h.fake.calls.intentRepos).toEqual([["web"]]);
     await h.shell.quit();
   });
 
@@ -1397,5 +1474,25 @@ describe("long results in the shell (SESSION-UX R7, R8)", () => {
     expect(frame).toContain("line 11");
     for (const row of frame.split("\n")) expect(row.length).toBeLessThanOrEqual(80);
     await h.shell.quit();
+  });
+});
+
+describe("parseIntentArgs", () => {
+  it("takes repeatable --repo anywhere and keeps the rest as text", () => {
+    expect(parseIntentArgs("--repo skepAgent hello")).toEqual({
+      text: "hello",
+      repos: ["skepAgent"],
+    });
+    expect(parseIntentArgs("--repo=a fix  the bug --repo b")).toEqual({
+      text: "fix  the bug",
+      repos: ["a", "b"],
+    });
+    expect(parseIntentArgs("--repo a --repo a x")).toEqual({ text: "x", repos: ["a"] });
+    expect(parseIntentArgs("plain text")).toEqual({ text: "plain text" });
+  });
+
+  it("rejects --repo without a value", () => {
+    expect(() => parseIntentArgs("hello --repo")).toThrow("--repo needs a value");
+    expect(() => parseIntentArgs("--repo --x hello")).toThrow("--repo needs a value");
   });
 });

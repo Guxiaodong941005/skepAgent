@@ -226,6 +226,8 @@ interface Intent {
   intentId: string;
   text: string;
   repos: string[];
+  /** The caller named the repos; an unmatched explicit repo is never rerouted. */
+  explicitRepos: boolean;
   state: "open" | "no_match" | "planned";
   items: ItemStatus[];
   waiting: Set<string>;
@@ -382,6 +384,7 @@ class SessionMaster implements MasterHandle {
         intentId: `intent-${++this.intentSeq}`,
         text: new Redactor().redact(input.text),
         repos: [...new Set(input.repos ?? [this.options.repo])],
+        explicitRepos: input.repos !== undefined,
         state: "open",
         items: [],
         waiting: new Set(this.peers.keys()),
@@ -712,6 +715,18 @@ class SessionMaster implements MasterHandle {
           cancel: () => {},
         });
     }
+    // A bare intent defaults to the master's repo, but a lone peer working on another repo is
+    // still the only possible assignee, so route the work to that peer's repo (INTENT-PEER).
+    const sole = candidates[0];
+    if (!intent.requests.length && !intent.explicitRepos && candidates.length === 1 && sole) {
+      intent.requests.push({
+        requestId: `request-${++this.requestSeq}`,
+        candidate: sole,
+        done: false,
+        entries: 0,
+        cancel: () => {},
+      });
+    }
     if (!intent.requests.length) {
       intent.state = "no_match";
       intent.reject(new NoMatchError(intent.repos, this.peers.size));
@@ -739,8 +754,10 @@ class SessionMaster implements MasterHandle {
       intent.requests.some((request) => !request.done)
     )
       return;
+    // Plan the repos that were actually routed, which may differ from the requested ones after
+    // the lone-peer fallback.
     const items = buildPlan(
-      intent,
+      { text: intent.text, repos: intent.requests.map((request) => request.candidate.repo) },
       this.options.repo,
       intent.requests.map((request) => request.candidate),
       {

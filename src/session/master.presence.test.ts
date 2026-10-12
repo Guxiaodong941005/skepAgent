@@ -42,13 +42,13 @@ afterEach(async () => {
   await Promise.all(masters.splice(0).map((master) => master.close()));
 });
 
-async function setup(subRepo = "app") {
+async function setup(subRepo = "app", masterRepo = "app") {
   const clock = new ManualClock();
   const events: { kind: string; message: string }[] = [];
   const master = await startMaster({
     listen: { host: "127.0.0.1", port: 0 },
     device: "mac",
-    repo: "app",
+    repo: masterRepo,
     controlToken: TOKEN,
     acceptJoin: async () => true,
     onJoinCode: () => {},
@@ -124,10 +124,10 @@ describe("no_match", () => {
     );
   });
 
-  it("names the repo when no connected peer works on it", async () => {
+  it("names the explicit repo when no connected peer works on it", async () => {
     const { master, join } = await setup("api");
     await join();
-    await expect(master.submitIntent("add a health check")).rejects.toThrow(
+    await expect(master.submitIntent("add a health check", ["app"])).rejects.toThrow(
       "None of the 1 connected peer(s) works on repo app",
     );
   });
@@ -146,5 +146,35 @@ describe("no_match", () => {
       ok: false,
       error: { code: "no_match", message: expect.stringMatching(/No peers have joined/) },
     });
+  });
+});
+
+describe("lone peer routing (INTENT-PEER)", () => {
+  it("routes a bare intent to the only peer even when its repo differs", async () => {
+    const { master, join } = await setup("skepAgent", "futrobomower");
+    await join();
+    await expect(master.submitIntent("view branch")).resolves.toEqual({ intentId: "intent-1" });
+    await until(() => master.status().intents[0]?.state === "planned");
+    expect(master.status().intents[0]?.items).toEqual([
+      expect.objectContaining({ repo: "skepAgent", assignee: "peer-1" }),
+    ]);
+  });
+
+  it("routes an explicit --repo naming the lone peer's repo", async () => {
+    const { master, join } = await setup("skepAgent", "futrobomower");
+    await join();
+    await master.submitIntent("view branch", ["skepAgent"]);
+    await until(() => master.status().intents[0]?.state === "planned");
+    expect(master.status().intents[0]?.items).toEqual([
+      expect.objectContaining({ repo: "skepAgent", assignee: "peer-1" }),
+    ]);
+  });
+
+  it("keeps no_match for an explicit repo the lone peer does not work on", async () => {
+    const { master, join } = await setup("skepAgent", "futrobomower");
+    await join();
+    await expect(master.submitIntent("view branch", ["futrobomower"])).rejects.toThrow(
+      "works on repo futrobomower",
+    );
   });
 });
