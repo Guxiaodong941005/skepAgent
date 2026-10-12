@@ -278,3 +278,96 @@ Leftover risks and notes:
   back to the same content by hand counts as unchanged. Pre-existing edits in a changed file
   are still submitted whole (N4, unchanged).
 - R1 still trusts the project root itself: a root that is a symlink is resolved once, as before.
+
+## Fix round re-review
+
+Date: 2026-10-12. Reviewer: Codex. Branch: `feat/session-ux-rethink`.
+Reviewed `0320f78..c2a5e57`: `796c438` (R1-R8 implementation), `7843b2c` (fix report),
+and `c2a5e57` (blocked-settle abort cleanup). The supplied `skep-session-ux-review2`
+workspace includes the cleanup commit; the older `skep-session-ux-review` clone ends at
+`7843b2c`, so this re-review uses the supplied workspace.
+
+**Verdict: FAIL.** The original symlink-target deletion is corrected, and R2, R3, R5,
+R6, R7 and R8 are resolved for their reported cases. Three blocking follow-ups remain:
+undo restores deleted nested files to the wrong path; a blocked-agent wait failure releases
+the queue without stopping the agent; and a blocked run that ultimately changes nothing
+retains its intermediate delta. All 721 tests and lint pass, but omit these cases.
+
+Read the original FAIL and implementer fix round, every commit and changed-file diff in the
+reviewed range, the affected production helpers and regressions, and the SESSION-UX plan,
+BRIEF/READY and relevant ARCHITECTURE/PRD requirements. The prior scope remains Phase 1,
+Phase 2 and Phase 3 undo only. The original review text and findings are retained above.
+
+| Finding | Disposition | Evidence and limits |
+| --- | --- | --- |
+| R1 | Original symlink cases resolved; new undo blocker R9 | Leaf links are hashed, unlinked and recreated as links; parent links and unsupported entry types are refused. The new Git/non-Git link regressions pass. Missing intermediate parents are not covered and cause R9. |
+| R2 | Resolved | Each started run replaces the old record before decline/abort/execution checks. The four two-session regressions refuse undo and submit for the later empty run and preserve the earlier files. Session identity appears in the record and refusal. |
+| R3 | Resolved | Recorded after hashes are checked before submit mutations. Deferred commit/push/PR regressions preserve HEAD, index, branch list and origin on drift; the two-item case submits only the matching later record. MR shares this guard but has no dedicated drift regression. |
+| R4 | Partial; R10/R11 remain | The resumed-success regression holds the queue, records resumed edits and excludes them from the next item's delta. Independent probes show that wait errors still release ownership, and an empty final delta does not replace the intermediate record. |
+| R5 | Resolved | Clean selected paths skip the no-op commit, allowing push. Agent-created commits and none → deferred commit → push → repeat commit are covered and pass. |
+| R6 | Reported failure/pending cases resolved | Submit failures carry FAILED, cause/fix and an uncapped SUBMIT FAILED block. Verdict/roll-up and two-peer tests distinguish submit failure and pending execution and emit no intent-done for either. Declined work has a separate roll-up count. |
+| R7 | Resolved | PgUp/PgDn and append anchoring use rendered rows. The actual shell key test reaches all 500 words; model tests cover 40/80/120 columns and resize clamping. |
+| R8 | Resolved | Status uses full result blocks independently of the success-event cap. The shell wraps result sections for both own and external masters; regressions preserve long failure text and success summaries beyond 600 characters. |
+
+Blocking follow-ups, continuing the original finding numbers:
+
+1. **R9 — P2: Missing parents make undo restore an unrecorded path.**
+   `src/cli/commands/session-delta.ts:519` breaks at the first missing parent, and line 528
+   appends only the leaf to that partial path, dropping any remaining directories.
+   Independent reproduction with the production snapshot/record/undo helpers and a local Git
+   repository: track `a/b/file.txt`, let the item remove directory `a`, record its deletion,
+   then undo without force. `entryPath` returns `a/file.txt`; undo writes the original bytes
+   there and reports `restored: ["a/b/file.txt"]`. The intended file remains absent. The run
+   is marked undone despite failing to restore it. Different deleted paths can also collapse
+   onto the same destination.
+
+   Preserve every validated path component after a missing ancestor while retaining the
+   parent-symlink checks. Add deleted-directory regressions with multiple missing ancestors
+   and equal leaf names in different subdirectories; verify actual destinations and content.
+
+2. **R10 — P2: A wait timeout releases the shared-folder queue while the agent remains live.**
+   `src/cli/commands/session.ts:2376` catches a non-abort wait failure, labels the agent
+   `lost`, records the current delta and resolves the hold. No cancellation or backend close
+   establishes that the first agent stopped. The backend contract explicitly permits wait
+   timeout errors (`docs/DEV-PLAN.md`, SK-620); a wait failure is not execution completion.
+   The production-worker probe returned blocked, then rejected the resumed wait with a timeout.
+   Queued I-2 started while I-1 was still active, with zero backend close calls. This reopens
+   R4's overlap risk through its error path, even though its resumed-success test passes.
+
+   Retain or fence peer execution until termination is confirmed or the run is explicitly
+   cancelled. Add a blocked-first-item regression whose subsequent wait times out or loses
+   contact while the agent can still edit; the second agent must not start in that folder.
+
+3. **R11 — P2: An empty settled delta leaves the blocked run's intermediate record active.**
+   `src/cli/commands/session.ts:2386` rewrites the record only when the final delta is nonempty.
+   The production-worker probe began with `notes.txt = base`, changed it to `interim` before
+   blocking, then restored `base` before returning done. The peer correctly printed
+   `the agent done; no changes`, but I-1's record still contained `notes.txt` with the interim
+   after hash, and `driftedFiles` immediately flagged it. Undo/submit therefore operate on an
+   obsolete intermediate delta rather than this run's final state.
+
+   Replace the record after every successful final comparison, including an empty delta.
+   Add a blocked edit-then-revert regression verifying an empty final record, no-change
+   refusals for undo/submit, and preservation of the folder and Git state.
+
+Validation from the supplied workspace:
+
+| Command/check | Result |
+| --- | --- |
+| `npm run lint && npm test` | PASS: Biome checked 84 files without fixes; TypeScript no-emit passed; 32 test files / 721 tests passed, duration 13.14 s. This reproduces the supplied independent green gate; the user also reports three consecutive full-suite passes after c2a5e57. |
+| `git diff --check 0320f78..c2a5e57` | PASS. |
+| Wire/core/package/config comparison | No changes to messages.ts, src/core, package.json, package-lock.json, tsconfig.json or biome.json. No new dependencies or version bump. |
+| Independent production probes | R9 wrong-path restoration, R10 queue release with a live first agent, and R11 stale intermediate record reproduced. |
+| Abort-cleanup probe | PASS for an abort while the blocked wait is pending: after removing the probe home and draining the queue, the watch neither recreated the home nor emitted settle output. c2a5e57's abort checks fix this observed cleanup path. |
+
+Probes used fake runtime adapters and temporary local repositories inside the supplied clone;
+all probe directories were removed. No implementation or regression test was changed, and no
+real herdr/agent CLI, provider connection or external network was used. The real herdr runtime
+is still absent from this branch, so its wait behavior remains an integration-validation note.
+The disclosed unchanged-wire limitation also remains: the master retains its pending result
+after a blocked run settles; it is not evidence of success. Prior N1-N5 remain applicable.
+
+Only this re-review section was appended. The review artifact is committed locally under the
+repository's AGENTS.md convention. No push, publication or version bump was performed.
+
+**Fix verdict: FAIL.**
