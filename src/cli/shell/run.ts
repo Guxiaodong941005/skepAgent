@@ -572,6 +572,7 @@ export class Shell {
     return [
       ...shown.map((command, i) => `${(labels[i] ?? "").padEnd(width)}  ${command.description}`),
       "text without / is sent as an intent to this device's session master (needs a joined peer)",
+      "/start: different projects select separate homes and available ports automatically",
       "/start: --listen is the address to bind, --advertise the one peers dial (default: listen)",
       "/join: auto by default (master drives work, submit none: changes stay local); --manual",
       "  confirms each item first; --submit pr|mr|push|none|ask overrides device.toml",

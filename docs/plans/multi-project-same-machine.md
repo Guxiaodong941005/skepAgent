@@ -235,3 +235,89 @@ The initial `npm ci` hit a sandbox `EPERM` during esbuild's post-install subproc
 install from a copy of the existing npm cache inside ignored repository scratch storage, with
 lifecycle scripts skipped, succeeded; Vitest, lint, and the build all execute. No dependency or
 package version changed. Changes remain uncommitted as required by the task brief.
+
+## Implemented automatic isolation (PROJ-ISOL)
+
+The diagnosis above records 0.1.8 and the earlier MULTI-PROJ guidance. The new defaults isolate
+projects automatically; the explicit setup above remains supported.
+
+### Chosen design
+
+* Resolve the project root from the invocation's cwd: use the realpath of
+  `git rev-parse --show-toplevel` inside a work tree, otherwise the realpath of cwd. Hash the
+  absolute root string with SHA-256 and use its first 12 hexadecimal characters as the project
+  ID. Subdirectories and symlink aliases of one checkout share an ID; separate checkouts with
+  the same basename have different IDs. Linked Git worktrees have their own toplevel and ID.
+* Resolve home in order: CLI `--home`, nonempty `SKEP_HOME`, then
+  `~/.skep/projects/<projectId>`. Overrides remain exact, without additional nesting. The CLI
+  passes its cwd explicitly to path resolution. All existing `skepPaths(home)` state follows
+  that home, including `session.json`, `session/worktrees`, `session/transcripts`, and
+  `device.toml`; a fresh project's submit policy therefore defaults to `none`.
+* Without `--listen`, try port 7419 on the existing selected LAN IPv4 interface, then scan
+  7420–7519 on that same interface only after an address-in-use error. Bind directly on each
+  attempt rather than checking availability first. Stop after 101 attempts; report exhausted
+  ports with advice to select an unused `--listen` address. Other bind failures surface
+  immediately. An explicit `--listen` gets one attempt and is never rewritten.
+* Publish the actual bound endpoint in the project's pointer. Advertise that endpoint and
+  print it in the full `/join --host ... --code ... --repo ...` line unless `--advertise`
+  explicitly overrides it. Repo routing remains basename / `--repo`, independent of the ID.
+* Keep the live-master guard and token-owned pointer cleanup per home. A second sequential
+  start in the same project is refused. If explicit home overrides make unrelated projects
+  share a home, the same guard applies; the error explains the override and automatic defaults.
+
+### Discovery and migration
+
+Two terminals in the same canonical project root select the same default home: bare `/join`,
+status, intent, and `/clean` discover that project's master as before. A peer in a different
+checkout selects a different home and must paste the master's full join line. A different
+project's `/clean` or status does not affect or discover the first project's pointer.
+
+The legacy global `~/.skep/session.json` is **not auto-migrated** or discovered by the new
+default. To retain the former shared home, launch with `SKEP_HOME="$HOME/.skep"` or
+`skep --home "$HOME/.skep"`. Existing global `device.toml`, trust, and key files are not copied;
+configure each project home or use the explicit legacy home. Opening a shell fixes its context;
+changing directory afterward still does not switch sessions.
+
+This change does not add a master registry, session history, or protocol changes. Starts racing
+in one home still have the pointer publication limitations described above. Git branch names
+remain repository-scoped, and herdr agent names remain shared outside the home namespace;
+independent sessions can still collide there. PTY/native execution and separate clones remain
+the relevant workarounds; broader worker identity isolation is a follow-up.
+
+### Acceptance coverage and validation
+
+| Criterion | Regression coverage |
+| --- | --- |
+| 1. Different default homes | `paths.test.ts` checks different roots with identical basenames under one temporary user home. |
+| 2. Stable same-project home | `paths.test.ts` checks repeated resolution, Git subdirectories, and symlink aliases; `session.test.ts` checks peer pointer discovery in the same Git root. |
+| 3. Exact overrides | `paths.test.ts` checks absolute and relative `SKEP_HOME`; `program.test.ts` checks `--home` over env before opening the shell. Existing concurrent override coverage remains. |
+| 4. Git root over cwd | `paths.test.ts` resolves a nested cwd to the canonical toplevel and ignores unrelated Git environment overrides. Non-Git and bare-repo fallbacks are covered. |
+| 5. Automatic busy-port retry | `session.test.ts` injects busy ports, checks bounded exhaustion, pointer publication, advertise overrides, and rotated paste lines. An additional real bind test injects occupied and ephemeral loopback targets; `run.test.ts` checks `/start` and its paste line. |
+| 6. Explicit busy port | `session.test.ts` checks exactly one attempted bind and retains the real occupied-port error test; `run.test.ts` checks shell guidance. |
+| 7. Same-home live guard | Existing shared-home control/shell tests retain pointer preservation. A new default-home real-master test also checks refusal before a second bind. |
+| 8. Concurrent project homes | A socket-free test starts two default project homes, checks separate pointers and same-root discovery, and closes each independently. Real ephemeral-master coverage checks scoped status, guards, and cleanup, including no discovery from another project. |
+| 9. Join, submit-none, clean | Existing regressions remain. New bare `/join` tests cover own and external masters in a default project home; the own-master test checks submit `none` and `/clean`, and a shell retry test checks cleanup after automatic port selection. |
+
+Validation for PROJ-ISOL in this sandbox on 2026-10-12:
+
+* `npm run lint` and `npm run build`: **passed**. Package version remains 0.1.8; no dependency
+  or configuration files changed.
+* A selection of all path/program tests and socket-free retry, exhaustion, default-project
+  discovery, own-master bare join, and cleanup regressions: **27 passed** (152 excluded by the
+  name filter).
+* The exact four-file focused run was attempted with its normal timeouts, then stopped after
+  60 seconds because listener fixtures cannot complete here. A standalone loopback bind
+  reproduces `listen EPERM: operation not permitted 127.0.0.1`.
+* The focused run with `--testTimeout 1000 --hookTimeout 1000` completed: **137 passed,
+  55 failed, 32 unhandled errors**. Real-listener regressions are blocked by the same `EPERM`,
+  with fixtures that wait for listening timing out.
+* The full `npm test -- --testTimeout 1000 --hookTimeout 1000` run completed: **570 passed,
+  79 failed, 32 unhandled errors** across 31 files. In addition to listener failures, seven
+  unchanged `src/util/exec.test.ts` cases receive empty stdout/stderr from child Node processes.
+  A standalone `execFile("node", ..., { shell: false, env: {} })` reproduces the empty output
+  despite exit code 0. These results are not a green focused or full gate.
+
+Logs are retained in ignored `.skep-sim/project-isolation-focused.log`,
+`.skep-sim/project-isolation-focused-bounded.log`, and `.skep-sim/project-isolation-full.log`.
+Re-run the normal focused command and full suite outside the sandbox before committing.
+Changes remain uncommitted, as required by PROJ-ISOL.

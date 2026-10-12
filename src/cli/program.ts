@@ -16,6 +16,8 @@ export type { SkepPaths } from "../config/paths.js";
 export type { CliContext } from "./context.js";
 
 export type ProgramContext = CliContext & {
+  /** Invocation directory, also used to select the default project home. */
+  cwd?: string;
   /** Runs the no-subcommand shell (default: {@link runShell}). Tests inject a fake. */
   shell?: (ctx: CliContext) => Promise<void>;
 };
@@ -42,8 +44,8 @@ export function buildProgram(ctx: ProgramContext): Command {
       outputError: () => {},
     });
 
-  program.hook("preAction", (thisCommand) => {
-    applyGlobals(ctx, thisCommand);
+  program.hook("preAction", async (thisCommand) => {
+    await applyGlobals(ctx, thisCommand);
   });
 
   registerUi(program, ctx);
@@ -78,12 +80,13 @@ interface Globals {
   home?: string;
 }
 
-function applyGlobals(ctx: CliContext, command: Command): void {
+async function applyGlobals(ctx: ProgramContext, command: Command): Promise<void> {
   const globals = command.optsWithGlobals<Globals>();
   if (globals.home !== undefined && globals.home !== "") {
     ctx.env = { ...ctx.env, SKEP_HOME: globals.home };
   }
-  ctx.paths = skepPaths(skepHome(ctx.env));
+  ctx.cwd ??= process.cwd();
+  ctx.paths = skepPaths(await skepHome(ctx.env, ctx.cwd));
 }
 
 function outputFor(program: Command, ctx: CliContext): Output {

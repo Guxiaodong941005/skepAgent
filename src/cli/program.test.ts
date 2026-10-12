@@ -44,6 +44,20 @@ describe("program session-only surface", () => {
     expect(opened[0]?.paths?.home).toBe("/tmp/skep-test-home-program");
   });
 
+  it("--home overrides SKEP_HOME exactly before opening the shell", async () => {
+    let selected: string | undefined;
+    expect(
+      await runCli(["--home", "/tmp/skep-explicit-home"], {
+        ...ctx(),
+        cwd: "/missing-project",
+        shell: async (shellCtx) => {
+          selected = shellCtx.paths?.home;
+        },
+      }),
+    ).toBe(0);
+    expect(selected).toBe("/tmp/skep-explicit-home");
+  });
+
   it("rejects stray words instead of sending them to an agent", async () => {
     let opened = false;
     const code = await runCli(["fix", "the", "bug"], {

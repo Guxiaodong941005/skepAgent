@@ -55,6 +55,8 @@ import { CliError, EXIT } from "../output.js";
 import { quoteSlashWord } from "../shell/flags.js";
 
 export const DEFAULT_PORT = 7419;
+/** Bounded automatic selection; explicit listen addresses never enter this scan. */
+export const LAST_AUTO_PORT = DEFAULT_PORT + 100;
 const SESSION_FILE = "session.json";
 /** A stale `session.json` must not hang `start`; a live master answers well within this. */
 const PROBE_TIMEOUT_MS = 2_000;
@@ -1729,7 +1731,10 @@ export function register(program: Command, ctx: CliContext): void {
   session
     .command("start")
     .description("Start a session master and print the join code")
-    .option("--listen <host:port>", `address to bind (default: LAN IPv4, port ${DEFAULT_PORT})`)
+    .option(
+      "--listen <host:port>",
+      `address to bind (default: LAN IPv4, first available port ${DEFAULT_PORT}–${LAST_AUTO_PORT})`,
+    )
     .option(
       "--advertise <host:port>",
       "address peers dial, printed in the join line (default: the --listen address)",
@@ -1830,6 +1835,45 @@ export interface MasterFlow {
   close(): Promise<void>;
 }
 
+async function bindMaster(
+  api: SessionApi,
+  options: MasterOptions,
+  target: HostPort,
+  autoListen: boolean,
+): Promise<MasterHandle> {
+  const lastPort = autoListen ? LAST_AUTO_PORT : target.port;
+  let port = target.port;
+  while (true) {
+    const listen = { host: target.host, port };
+    try {
+      // Bind directly: a separate availability probe would race other project starts.
+      return await api.startMaster({ ...options, listen });
+    } catch (error) {
+      if (
+        !(error instanceof ListenAddressError) ||
+        !(error.cause instanceof Error) ||
+        !("code" in error.cause) ||
+        error.cause.code !== "EADDRINUSE"
+      ) {
+        throw error;
+      }
+      if (port < lastPort) {
+        port++;
+        continue;
+      }
+      const problem = autoListen
+        ? `no available session listen port on ${target.host} in ${target.port}–${lastPort}`
+        : `the session listen address ${formatHostPort(listen)} is already in use`;
+      throw new CliError(
+        "session_port_in_use",
+        `${problem}; choose an unused port with --listen <host:unused-port> ` +
+          "(/start in the skep shell, or skep session start in a terminal). " +
+          "Different projects use separate homes and available ports automatically when overrides are omitted",
+      );
+    }
+  }
+}
+
 /**
  * Binds a master and publishes `session.json`. Resolves once the master listens; the caller owns
  * how long it runs (`closed`) and how it stops (`close`).
@@ -1869,10 +1913,9 @@ export async function startMasterFlow(
     if (started) opts.onJoinCode?.(code, codeExpiresAtMs);
   };
 
-  let handle: MasterHandle;
-  try {
-    handle = await api.startMaster({
-      listen: target,
+  const handle = await bindMaster(
+    api,
+    {
       repo,
       device,
       controlToken: token,
@@ -1882,24 +1925,10 @@ export async function startMasterFlow(
       acceptJoin: (request) =>
         opts.yes === true ? Promise.resolve(true) : opts.acceptJoin(request),
       ...(opts.onEvent === undefined ? {} : { onEvent: opts.onEvent }),
-    });
-  } catch (error) {
-    if (
-      error instanceof ListenAddressError &&
-      error.cause instanceof Error &&
-      "code" in error.cause &&
-      error.cause.code === "EADDRINUSE"
-    ) {
-      throw new CliError(
-        "session_port_in_use",
-        `the session listen address ${formatHostPort(target)} is already in use; ` +
-          "choose an unused port with --listen <host:unused-port> " +
-          "(/start in the skep shell, or skep session start in a terminal). " +
-          "Independent sessions also need a separate SKEP_HOME or skep --home <separate-dir>",
-      );
-    }
-    throw error;
-  }
+    },
+    target,
+    opts.listen === undefined,
+  );
   const closed = handle.closed.then(
     () => removeOwnSessionFile(file, token),
     async (error: unknown) => {
@@ -2034,10 +2063,10 @@ async function refuseIfRunning(file: string): Promise<void> {
   throw new CliError(
     "session_running",
     `a session master is already running at ${existing.listen} (${file})\n` +
-      "Project directories share one session per SKEP_HOME. For an independent session, " +
-      "launch skep --home <separate-dir> (or set SKEP_HOME), then " +
-      "/start --listen <host:unused-port>; from a terminal: " +
-      "skep --home <separate-dir> session start --listen <host:unused-port>",
+      "Only one session per home can run. Different projects use separate homes and available " +
+      "ports automatically. If SKEP_HOME or --home makes projects share this home, omit the " +
+      "override; for another session in this project, launch skep --home <separate-dir>, " +
+      "then /start (or skep --home <separate-dir> session start in a terminal)",
   );
 }
 
