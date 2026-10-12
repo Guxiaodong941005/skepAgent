@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import net from "node:net";
-import { type NetworkInterfaceInfo, tmpdir } from "node:os";
+import os, { type NetworkInterfaceInfo, tmpdir } from "node:os";
 import path from "node:path";
 import { Duplex, PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
@@ -345,12 +345,12 @@ describe("session start", () => {
         ]);
         expect(new Set(attempts.map((options) => options.controlToken)).size).toBe(1);
         const dial = advertise ?? `192.168.1.20:${DEFAULT_PORT + 2}`;
-        expect(c.stdout).toContain(`/join --host ${dial} --code 1234-5678-9012 --repo app`);
+        expect(c.stdout).toContain(`/join 1234-5678-9012 ${dial}`);
         expect(JSON.parse(await readFile(path.join(dir, "session.json"), "utf8")).listen).toBe(
           `192.168.1.20:${DEFAULT_PORT + 2}`,
         );
         attempts.at(-1)?.onJoinCode({ code: "999988887777", expiresAtMs: 1_800_000_600_000 });
-        expect(c.stdout).toContain(`/join --host ${dial} --code 9999-8888-7777 --repo app`);
+        expect(c.stdout).toContain(`/join 9999-8888-7777 ${dial}`);
       } finally {
         fake.closed.resolve();
         await run;
@@ -433,7 +433,7 @@ describe("session start", () => {
       ]);
       const pointer = JSON.parse(await readFile(path.join(dir, "session.json"), "utf8"));
       expect(pointer.listen).not.toBe(busy.listen);
-      expect(c.stdout).toContain(`/join --host ${pointer.listen} --code `);
+      expect(c.stdout).toMatch(new RegExp(`/join \\d{4}-\\d{4}-\\d{4} ${pointer.listen}\n`));
     } finally {
       await Promise.all(masters.map((master) => master.close()));
       await run;
@@ -479,14 +479,12 @@ describe("session start", () => {
     await vi.waitFor(() => expect(c.stdout).toContain("join code:"));
     expect(c.stdout).toContain("session master listening on 10.1.2.3:7500 (repo app)");
     expect(c.stdout).toContain("peers dial 203.0.113.7:7419");
+    expect(c.stdout).toContain("paste into skep: /join 1234-5678-9012 203.0.113.7:7419");
     expect(c.stdout).toContain(
-      "paste into skep: /join --host 203.0.113.7:7419 --code 1234-5678-9012 --repo app",
-    );
-    expect(c.stdout).toContain(
-      "or from a shell: skep session join --host 203.0.113.7:7419 --code 1234-5678-9012 --repo app",
+      "or from a shell: skep session join --code 1234-5678-9012 --host 203.0.113.7:7419",
     );
     fake.calls.master[0]?.onJoinCode({ code: "999988887777", expiresAtMs: 1_800_000_600_000 });
-    expect(c.stdout).toContain("/join --host 203.0.113.7:7419 --code 9999-8888-7777 --repo app");
+    expect(c.stdout).toContain("/join 9999-8888-7777 203.0.113.7:7419");
     fake.closed.resolve();
     expect(await run).toBe(0);
   });
@@ -577,19 +575,16 @@ describe("session start", () => {
   });
 
   it("shell-quotes the CLI twin so a shell reads back the same arguments", async () => {
-    const repo = "it's my app; false $(x) `y` | z";
-    const twin = formatJoinCli({ host: "[fe80::1]:7419", code: "863217270308", repo });
+    const twin = formatJoinCli({ host: "[fe80::1]:7419", code: "863217270308" });
     expect(twin.startsWith("skep session join ")).toBe(true);
     // The twin is meant for a shell, so a real POSIX shell is the oracle here.
     const args = twin.slice("skep session join ".length);
     const { stdout } = await execFileP("sh", ["-c", `set -- ${args}; printf '%s\\0' "$@"`]);
     expect(stdout.split("\0").slice(0, -1)).toEqual([
-      "--host",
-      "[fe80::1]:7419",
       "--code",
       "8632-1727-0308",
-      "--repo",
-      repo,
+      "--host",
+      "[fe80::1]:7419",
     ]);
   });
 
@@ -798,7 +793,9 @@ describe("session start", () => {
       expect(await readControlEndpoint(second.ctx)).not.toEqual(
         await readControlEndpoint(first.ctx),
       );
-      expect(second.stdout).toContain(`/join --host 192.168.1.20:${DEFAULT_PORT + 1} --code `);
+      expect(second.stdout).toMatch(
+        new RegExp(`/join \\d{4}-\\d{4}-\\d{4} 192\\.168\\.1\\.20:${DEFAULT_PORT + 1}\n`),
+      );
       firstFake.closed.resolve();
       expect(await firstRun).toBe(0);
       await expect(stat(path.join(firstHome, "session.json"))).rejects.toThrow(/ENOENT/);
@@ -1857,6 +1854,39 @@ describe("agent resolution at join", () => {
       "no agent CLI found (looked for claude, codex, pi on PATH)\n" +
         "fix: install one, or pass --agent <claude|codex|pi>",
     );
+    expect(fake.calls.sub).toHaveLength(0);
+  });
+
+  it("joins with only --code and --host: repo and device default to checkout and hostname", async () => {
+    const hostname = vi.spyOn(os, "hostname").mockReturnValue("Kris-MacBook.local");
+    try {
+      const box = await sandbox();
+      const fake = fakeApi();
+      const c = capture(box.home, { env: box.env, cwd: box.repo, sessionApi: fake.api });
+      const argv = ["session", "join", "--code", "1234-5678-9012", "--host", "10.0.0.5:7419"];
+      expect(await runCli(argv, c.ctx)).toBe(0);
+      const options = fake.calls.sub[0];
+      expect(options?.code).toBe("123456789012");
+      expect(options?.target).toEqual({ host: "10.0.0.5", port: 7419 });
+      // The device rides the handshake; the repo rides the peer's description (no wire change).
+      expect(options?.device).toBe("kris-macbook-local");
+      const described = await options?.describe();
+      expect(described?.repo).toBe(path.basename(box.repo));
+      expect(described?.role).toBe("coding");
+    } finally {
+      hostname.mockRestore();
+    }
+  });
+
+  it("joins without --repo outside a git checkout fails with the actionable fix", async () => {
+    const fake = fakeApi();
+    const dir = await home();
+    const c = capture(dir, { cwd: dir, sessionApi: fake.api });
+    const argv = ["--machine", "session", "join", "--code", "123456789012", "--host", "h:1"];
+    expect(await runCli(argv, c.ctx)).toBe(2);
+    const error = JSON.parse(c.stdout).error;
+    expect(error.code).toBe("repo_required");
+    expect(error.message).toContain("not inside a git repository; pass --repo <name>");
     expect(fake.calls.sub).toHaveLength(0);
   });
 
