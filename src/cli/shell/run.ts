@@ -104,7 +104,7 @@ interface Picker {
   resolve(peers: ShellPeer[] | null): void;
 }
 
-const REPO_FLAG = /(^|\s)--repo(?:=|\s+)(?!--)(\S+)(?=\s|$)/g;
+const REPO_FLAG = /(^|\s)--repo(?:=|\s+)(?:"((?:\\["\\]|[^"\\])*)"|((?!--|")\S+))(?=\s|$)/g;
 
 /**
  * `/intent [--repo <name>]... <text>`: `--repo` may appear anywhere and repeat; the rest of the
@@ -113,7 +113,9 @@ const REPO_FLAG = /(^|\s)--repo(?:=|\s+)(?!--)(\S+)(?=\s|$)/g;
 export function parseIntentArgs(args: string): { text: string; repos?: string[] } {
   const repos: string[] = [];
   const text = args
-    .replace(REPO_FLAG, (_match, _lead: string, repo: string) => {
+    .replace(REPO_FLAG, (_match, _lead: string, quoted: string | undefined, bare: string) => {
+      const repo = quoted === undefined ? bare : quoted.replace(/\\(["\\])/g, "$1");
+      if (repo === "") throw new CliError("usage", "--repo needs a value");
       repos.push(repo);
       // The whitespace after the value stays, so the words around the flag stay apart.
       return "";
@@ -235,13 +237,13 @@ export class Shell {
   // Keys.
 
   private onKey(key: ShellKey): void {
+    if (key.name !== "interrupt") this.interruptArmed = false;
     if (this.picker !== null) {
       this.onPickerKey(key);
       this.render();
       return;
     }
     const model = this.model;
-    if (key.name !== "interrupt") this.interruptArmed = false;
     switch (key.name) {
       case "text":
         model.input = insertText(model.input, key.text);
@@ -308,6 +310,7 @@ export class Shell {
         break;
       case "escape":
       case "interrupt":
+        this.interruptArmed = false;
         this.closePicker(false);
         break;
       default:
@@ -327,6 +330,7 @@ export class Shell {
 
   /** Asks which of several connected peers should take an intent; null when cancelled. */
   private pickPeers(peers: ShellPeer[]): Promise<ShellPeer[] | null> {
+    if (this.quitting !== null || this.cleaning !== null) return Promise.resolve(null);
     return new Promise((resolve) => {
       this.picker = { peers, resolve };
       this.model.picker = {
@@ -449,21 +453,42 @@ export class Shell {
    * a bare intent to it (INTENT-PEER).
    */
   private async sendIntent(text: string, explicit?: string[]): Promise<SlashResult> {
-    let route = this.session.intentRoute();
+    const route = this.session.intentRoute();
     if (route.kind === "refused") return { type: "error", message: route.message };
     let repos = explicit;
     const peers = this.session.snapshot().peers;
     if (repos === undefined && peers.length > 1) {
       const picked = await this.pickPeers(peers);
       if (picked === null) return { type: "ok", message: "intent cancelled" };
+      const unknown = picked.filter((peer) => peer.repo === undefined);
+      if (unknown.length > 0) {
+        return {
+          type: "error",
+          message:
+            `repo is unknown for ${unknown.map((peer) => peer.peerId).join(", ")}; intent was not sent\n` +
+            "use /intent --repo <name> <text> to name the repo explicitly",
+        };
+      }
       const known = [
         ...new Set(picked.flatMap((peer) => (peer.repo === undefined ? [] : [peer.repo]))),
       ];
-      // A picked peer that has not described its repo yet cannot be addressed by repo.
-      if (known.length > 0) repos = known;
-      // The session may have changed while the picker was open.
-      route = this.session.intentRoute();
-      if (route.kind === "refused") return { type: "error", message: route.message };
+      repos = known;
+      // A new discovery must not redirect a selection made for the previous master.
+      const current = this.session.intentRoute();
+      if (current.kind === "refused") return { type: "error", message: current.message };
+      const sameMaster =
+        route.kind === "own"
+          ? current.kind === "own" && route.master.handle === current.master.handle
+          : current.kind === "control" &&
+            route.external.status.sessionId === current.external.status.sessionId &&
+            sameEndpoint(route.external.endpoint, current.external.endpoint);
+      if (!sameMaster) {
+        return {
+          type: "error",
+          message:
+            "the session master changed while choosing peers; intent was not sent — check /status and resend",
+        };
+      }
     }
     try {
       let intentId: string;
@@ -1230,6 +1255,7 @@ export class Shell {
     this.log("leaving…", "muted");
     for (const question of this.questions.splice(0)) question.resolve(null);
     this.model.question = null;
+    this.closePicker(false);
     const problems: string[] = [];
     const join = this.session.ownJoin;
     const master = this.session.ownMaster;

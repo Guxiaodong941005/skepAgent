@@ -167,7 +167,8 @@ export class ShellModel {
     // A resize changes how many rows the scrollback wraps into.
     this.scroll = Math.min(this.scroll, this.maxScroll());
     const body = this.bodyLines(bodyRows, columns);
-    const overlay = this.picker === null ? this.menuLines() : this.pickerLines(this.picker);
+    const overlay =
+      this.picker === null ? this.menuLines() : this.pickerLines(this.picker, bodyRows);
     const menu = bodyRows === 0 ? [] : overlay.slice(-bodyRows);
     body.splice(body.length - menu.length, menu.length, ...menu);
     const out = [...lines, ...body, input, rule, ...bee, hint];
@@ -216,13 +217,21 @@ export class ShellModel {
     });
   }
 
-  private pickerLines(picker: ShellPicker): Line[] {
+  private pickerLines(picker: ShellPicker, maxRows: number): Line[] {
+    if (maxRows === 0) return [];
+    const title = maxRows > 1 ? [{ spans: [bold(`  ${picker.title}`, "primary")] }] : [];
+    const count = maxRows - title.length;
+    // Keep the active peer visible even in a short terminal or a roster larger than the body.
+    const first = Math.min(
+      Math.max(0, picker.cursor - count + 1),
+      Math.max(0, picker.rows.length - count),
+    );
     const mark = (selected: boolean) => (selected ? "[x]" : "[ ]");
     return [
-      { spans: [bold(`  ${picker.title}`, "primary")] },
-      ...picker.rows.map((row, index) => ({
+      ...title,
+      ...picker.rows.slice(first, first + count).map((row, index) => ({
         spans: [{ text: `  ${mark(row.selected)} ${row.label}` }],
-        selected: index === picker.cursor,
+        selected: first + index === picker.cursor,
         fill: true,
       })),
     ];

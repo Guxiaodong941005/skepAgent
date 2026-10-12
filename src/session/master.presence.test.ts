@@ -45,6 +45,7 @@ afterEach(async () => {
 async function setup(subRepo = "app", masterRepo = "app") {
   const clock = new ManualClock();
   const events: { kind: string; message: string }[] = [];
+  const datalistRepos: string[] = [];
   const master = await startMaster({
     listen: { host: "127.0.0.1", port: 0 },
     device: "mac",
@@ -57,7 +58,8 @@ async function setup(subRepo = "app", masterRepo = "app") {
     progressIntervalMs: 0,
   });
   masters.push(master);
-  const join = async (): Promise<SubHandle> => {
+  const join = async (repo = subRepo): Promise<SubHandle> => {
+    const count = master.status().peers.length;
     const code = master.status().joinCode;
     if (code === null || master.address === null) throw new Error("master has no join code");
     const sub = await connectSub({
@@ -65,16 +67,19 @@ async function setup(subRepo = "app", masterRepo = "app") {
       code,
       device: "vps",
       clock,
-      describe: async () => ({ repo: subRepo, head: "c".repeat(40), role: "coding" }),
-      collectDatalist: async () => [],
+      describe: async () => ({ repo, head: "c".repeat(40), role: "coding" }),
+      collectDatalist: async (repo) => {
+        datalistRepos.push(repo);
+        return [];
+      },
       onItem: () => new Promise<never>(() => {}),
       progressIntervalMs: 0,
     });
     subs.push(sub);
-    await until(() => master.status().peers.length === 1);
+    await until(() => master.status().peers.length === count + 1);
     return sub;
   };
-  return { clock, events, master, join };
+  return { clock, events, master, join, datalistRepos };
 }
 
 async function until(check: () => boolean): Promise<void> {
@@ -151,13 +156,14 @@ describe("no_match", () => {
 
 describe("lone peer routing (INTENT-PEER)", () => {
   it("routes a bare intent to the only peer even when its repo differs", async () => {
-    const { master, join } = await setup("skepAgent", "futrobomower");
+    const { master, join, datalistRepos } = await setup("skepAgent", "futrobomower");
     await join();
     await expect(master.submitIntent("view branch")).resolves.toEqual({ intentId: "intent-1" });
     await until(() => master.status().intents[0]?.state === "planned");
     expect(master.status().intents[0]?.items).toEqual([
       expect.objectContaining({ repo: "skepAgent", assignee: "peer-1" }),
     ]);
+    expect(datalistRepos).toEqual(["skepAgent"]);
   });
 
   it("routes an explicit --repo naming the lone peer's repo", async () => {
@@ -176,5 +182,39 @@ describe("lone peer routing (INTENT-PEER)", () => {
     await expect(master.submitIntent("view branch", ["futrobomower"])).rejects.toThrow(
       "works on repo futrobomower",
     );
+  });
+
+  it("does not fall back when multiple connected candidates answer", async () => {
+    const { master, join } = await setup("api");
+    await join();
+    await join("web");
+    await expect(master.submitIntent("view branch")).rejects.toThrow(
+      "None of the 2 connected peer(s) works on repo app",
+    );
+    expect(master.status().intents[0]?.items).toEqual([]);
+  });
+
+  it("keeps the matching repo when several candidates answer", async () => {
+    const { master, join } = await setup("api");
+    await join();
+    await join("app");
+    await master.submitIntent("view branch");
+    await until(() => master.status().intents[0]?.state === "planned");
+    expect(master.status().intents[0]?.items).toEqual([
+      expect.objectContaining({ repo: "app", assignee: "peer-2" }),
+    ]);
+  });
+
+  it("plans matched explicit repos in order and keeps earliest-join assignment", async () => {
+    const { master, join } = await setup("api");
+    await join();
+    await join();
+    await join("web");
+    await master.submitIntent("view branch", ["web", "api", "api", "missing"]);
+    await until(() => master.status().intents[0]?.state === "planned");
+    expect(master.status().intents[0]?.items).toEqual([
+      expect.objectContaining({ repo: "web", assignee: "peer-3" }),
+      expect.objectContaining({ repo: "api", assignee: "peer-1" }),
+    ]);
   });
 });
