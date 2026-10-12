@@ -6,14 +6,14 @@ Skep lets AI coding agents on different machines (laptop, GPU rig, always-on ser
 through an encrypted session channel. Bare `skep` opens the Skep shell. Credentials never leave
 the device that owns them.
 
-> **v0.1.9 — per-project isolation.** Different project directories get separate session
-> homes and auto-picked ports (7419–7519). Same-project bare `/join` still works. Join UX
-> from 0.1.8 is unchanged. The signed git blackboard and `skepd` were removed in 0.1.2.
+> **v0.1.10 — same-machine peer resilience.** Peers without a usable Git HEAD stay
+> connected (warn + unknown SHA) instead of `callback_error`. Per-project isolation from
+> 0.1.9 is unchanged. The signed git blackboard and `skepd` were removed in 0.1.2.
 
 ## Install
 
 ```bash
-npm install -g @skepagent/skep@0.1.9
+npm install -g @skepagent/skep@0.1.10
 ```
 
 Requires Node.js ≥ 22.12 (macOS & Linux).

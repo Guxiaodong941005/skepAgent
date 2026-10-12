@@ -11,6 +11,19 @@ protocol rules ([`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §4.4) apply to t
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-10-12
+
+Peers on the same machine stay connected through intents even when the join directory has
+no usable Git HEAD (`--repo` is only a routing label).
+
+### Fixed
+
+* Session join `describe` / datalist callbacks no longer close with `callback_error` when
+  local `git rev-parse HEAD` or tracked-file listing fails (unborn HEAD, non-Git cwd, or
+  invalid SHA). The peer warns, reports the unknown forty-zero SHA / empty datalist, and
+  can answer further intents; real work still fails with a typed Git check when the
+  checkout cannot run.
+
 ## [0.1.9] - 2026-10-12
 
 Per-project session isolation and automatic port picking so several projects can run
@@ -347,7 +360,8 @@ creates the npm org `skepagent` and explicitly says go. See [`docs/RELEASE.md`](
 * Manual lease revoke; no auto-merge. The human holds plan approval, escalation decisions and
   merges.
 
-[Unreleased]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.9...HEAD
+[Unreleased]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.10...HEAD
+[0.1.10]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.6...v0.1.7

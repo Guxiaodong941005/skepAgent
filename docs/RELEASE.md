@@ -2,8 +2,30 @@
 
 This document records the package-name decision (v0.1.0), the npm registry re-check, the
 v0.1.0 checklist, the v0.1.1 session-TUI notes, the v0.1.5 peer-progress and TUI notes, the
-v0.1.8 join-UX notes, the v0.1.9 per-project isolation notes, and the steps the orchestrator runs. Task agents must not `git push`,
+v0.1.8 join-UX notes, the v0.1.9 per-project isolation notes, the v0.1.10 SAME-CB notes, and the steps the orchestrator runs. Task agents must not `git push`,
 create tags, or `npm publish`.
+
+## v0.1.10 — same-machine peer without Git HEAD (2026-10-12)
+
+The human ordered this release as **0.1.10** after a box reproduction of SAME-CB passed.
+Package name stays **`@skepagent/skep`** (public). The published bin is `skep`.
+
+What this tag adds on top of v0.1.9 (details in [`../CHANGELOG.md`](../CHANGELOG.md)):
+
+* **Peers stay connected without a usable Git HEAD**: `--repo` is a routing label only.
+  Missing/unborn HEAD or a failed tracked-file listing warns and returns an unknown SHA /
+  empty datalist instead of closing with `callback_error`, so same-machine multi-directory
+  joins can keep answering intents.
+
+Compatibility: upgrade peers that hit `callback_error` on intent; wire protocol unchanged.
+
+Install:
+
+```bash
+npm install -g @skepagent/skep@0.1.10
+```
+
+---
 
 ## v0.1.9 — per-project isolation (2026-10-12)
 
