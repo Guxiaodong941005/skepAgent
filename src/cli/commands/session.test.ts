@@ -3,12 +3,12 @@ import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import net from "node:net";
 import { type NetworkInterfaceInfo, tmpdir } from "node:os";
 import path from "node:path";
-import { PassThrough } from "node:stream";
+import { Duplex, PassThrough } from "node:stream";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { skepHome, skepPaths } from "../../config/paths.js";
 import type { Notification } from "../../notify/ntfy.js";
-import { ListenAddressError, startMaster } from "../../session/index.js";
+import { connectSub, ListenAddressError, startMaster } from "../../session/index.js";
 import type { ItemStatus } from "../../session/messages.js";
 import { runCli } from "../program.js";
 import {
@@ -24,8 +24,10 @@ import {
   formatJoinCli,
   herdrAgentName,
   type ItemWorker,
+  type JoinFlow,
   type JoinView,
   type JoinViewModel,
+  joinSessionFlow,
   LAST_AUTO_PORT,
   loadSubmitPolicy,
   type MasterHandle,
@@ -1353,6 +1355,121 @@ async function joinAndWork(
 }
 
 describe("session join works items", () => {
+  it.each(["committed", "unborn", "non-git"] as const)(
+    "keeps a same-device peer in a different %s project connected through intent and work",
+    async (project) => {
+      const box = await sandbox();
+      const peerDir = path.join(box.home, "proj-b");
+      if (project === "committed") {
+        await gitIn(box.home, ["clone", "--quiet", box.repo, peerDir], box.env);
+      } else {
+        await mkdir(peerDir);
+        if (project === "unborn") await gitIn(peerDir, ["init", "--quiet"], box.env);
+      }
+      await writeFile(path.join(peerDir, "peer.txt"), "peer project\n");
+      if (project !== "non-git") await gitIn(peerDir, ["add", "peer.txt"], box.env);
+      const head =
+        project === "committed"
+          ? await gitIn(peerDir, ["rev-parse", "HEAD"], box.env)
+          : "0".repeat(40);
+      const master = await startMaster({
+        device: "mac",
+        repo: "proj-a",
+        controlToken: TOKEN,
+        acceptJoin: async () => true,
+        onJoinCode: () => {},
+      });
+      const log = recordingView();
+      const warnings: string[] = [];
+      const say = vi.fn();
+      const closed: string[] = [];
+      let joined: JoinFlow | undefined;
+      try {
+        const code = master.status().joinCode;
+        if (code === null) throw new Error("master has no join code");
+        const peerHome = path.join(box.home, "peer-skep");
+        const c = capture(peerHome, {
+          env: { ...box.env, SKEP_HOME: peerHome },
+          paths: skepPaths(peerHome),
+          cwd: peerDir,
+          sessionApi: {
+            startMaster,
+            connectSub: (options) => {
+              const toMaster = new PassThrough();
+              const toPeer = new PassThrough();
+              master.attach(Duplex.from({ readable: toMaster, writable: toPeer }), {
+                address: HOST,
+                family: "IPv4",
+              });
+              const { target: _target, ...sub } = options;
+              return connectSub({
+                ...sub,
+                stream: Duplex.from({ readable: toPeer, writable: toMaster }),
+              });
+            },
+          },
+        });
+        joined = await joinSessionFlow(
+          c.ctx,
+          {
+            host: "example.com:7419",
+            code,
+            repo: "proj-a",
+            device: "mac",
+            role: "coding",
+            submit: "none",
+            agent: "dry",
+          },
+          {
+            say,
+            ask: async () => null,
+            warn: (message) => warnings.push(message),
+            createView: () => log.view,
+          },
+        );
+        void joined.closed.then(({ reason }) => closed.push(reason));
+        for (let index = 0; index < 2; index++) {
+          await expect(master.submitIntent("add a health check")).resolves.toEqual({
+            intentId: `intent-${index + 1}`,
+          });
+          await vi.waitFor(
+            () => expect(master.status().intents[index]?.items[0]?.state).toBe("done"),
+            { timeout: 5_000 },
+          );
+          const item = master.status().intents[index]?.items[0];
+          expect(item).toMatchObject({
+            repo: "proj-a",
+            assignee: joined.handle.peerId,
+            datalistEntries: project === "committed" ? 2 : project === "unborn" ? 1 : 0,
+            result: {
+              repo: "proj-a",
+              baseSha: head,
+              submit: { method: "none", state: project === "committed" ? "local" : "failed" },
+            },
+          });
+          expect(master.status().peers).toMatchObject([
+            { peerId: joined.handle.peerId, device: "mac", repo: "proj-a", head },
+          ]);
+          expect(closed).toEqual([]);
+          if (project !== "committed") {
+            expect(item?.result).toMatchObject({
+              headSha: head,
+              checks: [{ name: "git", status: "fail" }],
+            });
+            expect(item?.result?.summary).toContain(
+              project === "unborn" ? "HEAD" : "not a git repository",
+            );
+          }
+        }
+        expect(say.mock.calls.some(([event]) => event.event === "session-error")).toBe(false);
+        expect(warnings.length).toBe(project === "committed" ? 0 : project === "unborn" ? 2 : 4);
+      } finally {
+        await joined?.close();
+        await master.close();
+      }
+    },
+  );
+
   it("--submit none commits on the session branch and reports local without pushing", async () => {
     const box = await sandbox();
     const base = await gitIn(box.repo, ["rev-parse", "HEAD"], box.env);

@@ -701,7 +701,7 @@ type DirectMethod = (typeof DIRECT_METHODS)[number];
 const AGENT_TIMEOUT_MS = 10 * 60_000;
 const MARKER_FILE = ".skep-session-item";
 const MAX_SUMMARY = 4_000;
-/** Stands in for a base sha when git could not even read `HEAD`: the result must still parse. */
+/** Unknown local HEAD; capability and failed-result SHAs must still satisfy the wire schema. */
 const UNKNOWN_SHA = "0".repeat(40);
 /** Variables the agent may see. Credentials are never forwarded to it (D19). */
 const AGENT_ENV_KEYS = ["PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TERM", "TMPDIR"];
@@ -2424,13 +2424,32 @@ export async function joinSessionFlow(
         if (kind !== "error") return;
         say({ event: "session-error", message }, () => `session: ${message}\n`);
       },
-      describe: async () => ({
-        repo,
-        role,
-        head: (await git(ctx, ["rev-parse", "HEAD"])).trim(),
-      }),
+      describe: async () => {
+        // --repo is a routing label, not a checkout path. Missing local HEAD would otherwise
+        // trigger callback_error (docs/plans/tui-session-reliability.md, Bug 4).
+        let head: string;
+        try {
+          head = ShaSchema.parse((await git(ctx, ["rev-parse", "HEAD"])).trim());
+        } catch (error) {
+          head = UNKNOWN_SHA;
+          warn(
+            `cannot read this directory's Git HEAD; reporting an unknown head for ${repo}. ` +
+              `Join from a Git checkout with a commit to run work (${errorMessage(error)})`,
+          );
+        }
+        return { repo, role, head };
+      },
       collectDatalist: async () => {
-        const listed = await git(ctx, ["ls-files", "-z"]);
+        let listed: string;
+        try {
+          listed = await git(ctx, ["ls-files", "-z"]);
+        } catch (error) {
+          warn(
+            `cannot list this directory's tracked files; sending an empty datalist for ${repo} ` +
+              `(${errorMessage(error)})`,
+          );
+          return [];
+        }
         return listed
           .split("\0")
           .filter((file) => file.length > 0 && file.length <= MAX_DATALIST_PATH)
