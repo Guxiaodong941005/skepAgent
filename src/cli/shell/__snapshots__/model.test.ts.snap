@@ -1,5 +1,32 @@
 // Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
 
+exports[`scrollback wrapping (SESSION-UX §3.4) > a 400-character error wraps onto several rows with the whole text visible 1`] = `
+"  skep                                                               v0.0.0-test
+  device  laptop | cwd  ~/app | no session
+
+
+
+
+
+
+
+
+
+
+
+  w000 w001 w002 w003 w004 w005 w006 w007 w008 w009 w010 w011 w012 w013 w014
+      w015 w016 w017 w018 w019 w020 w021 w022 w023 w024 w025 w026 w027 w028
+      w029 w030 w031 w032 w033 w034 w035 w036 w037 w038 w039 w040 w041 w042
+      w043 w044 w045 w046 w047 w048 w049 w050 w051 w052 w053 w054 w055 w056
+      w057 w058 w059 w060 w061 w062 w063 w064 w065 w066 w067 w068 w069 w070
+      w071 w072 w073 w074 w075 w076 w077 w078 w079
+  info iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii…
+> _
+  ------------------------------------------------------------------------------
+  (no session — /start or /join)
+  / commands | enter send | pgup/pgdn scroll | ctrl+c clear | /quit"
+`;
+
 exports[`shell frames > joined, with a healthy and a quiet peer 1`] = `
 "  skep   session joined 192.168.1.20:7419 as peer-3 · coding         v0.0.0-test
   device  laptop | cwd  ~/app | peers 2 | master hb 2s

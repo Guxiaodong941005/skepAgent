@@ -1,15 +1,16 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { type NetworkInterfaceInfo, tmpdir } from "node:os";
 import path from "node:path";
 import { Duplex, PassThrough } from "node:stream";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { skepHome, skepPaths } from "../../config/paths.js";
 import type { Notification } from "../../notify/ntfy.js";
 import { connectSub, ListenAddressError, startMaster } from "../../session/index.js";
-import type { ItemStatus } from "../../session/messages.js";
+import { type ItemStatus, SubResultSchema } from "../../session/messages.js";
 import { runCli } from "../program.js";
 import {
   type AgentRuntime,
@@ -17,6 +18,7 @@ import {
   type AgentSessionBackend,
   type AgentView,
   DEFAULT_PORT,
+  DRY_RUN_SUMMARY,
   encodeFrame,
   expandStartWithMaster,
   FrameDecoder,
@@ -32,15 +34,16 @@ import {
   loadSubmitPolicy,
   type MasterHandle,
   type MasterOptions,
-  materializeItem,
   NATIVE_ARGV,
   type PeerProgress,
   type PtyRunOptions,
   type PtyRunResult,
+  parseAgentFlag,
   parseHostPort,
   pickListenHost,
   readControlEndpoint,
   renderSessionStatus,
+  resolveAgentCli,
   type SessionApi,
   type SessionCliContext,
   type SessionStatus,
@@ -48,9 +51,9 @@ import {
   type SubHandle,
   type SubOptions,
   selectAgentView,
-  sessionBranch,
   setJoinViewFactory,
   summaryTail,
+  undoItem,
   workItem,
 } from "./session.js";
 
@@ -152,7 +155,8 @@ function capture(dir: string, extra: Partial<SessionCliContext> = {}) {
         out.stderr += s;
       },
     },
-    env: { SKEP_HOME: dir },
+    // Only stubs and git: a real agent CLI on this machine must never be found by a test.
+    env: { SKEP_HOME: dir, PATH: defaultStubs },
     output: () => {
       throw new Error("output() used before runCli");
     },
@@ -1252,21 +1256,65 @@ describe("control commands", () => {
 });
 
 // ---------------------------------------------------------------------------------------------
-// Sub-side item work against a real in-memory master and throwaway git repos. No agent CLI, no
-// network: `origin` is a local bare repo and `gh`/`glab` are never on PATH.
+// Sub-side item work against a real in-memory master and throwaway git repos. Never a real agent
+// CLI and no network: PATH holds only stub agents and a `git` wrapper that logs every call (the
+// spy for "no worktree, clone or branch"); `origin` is a local bare repo; gh/glab are absent.
 
 const execFileP = promisify(execFile);
 const HOST = "127.0.0.1";
+let realGit = "";
+let realCat = "";
+let realSleep = "";
+/** A PATH dir with a stub `claude` and plain `git`, for tests that only need some agent. */
+let defaultStubs = "";
+
+beforeAll(async () => {
+  realGit = (await execFileP("sh", ["-c", "command -v git"])).stdout.trim();
+  realCat = (await execFileP("sh", ["-c", "command -v cat"])).stdout.trim();
+  realSleep = (await execFileP("sh", ["-c", "command -v sleep"])).stdout.trim();
+  defaultStubs = await mkdtemp(path.join(tmpdir(), "skep-stubs-"));
+  await symlink(realGit, path.join(defaultStubs, "git"));
+  await writeFile(path.join(defaultStubs, "claude"), '#!/bin/sh\necho "stub claude"\n', {
+    mode: 0o755,
+  });
+});
+
+afterAll(async () => {
+  await rm(defaultStubs, { recursive: true, force: true });
+});
 
 interface Sandbox {
   home: string;
   repo: string;
   bare: string;
+  /** Stub agents go here; it is first on PATH. */
+  bin: string;
+  /** Every git invocation, one line of arguments each. */
+  gitLog: string;
   env: NodeJS.ProcessEnv;
 }
 
 async function gitIn(cwd: string, args: string[], env: NodeJS.ProcessEnv): Promise<string> {
-  return (await execFileP("git", args, { cwd, env: env as Record<string, string> })).stdout.trim();
+  return (
+    await execFileP(realGit || "git", args, { cwd, env: env as Record<string, string> })
+  ).stdout.trim();
+}
+
+async function gitCalls(box: Sandbox): Promise<string[]> {
+  return (await readFile(box.gitLog, "utf8").catch(() => "")).split("\n").filter(Boolean);
+}
+
+/**
+ * Writes a stub agent CLI into the sandbox. `body` is shell run in the project folder; it records
+ * argv and stdin under $HOME so they never show up as changed files.
+ */
+async function stubAgent(box: Sandbox, name: string, body = 'echo "stub done"'): Promise<void> {
+  await writeFile(
+    path.join(box.bin, name),
+    `#!/bin/sh\nprintf "%s\\n" "$@" > "$HOME/${name}-args.txt"\n` +
+      `${realCat} > "$HOME/${name}-stdin.txt"\n: > "$HOME/${name}-called"\n${body}\n`,
+    { mode: 0o755 },
+  );
 }
 
 /** A repo named `app` with one commit and a bare `origin`; HOME points into the temp dir. */
@@ -1275,24 +1323,41 @@ async function sandbox(): Promise<Sandbox> {
   const repo = path.join(root, "app");
   const bare = path.join(root, "origin.git");
   const fakeHome = path.join(root, "userhome");
+  const bin = path.join(root, "bin");
+  const tools = path.join(root, "tools");
+  const gitLog = path.join(root, "git.log");
   await mkdir(repo);
   await mkdir(fakeHome);
-  // A PATH without gh/glab: only git's own directory, so host commands are "not installed".
-  const gitPath = (await execFileP("sh", ["-c", "command -v git"])).stdout.trim();
+  await mkdir(bin);
+  await mkdir(tools);
+  await writeFile(
+    path.join(tools, "git"),
+    `#!/bin/sh\nprintf "%s\\n" "$*" >> "${gitLog}"\nexec "${realGit}" "$@"\n`,
+    { mode: 0o755 },
+  );
   const env = {
-    PATH: path.dirname(gitPath),
+    PATH: `${bin}${path.delimiter}${tools}`,
     HOME: fakeHome,
     SKEP_HOME: path.join(root, "skep"),
   };
+  const who = ["-c", "user.name=test", "-c", "user.email=test@example.invalid"];
   await gitIn(root, ["init", "--quiet", "--bare", bare], env);
   await gitIn(repo, ["init", "--quiet", "-b", "main"], env);
   await writeFile(path.join(repo, "README.md"), "app\n");
-  await gitIn(repo, ["add", "README.md"], env);
-  const who = ["-c", "user.name=test", "-c", "user.email=test@example.invalid"];
+  await writeFile(path.join(repo, "notes.txt"), "one\ntwo\n");
+  await gitIn(repo, ["add", "README.md", "notes.txt"], env);
   await gitIn(repo, [...who, "commit", "--quiet", "-m", "init"], env);
   await gitIn(repo, ["remote", "add", "origin", bare], env);
   await gitIn(repo, ["push", "--quiet", "origin", "main"], env);
-  return { home: root, repo, bare, env };
+  const box = { home: root, repo, bare, bin, gitLog, env };
+  // The default agent edits one file and adds another, then says what it did.
+  await stubAgent(
+    box,
+    "claude",
+    'printf "one\\nTWO\\nthree\\n" > notes.txt\nprintf "ok\\n" > health.txt\n' +
+      'echo "working"\necho\necho "Added a health check file."',
+  );
+  return box;
 }
 
 async function remoteHas(box: Sandbox, branch: string): Promise<string | null> {
@@ -1303,30 +1368,43 @@ async function remoteHas(box: Sandbox, branch: string): Promise<string | null> {
   ).catch(() => null);
 }
 
-/** Runs `skep session join` against a real master, sends one intent, returns the item status. */
-async function joinAndWork(
-  box: Sandbox,
-  extraArgs: string[],
-  stdin?: PassThrough,
-): Promise<{ item: ItemStatus; run: ReturnType<typeof capture>; exit: number }> {
-  const master = await startMaster({
+async function startTestMaster(events?: { kind: string; message: string }[]) {
+  return startMaster({
     listen: { host: HOST, port: 0 },
     device: "mac",
     repo: "app",
     controlToken: TOKEN,
     acceptJoin: async () => true,
     onJoinCode: () => {},
+    ...(events === undefined ? {} : { onEvent: (event) => events.push(event) }),
   });
+}
+
+/** Runs `skep session join` against a real master, sends one intent, returns the item status. */
+async function joinAndWork(
+  box: Sandbox,
+  extraArgs: string[],
+  extra: Partial<SessionCliContext> = {},
+  machine = true,
+): Promise<{
+  item: ItemStatus;
+  run: ReturnType<typeof capture>;
+  exit: number;
+  events: { kind: string; message: string }[];
+}> {
+  const events: { kind: string; message: string }[] = [];
+  const master = await startTestMaster(events);
   try {
     const code = master.status().joinCode;
     if (code === null || master.address === null) throw new Error("master has no join code");
     const c = capture(box.home, {
       env: box.env,
       cwd: box.repo,
-      ...(stdin === undefined ? {} : { stdin }),
+      paths: skepPaths(box.env.SKEP_HOME ?? ""),
+      ...extra,
     });
     const argv = [
-      "--machine",
+      ...(machine ? ["--machine"] : []),
       "session",
       "join",
       "--code",
@@ -1345,18 +1423,179 @@ async function joinAndWork(
     await vi.waitFor(() => expect(master.status().intents[0]?.items[0]?.state).toBe("done"), {
       timeout: 10_000,
     });
+    await vi.waitFor(() => expect(events.some((e) => e.kind === "intent-done")).toBe(true));
     const item = master.status().intents[0]?.items[0];
     if (item === undefined) throw new Error("no item");
     await master.close();
-    return { item, run: c, exit: await exit };
+    return { item, run: c, exit: await exit, events };
   } finally {
     await master.close();
   }
 }
 
-describe("session join works items", () => {
+describe("session join works items in the project folder", () => {
+  it("runs the agent with cwd = project root and never adds a worktree, clone or branch", async () => {
+    const box = await sandbox();
+    const base = await gitIn(box.repo, ["rev-parse", "HEAD"], box.env);
+    const { item, exit, events } = await joinAndWork(box, ["--submit", "none"]);
+    expect(exit).toBe(0);
+    // The agent ran in the folder itself and its edits are there, uncommitted.
+    expect(await readFile(path.join(box.repo, "health.txt"), "utf8")).toBe("ok\n");
+    expect(await readFile(path.join(box.env.HOME ?? "", "claude-args.txt"), "utf8")).toBe("-p\n");
+    expect(await gitIn(box.repo, ["rev-parse", "HEAD"], box.env)).toBe(base);
+    expect(await gitIn(box.repo, ["status", "--porcelain"], box.env)).toBe(
+      "M notes.txt\n?? health.txt",
+    );
+    const calls = await gitCalls(box);
+    expect(calls.length).toBeGreaterThan(0);
+    for (const call of calls) {
+      expect(call).not.toMatch(/^(worktree|clone|branch|checkout|switch|stash|reset|clean)\b/);
+    }
+    expect(await gitIn(box.repo, ["branch", "--list", "skep/*"], box.env)).toBe("");
+    await expect(
+      stat(path.join(box.env.SKEP_HOME ?? "", "session", "worktrees")),
+    ).rejects.toThrow();
+    expect(item.result).toMatchObject({
+      baseSha: base,
+      headSha: base,
+      checks: [{ name: "none", status: "skip" }],
+      submit: { method: "none", state: "local", branch: "main" },
+    });
+    const lines = item.result?.summary.split("\n") ?? [];
+    expect(lines[0]).toBe("submit none local");
+    expect(lines[1]).toMatch(/^done · claude · \d+s$/);
+    expect(lines[2]).toBe("changed 2 files (+3 −1): health.txt, notes.txt");
+    expect(lines[3]).toBe("summary: Added a health check file.");
+    const block = events.find((e) => e.kind === "item-result")?.message ?? "";
+    expect(block).toMatch(/^I-1 done · vps \(app\) · claude · \d+s\n {2}changed 2 files/);
+    expect(events.find((e) => e.kind === "intent-done")?.message).toBe(
+      "intent-1 done: add a health check\n  1 done · 0 failed · 2 files changed",
+    );
+  });
+
+  it("two sessions on the same device and project both run their I-1", async () => {
+    const box = await sandbox();
+    const first = await joinAndWork(box, ["--submit", "none"]);
+    // The second agent appends, so it really changes something again.
+    await stubAgent(box, "claude", 'printf "again\\n" >> health.txt');
+    const second = await joinAndWork(box, ["--submit", "none"]);
+    for (const { item } of [first, second]) {
+      expect(item.itemId).toBe("I-1");
+      expect(item.result?.checks).not.toContainEqual(expect.objectContaining({ status: "fail" }));
+    }
+    expect(second.item.result?.summary).toContain("changed 1 file (+1 −0): health.txt");
+    expect(second.item.result?.summary).not.toContain("already exists");
+  });
+
+  it("reports no changes when the agent changed nothing", async () => {
+    const box = await sandbox();
+    await stubAgent(box, "claude", 'echo "nothing to do"');
+    const { item } = await joinAndWork(box, ["--submit", "push"]);
+    expect(item.result?.summary.split("\n")[2]).toBe("no changes");
+    expect(item.result?.submit).toMatchObject({ method: "push", state: "skipped" });
+    expect(await remoteHas(box, "main")).toBe(
+      await gitIn(box.repo, ["rev-parse", "HEAD"], box.env),
+    );
+  });
+
+  it("a pre-dirty tree is left alone; only files changed by the run are listed, annotated", async () => {
+    const box = await sandbox();
+    // Dirty before the run: an edit the agent will touch again, and one it will not.
+    await writeFile(path.join(box.repo, "notes.txt"), "one\nmine\n");
+    await writeFile(path.join(box.repo, "README.md"), "app, edited by me\n");
+    await writeFile(path.join(box.repo, "scratch.txt"), "untracked\n");
+    const { item } = await joinAndWork(box, ["--submit", "none"]);
+    // Nothing was stashed or reset: the human's edit to README.md and scratch.txt survive.
+    expect(await readFile(path.join(box.repo, "README.md"), "utf8")).toBe("app, edited by me\n");
+    expect(await readFile(path.join(box.repo, "scratch.txt"), "utf8")).toBe("untracked\n");
+    expect(item.result?.summary.split("\n")[2]).toBe(
+      "changed 2 files (+3 −1): health.txt, notes.txt (was already modified)",
+    );
+  });
+
+  it("a non-zero exit is a FAILED block with one cause, one fix and the whole text", async () => {
+    const box = await sandbox();
+    const noise = Array.from({ length: 40 }, (_, n) => `trace line ${n} ${"x".repeat(20)}`);
+    await stubAgent(
+      box,
+      "claude",
+      `printf "half\\n" > half.txt\n${noise.map((line) => `echo "${line}"`).join("\n")}\nexit 3`,
+    );
+    const { item, events } = await joinAndWork(box, ["--submit", "push"]);
+    expect(item.result?.checks).toEqual([{ name: "agent", status: "fail" }]);
+    expect(item.result?.submit).toMatchObject({ method: "push", state: "failed", branch: "main" });
+    const summary = item.result?.summary ?? "";
+    expect(summary).toContain("cause: agent claude exited 3");
+    expect(summary).toMatch(/\nfix: read the agent's output/);
+    expect(summary).toContain("changed 1 file (+1 −0): half.txt");
+    const log = path.join(box.env.SKEP_HOME ?? "", "session", "last-error.log");
+    expect(summary).toContain(`full text: ${log}`);
+    expect(await readFile(log, "utf8")).toContain("trace line 39");
+    const block = events.find((e) => e.kind === "item-failed")?.message ?? "";
+    expect(block).toMatch(/^I-1 FAILED · vps \(app\) · claude · \d+s\n/);
+    expect(block.length).toBeGreaterThan(600);
+    expect(block).toContain("trace line 39");
+    expect(events.some((e) => e.kind === "item-result")).toBe(false);
+    expect(events.find((e) => e.kind === "intent-done")?.message).toContain("0 done · 1 failed");
+  });
+
+  it("a missing agent binary at run time names the CLI and the fix", async () => {
+    const box = await sandbox();
+    const dir = await home();
+    const c = capture(dir, { env: box.env, cwd: box.repo, paths: skepPaths(dir) });
+    const worker = itemWorker(box, c, "native", fakeRuntime(), { method: "none" });
+    if (worker.agent !== undefined) worker.agent.cli = "codex";
+    const result = await workItem(worker, ITEM);
+    expect(result.checks).toEqual([{ name: "agent", status: "fail" }]);
+    expect(result.summary).toContain("cause: agent CLI codex not found on PATH");
+    expect(result.summary).toContain("fix: install codex");
+  });
+
+  it("joins in auto mode by default: no per-item question before the run", async () => {
+    const box = await sandbox();
+    const { item, run } = await joinAndWork(box, ["--submit", "none"]);
+    expect(run.stderr).not.toContain("Run item");
+    expect(run.stdout).toContain('"control":"auto"');
+    expect(run.stdout).toContain('"agent":{"cli":"claude","source":"PATH","view":"native"}');
+    expect(item.result?.submit).toMatchObject({ method: "none", state: "local" });
+  });
+
+  it("--manual asks before each item; Enter runs it", async () => {
+    const box = await sandbox();
+    const stdin = new PassThrough();
+    stdin.write("\n");
+    const { item, run } = await joinAndWork(box, ["--manual", "--submit", "none"], { stdin });
+    expect(run.stdout).toContain('"control":"manual"');
+    expect(run.stderr).toContain("Run item I-1 (app): add a health check? [Y/n]");
+    expect(item.result?.submit).toMatchObject({ method: "none", state: "local" });
+  });
+
+  it("--manual: n declines the item and runs nothing", async () => {
+    const box = await sandbox();
+    const stdin = new PassThrough();
+    stdin.write("n\n");
+    const { item } = await joinAndWork(box, ["--manual", "--submit", "push"], { stdin });
+    expect(item.result?.checks).toEqual([{ name: "peer", status: "skip" }]);
+    expect(item.result?.submit).toEqual({ method: "push", state: "skipped", branch: "main" });
+    expect(item.result?.summary).toContain("declined on this device (manual mode)");
+    await expect(stat(path.join(box.env.HOME ?? "", "claude-called"))).rejects.toThrow();
+  });
+
+  it("--manual cannot be combined with --ui", async () => {
+    const box = await sandbox();
+    setJoinViewFactory(() => recordingView().view);
+    try {
+      const c = capture(box.home, { env: box.env, cwd: box.repo });
+      const argv = ["--machine", "session", "join", "--code", "123456789012", "--host", "h:1"];
+      expect(await runCli([...argv, "--ui", "--manual"], c.ctx)).toBe(2);
+      expect(JSON.parse(c.stdout).error.message).toMatch(/--manual cannot be combined with --ui/);
+    } finally {
+      setJoinViewFactory(null);
+    }
+  });
+
   it.each(["committed", "unborn", "non-git"] as const)(
-    "keeps a same-device peer in a different %s project connected through intent and work",
+    "keeps a same-device peer in a different %s project connected and working (SAME-CB)",
     async (project) => {
       const box = await sandbox();
       const peerDir = path.join(box.home, "proj-b");
@@ -1372,6 +1611,7 @@ describe("session join works items", () => {
         project === "committed"
           ? await gitIn(peerDir, ["rev-parse", "HEAD"], box.env)
           : "0".repeat(40);
+      await stubAgent(box, "claude", 'printf "x\\n" >> peer.txt\necho "Appended x."');
       const master = await startMaster({
         device: "mac",
         repo: "proj-a",
@@ -1418,7 +1658,6 @@ describe("session join works items", () => {
             device: "mac",
             role: "coding",
             submit: "none",
-            agent: "dry",
           },
           {
             say,
@@ -1427,6 +1666,7 @@ describe("session join works items", () => {
             createView: () => log.view,
           },
         );
+        expect(joined.dir).toBe(peerDir);
         void joined.closed.then(({ reason }) => closed.push(reason));
         for (let index = 0; index < 2; index++) {
           await expect(master.submitIntent("add a health check")).resolves.toEqual({
@@ -1440,26 +1680,21 @@ describe("session join works items", () => {
           expect(item).toMatchObject({
             repo: "proj-a",
             assignee: joined.handle.peerId,
-            datalistEntries: project === "committed" ? 2 : project === "unborn" ? 1 : 0,
+            datalistEntries: project === "committed" ? 3 : project === "unborn" ? 1 : 0,
             result: {
               repo: "proj-a",
               baseSha: head,
-              submit: { method: "none", state: project === "committed" ? "local" : "failed" },
+              headSha: head,
+              checks: [{ name: "none", status: "skip" }],
+              submit: { method: "none", state: "local" },
             },
           });
+          // A repo without HEAD or no repo at all now runs the agent in place too.
+          expect(item?.result?.summary).toContain("changed 1 file (+1 −0): peer.txt");
           expect(master.status().peers).toMatchObject([
             { peerId: joined.handle.peerId, device: "mac", repo: "proj-a", head },
           ]);
           expect(closed).toEqual([]);
-          if (project !== "committed") {
-            expect(item?.result).toMatchObject({
-              headSha: head,
-              checks: [{ name: "git", status: "fail" }],
-            });
-            expect(item?.result?.summary).toContain(
-              project === "unborn" ? "HEAD" : "not a git repository",
-            );
-          }
         }
         expect(say.mock.calls.some(([event]) => event.event === "session-error")).toBe(false);
         expect(warnings.length).toBe(project === "committed" ? 0 : project === "unborn" ? 2 : 4);
@@ -1469,55 +1704,227 @@ describe("session join works items", () => {
       }
     },
   );
+});
 
-  it("--submit none commits on the session branch and reports local without pushing", async () => {
-    const box = await sandbox();
-    const base = await gitIn(box.repo, ["rev-parse", "HEAD"], box.env);
-    const { item, exit, run } = await joinAndWork(box, ["--submit", "none"]);
-    expect(exit).toBe(0);
-    const branch = "skep/session/I-1-e1";
-    const head = await gitIn(box.repo, ["rev-parse", branch], box.env);
-    expect(item.result).toMatchObject({
-      repo: "app",
-      baseSha: base,
-      headSha: head,
-      checks: [{ name: "none", status: "skip" }],
-      submit: { method: "none", state: "local", branch },
+describe("agent resolution at join", () => {
+  async function stubs(names: readonly string[]): Promise<string> {
+    const dir = await home();
+    for (const name of names) await writeFile(path.join(dir, name), "#!/bin/sh\n", { mode: 0o755 });
+    return dir;
+  }
+
+  it("honours flag > /agent > SKEP_AGENT_CLI > AGENT.md > PATH, first of claude, codex, pi", async () => {
+    const bin = await stubs(["claude", "codex", "pi"]);
+    const dir = await home();
+    const warn = vi.fn();
+    const env = { PATH: bin, SKEP_AGENT_CLI: "codex" };
+    await writeFile(path.join(dir, "AGENT.md"), AGENT_MD("pi"));
+    expect(await resolveAgentCli({ flag: "pi", setting: "claude", env, dir, warn })).toEqual({
+      cli: "pi",
+      source: "--agent",
     });
-    expect(head).not.toBe(base);
-    expect(item.result?.summary.split("\n")[0]).toBe("submit none local");
-    expect(await gitIn(box.repo, ["log", "-1", "--format=%s", branch], box.env)).toBe(
-      "session I-1 epoch 1",
-    );
-    expect(await gitIn(box.repo, ["show", `${branch}:.skep-session-item`], box.env)).toBe("I-1");
-    // The device's own checkout is untouched and nothing reached origin.
-    expect(await gitIn(box.repo, ["rev-parse", "HEAD"], box.env)).toBe(base);
-    expect(await remoteHas(box, branch)).toBeNull();
-    expect(run.stdout).toContain('"event":"item-result"');
-
-    // `skep session submit --method none` on that branch prints local and still does not push.
-    const c = capture(box.home, { env: box.env, cwd: box.repo });
-    expect(await runCli(["session", "submit", "I-1", "--method", "none"], c.ctx)).toBe(0);
-    expect(c.stdout).toBe("submit none local\n");
-    expect(await remoteHas(box, branch)).toBeNull();
+    expect(await resolveAgentCli({ setting: "claude", env, dir, warn })).toEqual({
+      cli: "claude",
+      source: "/agent",
+    });
+    expect(await resolveAgentCli({ env, dir, warn })).toEqual({
+      cli: "codex",
+      source: "SKEP_AGENT_CLI",
+    });
+    expect(await resolveAgentCli({ env: { PATH: bin }, dir, warn })).toEqual({
+      cli: "pi",
+      source: "AGENT.md",
+    });
+    const empty = await home();
+    expect(await resolveAgentCli({ env: { PATH: bin }, dir: empty, warn })).toEqual({
+      cli: "claude",
+      source: "PATH",
+    });
+    const onlyPi = await stubs(["pi"]);
+    expect(await resolveAgentCli({ env: { PATH: onlyPi }, dir: empty, warn })).toEqual({
+      cli: "pi",
+      source: "PATH",
+    });
+    expect(warn).not.toHaveBeenCalled();
   });
 
-  it("--submit push pushes only the session branch to origin", async () => {
+  it("an explicit choice must be installed; a broken AGENT.md is skipped with a warning", async () => {
+    const bin = await stubs(["codex"]);
+    const dir = await home();
+    await expect(
+      resolveAgentCli({ flag: "claude", env: { PATH: bin }, dir, warn: () => {} }),
+    ).rejects.toThrow(/agent claude \(from --agent\) is not on PATH\nfix: install claude/);
+    await expect(
+      resolveAgentCli({ env: { PATH: bin, SKEP_AGENT_CLI: "gpt" }, dir, warn: () => {} }),
+    ).rejects.toThrow(/SKEP_AGENT_CLI=gpt is not one of claude, codex, pi/);
+    await writeFile(path.join(dir, "AGENT.md"), "not front matter\n");
+    const warn = vi.fn();
+    expect(await resolveAgentCli({ env: { PATH: bin }, dir, warn })).toEqual({
+      cli: "codex",
+      source: "PATH",
+    });
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("ignoring AGENT.md"));
+  });
+
+  it("no agent anywhere: join fails with the actionable message and never connects", async () => {
     const box = await sandbox();
-    const mainBefore = await remoteHas(box, "main");
+    await rm(path.join(box.bin, "claude"));
+    const fake = fakeApi();
+    const c = capture(box.home, { env: box.env, cwd: box.repo, sessionApi: fake.api });
+    const argv = ["session", "join", "--code", "123456789012", "--host", "h:1", "--repo", "app"];
+    expect(await runCli(argv, c.ctx)).toBe(2);
+    expect(c.stderr).toContain(
+      "no agent CLI found (looked for claude, codex, pi on PATH)\n" +
+        "fix: install one, or pass --agent <claude|codex|pi>",
+    );
+    expect(fake.calls.sub).toHaveLength(0);
+  });
+
+  it("joins with no AGENT.md and no --role-dir, naming the agent and the folder", async () => {
+    const box = await sandbox();
+    const fake = fakeApi();
+    const c = capture(box.home, { env: box.env, cwd: box.repo, sessionApi: fake.api });
+    const argv = ["session", "join", "--code", "123456789012", "--host", "h:1", "--repo", "app"];
+    expect(await runCli(argv, c.ctx)).toBe(0);
+    expect(c.stdout).toContain(
+      `agent: claude (found on PATH) · mode: edits this folder directly (${box.repo})`,
+    );
+  });
+
+  it("legacy --agent pty still joins, as --view pty, with a one-line notice", async () => {
+    const box = await sandbox();
+    const fake = fakeApi();
+    const c = capture(box.home, { env: box.env, cwd: box.repo, sessionApi: fake.api });
+    const argv = ["session", "join", "--code", "123456789012", "--host", "h:1", "--repo", "app"];
+    expect(await runCli([...argv, "--agent", "pty", "--role-dir", "/x"], c.ctx)).toBe(0);
+    expect(c.stderr).toContain("skep: --agent pty is now --view pty\n");
+    expect(c.stderr).toContain("skep: --role-dir is ignored; AGENT.md is no longer required\n");
+    expect(c.stdout).toContain("agent: claude (found on PATH) (pty view)");
+  });
+
+  it("--view dry runs nothing, commits nothing and reports a failed-class DRY RUN", async () => {
+    const box = await sandbox();
+    const base = await gitIn(box.repo, ["rev-parse", "HEAD"], box.env);
+    const fake = fakeRuntime();
+    const { item, events } = await joinAndWork(box, ["--submit", "none", "--view", "dry"], {
+      agentRuntime: fake.runtime,
+    });
+    expect(fake.loads).toBe(0);
+    await expect(stat(path.join(box.env.HOME ?? "", "claude-called"))).rejects.toThrow();
+    expect(await gitIn(box.repo, ["rev-parse", "HEAD"], box.env)).toBe(base);
+    expect(await gitIn(box.repo, ["status", "--porcelain"], box.env)).toBe("");
+    expect(item.result?.checks).toEqual([{ name: "agent", status: "fail" }]);
+    expect(item.result?.summary).toContain(DRY_RUN_SUMMARY);
+    expect(events.some((e) => e.kind === "item-failed")).toBe(true);
+  });
+
+  it("the dry marker and its fake-success text are gone from src/", async () => {
+    const src = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+    const banned = [`dry run: committed the ${"session marker"}`, `.skep-${"session-item"}`];
+    const files = await readdir(src, { recursive: true });
+    for (const file of files) {
+      if (!file.endsWith(".ts")) continue;
+      const text = await readFile(path.join(src, file), "utf8");
+      for (const needle of banned) expect(text, file).not.toContain(needle);
+    }
+  });
+});
+
+describe("items on one peer run strictly one at a time", () => {
+  it("a second item waits for the first agent to exit", async () => {
+    const box = await sandbox();
+    const order = path.join(box.env.HOME ?? "", "order.log");
+    await stubAgent(
+      box,
+      "claude",
+      `echo "start $SKEP_SESSION_ITEM" >> "${order}"\n${realSleep} 0.3\n` +
+        `echo "end $SKEP_SESSION_ITEM" >> "${order}"`,
+    );
+    const fake = fakeApi();
+    const open = deferred();
+    const connect = fake.api.connectSub;
+    // A session that stays up while both items run.
+    fake.api.connectSub = async (options) => ({
+      ...(await connect(options)),
+      closed: open.promise.then(() => ({ reason: "test" })),
+      close: async () => open.resolve(),
+    });
+    const c = capture(box.home, {
+      env: box.env,
+      cwd: box.repo,
+      sessionApi: fake.api,
+      paths: skepPaths(box.env.SKEP_HOME ?? ""),
+    });
+    const flow = await joinSessionFlow(
+      c.ctx,
+      { code: "123456789012", host: "h:1", repo: "app", role: "coding", submit: "none" },
+      {
+        say: () => {},
+        ask: async () => null,
+        warn: () => {},
+        createView: () => recordingView().view,
+      },
+    );
+    const sub = fake.calls.sub[0];
+    if (sub === undefined) throw new Error("no join");
+    const results = await Promise.all([
+      sub.onItem({ ...ITEM, itemId: "I-1" }),
+      sub.onItem({ ...ITEM, itemId: "I-2" }),
+    ]);
+    expect((await readFile(order, "utf8")).trim().split("\n")).toEqual([
+      "start I-1",
+      "end I-1",
+      "start I-2",
+      "end I-2",
+    ]);
+    for (const result of results)
+      expect(result?.checks).toEqual([{ name: "none", status: "skip" }]);
+    await flow.close();
+  });
+});
+
+describe("submit modes on the item's delta", () => {
+  it("commit commits only the item's files on the current branch", async () => {
+    const box = await sandbox();
+    await writeFile(path.join(box.repo, "README.md"), "my own edit\n");
+    const base = await gitIn(box.repo, ["rev-parse", "HEAD"], box.env);
+    const { item } = await joinAndWork(box, ["--submit", "commit"]);
+    const head = await gitIn(box.repo, ["rev-parse", "HEAD"], box.env);
+    expect(head).not.toBe(base);
+    expect(item.result?.headSha).toBe(head);
+    // The wire has no commit method: it travels as none/local, the summary says commit.
+    expect(item.result?.submit).toEqual({ method: "none", state: "local", branch: "main" });
+    expect(item.result?.summary.split("\n")[0]).toBe(
+      `submit commit local ${head.slice(0, 7)} on main`,
+    );
+    expect(await gitIn(box.repo, ["show", "--name-only", "--format=", "HEAD"], box.env)).toBe(
+      "health.txt\nnotes.txt",
+    );
+    expect(await gitIn(box.repo, ["status", "--porcelain"], box.env)).toBe("M README.md");
+    expect(await remoteHas(box, "main")).toBe(base);
+  });
+
+  it("push commits the item's files and pushes the current branch", async () => {
+    const box = await sandbox();
+    const { item } = await joinAndWork(box, ["--submit", "push"]);
+    const head = await gitIn(box.repo, ["rev-parse", "HEAD"], box.env);
+    expect(item.result?.submit).toEqual({ method: "push", state: "pushed", branch: "main" });
+    expect(await remoteHas(box, "main")).toBe(head);
+  });
+
+  it("a push that fails is a failed outcome, not a crash", async () => {
+    const box = await sandbox();
+    await rm(box.bare, { recursive: true, force: true });
     const { item, exit } = await joinAndWork(box, ["--submit", "push"]);
     expect(exit).toBe(0);
-    const branch = "skep/session/I-1-e1";
-    expect(item.result?.submit).toEqual({ method: "push", state: "pushed", branch });
-    expect(await remoteHas(box, branch)).toBe(item.result?.headSha);
-    expect(await remoteHas(box, "main")).toBe(mainBefore);
+    expect(item.result?.submit).toMatchObject({ method: "push", state: "failed" });
   });
 
   it("uses the device.toml policy when --submit is absent", async () => {
     const box = await sandbox();
-    await mkdir(path.join(box.home, "skep"), { recursive: true });
+    await mkdir(box.env.SKEP_HOME ?? "", { recursive: true });
     await writeFile(
-      path.join(box.home, "skep", "device.toml"),
+      path.join(box.env.SKEP_HOME ?? "", "device.toml"),
       '[submit]\nmethod = "pr"\nhost = "git"\n',
     );
     const { item } = await joinAndWork(box, []);
@@ -1525,107 +1932,58 @@ describe("session join works items", () => {
     expect(item.result?.submit).toMatchObject({ method: "push", state: "pushed" });
   });
 
-  it("joins in auto mode by default: no per-item question before the run", async () => {
-    const box = await sandbox();
-    const { item, run } = await joinAndWork(box, ["--submit", "none"]);
-    expect(run.stderr).not.toContain("Run item");
-    expect(run.stdout).toContain('"control":"auto"');
-    expect(item.result?.submit).toMatchObject({ method: "none", state: "local" });
-  });
-
-  it("--manual asks before each item; Enter runs it", async () => {
-    const box = await sandbox();
-    const stdin = new PassThrough();
-    stdin.write("\n");
-    const { item, run } = await joinAndWork(box, ["--manual", "--submit", "none"], stdin);
-    expect(run.stdout).toContain('"control":"manual"');
-    expect(run.stderr).toContain("Run item I-1 (app): add a health check? [Y/n]");
-    expect(item.result?.submit).toMatchObject({ method: "none", state: "local" });
-  });
-
-  it("--manual: n declines the item without checking anything out", async () => {
-    const box = await sandbox();
-    const stdin = new PassThrough();
-    stdin.write("n\n");
-    const { item } = await joinAndWork(box, ["--manual", "--submit", "push"], stdin);
-    const branch = "skep/session/I-1-e1";
-    expect(item.result?.checks).toEqual([{ name: "peer", status: "skip" }]);
-    expect(item.result?.submit).toEqual({ method: "push", state: "skipped", branch });
-    expect(item.result?.summary).toContain("declined on this device (manual mode)");
-    await expect(gitIn(box.repo, ["rev-parse", "--verify", branch], box.env)).rejects.toThrow();
-  });
-
-  it("--manual cannot be combined with --ui", async () => {
-    const box = await sandbox();
-    setJoinViewFactory(() => recordingView().view);
-    try {
-      const c = capture(box.home, { env: box.env, cwd: box.repo });
-      const argv = ["--machine", "session", "join", "--code", "123456789012", "--host", "h:1"];
-      expect(await runCli([...argv, "--ui", "--manual"], c.ctx)).toBe(2);
-      expect(JSON.parse(c.stdout).error.message).toMatch(/--manual cannot be combined with --ui/);
-    } finally {
-      setJoinViewFactory(null);
-    }
-  });
-
-  it("without device.toml or --submit, defaults to none: local, no submit prompt", async () => {
+  it("without device.toml or --submit, defaults to none: edits stay, no submit prompt", async () => {
     const box = await sandbox();
     const stdin = new PassThrough();
     stdin.end();
-    const { item, run } = await joinAndWork(box, [], stdin);
-    const branch = "skep/session/I-1-e1";
-    expect(item.result?.submit).toEqual({ method: "none", state: "local", branch });
+    const { item, run } = await joinAndWork(box, [], { stdin });
+    expect(item.result?.submit).toEqual({ method: "none", state: "local", branch: "main" });
     expect(run.stderr).not.toContain("Submit this item?");
-    expect(await remoteHas(box, branch)).toBeNull();
   });
 
-  it("device.toml method ask still asks", async () => {
+  it("pr without gh on PATH stays local: no branch, no commit, no push", async () => {
     const box = await sandbox();
-    const skepHome = path.join(box.home, "skep");
-    await mkdir(skepHome, { recursive: true });
-    await writeFile(path.join(skepHome, "device.toml"), '[submit]\nmethod = "ask"\n');
-    const stdin = new PassThrough();
-    stdin.end();
-    const { item, run } = await joinAndWork(box, [], stdin);
-    expect(run.stderr).toContain("Submit this item? [pr/mr/push/none/skip]");
-    expect(item.result?.submit).toMatchObject({ method: "ask", state: "skipped" });
-  });
-
-  it("ask: prints branch and sha, then a typed answer submits", async () => {
-    const box = await sandbox();
-    const stdin = new PassThrough();
-    stdin.write("push\n");
-    const { item, run } = await joinAndWork(box, ["--submit", "ask"], stdin);
-    expect(run.stderr).toContain("Submit this item? [pr/mr/push/none/skip]");
-    expect(run.stderr).toContain(`skep/session/I-1-e1 at ${item.result?.headSha}`);
-    expect(item.result?.submit).toMatchObject({ method: "push", state: "pushed" });
-  });
-
-  it("ask: skip or EOF leaves the branch local as skipped, and submit can push it later", async () => {
-    const box = await sandbox();
-    const stdin = new PassThrough();
-    stdin.end();
-    const { item } = await joinAndWork(box, ["--submit", "ask"], stdin);
-    const branch = "skep/session/I-1-e1";
-    expect(item.result?.submit).toEqual({ method: "ask", state: "skipped", branch });
-    expect(await remoteHas(box, branch)).toBeNull();
-
-    const c = capture(box.home, { env: box.env, cwd: box.repo });
-    expect(await runCli(["--machine", "session", "submit", "I-1", "--method", "push"], c.ctx)).toBe(
-      0,
-    );
-    expect(JSON.parse(c.stdout).result.submit).toEqual({ method: "push", state: "pushed", branch });
-    expect(await remoteHas(box, branch)).toBe(item.result?.headSha);
-  });
-
-  it("pr without gh on PATH stays local and does not push", async () => {
-    const box = await sandbox();
+    const base = await gitIn(box.repo, ["rev-parse", "HEAD"], box.env);
     const { item } = await joinAndWork(box, ["--submit", "pr"]);
-    expect(item.result?.submit).toMatchObject({ method: "pr", state: "local" });
-    expect(await remoteHas(box, "skep/session/I-1-e1")).toBeNull();
+    expect(item.result?.submit).toMatchObject({ method: "pr", state: "local", branch: "main" });
+    expect(item.result?.summary).toContain("gh is not on PATH; nothing was committed");
+    expect(await gitIn(box.repo, ["rev-parse", "HEAD"], box.env)).toBe(base);
+    expect(await gitIn(box.repo, ["branch", "--list", "skep/*"], box.env)).toBe("");
   });
 
-  it("a failing check is reported and not submitted", async () => {
+  it("pr creates skep/<item>-<slug> at submit time without touching the folder or branch", async () => {
+    const box = await sandbox();
+    await writeFile(
+      path.join(box.bin, "gh"),
+      `#!/bin/sh\nprintf "%s\\n" "$@" > "$HOME/gh-args.txt"\necho "https://github.com/o/r/pull/7"\n`,
+      { mode: 0o755 },
+    );
+    const base = await gitIn(box.repo, ["rev-parse", "HEAD"], box.env);
+    const { item } = await joinAndWork(box, ["--submit", "pr"]);
+    const branch = "skep/I-1-add-a-health-check";
+    expect(item.result?.submit).toEqual({
+      method: "pr",
+      state: "opened",
+      branch,
+      url: "https://github.com/o/r/pull/7",
+      number: 7,
+    });
+    // The folder keeps the edits on its own branch; the PR branch holds a copy on top of HEAD.
+    expect(await gitIn(box.repo, ["rev-parse", "--abbrev-ref", "HEAD"], box.env)).toBe("main");
+    expect(await gitIn(box.repo, ["rev-parse", "HEAD"], box.env)).toBe(base);
+    expect(await gitIn(box.repo, ["status", "--porcelain"], box.env)).toBe(
+      "M notes.txt\n?? health.txt",
+    );
+    expect(await gitIn(box.repo, ["rev-parse", `${branch}^`], box.env)).toBe(base);
+    expect(await gitIn(box.repo, ["show", `${branch}:health.txt`], box.env)).toBe("ok");
+    expect(await remoteHas(box, branch)).toBe(
+      await gitIn(box.repo, ["rev-parse", branch], box.env),
+    );
+    const args = await readFile(path.join(box.env.HOME ?? "", "gh-args.txt"), "utf8");
+    expect(args).toContain(`--head\n${branch}\n--base\nmain\n`);
+  });
+
+  it("a failing check is reported, the edits stay, nothing is pushed", async () => {
     const box = await sandbox();
     await mkdir(path.join(box.repo, ".skep"));
     await writeFile(
@@ -1636,10 +1994,12 @@ describe("session join works items", () => {
     const who = ["-c", "user.name=test", "-c", "user.email=test@example.invalid"];
     await gitIn(box.repo, ["add", "."], box.env);
     await gitIn(box.repo, [...who, "commit", "--quiet", "-m", "checks"], box.env);
+    const head = await gitIn(box.repo, ["rev-parse", "HEAD"], box.env);
     const { item } = await joinAndWork(box, ["--submit", "push"]);
     expect(item.result?.checks).toEqual([{ name: "unit", status: "fail" }]);
     expect(item.result?.submit).toMatchObject({ method: "push", state: "skipped" });
-    expect(await remoteHas(box, "skep/session/I-1-e1")).toBeNull();
+    expect(item.result?.summary).toContain("checks failed; not submitted");
+    expect(await gitIn(box.repo, ["rev-parse", "HEAD"], box.env)).toBe(head);
   });
 
   it("a passing check is recorded before the push", async () => {
@@ -1657,32 +2017,86 @@ describe("session join works items", () => {
     expect(item.result?.submit).toMatchObject({ state: "pushed" });
   });
 
-  it("a push that fails is a failed outcome, not a crash", async () => {
+  it("device.toml method ask still asks", async () => {
     const box = await sandbox();
-    await rm(box.bare, { recursive: true, force: true });
-    const { item, exit } = await joinAndWork(box, ["--submit", "push"]);
-    expect(exit).toBe(0);
-    expect(item.result?.submit).toMatchObject({ method: "push", state: "failed" });
+    await mkdir(box.env.SKEP_HOME ?? "", { recursive: true });
+    await writeFile(
+      path.join(box.env.SKEP_HOME ?? "", "device.toml"),
+      '[submit]\nmethod = "ask"\n',
+    );
+    const stdin = new PassThrough();
+    stdin.end();
+    const { item, run } = await joinAndWork(box, [], { stdin });
+    expect(run.stderr).toContain("Submit this item? [commit/push/pr/mr/none/skip]");
+    expect(item.result?.submit).toMatchObject({ method: "ask", state: "skipped" });
   });
 
-  it("a git failure while materializing is reported as failed", async () => {
+  it("ask: shows the changed files, then a typed answer submits", async () => {
     const box = await sandbox();
-    // The branch already exists from an earlier session: never clobbered.
-    await gitIn(box.repo, ["branch", "skep/session/I-1-e1"], box.env);
-    const base = await gitIn(box.repo, ["rev-parse", "HEAD"], box.env);
-    const { item, exit } = await joinAndWork(box, ["--submit", "push"]);
-    expect(exit).toBe(0);
-    expect(item.result).toMatchObject({
-      baseSha: base,
-      headSha: base,
-      checks: [{ name: "git", status: "fail" }],
-      submit: { method: "push", state: "failed" },
+    const stdin = new PassThrough();
+    stdin.write("push\n");
+    const { item, run } = await joinAndWork(box, ["--submit", "ask"], { stdin });
+    expect(run.stderr).toContain("item I-1 changed 2 files (+3 −1): health.txt, notes.txt");
+    expect(item.result?.submit).toMatchObject({ method: "push", state: "pushed" });
+  });
+
+  it("ask: skip leaves the edits; skep session submit commits the recorded delta later", async () => {
+    const box = await sandbox();
+    const stdin = new PassThrough();
+    stdin.end();
+    const { item } = await joinAndWork(box, ["--submit", "ask"], { stdin });
+    expect(item.result?.submit).toEqual({ method: "ask", state: "skipped", branch: "main" });
+    await writeFile(path.join(box.repo, "README.md"), "unrelated\n");
+
+    const c = capture(box.home, {
+      env: box.env,
+      cwd: box.repo,
+      paths: skepPaths(box.env.SKEP_HOME ?? ""),
     });
-    expect(item.result?.summary).toContain("already exists");
+    const argv = ["--machine", "session", "submit", "I-1", "--method", "push"];
+    expect(await runCli(argv, c.ctx)).toBe(0);
+    const out = JSON.parse(c.stdout).result;
+    expect(out.submit).toEqual({ method: "push", state: "pushed", branch: "main" });
+    expect(out.files).toEqual(["health.txt", "notes.txt"]);
+    expect(await gitIn(box.repo, ["show", "--name-only", "--format=", "HEAD"], box.env)).toBe(
+      "health.txt\nnotes.txt",
+    );
+    expect(await gitIn(box.repo, ["status", "--porcelain"], box.env)).toBe("M README.md");
+  });
+
+  it("submit on a legacy skep/session/* branch says so and deletes nothing", async () => {
+    const box = await sandbox();
+    await gitIn(box.repo, ["branch", "skep/session/I-3-e1"], box.env);
+    const c = capture(box.home, {
+      env: box.env,
+      cwd: box.repo,
+      paths: skepPaths(box.env.SKEP_HOME ?? ""),
+    });
+    expect(await runCli(["session", "submit", "I-3", "--method", "push"], c.ctx)).not.toBe(0);
+    expect(c.stderr).toContain("skep/session/I-3-e1 is a legacy branch from skep 0.1.x");
+    expect(c.stderr).toContain("git push origin skep/session/I-3-e1");
+    expect(await gitIn(box.repo, ["branch", "--list", "skep/session/*"], box.env)).toContain(
+      "skep/session/I-3-e1",
+    );
+    expect(await remoteHas(box, "skep/session/I-3-e1")).toBeNull();
+  });
+
+  it("a new peer's result stays valid on the unchanged wire for any master", async () => {
+    const box = await sandbox();
+    const c = capture(box.home, {
+      env: box.env,
+      cwd: box.repo,
+      paths: skepPaths(box.env.SKEP_HOME ?? ""),
+    });
+    const worker = itemWorker(box, c, "native", fakeRuntime(), { method: "commit" });
+    const result = await workItem(worker, ITEM);
+    expect(SubResultSchema.safeParse(result).success).toBe(true);
+    // An old master shows the first line as before: a submit line.
+    expect(result.summary.split("\n")[0]).toMatch(/^submit commit local [0-9a-f]{7} on main$/);
   });
 });
 
-describe("session submit policy and materialize fallback", () => {
+describe("session submit policy", () => {
   it("defaults to none; reads method; host git forces push; a bad file falls back", async () => {
     const dir = await home();
     const file = path.join(dir, "device.toml");
@@ -1691,6 +2105,8 @@ describe("session submit policy and materialize fallback", () => {
     expect(await loadSubmitPolicy(file)).toEqual({ method: "none", host: "github" });
     await writeFile(file, '[submit]\nmethod = "mr"\nhost = "gitlab"\n');
     expect(await loadSubmitPolicy(file)).toEqual({ method: "mr", host: "gitlab" });
+    await writeFile(file, '[submit]\nmethod = "commit"\n');
+    expect(await loadSubmitPolicy(file)).toEqual({ method: "commit", host: "github" });
     await writeFile(file, '[submit]\nhost = "git"\n');
     expect(await loadSubmitPolicy(file)).toEqual({ method: "push", host: "git" });
     const warnings: string[] = [];
@@ -1709,48 +2125,60 @@ describe("session submit policy and materialize fallback", () => {
     await writeFile(file, '[submit]\nmethod = "ask"\n');
     expect(await loadSubmitPolicy(file)).toEqual({ method: "ask", host: "github" });
   });
+});
 
-  it("falls back to a local clone and fetches the branch back", async () => {
+describe("session undo", () => {
+  it("restores the files of an item and removes the ones it created", async () => {
     const box = await sandbox();
-    const c = capture(box.home, { env: box.env, cwd: box.repo });
-    const item = {
-      itemId: "I-4",
-      repo: "app",
-      assignee: "P-1",
-      epoch: 2,
-      title: "x",
-      datalistEntries: 0,
-    };
-    const root = path.join(box.home, "work");
-    const work = await materializeItem(c.ctx, item, root, { worktree: false });
-    expect(work.clone).not.toBeNull();
-    expect(work.branch).toBe("skep/session/I-4-e2");
-    expect(await gitIn(work.dir, ["remote", "get-url", "origin"], box.env)).toBe(box.bare);
-    const result = await workItem(
-      {
-        ctx: c.ctx,
-        root: path.join(box.home, "other"),
-        method: "none",
-        ask: async () => null,
-        worktree: false,
-      },
-      { ...item, itemId: "I-5" },
+    await joinAndWork(box, ["--submit", "none"]);
+    const c = capture(box.home, {
+      env: box.env,
+      cwd: box.repo,
+      paths: skepPaths(box.env.SKEP_HOME ?? ""),
+    });
+    expect(await runCli(["session", "undo", "I-1"], c.ctx)).toBe(0);
+    expect(c.stdout).toBe(`undid I-1 in ${box.repo}: restored notes.txt; removed health.txt\n`);
+    expect(await readFile(path.join(box.repo, "notes.txt"), "utf8")).toBe("one\ntwo\n");
+    await expect(stat(path.join(box.repo, "health.txt"))).rejects.toThrow();
+    expect(await gitIn(box.repo, ["status", "--porcelain"], box.env)).toBe("");
+    // Undoing twice is refused: there is nothing recorded to put back any more.
+    const again = capture(box.home, { env: box.env, cwd: box.repo, paths: c.ctx.paths });
+    expect(await runCli(["session", "undo", "I-1"], again.ctx)).not.toBe(0);
+    expect(again.stderr).toContain("I-1 was already undone");
+  });
+
+  it("refuses when a file changed again after the item, unless --force", async () => {
+    const box = await sandbox();
+    await writeFile(path.join(box.repo, "notes.txt"), "one\nmine\n");
+    await joinAndWork(box, ["--submit", "none"]);
+    await writeFile(path.join(box.repo, "health.txt"), "edited after the item\n");
+    const paths = skepPaths(box.env.SKEP_HOME ?? "");
+    const c = capture(box.home, { env: box.env, cwd: box.repo, paths });
+    expect(await runCli(["session", "undo", "I-1"], c.ctx)).not.toBe(0);
+    expect(c.stderr).toContain("cannot undo I-1: health.txt changed again after the item");
+    expect(c.stderr).toContain("Nothing was changed; pass --force");
+    expect(await readFile(path.join(box.repo, "health.txt"), "utf8")).toBe(
+      "edited after the item\n",
     );
-    expect(result.submit).toMatchObject({ state: "local" });
-    expect(sessionBranch("I-5", 2)).toBe("skep/session/I-5-e2");
-    // A clone, not a linked worktree: the device repo only has its own checkout registered.
-    expect(await gitIn(box.repo, ["worktree", "list", "--porcelain"], box.env)).not.toContain(
-      "I-5",
-    );
-    expect(await gitIn(box.repo, ["rev-parse", "skep/session/I-5-e2"], box.env)).toBe(
-      result.headSha,
-    );
+    const forced = capture(box.home, { env: box.env, cwd: box.repo, paths });
+    expect(await runCli(["session", "undo", "I-1", "--force"], forced.ctx)).toBe(0);
+    expect(forced.stdout).toContain("overwrote later edits in health.txt (--force)");
+    // The pre-existing edit comes back, not HEAD's content.
+    expect(await readFile(path.join(box.repo, "notes.txt"), "utf8")).toBe("one\nmine\n");
+    await expect(stat(path.join(box.repo, "health.txt"))).rejects.toThrow();
+  });
+
+  it("an unknown item is refused with where it looked", async () => {
+    const dir = await home();
+    const c = capture(dir, { paths: skepPaths(dir) });
+    expect(await runCli(["session", "undo", "I-9"], c.ctx)).not.toBe(0);
+    expect(c.stderr).toContain("no recorded changes for I-9 in this project");
   });
 });
 
 // ---------------------------------------------------------------------------------------------
-// SK-621: live agent view. Fake PtyRunner and AgentSessionBackend; the native fallback runs a
-// fake CLI script from a temp PATH entry. No real agent CLI, PTY or herdr.
+// SK-621: live agent view. Fake PtyRunner and AgentSessionBackend; the native path runs a stub
+// CLI from the sandbox PATH. No real agent CLI, PTY or herdr.
 
 const AGENT_MD = (cli: string): string =>
   [
@@ -1769,6 +2197,9 @@ const AGENT_MD = (cli: string): string =>
 /** Built from pieces so no secret-shaped literal sits in the repo. */
 const PLANTED = `ghp_${"A1b2C3d4E5".repeat(4)}`;
 const ESC = "\u001b";
+const PROMPT =
+  "add a health check\n\n" +
+  "Work directly in the current directory. End with a brief summary of what you changed.\n";
 
 class FakeSessionError extends Error {
   constructor(
@@ -1867,23 +2298,6 @@ function fakeRuntime(
   return fake;
 }
 
-/**
- * A fake agent CLI on PATH for the native path: records argv and stdin into the worktree (so they
- * are committed) and touches `$HOME/native-called`.
- */
-async function fakeCli(box: Sandbox, name: string): Promise<NodeJS.ProcessEnv> {
-  const bin = path.join(box.home, "bin");
-  await mkdir(bin, { recursive: true });
-  const script = path.join(bin, name);
-  await writeFile(
-    script,
-    '#!/bin/sh\nprintf "%s\\n" "$@" > native-args.txt\ncat > native-stdin.txt\n' +
-      ': > "$HOME/native-called"\necho "native output"\n',
-    { mode: 0o755 },
-  );
-  return { ...box.env, PATH: `${bin}${path.delimiter}${box.env.PATH}` };
-}
-
 const ITEM = {
   itemId: "I-7",
   repo: "app",
@@ -1899,7 +2313,7 @@ interface ViewLog {
   models: JoinViewModel[];
 }
 
-function recordingView(choice: "pr" | "mr" | "push" | "none" | null = null): ViewLog {
+function recordingView(choice: "commit" | "pr" | "mr" | "push" | "none" | null = null): ViewLog {
   const events: string[] = [];
   const models: JoinViewModel[] = [];
   return {
@@ -1933,7 +2347,7 @@ function itemWorker(
   const notes: Notification[] = [];
   return {
     ctx: c.ctx,
-    root: path.join(box.home, "work"),
+    dir: box.repo,
     method: "push",
     ask: async () => null,
     agent: {
@@ -1949,9 +2363,10 @@ function itemWorker(
 }
 
 describe("agent strategy selection", () => {
-  it("dry by default, pty with SKEP_SESSION_EXEC=1, herdr with the view, --agent wins", () => {
-    expect(selectAgentView(undefined, {})).toBe("dry");
-    expect(selectAgentView(undefined, { SKEP_SESSION_VIEW: "herdr" })).toBe("dry");
+  it("native by default; --view wins; SKEP_SESSION_EXEC/VIEW still honoured", () => {
+    expect(selectAgentView(undefined, {})).toBe("native");
+    expect(selectAgentView(undefined, { SKEP_SESSION_VIEW: "herdr" })).toBe("herdr");
+    expect(selectAgentView(undefined, { SKEP_SESSION_VIEW: "nonsense" })).toBe("native");
     expect(selectAgentView(undefined, { SKEP_SESSION_EXEC: "1" })).toBe("pty");
     expect(selectAgentView(undefined, { SKEP_SESSION_EXEC: "1", SKEP_SESSION_VIEW: "herdr" })).toBe(
       "herdr",
@@ -1961,6 +2376,16 @@ describe("agent strategy selection", () => {
         flag,
       );
     }
+  });
+
+  it("--agent takes a CLI; legacy view names map to --view with a notice", () => {
+    expect(parseAgentFlag(undefined)).toEqual({});
+    expect(parseAgentFlag("codex")).toEqual({ cli: "codex" });
+    expect(parseAgentFlag("native")).toEqual({
+      view: "native",
+      notice: "--agent native is now --view native",
+    });
+    expect(() => parseAgentFlag("gpt")).toThrow(/--agent must be claude, codex, pi/);
   });
 
   it("native argv never carries an approval-bypass flag", () => {
@@ -1998,24 +2423,20 @@ describe("workItem with a live agent", () => {
     },
   );
 
-  it("reports a final failed state when materialization fails", async () => {
+  it("reports a final failed state when no agent is configured, never a fake success", async () => {
     const dir = await home();
-    const c = capture(dir, { cwd: dir });
+    const c = capture(dir, { cwd: dir, env: { PATH: defaultStubs } });
     const onAgentState = vi.fn();
-    await workItem(
-      {
-        ctx: c.ctx,
-        root: path.join(dir, "work"),
-        method: "none",
-        ask: async () => null,
-        onAgentState,
-      },
+    const result = await workItem(
+      { ctx: c.ctx, dir, method: "none", ask: async () => null, onAgentState },
       ITEM,
     );
-    expect(onAgentState).toHaveBeenCalledExactlyOnceWith(ITEM.itemId, "failed");
+    expect(onAgentState).toHaveBeenLastCalledWith(ITEM.itemId, "failed");
+    expect(result.checks).toEqual([{ name: "agent", status: "fail" }]);
+    expect(result.summary).toContain("cause: no agent CLI is configured on this device");
   });
 
-  it("pty: runs the CLI with the prompt as argv, suspends the view around it, commits", async () => {
+  it("pty: runs the CLI with the prompt as argv in the project folder, suspends the view", async () => {
     const box = await sandbox();
     const c = capture(box.home, { env: box.env, cwd: box.repo });
     const fake = fakeRuntime();
@@ -2024,9 +2445,9 @@ describe("workItem with a live agent", () => {
     const result = await workItem(worker, ITEM);
     expect(fake.ptyRuns).toHaveLength(1);
     const run = fake.ptyRuns[0];
-    expect(run?.argv).toEqual(["claude", "add a health check\n"]);
+    expect(run?.argv).toEqual(["claude", PROMPT]);
     expect(run?.input).toBe("inherit");
-    expect(run?.cwd).toBe(path.join(box.home, "work", "app-I-7-e1"));
+    expect(run?.cwd).toBe(box.repo);
     expect(run?.env.SKEP_SESSION_ITEM).toBe("I-7");
     expect(run?.env).not.toHaveProperty("SKEP_HOME");
     // The raw transcript stays in the local journal, 0600.
@@ -2036,11 +2457,10 @@ describe("workItem with a live agent", () => {
     expect(log.events.slice(suspend, suspend + 2)).toEqual(["suspend", "resume"]);
     expect(log.events).toContain("update:running");
     expect(log.events.at(-1)).toBe("update:done");
-    expect(result.submit).toMatchObject({ method: "none", state: "local" });
-    expect(result.headSha).not.toBe(result.baseSha);
-    expect(await gitIn(box.repo, ["show", "skep/session/I-7-e1:feature.txt"], box.env)).toBe(
-      "done",
-    );
+    expect(result.submit).toMatchObject({ method: "none", state: "local", branch: "main" });
+    expect(result.headSha).toBe(result.baseSha);
+    expect(await readFile(path.join(box.repo, "feature.txt"), "utf8")).toBe("done\n");
+    expect(result.summary).toContain("changed 1 file (+1 −0): feature.txt");
     expect(result.summary).toContain("agent exited 0");
     expect(result.summary).toContain("working\nfinished");
     expect(result.summary).not.toContain(ESC);
@@ -2072,26 +2492,13 @@ describe("workItem with a live agent", () => {
     for (const model of log.models) expect(model.tail).not.toContain(PLANTED);
   });
 
-  it("pty: no changes reports so and submits nothing", async () => {
+  it("pty: a non-zero exit fails the item and leaves its edits for undo", async () => {
     const box = await sandbox();
-    const c = capture(box.home, { env: box.env, cwd: box.repo });
-    const fake = fakeRuntime({
-      pty: async () => ({
-        exit: { code: 0, signal: null },
-        aborted: false,
-        transcript: Buffer.from("nothing to do\n"),
-      }),
+    const c = capture(box.home, {
+      env: box.env,
+      cwd: box.repo,
+      paths: skepPaths(box.env.SKEP_HOME ?? ""),
     });
-    const result = await workItem(itemWorker(box, c, "pty", fake), ITEM);
-    expect(result.headSha).toBe(result.baseSha);
-    expect(result.submit).toMatchObject({ method: "push", state: "skipped" });
-    expect(result.summary).toContain("no changes");
-    expect(await remoteHas(box, "skep/session/I-7-e1")).toBeNull();
-  });
-
-  it("pty: a non-zero exit fails the item without committing", async () => {
-    const box = await sandbox();
-    const c = capture(box.home, { env: box.env, cwd: box.repo });
     const fake = fakeRuntime({
       pty: async (run) => {
         await writeFile(path.join(run.cwd, "half.txt"), "x\n");
@@ -2101,13 +2508,15 @@ describe("workItem with a live agent", () => {
     const result = await workItem(itemWorker(box, c, "pty", fake), ITEM);
     expect(result.submit).toMatchObject({ state: "failed" });
     expect(result.headSha).toBe(result.baseSha);
-    expect(result.summary).toContain("agent exited 3");
+    expect(result.summary).toContain("cause: agent claude exited 3");
+    expect(result.summary).toContain("changed 1 file (+1 −0): half.txt");
+    const undone = await undoItem(c.ctx, "I-7");
+    expect(undone.removed).toEqual(["half.txt"]);
   });
 
   it("pty: an unavailable PTY falls back to the native CLI and says why", async () => {
     const box = await sandbox();
-    const env = await fakeCli(box, "claude");
-    const c = capture(box.home, { env, cwd: box.repo });
+    const c = capture(box.home, { env: box.env, cwd: box.repo });
     const fake = fakeRuntime({
       pty: async () => {
         throw new FakePtyUnavailableError("script(1) not found");
@@ -2117,17 +2526,14 @@ describe("workItem with a live agent", () => {
     expect(c.stderr).toContain("pty is unavailable: script(1) not found");
     expect(result.summary).toContain("ran claude non-interactively");
     expect(result.submit).toMatchObject({ state: "local" });
-    const branch = "skep/session/I-7-e1";
-    expect(await gitIn(box.repo, ["show", `${branch}:native-args.txt`], box.env)).toBe("-p");
-    expect(await gitIn(box.repo, ["show", `${branch}:native-stdin.txt`], box.env)).toBe(
-      "add a health check",
-    );
+    const home = box.env.HOME ?? "";
+    expect(await readFile(path.join(home, "claude-args.txt"), "utf8")).toBe("-p\n");
+    expect(await readFile(path.join(home, "claude-stdin.txt"), "utf8")).toBe(PROMPT);
   });
 
   it("a missing runtime module falls back to native", async () => {
     const box = await sandbox();
-    const env = await fakeCli(box, "claude");
-    const c = capture(box.home, { env, cwd: box.repo });
+    const c = capture(box.home, { env: box.env, cwd: box.repo });
     const fake = fakeRuntime();
     fake.runtime = async () => {
       throw new AgentRuntimeUnavailableError("not in this build");
@@ -2139,23 +2545,24 @@ describe("workItem with a live agent", () => {
 
   it("native: runs `codex exec -` with the prompt on stdin", async () => {
     const box = await sandbox();
-    const env = await fakeCli(box, "codex");
-    const c = capture(box.home, { env, cwd: box.repo });
+    await stubAgent(box, "codex", 'echo "native output"');
+    const c = capture(box.home, { env: box.env, cwd: box.repo });
     const worker = itemWorker(box, c, "native", fakeRuntime(), { method: "none" });
     if (worker.agent !== undefined) worker.agent.cli = "codex";
     const result = await workItem(worker, ITEM);
     expect(result.summary).toContain("agent exited 0\nnative output");
-    const branch = "skep/session/I-7-e1";
-    expect(await gitIn(box.repo, ["show", `${branch}:native-args.txt`], box.env)).toBe("exec\n-");
+    const home = box.env.HOME ?? "";
+    expect(await readFile(path.join(home, "codex-args.txt"), "utf8")).toBe("exec\n-\n");
+    expect(await readFile(path.join(home, "codex-stdin.txt"), "utf8")).toBe(PROMPT);
   });
 
-  it("herdr: start, prompt, wait, read 200 lines; done commits and submits", async () => {
+  it("herdr: start, prompt, wait, read 200 lines in the project folder; done submits", async () => {
     const box = await sandbox();
     const c = capture(box.home, { env: box.env, cwd: box.repo });
     const fake = fakeRuntime({
       herdr: {
         wait: async () => {
-          await writeFile(path.join(box.home, "work", "app-I-7-e1", "pane.txt"), "x\n");
+          await writeFile(path.join(box.repo, "pane.txt"), "x\n");
           return "done";
         },
         read: async () => `pane ${ESC}[31mred${ESC}[0m ${PLANTED}`,
@@ -2163,15 +2570,14 @@ describe("workItem with a live agent", () => {
     });
     const log = recordingView();
     const result = await workItem(itemWorker(box, c, "herdr", fake, { view: log.view }), ITEM);
-    const dir = path.join(box.home, "work", "app-I-7-e1");
     expect(fake.herdrCalls).toEqual([
       "probe",
-      `start skep-i-7-e1 claude ${dir}`,
-      'prompt "add a health check\\n"',
+      `start skep-i-7-e1 claude ${box.repo}`,
+      `prompt ${JSON.stringify(PROMPT)}`,
       "wait",
       "read",
     ]);
-    expect(result.submit).toMatchObject({ method: "push", state: "pushed" });
+    expect(result.submit).toMatchObject({ method: "push", state: "pushed", branch: "main" });
     expect(result.summary).toContain("pane red");
     expect(result.summary).not.toContain(PLANTED);
     const running = log.models.find((m) => m.agent?.state === "running");
@@ -2188,7 +2594,7 @@ describe("workItem with a live agent", () => {
     const fake = fakeRuntime({
       herdr: {
         wait: async () => {
-          await writeFile(path.join(box.home, "work", "app-I-7-e1", "pane.txt"), "x\n");
+          await writeFile(path.join(box.repo, "pane.txt"), "x\n");
           return "blocked";
         },
       },
@@ -2198,14 +2604,11 @@ describe("workItem with a live agent", () => {
       view: log.view,
       chooseSubmit: log.view.chooseSubmit,
     });
+    const base = await gitIn(box.repo, ["rev-parse", "HEAD"], box.env);
     const result = await workItem(worker, ITEM);
-    expect(result.submit).toEqual({
-      method: "push",
-      state: "pending",
-      branch: "skep/session/I-7-e1",
-    });
-    expect(result.headSha).toBe(result.baseSha);
-    expect(await remoteHas(box, "skep/session/I-7-e1")).toBeNull();
+    expect(result.submit).toEqual({ method: "push", state: "pending", branch: "main" });
+    expect(result.headSha).toBe(base);
+    expect(await remoteHas(box, "main")).toBe(base);
     // Only the calls of a normal run: no focus, no prompt after the first, nothing else.
     expect(fake.herdrCalls.map((call) => call.split(" ")[0])).toEqual([
       "probe",
@@ -2224,8 +2627,7 @@ describe("workItem with a live agent", () => {
 
   it("herdr: a fallbackSafe error before the prompt falls back to native", async () => {
     const box = await sandbox();
-    const env = await fakeCli(box, "claude");
-    const c = capture(box.home, { env, cwd: box.repo });
+    const c = capture(box.home, { env: box.env, cwd: box.repo });
     const fake = fakeRuntime({
       herdr: {
         prompt: async () => {
@@ -2238,13 +2640,12 @@ describe("workItem with a live agent", () => {
     // The pane it opened is closed before the native run.
     expect(fake.herdrCalls.at(-1)).toBe("close");
     expect(result.submit).toMatchObject({ state: "local" });
-    expect(await stat(path.join(box.env.HOME ?? "", "native-called"))).toBeTruthy();
+    expect(await stat(path.join(box.env.HOME ?? "", "claude-called"))).toBeTruthy();
   });
 
   it("herdr: an error after the prompt was accepted fails the item and never re-runs", async () => {
     const box = await sandbox();
-    const env = await fakeCli(box, "claude");
-    const c = capture(box.home, { env, cwd: box.repo });
+    const c = capture(box.home, { env: box.env, cwd: box.repo });
     const fake = fakeRuntime({
       herdr: {
         wait: async () => {
@@ -2255,7 +2656,7 @@ describe("workItem with a live agent", () => {
     const result = await workItem(itemWorker(box, c, "herdr", fake), ITEM);
     expect(result.submit).toMatchObject({ method: "push", state: "failed" });
     expect(result.summary).toContain("herdr agent wait: timeout");
-    await expect(stat(path.join(box.env.HOME ?? "", "native-called"))).rejects.toThrow();
+    await expect(stat(path.join(box.env.HOME ?? "", "claude-called"))).rejects.toThrow();
     expect(c.stderr).not.toContain("non-interactively");
   });
 
@@ -2286,146 +2687,62 @@ async function joinWith(
   extraArgs: string[],
   extra: Partial<SessionCliContext> = {},
 ): Promise<{ item: ItemStatus; run: ReturnType<typeof capture>; exit: number }> {
-  const master = await startMaster({
-    listen: { host: HOST, port: 0 },
-    device: "mac",
-    repo: "app",
-    controlToken: TOKEN,
-    acceptJoin: async () => true,
-    onJoinCode: () => {},
-  });
-  try {
-    const code = master.status().joinCode;
-    if (code === null || master.address === null) throw new Error("master has no join code");
-    const c = capture(box.home, { env: box.env, cwd: box.repo, ...extra });
-    const exit = runCli(
-      [
-        "session",
-        "join",
-        "--code",
-        code,
-        "--host",
-        `${HOST}:${master.address.port}`,
-        "--repo",
-        "app",
-        "--device",
-        "vps",
-        ...extraArgs,
-      ],
-      c.ctx,
-    );
-    await vi.waitFor(() => expect(master.status().peers).toHaveLength(1), { timeout: 5_000 });
-    await master.submitIntent("add a health check");
-    await vi.waitFor(() => expect(master.status().intents[0]?.items[0]?.state).toBe("done"), {
-      timeout: 10_000,
-    });
-    const item = master.status().intents[0]?.items[0];
-    if (item === undefined) throw new Error("no item");
-    await master.close();
-    return { item, run: c, exit: await exit };
-  } finally {
-    await master.close();
-  }
-}
-
-async function roleDir(box: Sandbox, cli: string): Promise<string> {
-  const dir = path.join(box.home, "role");
-  await mkdir(dir, { recursive: true });
-  await writeFile(path.join(dir, "AGENT.md"), AGENT_MD(cli));
-  return dir;
+  const { item, run, exit } = await joinAndWork(box, extraArgs, extra, false);
+  return { item, run, exit };
 }
 
 describe("session join with a live agent", () => {
   afterEach(() => setJoinViewFactory(null));
 
-  it("SKEP_SESSION_EXEC=1 selects pty with the AGENT.md CLI from --role-dir", async () => {
+  it("SKEP_SESSION_EXEC=1 selects pty with the CLI from an AGENT.md that happens to exist", async () => {
     const box = await sandbox();
     box.env = { ...box.env, SKEP_SESSION_EXEC: "1" };
+    await stubAgent(box, "pi");
+    await writeFile(path.join(box.repo, "AGENT.md"), AGENT_MD("pi"));
     const fake = fakeRuntime();
-    const role = await roleDir(box, "pi");
-    const { item, exit, run } = await joinWith(box, ["--submit", "none", "--role-dir", role], {
+    const { item, exit, run } = await joinWith(box, ["--submit", "none"], {
       agentRuntime: fake.runtime,
     });
     expect(exit).toBe(0);
-    expect(fake.ptyRuns.map((r) => r.argv)).toEqual([["pi", "add a health check\n"]]);
+    expect(fake.ptyRuns.map((r) => r.argv)).toEqual([["pi", PROMPT]]);
     expect(item.result?.submit).toMatchObject({ state: "local" });
     expect(run.stderr).toContain("item I-1: agent pi (pty) running");
     expect(run.stderr).toContain("item I-1: agent pi (pty) done");
   });
 
-  it("the role dir defaults to the current directory", async () => {
-    const box = await sandbox();
-    await writeFile(path.join(box.repo, "AGENT.md"), AGENT_MD("codex"));
-    const fake = fakeRuntime();
-    await joinWith(box, ["--submit", "none", "--agent", "pty"], { agentRuntime: fake.runtime });
-    expect(fake.ptyRuns[0]?.argv[0]).toBe("codex");
-  });
-
   it("SKEP_SESSION_VIEW=herdr selects herdr and prints the focus command", async () => {
     const box = await sandbox();
-    box.env = { ...box.env, SKEP_SESSION_EXEC: "1", SKEP_SESSION_VIEW: "herdr" };
+    box.env = { ...box.env, SKEP_SESSION_VIEW: "herdr" };
     const fake = fakeRuntime({
       herdr: {
         wait: async () => {
-          await writeFile(
-            path.join(box.home, "skep", "session", "worktrees", "app-I-1-e1", "h"),
-            "",
-          );
+          await writeFile(path.join(box.repo, "h"), "");
           return "idle";
         },
       },
     });
-    const role = await roleDir(box, "claude");
-    const { item, run } = await joinWith(box, ["--submit", "none", "--role-dir", role], {
+    const { item, run } = await joinWith(box, ["--submit", "none"], {
       agentRuntime: fake.runtime,
     });
     expect(fake.ptyRuns).toHaveLength(0);
-    expect(fake.herdrCalls[1]).toContain("start skep-i-1-e1 claude");
+    expect(fake.herdrCalls[1]).toBe(`start skep-i-1-e1 claude ${box.repo}`);
     expect(run.stderr).toContain("watch with: herdr agent focus skep-i-1-e1");
     expect(item.result?.submit).toMatchObject({ state: "local" });
   });
 
-  it("--agent dry overrides the variables and never loads the runtime", async () => {
-    const box = await sandbox();
-    box.env = { ...box.env, SKEP_SESSION_EXEC: "1", SKEP_SESSION_VIEW: "herdr" };
-    const fake = fakeRuntime();
-    const { item } = await joinWith(box, ["--submit", "none", "--agent", "dry"], {
-      agentRuntime: fake.runtime,
-    });
-    expect(fake.loads).toBe(0);
-    expect(await gitIn(box.repo, ["show", "skep/session/I-1-e1:.skep-session-item"], box.env)).toBe(
-      "I-1",
-    );
-    expect(item.result?.summary).toContain("dry run");
-  });
-
-  it("--agent herdr blocked: pending result, message printed, notification sent", async () => {
+  it("--view herdr blocked: pending result, message printed, notification sent", async () => {
     const box = await sandbox();
     const notes: Notification[] = [];
     const fake = fakeRuntime({ herdr: { wait: async () => "blocked" } });
-    const role = await roleDir(box, "claude");
-    const { item, run } = await joinWith(
-      box,
-      ["--submit", "push", "--agent", "herdr", "--role-dir", role],
-      { agentRuntime: fake.runtime, notify: async (n) => notes.push(n) },
-    );
+    const { item, run } = await joinWith(box, ["--submit", "push", "--view", "herdr"], {
+      agentRuntime: fake.runtime,
+      notify: async (n) => notes.push(n),
+    });
     expect(item.result?.submit).toMatchObject({ method: "push", state: "pending" });
     expect(run.stderr).toContain(
       "agent skep-i-1-e1 is waiting for you: herdr agent focus skep-i-1-e1",
     );
     expect(notes).toHaveLength(1);
-    expect(await remoteHas(box, "skep/session/I-1-e1")).toBeNull();
-  });
-
-  it("a missing AGENT.md is a usage error before joining", async () => {
-    const box = await sandbox();
-    const c = capture(box.home, { env: box.env, cwd: box.repo });
-    const exit = await runCli(
-      ["session", "join", "--code", "123456789012", "--host", "127.0.0.1:1", "--agent", "pty"],
-      c.ctx,
-    );
-    expect(exit).toBe(2);
-    expect(c.stderr).toContain("needs this device's AGENT.md");
   });
 
   it("--ui without a registered view exits with a clear message", async () => {
@@ -2448,10 +2765,9 @@ describe("session join with a live agent", () => {
       return log.view;
     });
     const fake = fakeRuntime();
-    const role = await roleDir(box, "claude");
     const { item, run, exit } = await joinWith(
       box,
-      ["--ui", "--submit", "ask", "--agent", "pty", "--role-dir", role],
+      ["--ui", "--submit", "ask", "--agent", "claude", "--view", "pty"],
       { agentRuntime: fake.runtime, stdin: new PassThrough() },
     );
     expect(exit).toBe(0);

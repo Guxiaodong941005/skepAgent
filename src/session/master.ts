@@ -48,14 +48,17 @@ export const SCROLLBACK_SUMMARY_CHARS = 600;
 
 /**
  * The first {@link SCROLLBACK_SUMMARY_LINES} non-empty lines of an (already redacted) summary,
- * at most {@link SCROLLBACK_SUMMARY_CHARS} characters, marked when anything was cut.
+ * at most {@link SCROLLBACK_SUMMARY_CHARS} characters, marked when anything was cut. A failed
+ * item's summary is never cut: its cause and the agent's last words are what the operator needs
+ * (SESSION-UX §3.4); the wire already bounds it to 4000 characters.
  */
-export function scrollbackSummary(summary: string): string {
+export function scrollbackSummary(summary: string, opts: { failed?: boolean } = {}): string {
   const lines = summary
     .split(/\r?\n/)
     .map((line) => line.trimEnd())
     .filter((line) => line.trim().length > 0);
   if (lines.length === 0) return "(no summary)";
+  if (opts.failed === true) return lines.join("\n");
   let text = lines.slice(0, SCROLLBACK_SUMMARY_LINES).join("\n");
   let cut = lines.length > SCROLLBACK_SUMMARY_LINES;
   if (text.length > SCROLLBACK_SUMMARY_CHARS) {
@@ -63,6 +66,63 @@ export function scrollbackSummary(summary: string): string {
     cut = true;
   }
   return cut ? `${text} …` : text;
+}
+
+/** The item fields a roll-up reads; also satisfied by the CLI's parsed status. */
+export interface ItemOutcome {
+  state: string;
+  result?: { checks: readonly { status: string }[]; summary: string } | undefined;
+}
+
+/** A finished item counts as failed: dropped assignee, or a failing check (also the agent's). */
+export function itemFailed(item: ItemOutcome): boolean {
+  return item.state === "failed" || (item.result?.checks.some((c) => c.status === "fail") ?? false);
+}
+
+const PEER_STATUS_RE = /^(done|FAILED|blocked|declined|skipped|DRY RUN) · (.+)$/;
+
+/**
+ * One finished item as the operator reads it (SESSION-UX §2.3):
+ * `I-1 done · mac (app) · claude · 2m 14s` then the indented summary lines. The peer's leading
+ * `submit …` line moves to the end; its status line is folded into the headline. Older peers
+ * without a status line still render, just with fewer fields.
+ */
+export function itemBlock(
+  itemId: string,
+  where: { device: string; repo: string },
+  summary: string,
+  failed: boolean,
+): string {
+  const lines = scrollbackSummary(summary, { failed }).split("\n");
+  const submit = lines[0]?.startsWith("submit ") === true ? lines.shift() : undefined;
+  const status = PEER_STATUS_RE.exec(lines[0] ?? "");
+  if (status !== null) lines.shift();
+  const word = failed ? "FAILED" : (status?.[1] ?? "done");
+  const tail = status?.[2] === undefined ? "" : ` · ${status[2]}`;
+  const body = [...lines, ...(submit === undefined ? [] : [submit])].filter(
+    (line) => line !== "(no summary)",
+  );
+  return [
+    `${itemId} ${word} · ${where.device} (${where.repo})${tail}`,
+    ...body.map((l) => `  ${l}`),
+  ].join("\n");
+}
+
+/** `2 done · 1 failed · 4 files changed` over an intent's finished items. */
+export function intentRollup(items: readonly ItemOutcome[]): string {
+  const finished = items.filter((item) => item.state === "done" || item.state === "failed");
+  const failed = finished.filter(itemFailed).length;
+  let files = 0;
+  for (const item of finished) {
+    files += Number(/^changed (\d+) files?\b/m.exec(item.result?.summary ?? "")?.[1] ?? 0);
+  }
+  const open = items.length - finished.length;
+  return [
+    `${finished.length - failed} done`,
+    `${failed} failed`,
+    ...(open === 0 ? [] : [`${open} running`]),
+    `${files} ${files === 1 ? "file" : "files"} changed`,
+  ].join(" · ");
 }
 
 export class ListenAddressError extends Error {
@@ -115,6 +175,8 @@ interface Intent {
   candidates: SubCandidate[];
   requests: Request[];
   routing: boolean;
+  /** The final roll-up was emitted; it is said once per intent. */
+  finished?: boolean;
   cancel: () => void;
   resolve: (value: { intentId: string }) => void;
   reject: (error: Error) => void;
@@ -547,8 +609,18 @@ class SessionMaster implements MasterHandle {
       peer.wire.send(change.reply);
       if (change.reply.type === "result-ack" && message.type === "result") {
         // The operator reads the peer agent's outcome here instead of on the peer's machine.
-        const stored = change.items.find((item) => item.itemId === message.itemId)?.result;
-        this.event("item-result", `${message.itemId}: ${scrollbackSummary(stored?.summary ?? "")}`);
+        const stored = change.items.find((item) => item.itemId === message.itemId);
+        const failed = stored === undefined ? false : itemFailed(stored);
+        this.event(
+          failed ? "item-failed" : "item-result",
+          itemBlock(
+            message.itemId,
+            { device: peer.device, repo: message.repo },
+            stored?.result?.summary ?? "",
+            failed,
+          ),
+        );
+        if (intent) this.intentFinished(intent);
       } else if (change.reply.type === "result-reject") {
         this.event("result-reject", `${message.itemId}: ${change.reply.reason}`);
       } else {
@@ -736,6 +808,7 @@ class SessionMaster implements MasterHandle {
         }
       }
       if (intent.requests.length) this.plan(intent);
+      this.intentFinished(intent);
     }
     // The dropped peer's items failed; anyone else whose plan just landed is already covered by
     // plan(), and the coalescers drop unchanged values.
@@ -787,6 +860,20 @@ class SessionMaster implements MasterHandle {
       controller.abort();
       this.timers.delete(controller);
     };
+  }
+
+  /**
+   * Once every item of a planned intent finished, one roll-up across its peers:
+   * `intent-1 done: <text>` then `2 done · 1 failed · 4 files changed` (SESSION-UX Phase 2).
+   */
+  private intentFinished(intent: Intent): void {
+    if (intent.finished === true || intent.state !== "planned" || intent.items.length === 0) return;
+    if (!intent.items.every((item) => item.state === "done" || item.state === "failed")) return;
+    intent.finished = true;
+    this.event(
+      "intent-done",
+      `${intent.intentId} done: ${intent.text}\n  ${intentRollup(intent.items)}`,
+    );
   }
 
   private event(kind: string, message: string): void {

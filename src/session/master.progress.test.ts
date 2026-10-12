@@ -12,7 +12,13 @@ import {
   type SubResult,
   startMaster,
 } from "./index.js";
-import { SCROLLBACK_SUMMARY_CHARS, SCROLLBACK_SUMMARY_LINES, scrollbackSummary } from "./master.js";
+import {
+  intentRollup,
+  itemBlock,
+  SCROLLBACK_SUMMARY_CHARS,
+  SCROLLBACK_SUMMARY_LINES,
+  scrollbackSummary,
+} from "./master.js";
 import { deriveProgress } from "./progress.js";
 import { connectSub } from "./sub.js";
 
@@ -345,12 +351,84 @@ describe("peer progress relay", () => {
     await m.submitIntent("add a health check");
     await vi.waitFor(() => expect(events.some((e) => e.kind === "item-result")).toBe(true));
     const result = events.find((e) => e.kind === "item-result");
-    expect(result?.message).toMatch(/^I-1: added GET \/healthz\ntoken .+\ntests pass$/);
+    expect(result?.message).toMatch(
+      /^I-1 done · mac \(app\)\n {2}added GET \/healthz\n {2}token .+\n {2}tests pass$/,
+    );
     expect(result?.message).not.toContain(token);
     // Progress stays a bare peer id; the summary only arrives once, with the accepted result.
     for (const e of events.filter((entry) => entry.kind === "progress"))
       expect(e.message).not.toContain("healthz");
     expect(events.some((e) => e.kind === "result-ack")).toBe(false);
+  });
+
+  it("formats an item block: status folded into the headline, submit line last", () => {
+    const summary = [
+      "submit none local",
+      "done · claude · 2m 14s",
+      "changed 3 files (+41 −7): a.ts, b.ts, c.ts",
+      "summary: Added validation.",
+    ].join("\n");
+    expect(itemBlock("I-1", { device: "mac", repo: "app" }, summary, false)).toBe(
+      [
+        "I-1 done · mac (app) · claude · 2m 14s",
+        "  changed 3 files (+41 −7): a.ts, b.ts, c.ts",
+        "  summary: Added validation.",
+        "  submit none local",
+      ].join("\n"),
+    );
+    // An older peer's summary has no status line; it still renders.
+    expect(itemBlock("I-2", { device: "vps", repo: "api" }, "submit none local\nok", false)).toBe(
+      "I-2 done · vps (api)\n  ok\n  submit none local",
+    );
+  });
+
+  it("never caps a FAILED block: the cause and the whole text stay", () => {
+    const trace = Array.from({ length: 30 }, (_, n) => `trace ${n} ${"y".repeat(30)}`);
+    const summary = [
+      "submit push failed",
+      "FAILED · claude · 3s",
+      "no changes",
+      "cause: agent claude exited 3",
+      "fix: read the agent's output below",
+      ...trace,
+    ].join("\n");
+    const block = itemBlock("I-2", { device: "mac", repo: "app" }, summary, true);
+    expect(block.startsWith("I-2 FAILED · mac (app) · claude · 3s\n  no changes\n")).toBe(true);
+    expect(block).toContain("  cause: agent claude exited 3\n  fix: read the agent's output below");
+    expect(block.length).toBeGreaterThan(SCROLLBACK_SUMMARY_CHARS);
+    expect(block).toContain("trace 29");
+    expect(scrollbackSummary(summary, { failed: true }).split("\n")).toHaveLength(35);
+  });
+
+  it("rolls an intent up across peers", () => {
+    const result = (summary: string, status: "pass" | "fail" = "pass") => ({
+      checks: [{ status }],
+      summary,
+    });
+    expect(
+      intentRollup([
+        {
+          state: "done",
+          result: result("submit none local\ndone · a\nchanged 3 files (+1 −0): x"),
+        },
+        { state: "done", result: result("submit none local\ndone · a\nchanged 1 file (+1 −0): y") },
+        { state: "done", result: result("FAILED", "fail") },
+        { state: "failed" },
+        { state: "claimed" },
+      ]),
+    ).toBe("2 done · 2 failed · 1 running · 4 files changed");
+  });
+
+  it("emits one intent-done roll-up when every item finished", async () => {
+    const events: { kind: string; message: string }[] = [];
+    const m = await master({ onEvent: (e) => events.push(e) });
+    const summary = "submit none local\ndone · claude · 1s\nchanged 2 files (+2 −0): a, b";
+    await join(m, "mac", "app", { work: async (item) => ({ ...resultFor(item), summary }) });
+    await m.submitIntent("add a health check");
+    await vi.waitFor(() => expect(events.some((e) => e.kind === "intent-done")).toBe(true));
+    expect(events.filter((e) => e.kind === "intent-done").map((e) => e.message)).toEqual([
+      "intent-1 done: add a health check\n  1 done · 0 failed · 2 files changed",
+    ]);
   });
 
   it("caps the scrollback summary by lines and characters", () => {

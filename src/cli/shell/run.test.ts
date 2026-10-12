@@ -184,6 +184,18 @@ async function harness(
 ) {
   const dir = await mkdtemp(path.join(tmpdir(), "skep-shell-"));
   roots.push(dir);
+  // Only a stub agent and a logging git: a real agent CLI on this machine is never found.
+  const bin = path.join(dir, "bin");
+  await mkdir(bin);
+  await writeFile(path.join(bin, "claude"), '#!/bin/sh\necho "stub claude"\n', { mode: 0o755 });
+  const realGit = (
+    await execFileChecked("sh", ["-c", "command -v git"], { env: { PATH: process.env.PATH ?? "" } })
+  ).stdout.trim();
+  await writeFile(
+    path.join(bin, "git"),
+    `#!/bin/sh\nprintf "%s\\n" "$*" >> "${path.join(dir, "git.log")}"\nexec "${realGit}" "$@"\n`,
+    { mode: 0o755 },
+  );
   const prepared = await prepare?.(dir);
   const stdin = new FakeStdin();
   let screen = "";
@@ -198,6 +210,7 @@ async function harness(
       SKEP_TUI_ANIMATE: "0",
       NO_COLOR: "1",
       HOME: dir,
+      PATH: bin,
     },
     output: () => {
       throw new Error("the shell must not use the Commander output");
@@ -533,9 +546,14 @@ describe("unified shell", () => {
     await h.shell.submit("/start --yes --repo app");
     const onEvent = h.fake.calls.master[0]?.onEvent;
     onEvent?.({ kind: "progress", message: "peer-2" });
-    onEvent?.({ kind: "item-result", message: "I-4: added /healthz\ntests pass" });
+    onEvent?.({ kind: "item-result", message: "I-4 done · mac (app)\n  added /healthz" });
+    onEvent?.({ kind: "item-failed", message: "I-6 FAILED · mac (app)\n  cause: agent exited 3" });
+    onEvent?.({ kind: "intent-done", message: "intent-1 done: x\n  1 done · 1 failed" });
     onEvent?.({ kind: "result-reject", message: "I-5: stale_epoch" });
-    expect(h.scrollback()).toContain("item I-4: added /healthz\ntests pass");
+    expect(h.scrollback()).toContain("I-4 done · mac (app)\n  added /healthz");
+    expect(h.scrollback()).toContain("intent-1 done: x\n  1 done · 1 failed");
+    const failed = h.shell.model.scrollback.find((line) => line.text.startsWith("I-6 FAILED"));
+    expect(failed?.tone).toBe("error");
     expect(h.scrollback()).toContain("result rejected I-5: stale_epoch");
     expect(h.scrollback()).not.toMatch(/^progress/m);
     await h.shell.quit();
@@ -677,8 +695,16 @@ describe("unified shell", () => {
       expect(master.status().intents[0]?.items[0]).toMatchObject({
         assignee: "peer-2",
         datalistEntries: 0,
-        result: { checks: [{ name: "git", status: "fail" }], submit: { state: "failed" } },
+        // A non-git folder now runs the agent in place; this stub changes nothing.
+        result: {
+          checks: [{ name: "none", status: "skip" }],
+          submit: { method: "none", state: "skipped" },
+        },
       });
+      expect(master.status().intents[0]?.items[0]?.result?.summary).toContain("\nno changes");
+      expect(peer.scrollback()).toContain(
+        `agent: claude (found on PATH) · mode: edits this folder directly (${path.join(peer.dir, "proj-b")})`,
+      );
       expect(peer.shell.session.snapshot().mode).toBe("joined");
       expect(peer.scrollback()).toContain("cannot read this directory's Git HEAD");
       expect(peer.scrollback()).toContain("sending an empty datalist");
@@ -1194,6 +1220,65 @@ describe("/clean", () => {
     );
     expect(h.shell.session.snapshot().mode).toBe("external");
     expect(await readFile(path.join(h.dir, "session.json"), "utf8")).toContain(`${other.port}`);
+    await h.shell.quit();
+  });
+});
+
+describe("SESSION-UX shell copy", () => {
+  it("/join names the agent, says it edits the folder, and /clean leaves nothing on disk", async () => {
+    const h = await harness();
+    await h.shell.submit("/join --host 192.168.1.20:7419 --code 1234-5678-9012 --repo app");
+    expect(h.scrollback()).toContain(
+      `agent: claude (found on PATH) · mode: edits this folder directly (${h.dir})`,
+    );
+    const log = path.join(h.dir, "git.log");
+    const before = await readFile(log, "utf8").catch(() => "");
+    await h.shell.submit("/clean");
+    expect(h.scrollback()).toContain(
+      "nothing left on disk: no worktrees or session branches; edits stay in your folder",
+    );
+    // /clean only ends connection state: it never runs git.
+    expect(await readFile(log, "utf8").catch(() => "")).toBe(before);
+    await h.shell.quit();
+  });
+
+  it("a /join without any agent fails with one cause and one fix, and stays unjoined", async () => {
+    const h = await harness();
+    await rm(path.join(h.dir, "bin", "claude"));
+    await h.shell.submit("/join --host 192.168.1.20:7419 --code 1234-5678-9012 --repo app");
+    expect(h.scrollback()).toContain(
+      "join failed: no agent CLI found (looked for claude, codex, pi on PATH)\n" +
+        "fix: install one, or pass --agent <claude|codex|pi> (in the skep shell: /agent <cli>)",
+    );
+    expect(h.scrollback()).toContain(`full text: ${path.join(h.dir, "session", "last-error.log")}`);
+    expect(h.fake.calls.sub).toHaveLength(0);
+    expect(h.shell.session.snapshot().mode).toBe("none");
+    await h.shell.quit();
+  });
+
+  it("legacy --agent pty joins with a notice; /agent shows and sets the CLI", async () => {
+    const h = await harness();
+    await h.shell.submit("/agent");
+    expect(h.scrollback()).toContain("agent: not set; /join uses --agent, SKEP_AGENT_CLI");
+    await h.shell.submit("/agent codex");
+    expect(h.scrollback()).toContain("session items will run codex");
+    await writeFile(path.join(h.dir, "bin", "codex"), "#!/bin/sh\n", { mode: 0o755 });
+    await h.shell.submit(
+      "/join --host 192.168.1.20:7419 --code 1234-5678-9012 --repo app --agent pty",
+    );
+    expect(h.scrollback()).toContain("skep: --agent pty is now --view pty");
+    expect(h.scrollback()).toContain("agent: codex (from /agent) (pty view)");
+    await h.shell.submit("/agent");
+    expect(h.scrollback()).toContain("agent: this join runs codex");
+    await h.shell.quit();
+  });
+
+  it("/undo refuses an unknown item with where it looked", async () => {
+    const h = await harness();
+    await h.shell.submit("/undo I-4");
+    expect(h.scrollback()).toContain("no recorded changes for I-4 in this project");
+    await h.shell.submit("/undo");
+    expect(h.scrollback()).toContain("usage: /undo <item> [--force]");
     await h.shell.quit();
   });
 });

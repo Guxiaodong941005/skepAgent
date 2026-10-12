@@ -30,7 +30,14 @@ export const MAX_MENU_ROWS = 6;
 /** Below this the shell cannot show the input and footer, so only a notice is drawn. */
 export const SHELL_MIN_ROWS = Math.min(10, MIN_ROWS);
 
-export type ShellTone = "info" | "event" | "error" | "muted";
+export type ShellTone = "info" | "event" | "warn" | "error" | "muted";
+/**
+ * Tones whose lines wrap to the terminal width instead of being cut: the one message that
+ * explains a failure is usually the long one (SESSION-UX §3.4). Others keep one row each.
+ */
+const WRAPPED_TONES: ReadonlySet<ShellTone> = new Set(["warn", "error"]);
+/** Continuation rows of a wrapped line sit this much deeper than its first row. */
+const HANGING_INDENT = "    ";
 /** A footer row; `silentMs` is the time since the peer was last heard from, when known. */
 export type ShellPeer = JoinViewModel["peers"][number] & { silentMs?: number };
 
@@ -44,6 +51,7 @@ export interface ShellHeader {
 const TONE_ROLES: Record<ShellTone, Role> = {
   info: "on-surface",
   event: "secondary",
+  warn: "tertiary",
   error: "error",
   muted: "on-surface-variant",
 };
@@ -124,7 +132,7 @@ export class ShellModel {
       spans: [fg("outline", `  ${g.rule.repeat(Math.max(0, columns - 2))}`)],
     };
     const bodyRows = Math.max(0, rows - lines.length - 1 - 1 - bee.length - 1);
-    const body = this.bodyLines(bodyRows);
+    const body = this.bodyLines(bodyRows, columns);
     const menu = bodyRows === 0 ? [] : this.menuLines().slice(-bodyRows);
     body.splice(body.length - menu.length, menu.length, ...menu);
     const out = [...lines, ...body, input, rule, ...bee, hint];
@@ -135,13 +143,17 @@ export class ShellModel {
     );
   }
 
-  private bodyLines(count: number): Line[] {
+  private bodyLines(count: number, columns: number): Line[] {
     const source: Line[] =
       this.scrollback.length === 0
         ? welcomeLines(this.glyphs)
-        : this.scrollback.map((entry) => ({
-            spans: [fg(TONE_ROLES[entry.tone], `  ${entry.text}`)],
-          }));
+        : this.scrollback.flatMap((entry) => {
+            const role = TONE_ROLES[entry.tone];
+            const rows = WRAPPED_TONES.has(entry.tone)
+              ? wrapLine(`  ${entry.text}`, columns, `  ${HANGING_INDENT}`)
+              : [`  ${entry.text}`];
+            return rows.map((row) => ({ spans: [fg(role, row)] }));
+          });
     const end = Math.max(0, source.length - this.scroll);
     const visible = source.slice(Math.max(0, end - count), end);
     return [...Array<Line>(Math.max(0, count - visible.length)).fill(""), ...visible];
@@ -249,4 +261,38 @@ export class ShellModel {
           : ["/ commands", "enter send", "pgup/pgdn scroll", "ctrl+c clear", "/quit"];
     return { spans: [fg("on-surface-variant", `  ${keys.join(separator)}`)] };
   }
+}
+
+/**
+ * Splits `text` into rows of at most `width` columns, breaking at the last space that fits (or
+ * mid-word when none does). Rows after the first start with `indent`. Nothing is dropped.
+ */
+export function wrapLine(text: string, width: number, indent: string): string[] {
+  const clean = truncate(text, Number.MAX_SAFE_INTEGER);
+  if (width <= displayWidth(indent) + 1 || displayWidth(clean) <= width) return [clean];
+  const rows: string[] = [];
+  let rest = clean;
+  let prefix = "";
+  while (displayWidth(prefix + rest) > width) {
+    const room = width - displayWidth(prefix);
+    let used = 0;
+    let cut = 0;
+    let lastSpace = -1;
+    const chars = [...rest];
+    // Spaces of the leading indent are no break points: a row would come out empty.
+    const lead = rest.length - rest.trimStart().length;
+    for (let i = 0; i < chars.length; i++) {
+      const w = displayWidth(chars[i] ?? "");
+      if (used + w > room) break;
+      used += w;
+      cut = i + 1;
+      if (chars[i] === " " && i > lead) lastSpace = i;
+    }
+    const at = lastSpace > 0 ? lastSpace : Math.max(1, cut);
+    rows.push(prefix + chars.slice(0, at).join("").trimEnd());
+    rest = chars.slice(at).join("").replace(/^ +/, "");
+    prefix = indent;
+  }
+  if (rest !== "") rows.push(prefix + rest);
+  return rows;
 }

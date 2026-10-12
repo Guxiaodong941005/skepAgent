@@ -4,9 +4,10 @@
  * The protocol engine lives in `src/session/`. Commands reach it through the {@link SessionApi}
  * subset declared below, so tests can inject `sessionApi` on the context instead.
  *
- * A joined sub works its items here: it checks out a session branch, runs the agent (or commits a
- * marker on the dry path), runs one trusted check, and submits by this device's own policy. The
- * master only learns the outcome; `skep session submit` finishes a deferred submit locally.
+ * A joined sub works its items here, one at a time, in its own project folder: no worktree, clone
+ * or session branch (docs/plans/session-ux-rethink.md, SESSION-UX). It runs the agent resolved at
+ * join, reports which files changed, runs one trusted check, and submits by this device's own
+ * policy (default: leave the edits in the folder). The master only learns the outcome.
  *
  * `intent` and `status` talk to a running master over the plaintext control frame, authenticated
  * by the token in `${SKEP_HOME}/session.json`. The master writes that file after it binds and
@@ -24,6 +25,7 @@ import { type Command, Option } from "commander";
 import { z } from "zod";
 import { loadAgentMd } from "../../config/agent-md.js";
 import { ConfigError, parseTomlConfig } from "../../config/errors.js";
+import { resolveProjectRoot } from "../../config/paths.js";
 import { type AgentCliSchema, RepoRefSchema, ShaSchema } from "../../core/schemas/common.js";
 import { CHECKS_FILE_PATH, ChecksFileSchema } from "../../core/schemas/config.js";
 import { Redactor } from "../../exec/redact.js";
@@ -46,6 +48,7 @@ import {
   type SubResult,
   startMaster,
 } from "../../session/index.js";
+import { intentRollup, itemBlock, itemFailed } from "../../session/master.js";
 import { type Clock, isoUtc, systemClock } from "../../util/clock.js";
 import { execFileChecked } from "../../util/exec.js";
 import { atomicWrite, safeJoin } from "../../util/fs.js";
@@ -53,6 +56,20 @@ import { cryptoRandom } from "../../util/random.js";
 import type { CliContext } from "../context.js";
 import { CliError, EXIT } from "../output.js";
 import { quoteSlashWord } from "../shell/flags.js";
+import {
+  changedLine,
+  computeDelta,
+  DeltaError,
+  type ItemDelta,
+  readDeltaRecord,
+  type SnapshotIo,
+  snapshotTree,
+  type TreeSnapshot,
+  type UndoOutcome,
+  UndoRefusedError,
+  undoDelta,
+  writeDeltaRecord,
+} from "./session-delta.js";
 
 export const DEFAULT_PORT = 7419;
 /** Bounded automatic selection; explicit listen addresses never enter this scan. */
@@ -688,19 +705,25 @@ class LineReader {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Sub-side item work: materialize, execute, check, submit.
+// Sub-side item work: snapshot, execute, report the delta, check, submit.
 //
 // A sub and the master do not share a repo, so what happens to a finished item's code is decided
 // here, by this device's own policy or the human at it. The master only records the outcome.
 
-export const SUBMIT_METHODS = ["pr", "mr", "push", "none", "ask"] as const;
-const SUBMIT_COMMAND_METHODS = ["pr", "mr", "push", "none", "skip"] as const;
+/** `commit` is device-local: the wire carries it as `none`/`local` (no schema change). */
+export const SUBMIT_METHODS = ["commit", "pr", "mr", "push", "none", "ask"] as const;
+export type LocalSubmitMethod = (typeof SUBMIT_METHODS)[number];
+const SUBMIT_COMMAND_METHODS = ["commit", "pr", "mr", "push", "none", "skip"] as const;
 const DIRECT_METHODS = ["pr", "mr", "push", "none"] as const;
 type DirectMethod = (typeof DIRECT_METHODS)[number];
 
 const AGENT_TIMEOUT_MS = 10 * 60_000;
-const MARKER_FILE = ".skep-session-item";
 const MAX_SUMMARY = 4_000;
+/** What `--view dry` reports: it is never mistaken for work (SESSION-UX §3.2). */
+export const DRY_RUN_SUMMARY = "DRY RUN: no agent ran, nothing changed";
+/** Sent with every item so the agent edits in place and ends with something to show. */
+const PROMPT_PREAMBLE =
+  "Work directly in the current directory. End with a brief summary of what you changed.";
 /** Unknown local HEAD; capability and failed-result SHAs must still satisfy the wire schema. */
 const UNKNOWN_SHA = "0".repeat(40);
 /** Variables the agent may see. Credentials are never forwarded to it (D19). */
@@ -755,18 +778,15 @@ export async function loadSubmitPolicy(
     warn(`ignoring submit policy (${error.message}); falling back to none`);
     return DEFAULT_POLICY;
   }
-  return policy.host === "git" ? { ...policy, method: "push" } : policy;
+  // `commit` never talks to a host, so a plain git host leaves it alone.
+  return policy.host === "git" && policy.method !== "commit"
+    ? { ...policy, method: "push" }
+    : policy;
 }
 
-export function sessionBranch(itemId: string, epoch: number): string {
+/** The branch name skep ≤ 0.1.10 used for an item; only `submit` still recognises it. */
+export function legacySessionBranch(itemId: string, epoch: number): string {
   return `skep/session/${itemId}-e${epoch}`;
-}
-
-export class SessionItemError extends Error {
-  constructor(stage: string, message: string, options?: ErrorOptions) {
-    super(`${stage}: ${message}`, options);
-    this.name = "SessionItemError";
-  }
 }
 
 async function onPath(bin: string, env: NodeJS.ProcessEnv): Promise<boolean> {
@@ -792,73 +812,51 @@ async function exists(file: string): Promise<boolean> {
   }
 }
 
-interface Materialized {
-  dir: string;
-  branch: string;
-  baseSha: string;
+/**
+ * The folder the agent edits: the git top level of the joined directory, else that directory
+ * itself (SAME-CB: a repo without HEAD, or no repo at all, still works).
+ */
+export async function projectRoot(ctx: SessionCliContext): Promise<string> {
+  const cwd = ctx.cwd ?? process.cwd();
+  return resolveProjectRoot(cwd, pickEnv(ctx, ["PATH", "HOME"])).catch(() => path.resolve(cwd));
+}
+
+/** The checked-out branch, or `HEAD` when detached, unborn without a name, or not a repo. */
+async function currentBranch(ctx: SessionCliContext, dir: string): Promise<string> {
+  const name = await git(ctx, ["symbolic-ref", "--short", "-q", "HEAD"], dir).then(
+    (value) => value.trim(),
+    () => "",
+  );
+  return name === "" ? "HEAD" : name;
+}
+
+function snapshotIo(ctx: SessionCliContext): SnapshotIo {
+  return {
+    git: (args, cwd) => git(ctx, args, cwd),
+    env: pickEnv(ctx, ["PATH", "HOME"]),
+    // A home inside the project (SKEP_HOME pointed there) holds transcripts, never results.
+    exclude: ctx.paths === undefined ? [] : [ctx.paths.home],
+  };
+}
+
+/** `2m 14s`, `12s`. */
+export function formatDuration(ms: number): string {
+  const seconds = Math.max(0, Math.round(ms / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
 }
 
 /**
- * A fresh checkout of this device's `HEAD` on the item's session branch. A linked worktree keeps
- * the branch in the device's repo; when `git worktree` is unavailable a local clone is used and
- * the branch is fetched back after the commit (see {@link syncBack}).
+ * Writes the full, untruncated (but redacted) text of a failure next to the session state and
+ * returns its path, so the scrollback can stay at one cause and one fix (SESSION-UX §3.4).
  */
-export async function materializeItem(
-  ctx: SessionCliContext,
-  item: PlanItem,
-  root: string,
-  opts: { worktree?: boolean } = {},
-): Promise<Materialized & { clone: string | null }> {
-  const top = (await git(ctx, ["rev-parse", "--show-toplevel"])).trim();
-  const baseSha = (await git(ctx, ["rev-parse", "HEAD"], top)).trim();
-  const branch = sessionBranch(item.itemId, item.epoch);
-  const dir = path.join(root, `${path.basename(top)}-${item.itemId}-e${item.epoch}`);
-  // Item ids restart in every session; an earlier session's unsubmitted work is never clobbered.
-  const existing = await git(ctx, ["branch", "--list", branch], top);
-  if (existing.trim() !== "" || (await exists(dir))) {
-    throw new SessionItemError(
-      "materialize",
-      `${branch} or ${dir} already exists; submit or delete it first`,
-    );
-  }
-  await mkdir(root, { recursive: true, mode: 0o700 });
-  if (opts.worktree !== false) {
-    try {
-      await git(ctx, ["worktree", "add", "--quiet", "-b", branch, dir, baseSha], top);
-      return { dir, branch, baseSha, clone: null };
-    } catch {
-      // Fall through to a plain clone below; its failure is the one reported.
-      await rm(dir, { recursive: true, force: true });
-    }
-  }
-  await git(ctx, ["clone", "--quiet", "--no-checkout", top, dir]);
-  await git(ctx, ["checkout", "--quiet", "-b", branch, baseSha], dir);
-  // The clone's `origin` is the device repo; pushes must go where the device repo pushes.
-  const origin = await git(ctx, ["remote", "get-url", "origin"], top).catch(() => null);
-  if (origin === null) await git(ctx, ["remote", "remove", "origin"], dir);
-  else await git(ctx, ["remote", "set-url", "origin", origin.trim()], dir);
-  return { dir, branch, baseSha, clone: top };
-}
-
-/** A clone's branch is copied into the device repo so `skep session submit` can find it later. */
-async function syncBack(ctx: SessionCliContext, work: Materialized, top: string): Promise<void> {
-  await git(ctx, ["fetch", "--quiet", work.dir, `${work.branch}:${work.branch}`], top);
-}
-
-/** Commit everything in the checkout. Falls back to a placeholder identity only if none is set. */
-async function commitAll(ctx: SessionCliContext, dir: string, message: string): Promise<boolean> {
-  await git(ctx, ["add", "-A"], dir);
-  const status = await git(ctx, ["status", "--porcelain"], dir);
-  if (status.trim() === "") return false;
-  const configured = await git(ctx, ["config", "user.email"], dir).then(
-    (value) => value.trim() !== "",
-    () => false,
-  );
-  const identity = configured
-    ? []
-    : ["-c", "user.name=skep", "-c", "user.email=skep@example.invalid"];
-  await git(ctx, [...identity, "commit", "--quiet", "--no-verify", "-m", message], dir);
-  return true;
+export async function writeLastError(home: string, text: string): Promise<string> {
+  const file = path.join(home, "session", "last-error.log");
+  await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+  await writeFile(file, `${new Redactor().redact(text).trimEnd()}\n`, { mode: 0o600 });
+  return file;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1032,7 +1030,7 @@ export interface JoinViewModel {
 export interface JoinView {
   update(model: JoinViewModel): void;
   /** Replaces ItemWorker.ask when the policy is "ask"; null = defer (skip). */
-  chooseSubmit(model: JoinViewModel): Promise<"pr" | "mr" | "push" | "none" | null>;
+  chooseSubmit(model: JoinViewModel): Promise<"commit" | "pr" | "mr" | "push" | "none" | null>;
   /** PTY: give the terminal to the agent; resolves when the TUI may redraw. */
   suspend(): Promise<void>;
   resume(): void;
@@ -1068,19 +1066,122 @@ const HERDR_READ_LINES = 200;
 const TAIL_WINDOW = 64 * 1024;
 
 /**
- * `--agent` wins; otherwise `SKEP_SESSION_EXEC=1` selects pty, or herdr with
- * `SKEP_SESSION_VIEW=herdr`; otherwise the dry marker.
+ * `--view` wins; then the deprecated `SKEP_SESSION_EXEC=1` (pty, or herdr with
+ * `SKEP_SESSION_VIEW=herdr`); then `SKEP_SESSION_VIEW`; otherwise native. A real agent run is the
+ * default: there is no silent dry fallback any more (SESSION-UX §3.2).
  */
 export function selectAgentView(flag: AgentView | undefined, env: NodeJS.ProcessEnv): AgentView {
   if (flag !== undefined) return flag;
-  if (env.SKEP_SESSION_EXEC !== "1") return "dry";
-  return env.SKEP_SESSION_VIEW === "herdr" ? "herdr" : "pty";
+  const fromEnv = AGENT_VIEWS.find((view) => view === env.SKEP_SESSION_VIEW);
+  if (env.SKEP_SESSION_EXEC === "1") return fromEnv === "herdr" ? "herdr" : "pty";
+  return fromEnv ?? "native";
 }
 
-/** How a joined device runs its agent. Absent on an {@link ItemWorker} means dry. */
+export const AGENT_CLIS = ["claude", "codex", "pi"] as const satisfies readonly AgentCli[];
+
+function isAgentCli(value: string | undefined): value is AgentCli {
+  return AGENT_CLIS.some((cli) => cli === value);
+}
+
+function isAgentView(value: string | undefined): value is AgentView {
+  return AGENT_VIEWS.some((view) => view === value);
+}
+
+/**
+ * Splits a `--agent` value: a CLI name is the agent, a legacy view name (`pty`, `native`,
+ * `herdr`, `dry`) still selects the view during the deprecation window and says so once.
+ */
+export function parseAgentFlag(value: string | undefined): {
+  cli?: AgentCli;
+  view?: AgentView;
+  notice?: string;
+} {
+  if (value === undefined) return {};
+  if (isAgentCli(value)) return { cli: value };
+  if (isAgentView(value)) {
+    return { view: value, notice: `--agent ${value} is now --view ${value}` };
+  }
+  throw new CliError(
+    "bad_agent",
+    `--agent must be ${AGENT_CLIS.join(", ")} (the agent CLI), got ${value}`,
+    EXIT.usage,
+  );
+}
+
+/** Where the agent CLI of a join came from, in resolution order (SESSION-UX §3.2). */
+export type AgentSource = "--agent" | "/agent" | "SKEP_AGENT_CLI" | "AGENT.md" | "PATH";
+
+export interface ResolvedAgent {
+  cli: AgentCli;
+  source: AgentSource;
+}
+
+export function agentSourceText(source: AgentSource): string {
+  return source === "PATH" ? "found on PATH" : `from ${source}`;
+}
+
+export const NO_AGENT_MESSAGE =
+  `no agent CLI found (looked for ${AGENT_CLIS.join(", ")} on PATH)\n` +
+  "fix: install one, or pass --agent <claude|codex|pi> (in the skep shell: /agent <cli>)";
+
+/**
+ * This device's agent CLI, decided once at join so the human learns immediately: `--agent`, then
+ * `/agent`, then `SKEP_AGENT_CLI`, then an AGENT.md that happens to exist (never required), then
+ * the first of claude, codex, pi on PATH. No agent is an error: the peer never joins without one.
+ * The master never chooses the CLI (D27).
+ */
+export async function resolveAgentCli(input: {
+  flag?: AgentCli;
+  setting?: AgentCli;
+  env: NodeJS.ProcessEnv;
+  /** Where an AGENT.md might be. */
+  dir: string;
+  warn(message: string): void;
+}): Promise<ResolvedAgent> {
+  const { env } = input;
+  let chosen: ResolvedAgent | null = null;
+  if (input.flag !== undefined) chosen = { cli: input.flag, source: "--agent" };
+  else if (input.setting !== undefined) chosen = { cli: input.setting, source: "/agent" };
+  else if (env.SKEP_AGENT_CLI !== undefined && env.SKEP_AGENT_CLI !== "") {
+    if (!isAgentCli(env.SKEP_AGENT_CLI)) {
+      throw new CliError(
+        "bad_agent",
+        `SKEP_AGENT_CLI=${env.SKEP_AGENT_CLI} is not one of ${AGENT_CLIS.join(", ")}\n` +
+          "fix: set it to claude, codex or pi, or unset it",
+        EXIT.usage,
+      );
+    }
+    chosen = { cli: env.SKEP_AGENT_CLI, source: "SKEP_AGENT_CLI" };
+  } else if (await exists(path.join(input.dir, "AGENT.md"))) {
+    try {
+      chosen = { cli: (await loadAgentMd(input.dir)).frontMatter.agent_cli, source: "AGENT.md" };
+    } catch (error) {
+      if (!(error instanceof ConfigError)) throw error;
+      // Back-compat only: a broken AGENT.md never blocks a join that auto-detect can serve.
+      input.warn(`ignoring AGENT.md (${error.message})`);
+    }
+  }
+  if (chosen !== null) {
+    if (!(await onPath(chosen.cli, env))) {
+      throw new CliError(
+        "no_agent",
+        `agent ${chosen.cli} (${agentSourceText(chosen.source)}) is not on PATH\n` +
+          `fix: install ${chosen.cli}, or choose another with --agent <claude|codex|pi>`,
+        EXIT.usage,
+      );
+    }
+    return chosen;
+  }
+  for (const cli of AGENT_CLIS) {
+    if (await onPath(cli, env)) return { cli, source: "PATH" };
+  }
+  throw new CliError("no_agent", NO_AGENT_MESSAGE, EXIT.usage);
+}
+
+/** How a joined device runs its agent. */
 export interface AgentSetup {
   view: AgentView;
-  /** This device's AGENT.md `agent_cli`; the master never chooses it (D27). */
+  /** Resolved at join on this device; the master never chooses it (D27). */
   cli: AgentCli;
   runtime(): Promise<AgentRuntime>;
   /** Local directory for raw transcripts (0600 files). Never sent anywhere. */
@@ -1107,10 +1208,22 @@ export function summaryTail(
   return cleaned.slice(-max);
 }
 
-type Executed =
-  | { status: "ok"; changed: boolean; summary: string }
-  | { status: "failed"; summary: string }
-  | { status: "blocked"; summary: string };
+/**
+ * One item's agent outcome. `summary` is the cleaned, redacted text for the master; `full` is
+ * everything the agent printed, for `last-error.log` only. A failure carries one cause and one
+ * fix (SESSION-UX §3.4).
+ */
+type Executed = (
+  | { status: "ok" }
+  | { status: "dry" }
+  | { status: "failed"; cause: string; fix: string }
+  | { status: "blocked" }
+) & {
+  summary: string;
+  full: string;
+  /** The agent's own closing words ({@link agentSummary}), when it said anything. */
+  said?: string;
+};
 
 /** One agent run's raw outcome, before commit and cleaning. `tail` is local, unredacted text. */
 interface AgentRun {
@@ -1225,9 +1338,9 @@ async function runHerdr(run: RunContext, runtime: AgentRuntime): Promise<AgentRu
 }
 
 /**
- * Runs the item with the worker's strategy. Dry commits a marker so the result still carries a
- * real new head. herdr falls back to native only on a `fallbackSafe` error, PTY only when the PTY
- * could not start (D28); the reason is printed.
+ * Runs the item with the worker's strategy in `dir`, the project folder itself. Nothing is
+ * committed here: the delta is measured by the caller. herdr falls back to native only on a
+ * `fallbackSafe` error, PTY only when the PTY could not start (D28); the reason is printed.
  */
 async function executeItem(
   worker: ItemWorker,
@@ -1236,25 +1349,26 @@ async function executeItem(
   report: RunContext["report"],
 ): Promise<Executed> {
   const { ctx } = worker;
-  const message = `session ${item.itemId} epoch ${item.epoch}`;
   const setup = worker.agent;
-  if (setup === undefined || setup.view === "dry") {
-    await writeFile(path.join(dir, MARKER_FILE), `${item.itemId}\n`);
-    await commitAll(ctx, dir, message);
+  if (setup === undefined) {
+    // A join always resolves an agent; reaching this is a wiring bug, reported, never faked.
     return {
-      status: "ok",
-      changed: true,
-      summary: "dry run: committed the session marker (no agent configured)",
+      status: "failed",
+      summary: "",
+      cause: "no agent CLI is configured on this device",
+      fix: "leave and /join again with --agent <claude|codex|pi>",
+      full: "",
     };
   }
+  if (setup.view === "dry") return { status: "dry", summary: DRY_RUN_SUMMARY, full: "" };
 
   const run: RunContext = {
     worker,
     setup,
     item,
     dir,
-    // The item title is the task, exactly as the native CLI reads it on stdin.
-    prompt: `${item.title}\n`,
+    // The item title is the task; the preamble keeps the agent in place and asks for a summary.
+    prompt: `${item.title}\n\n${PROMPT_PREAMBLE}\n`,
     env: {
       ...pickEnv(ctx, AGENT_ENV_KEYS),
       SKEP_SESSION_ITEM: item.itemId,
@@ -1279,29 +1393,39 @@ async function executeItem(
   report("starting");
   let agent: AgentRun | null = null;
   let fallback: string | null = null;
-  if (setup.view === "native") {
-    agent = await runNative(run);
-  } else if (runtime === null) {
-    fallback = `${setup.view} is unavailable: ${unavailable}`;
-  } else {
-    try {
-      agent = setup.view === "pty" ? await runPty(run, runtime) : await runHerdr(run, runtime);
-    } catch (error) {
-      const safe = setup.view === "pty" ? runtime.isPtyUnavailable(error) : isFallbackSafe(error);
-      if (!safe) throw error;
-      fallback = `${setup.view} is unavailable: ${errorMessage(error)}`;
+  try {
+    if (setup.view === "native") {
+      agent = await runNative(run);
+    } else if (runtime === null) {
+      fallback = `${setup.view} is unavailable: ${unavailable}`;
+    } else {
+      try {
+        agent = setup.view === "pty" ? await runPty(run, runtime) : await runHerdr(run, runtime);
+      } catch (error) {
+        const safe = setup.view === "pty" ? runtime.isPtyUnavailable(error) : isFallbackSafe(error);
+        if (!safe) throw error;
+        fallback = `${setup.view} is unavailable: ${errorMessage(error)}`;
+      }
     }
+  } catch (error) {
+    return spawnFailure(setup, error, "");
   }
   let note = "";
   if (agent === null) {
     note = `${fallback}; ran ${setup.cli} non-interactively\n`;
     ctx.stderr.write(`skep: item ${item.itemId}: ${note}`);
     run.transcript = run.transcript.replace(/-[a-z]+\.log$/, "-native.log");
-    agent = await runNative(run);
+    try {
+      agent = await runNative(run);
+    } catch (error) {
+      return spawnFailure(setup, error, note);
+    }
   }
 
   const strip = runtime?.stripTerminalControls ?? dropControlChars;
   const tail = summaryTail(agent.tail, strip);
+  const full = `${note}agent ${agent.status}\n${strip(agent.tail)}`;
+  const said = agentSummary(tail);
   if (agent.blocked !== undefined) {
     const focus = agent.blocked.focusCommand.join(" ");
     const waiting = `agent ${agent.blocked.name} is waiting for you: ${focus}`;
@@ -1313,17 +1437,46 @@ async function executeItem(
     report("blocked", agent.blocked.focusCommand);
     return {
       status: "blocked",
-      summary:
-        `${note}${waiting}\nfinish in the pane, commit in ${dir}, ` +
-        `then run skep session submit ${item.itemId} --epoch ${item.epoch}\n${tail}`,
+      summary: `${note}${waiting}\nfinish in the pane; its edits land in ${dir} directly\n${tail}`,
+      full,
+      said,
     };
   }
-  if (!agent.ok) return { status: "failed", summary: `${note}agent ${agent.status}\n${tail}` };
-  const changed = await commitAll(ctx, dir, message);
+  if (!agent.ok) {
+    const timedOut = agent.status === "timed out";
+    return {
+      status: "failed",
+      summary: `${note}${tail}`,
+      cause: timedOut
+        ? `agent ${setup.cli} timed out after ${formatDuration(AGENT_TIMEOUT_MS)}`
+        : `agent ${setup.cli} ${agent.status}`,
+      fix: timedOut
+        ? "split the intent into smaller steps, or join with --view pty to watch it"
+        : "read the agent's output below, fix the cause on this device, then send the intent again",
+      full,
+      said,
+    };
+  }
+  return { status: "ok", summary: `${note}agent ${agent.status}\n${tail}`, full, said };
+}
+
+/** The agent could not even start: name the missing binary rather than a raw spawn error. */
+function spawnFailure(setup: AgentSetup, error: unknown, note: string): Executed {
+  let missing = false;
+  // execFileChecked wraps the spawn error; its `cause` carries the errno.
+  for (let at: unknown = error; at instanceof Error; at = at.cause) {
+    if ((at as NodeJS.ErrnoException).code === "ENOENT") missing = true;
+  }
   return {
-    status: "ok",
-    changed,
-    summary: `${note}agent ${agent.status}${changed ? "" : "; no changes"}\n${tail}`,
+    status: "failed",
+    summary: note,
+    cause: missing
+      ? `agent CLI ${setup.cli} not found on PATH`
+      : `agent ${setup.cli} could not run: ${errorMessage(error)}`,
+    fix: missing
+      ? `install ${setup.cli}, or leave and /join again with --agent <claude|codex|pi>`
+      : "check that the agent CLI runs in a terminal on this device, then send the intent again",
+    full: `${note}${errorMessage(error)}`,
   };
 }
 
@@ -1396,62 +1549,231 @@ function openedFrom(stdout: string): { url: string; number?: number } | null {
   return number === undefined ? { url } : { url, number: Number(number) };
 }
 
-/**
- * Pushes the session branch (never the base branch) and opens a PR/MR when asked. Every failure
- * becomes a `failed` outcome rather than an exception, so `onItem` always has a result to send.
- */
-export async function submitBranch(
-  ctx: SessionCliContext,
-  opts: { cwd: string; branch: string; method: DirectMethod; title: string; body: string },
-): Promise<{ submit: SubmitOutcome; detail: string }> {
-  const { cwd, branch, method } = opts;
-  if (method === "none") return { submit: outcome("none", "local", branch), detail: "" };
-  const host = method === "pr" ? "gh" : method === "mr" ? "glab" : null;
-  if (host !== null && !(await onPath(host, ctx.env))) {
-    return {
-      submit: outcome(method, "local", branch),
-      detail: `${host} is not on PATH; ${branch} stays local`,
-    };
-  }
-  const refspec = `refs/heads/${branch}:refs/heads/${branch}`;
-  const push = await execFileChecked("git", ["push", "--quiet", "origin", refspec], {
-    cwd,
-    env: pickEnv(ctx, PUSH_ENV_KEYS),
-    allowFailure: true,
-  }).catch((error: unknown) => ({ code: null, stdout: "", stderr: errorMessage(error) }));
-  if (push.code !== 0) {
-    return { submit: outcome(method, "failed", branch), detail: push.stderr.trim() };
-  }
-  if (host === null) return { submit: outcome(method, "pushed", branch), detail: "" };
-  const base = await defaultBranch(ctx, cwd);
-  const args =
-    host === "gh"
-      ? ["pr", "create", "--head", branch, "--base", base, "--title", opts.title]
-      : ["mr", "create", "--source-branch", branch, "--target-branch", base, "--title", opts.title];
-  args.push(host === "gh" ? "--body" : "--description", opts.body);
-  const created = await execFileChecked(host, args, {
-    cwd,
-    env: pickEnv(ctx, HOST_ENV_KEYS),
-    allowFailure: true,
-  }).catch((error: unknown) => ({ code: null, stdout: "", stderr: errorMessage(error) }));
-  if (created.code !== 0) {
-    return { submit: outcome(method, "failed", branch), detail: created.stderr.trim() };
-  }
-  const opened = openedFrom(created.stdout);
-  // Created but no URL to show for it: the branch is at least pushed.
-  if (opened === null) return { submit: outcome(method, "pushed", branch), detail: "" };
-  return { submit: outcome(method, "opened", branch, opened), detail: "" };
-}
-
 function submitLine(submit: SubmitOutcome): string {
   return `submit ${submit.method} ${submit.state}${submit.url === undefined ? "" : ` ${submit.url}`}`;
 }
 
+/** A git identity for commits skep makes, only when the repo has none configured. */
+async function commitIdentity(ctx: SessionCliContext, dir: string): Promise<string[]> {
+  const configured = await git(ctx, ["config", "user.email"], dir).then(
+    (value) => value.trim() !== "",
+    () => false,
+  );
+  return configured ? [] : ["-c", "user.name=skep", "-c", "user.email=skep@example.invalid"];
+}
+
+/** The delta paths git can stage: present now, or tracked (a deletion). */
+async function stageablePaths(ctx: SessionCliContext, dir: string, paths: readonly string[]) {
+  const tracked = new Set(
+    (await git(ctx, ["ls-files", "-z", "--", ...paths], dir)).split("\0").filter(Boolean),
+  );
+  const out: string[] = [];
+  for (const rel of paths) {
+    if (tracked.has(rel) || (await exists(path.join(dir, rel)))) out.push(rel);
+  }
+  return out;
+}
+
+/**
+ * Commits exactly the item's files on the current branch (`--only`), whatever else is staged or
+ * dirty. A file the user had already modified is committed with their edits too: the working
+ * tree holds one version of it. Returns the new commit, or null when nothing was left to commit.
+ */
+async function commitDelta(
+  ctx: SessionCliContext,
+  dir: string,
+  paths: readonly string[],
+  message: string,
+): Promise<string | null> {
+  const files = await stageablePaths(ctx, dir, paths);
+  if (files.length === 0) return null;
+  await git(ctx, ["add", "-A", "--", ...files], dir);
+  const identity = await commitIdentity(ctx, dir);
+  await git(
+    ctx,
+    [...identity, "commit", "--quiet", "--no-verify", "-m", message, "--only", "--", ...files],
+    dir,
+  );
+  return (await git(ctx, ["rev-parse", "HEAD"], dir)).trim();
+}
+
+/** `skep/<itemId>-<slug>` for a PR/MR, made unique against existing branches. */
+async function submitBranchName(
+  ctx: SessionCliContext,
+  dir: string,
+  itemId: string,
+  title: string,
+): Promise<string> {
+  const slug = title
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40)
+    .replace(/-+$/, "");
+  const base = `skep/${itemId}${slug === "" ? "" : `-${slug}`}`;
+  for (let n = 1; ; n++) {
+    const name = n === 1 ? base : `${base}-${n}`;
+    const taken = await git(ctx, ["rev-parse", "--verify", "--quiet", `refs/heads/${name}`], dir)
+      .then(() => true)
+      .catch(() => false);
+    if (!taken) return name;
+  }
+}
+
+/**
+ * A commit of the item's files on top of HEAD, written through a private index so neither the
+ * working tree, the real index nor the checked-out branch moves: the edits stay in the folder
+ * and the PR branch gets a copy. This is the only place a session branch is ever created, and
+ * only for an opted-in `pr`/`mr` (SESSION-UX §3.3).
+ */
+async function branchFromDelta(
+  ctx: SessionCliContext,
+  dir: string,
+  branch: string,
+  paths: readonly string[],
+  message: string,
+): Promise<string> {
+  const index = path.resolve(
+    dir,
+    (
+      await git(
+        ctx,
+        ["rev-parse", "--git-path", `skep-submit-${branch.replace(/\//g, "-")}.index`],
+        dir,
+      )
+    ).trim(),
+  );
+  const env = { ...pickEnv(ctx, ["PATH", "HOME"]), GIT_INDEX_FILE: index };
+  const run = async (args: string[]): Promise<string> =>
+    (await execFileChecked("git", args, { env, cwd: dir })).stdout;
+  const head = await git(ctx, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"], dir)
+    .then((value) => value.trim())
+    .catch(() => "");
+  try {
+    await run(head === "" ? ["read-tree", "--empty"] : ["read-tree", head]);
+    await run(["update-index", "--add", "--remove", "--", ...paths]);
+    const tree = (await run(["write-tree"])).trim();
+    const identity = await commitIdentity(ctx, dir);
+    const parent = head === "" ? [] : ["-p", head];
+    const commit = (await run([...identity, "commit-tree", tree, ...parent, "-m", message])).trim();
+    // Create-only: an existing branch of that name is never moved.
+    await run(["update-ref", `refs/heads/${branch}`, commit, "0".repeat(40)]);
+    return commit;
+  } finally {
+    await rm(index, { force: true });
+  }
+}
+
+/** Submit methods a device can apply to an item's delta; `commit` never leaves the device. */
+export type DeltaMethod = DirectMethod | "commit";
+
+export interface SubmitDeltaOptions {
+  dir: string;
+  itemId: string;
+  method: DeltaMethod;
+  paths: readonly string[];
+  title: string;
+  body: string;
+}
+
+export interface SubmittedDelta {
+  /** The wire outcome. `commit` is sent as `none`/`local`: the wire has no commit method. */
+  submit: SubmitOutcome;
+  /** The human line, first in the summary: `submit commit local abc1234 on main`. */
+  line: string;
+  detail: string;
+}
+
+/**
+ * Applies a submit method to an item's changed files (SESSION-UX §3.3). `none` leaves them in the
+ * working tree; `commit` commits only them on the current branch; `push` also pushes that branch;
+ * `pr`/`mr` copy them onto a new `skep/<itemId>-<slug>` branch, push it and open the PR/MR without
+ * touching the working tree. Every failure is a `failed` outcome, never an exception.
+ */
+export async function submitDelta(
+  ctx: SessionCliContext,
+  opts: SubmitDeltaOptions,
+): Promise<SubmittedDelta> {
+  const { dir, method } = opts;
+  const current = await currentBranch(ctx, dir);
+  const line = (submit: SubmitOutcome, label: string = submit.method): string =>
+    `submit ${label} ${submit.state}${submit.url === undefined ? "" : ` ${submit.url}`}`;
+  const done = (submit: SubmitOutcome, detail = "", label?: string): SubmittedDelta => ({
+    submit,
+    line: line(submit, label),
+    detail,
+  });
+  if (method === "none") return done(outcome("none", "local", current));
+  const message = opts.title === "" ? `session ${opts.itemId}` : opts.title;
+  const fullMessage = opts.body === "" ? message : `${message}\n\n${opts.body}`;
+  try {
+    if (method === "commit" || method === "push") {
+      const sha = await commitDelta(ctx, dir, opts.paths, fullMessage);
+      if (method === "commit") {
+        const submit = outcome("none", "local", current);
+        if (sha === null) return done(submit, "nothing left to commit", "commit");
+        return { submit, line: `submit commit local ${sha.slice(0, 7)} on ${current}`, detail: "" };
+      }
+      if (current === "HEAD") {
+        return done(outcome("push", "failed", current), "detached HEAD: no branch to push");
+      }
+      return pushBranch(ctx, dir, method, current, done);
+    }
+    const host = method === "pr" ? "gh" : "glab";
+    if (!(await onPath(host, ctx.env))) {
+      return done(
+        outcome(method, "local", current),
+        `${host} is not on PATH; nothing was committed, the edits stay in ${dir}`,
+      );
+    }
+    const branch = await submitBranchName(ctx, dir, opts.itemId, opts.title);
+    await branchFromDelta(ctx, dir, branch, opts.paths, fullMessage);
+    const pushed = await pushBranch(ctx, dir, method, branch, done);
+    if (pushed.submit.state !== "pushed") return pushed;
+    const base = await defaultBranch(ctx, dir);
+    const args =
+      host === "gh"
+        ? ["pr", "create", "--head", branch, "--base", base, "--title", message]
+        : ["mr", "create", "--source-branch", branch, "--target-branch", base, "--title", message];
+    args.push(host === "gh" ? "--body" : "--description", opts.body);
+    const created = await execFileChecked(host, args, {
+      cwd: dir,
+      env: pickEnv(ctx, HOST_ENV_KEYS),
+      allowFailure: true,
+    }).catch((error: unknown) => ({ code: null, stdout: "", stderr: errorMessage(error) }));
+    if (created.code !== 0) return done(outcome(method, "failed", branch), created.stderr.trim());
+    const opened = openedFrom(created.stdout);
+    // Created but no URL to show for it: the branch is at least pushed.
+    if (opened === null) return done(outcome(method, "pushed", branch));
+    return done(outcome(method, "opened", branch, opened));
+  } catch (error) {
+    const wire = method === "commit" ? "none" : method;
+    return done(outcome(wire, "failed", current), errorMessage(error), method);
+  }
+}
+
+async function pushBranch(
+  ctx: SessionCliContext,
+  dir: string,
+  method: DirectMethod,
+  branch: string,
+  done: (submit: SubmitOutcome, detail?: string) => SubmittedDelta,
+): Promise<SubmittedDelta> {
+  const refspec = `refs/heads/${branch}:refs/heads/${branch}`;
+  const push = await execFileChecked("git", ["push", "--quiet", "origin", refspec], {
+    cwd: dir,
+    env: pickEnv(ctx, PUSH_ENV_KEYS),
+    allowFailure: true,
+  }).catch((error: unknown) => ({ code: null, stdout: "", stderr: errorMessage(error) }));
+  if (push.code !== 0) return done(outcome(method, "failed", branch), push.stderr.trim());
+  return done(outcome(method, "pushed", branch));
+}
+
 export interface ItemWorker {
   ctx: SessionCliContext;
-  /** Where session checkouts live (under SKEP_HOME, never inside the device repo). */
-  root: string;
-  method: SubmitMethod;
+  /** The folder the agent edits; resolved per item ({@link projectRoot}) when absent. */
+  dir?: string;
+  method: LocalSubmitMethod;
   /** Asks the human; null on EOF. Used when `method` is `ask` and, in manual mode, per item. */
   ask(question: string): Promise<string | null>;
   /**
@@ -1459,9 +1781,7 @@ export interface ItemWorker {
    * master-driven items run without a skep prompt and only the submit policy may still ask.
    */
   confirmItems?: boolean;
-  /** False forces the clone fallback (tests; hosts whose git lacks `worktree`). */
-  worktree?: boolean;
-  /** How the agent runs; absent means the dry marker. */
+  /** How the agent runs. Absent fails the item: there is no dry fallback (SESSION-UX §3.2). */
   agent?: AgentSetup;
   /** Receives state changes; a PTY run is bracketed by `suspend()`/`resume()`. */
   view?: JoinView;
@@ -1471,9 +1791,26 @@ export interface ItemWorker {
   peers?: JoinViewModel["peers"];
   /** Serializes PTY runs: one agent owns the terminal at a time. */
   terminal?: <T>(fn: () => Promise<T>) => Promise<T>;
+  /**
+   * Runs whole items one at a time. Items share one working tree, so two agents at once would
+   * interleave edits and each delta would contain the other's files.
+   */
+  serial?: <T>(fn: () => Promise<T>) => Promise<T>;
   /** Aborted when the join is closing; stops a running PTY or herdr wait. */
   signal?: AbortSignal;
   onAgentState?(itemId: string, state: JoinAgentState): void;
+  /** Measures item duration (default: the system clock). */
+  clock?: Clock;
+}
+
+/** A one-at-a-time queue: each call starts after the previous one settled. */
+export function serialQueue(): <T>(fn: () => Promise<T>) => Promise<T> {
+  let tail: Promise<unknown> = Promise.resolve();
+  return (fn) => {
+    const run = tail.then(fn);
+    tail = run.catch(() => undefined);
+    return run;
+  };
 }
 
 /**
@@ -1504,13 +1841,38 @@ async function confirmItem(worker: ItemWorker, item: PlanItem): Promise<boolean>
   return answer !== null && /^\s*(y(es)?)?\s*$/i.test(answer);
 }
 
+/** The agent's own closing words: its last paragraph, a few lines at most. */
+export function agentSummary(tail: string): string {
+  const lines = tail.split("\n").map((line) => line.trimEnd());
+  while (lines.length > 0 && lines.at(-1)?.trim() === "") lines.pop();
+  const start = lines.findLastIndex((line) => line.trim() === "");
+  const paragraph = lines.slice(start + 1).slice(-5);
+  const text = paragraph.join(" ").replace(/\s+/g, " ").trim();
+  return text.length > 400 ? `${text.slice(0, 399)}…` : text;
+}
+
+function said(executed: Executed): { said?: string } {
+  return executed.said === undefined || executed.said === "" ? {} : { said: executed.said };
+}
+
+const DELTA_ASK = "Submit this item? [commit/push/pr/mr/none/skip] ";
+const ASK_CHOICES = ["commit", ...DIRECT_METHODS] as const;
+
 /** Everything a sub does for one item. Never throws: a failure is a result with `failed`. */
 export async function workItem(worker: ItemWorker, item: PlanItem): Promise<SubResult> {
+  const run = (): Promise<SubResult> => workItemNow(worker, item);
+  return worker.serial === undefined ? run() : worker.serial(run);
+}
+
+async function workItemNow(worker: ItemWorker, item: PlanItem): Promise<SubResult> {
   const { ctx } = worker;
+  const clock = worker.clock ?? systemClock;
+  const started = clock.monotonicMs();
   const redactor = new Redactor();
-  const branch = sessionBranch(item.itemId, item.epoch);
   // Every summary byte that leaves for the master is control-stripped and redacted (D27).
   const clean = (text: string): string => redactor.redact(dropControlChars(text));
+  const cli = worker.agent?.view === "dry" ? "no agent" : (worker.agent?.cli ?? "no agent");
+  const wireMethod: SubmitMethod = worker.method === "commit" ? "none" : worker.method;
 
   let agentState: JoinAgentState = "starting";
   let focusCommand: readonly string[] | undefined;
@@ -1528,7 +1890,7 @@ export async function workItem(worker: ItemWorker, item: PlanItem): Promise<SubR
             ...(focusCommand === undefined ? {} : { focusCommand }),
           },
     tail,
-    submit: { policy: worker.method, ...(submit === undefined ? {} : { outcome: submit }) },
+    submit: { policy: wireMethod, ...(submit === undefined ? {} : { outcome: submit }) },
   });
   const report = (state: JoinAgentState, focus?: readonly string[]): void => {
     agentState = state;
@@ -1536,155 +1898,263 @@ export async function workItem(worker: ItemWorker, item: PlanItem): Promise<SubR
     worker.onAgentState?.(item.itemId, agentState);
     worker.view?.update(show());
   };
+  /**
+   * The summary the master shows (SESSION-UX §2.3): the submit line, a status line, the changed
+   * files, then cause and fix for a failure, then the agent's own words.
+   */
   const result = (
     fields: Omit<SubResult, "repo" | "summary" | "submit"> & { submit: SubmitOutcome },
-    summary: string,
+    parts: {
+      word: string;
+      submitLine?: string;
+      changed?: string;
+      cause?: string;
+      fix?: string;
+      log?: string | undefined;
+      said?: string;
+      body?: string;
+    },
   ): SubResult => {
-    const final: SubResult = {
-      repo: item.repo,
-      ...fields,
-      summary: clipSummary(`${submitLine(fields.submit)}\n${clean(summary)}`),
-    };
+    const elapsed = formatDuration(clock.monotonicMs() - started);
+    const lines = [
+      parts.submitLine ?? submitLine(fields.submit),
+      `${parts.word} · ${cli} · ${elapsed}`,
+      ...(parts.changed === undefined ? [] : [parts.changed]),
+      ...(parts.cause === undefined ? [] : [`cause: ${parts.cause}`]),
+      ...(parts.fix === undefined ? [] : [`fix: ${parts.fix}`]),
+      ...(parts.log === undefined ? [] : [`full text: ${parts.log}`]),
+    ];
+    const body = parts.body === undefined ? "" : clean(parts.body).trim();
+    const said = parts.said === undefined ? "" : clean(parts.said);
+    const text = [...lines.map(clean), ...(said === "" ? [] : [`summary: ${said}`]), body]
+      .filter((line) => line !== "")
+      .join("\n");
+    const final: SubResult = { repo: item.repo, ...fields, summary: clipSummary(text) };
     worker.onAgentState?.(item.itemId, agentState);
     worker.view?.update(show(fields.submit));
     return final;
   };
 
+  const dir = worker.dir ?? (await projectRoot(ctx));
   const deviceHead = async (): Promise<string> => {
-    const sha = await git(ctx, ["rev-parse", "HEAD"])
+    const sha = await git(ctx, ["rev-parse", "HEAD"], dir)
       .then((value) => value.trim())
       .catch(() => UNKNOWN_SHA);
     return ShaSchema.safeParse(sha).success ? sha : UNKNOWN_SHA;
   };
+  const branch = await currentBranch(ctx, dir);
+  const baseSha = await deviceHead();
+  const home = ctx.paths?.home;
+  const failLog = async (text: string): Promise<string | undefined> =>
+    home === undefined ? undefined : writeLastError(home, text).catch(() => undefined);
 
-  if (worker.confirmItems === true && !(await confirmItem(worker, item))) {
-    // Declined before anything was checked out, so no branch or worktree is left behind.
-    const sha = await deviceHead();
-    return result(
-      {
-        baseSha: sha,
-        headSha: sha,
-        checks: [{ name: "peer", status: "skip" }],
-        submit: outcome(worker.method, "skipped", branch),
-      },
-      "declined on this device (manual mode)",
-    );
-  }
-
-  let work: Materialized & { clone: string | null };
-  try {
-    work = await materializeItem(ctx, item, worker.root, { worktree: worker.worktree });
-  } catch (error) {
-    const sha = await deviceHead();
+  if (worker.signal?.aborted === true) {
     agentState = "failed";
     return result(
       {
-        baseSha: sha,
-        headSha: sha,
-        checks: [{ name: "git", status: "fail" }],
-        submit: outcome(worker.method, "failed", branch),
+        baseSha,
+        headSha: baseSha,
+        checks: [{ name: "peer", status: "skip" }],
+        submit: outcome(wireMethod, "skipped", branch),
       },
-      errorMessage(error),
+      { word: "skipped", body: "the session closed before this item started; nothing ran" },
+    );
+  }
+  if (worker.confirmItems === true && !(await confirmItem(worker, item))) {
+    return result(
+      {
+        baseSha,
+        headSha: baseSha,
+        checks: [{ name: "peer", status: "skip" }],
+        submit: outcome(wireMethod, "skipped", branch),
+      },
+      { word: "declined", body: "declined on this device (manual mode); nothing ran" },
     );
   }
 
-  const { dir, baseSha } = work;
-  const headOf = () =>
-    git(ctx, ["rev-parse", "HEAD"], dir)
-      .then((value) => value.trim())
-      .catch(() => baseSha);
+  const io = snapshotIo(ctx);
+  let before: TreeSnapshot;
+  try {
+    before = await snapshotTree(dir, io);
+  } catch (error) {
+    agentState = "failed";
+    const cause = `could not read the project folder ${dir}: ${errorMessage(error)}`;
+    const fix =
+      "check that this folder is readable and git works in it, then send the intent again";
+    return result(
+      {
+        baseSha,
+        headSha: baseSha,
+        checks: [{ name: "git", status: "fail" }],
+        submit: outcome(wireMethod, "failed", branch),
+      },
+      { word: "FAILED", cause, fix, log: await failLog(`${item.itemId}\n${cause}\nfix: ${fix}`) },
+    );
+  }
+
   let executed: Executed;
   try {
     executed = await executeItem(worker, item, dir, report);
-    if (work.clone !== null && executed.status === "ok") await syncBack(ctx, work, work.clone);
   } catch (error) {
     // After an accepted prompt a herdr failure is final: never replayed natively (§11.4).
-    executed = { status: "failed", summary: errorMessage(error) };
+    executed = {
+      status: "failed",
+      summary: "",
+      cause: `agent ${cli} failed: ${errorMessage(error)}`,
+      fix: "read the full text, fix the cause on this device, then send the intent again",
+      full: errorMessage(error),
+    };
   }
   tail = clean(executed.summary).slice(-MAX_SUMMARY);
-  const headSha = await headOf();
+
+  let delta: ItemDelta = { files: [], partial: false };
+  let deltaProblem = "";
+  try {
+    delta = await computeDelta(before, io);
+  } catch (error) {
+    deltaProblem = `could not compare the files after the run: ${errorMessage(error)}`;
+  }
+  const headSha = await deviceHead();
+  if (delta.files.length > 0 && home !== undefined) {
+    try {
+      await writeDeltaRecord(
+        home,
+        { itemId: item.itemId, epoch: item.epoch, title: item.title, root: dir, head: headSha },
+        delta,
+        clock.nowMs(),
+      );
+    } catch (error) {
+      deltaProblem = `could not record the changes for undo: ${errorMessage(error)}`;
+    }
+  }
+  const changed =
+    deltaProblem === "" ? changedLine(delta) : `${changedLine(delta)}; ${deltaProblem}`;
+  const paths = delta.files.map((file) => file.path);
+
+  if (executed.status === "dry") {
+    // Never success-shaped: a failed check, so the master counts it failed (SESSION-UX §3.2).
+    agentState = "done";
+    return result(
+      {
+        baseSha,
+        headSha,
+        checks: [{ name: "agent", status: "fail" }],
+        submit: outcome(wireMethod, "skipped", branch),
+      },
+      { word: "DRY RUN", body: executed.summary },
+    );
+  }
   if (executed.status === "blocked") {
-    // Nothing is committed, checked or submitted; `skep session submit` finishes it later (D29).
+    // Nothing is checked or submitted; the edits stay in the folder (D29).
     agentState = "blocked";
     return result(
       {
         baseSha,
         headSha,
         checks: [{ name: "agent", status: "skip" }],
-        submit: outcome(worker.method, "pending", branch),
+        submit: outcome(wireMethod, "pending", branch),
       },
-      executed.summary,
+      { word: "blocked", changed, ...said(executed), body: executed.summary },
     );
   }
   if (executed.status === "failed") {
     agentState = "failed";
+    const log = await failLog(
+      `${item.itemId} (epoch ${item.epoch}) in ${dir}: ${item.title}\n` +
+        `cause: ${executed.cause}\nfix: ${executed.fix}\n${changed}\n\n${executed.full}`,
+    );
     return result(
       {
         baseSha,
         headSha,
         checks: [{ name: "agent", status: "fail" }],
-        submit: outcome(worker.method, "failed", branch),
+        submit: outcome(wireMethod, "failed", branch),
       },
-      executed.summary,
+      {
+        word: "FAILED",
+        changed,
+        cause: executed.cause,
+        fix: executed.fix,
+        ...(log === undefined ? {} : { log }),
+        ...said(executed),
+        body: executed.summary,
+      },
     );
   }
   agentState = "done";
-  if (!executed.changed) {
+  if (delta.files.length === 0) {
     return result(
       {
         baseSha,
         headSha,
         checks: [{ name: "none", status: "skip" }],
-        submit: outcome(worker.method, "skipped", branch),
+        submit: outcome(wireMethod, "skipped", branch),
       },
-      `no changes; nothing submitted\n${executed.summary}`,
+      { word: "done", changed, ...said(executed), body: executed.summary },
     );
   }
 
+  // Checks are information now: they run where the agent worked, after it (SESSION-UX §3.3).
   const checks = await runChecks(ctx, dir).catch((): CheckStatus[] => [
     { name: "checks-file", status: "fail" },
   ]);
-  if (checks.some((check) => check.status === "fail")) {
-    // Failing code is never submitted; the human can fix it and run `skep session submit`.
-    return result(
-      { baseSha, headSha, checks, submit: outcome(worker.method, "skipped", branch) },
-      `checks failed; ${branch} not submitted\n${executed.summary}`,
-    );
-  }
-
-  let method: DirectMethod;
+  let method: DeltaMethod;
   if (worker.method === "ask") {
-    let chosen: DirectMethod | undefined;
+    let chosen: DeltaMethod | undefined;
     if (worker.chooseSubmit !== undefined) {
       const picked = await worker.chooseSubmit(show());
-      chosen = DIRECT_METHODS.find((value) => value === picked);
+      chosen = ASK_CHOICES.find((value) => value === picked);
     } else {
-      ctx.stderr.write(`item ${item.itemId} finished on ${branch} at ${headSha}\n`);
-      const answer = (await worker.ask("Submit this item? [pr/mr/push/none/skip] "))?.trim() ?? "";
-      chosen = DIRECT_METHODS.find((value) => value === answer.toLowerCase());
+      ctx.stderr.write(`item ${item.itemId} ${changed}\n`);
+      const answer = (await worker.ask(DELTA_ASK))?.trim() ?? "";
+      chosen = ASK_CHOICES.find((value) => value === answer.toLowerCase());
     }
     if (chosen === undefined) {
       return result(
         { baseSha, headSha, checks, submit: outcome("ask", "skipped", branch) },
-        executed.summary,
+        { word: "done", changed, ...said(executed), body: executed.summary },
       );
     }
     method = chosen;
   } else {
     method = worker.method;
   }
-  const submitted = await submitBranch(ctx, {
-    cwd: dir,
-    branch,
+  if (method !== "none" && checks.some((check) => check.status === "fail")) {
+    // Failing code is never committed or pushed; the edits stay in the folder.
+    return result(
+      {
+        baseSha,
+        headSha,
+        checks,
+        submit: outcome(method === "commit" ? "none" : method, "skipped", branch),
+      },
+      {
+        word: "done",
+        changed,
+        ...said(executed),
+        body: `checks failed; not submitted\n${executed.summary}`,
+      },
+    );
+  }
+  const submitted = await submitDelta(ctx, {
+    dir,
+    itemId: item.itemId,
     method,
-    title: item.title === "" ? `session ${item.itemId}` : item.title,
-    body: clean(executed.summary),
-  }).catch((error: unknown) => ({
-    submit: outcome(method, "failed", branch),
-    detail: errorMessage(error),
-  }));
+    paths,
+    title: item.title,
+    body: clean(executed.said ?? ""),
+  });
   const detail = submitted.detail === "" ? "" : `${submitted.detail}\n`;
-  return result({ baseSha, headSha, checks, submit: submitted.submit }, detail + executed.summary);
+  return result(
+    { baseSha, headSha: await deviceHead(), checks, submit: submitted.submit },
+    {
+      word: "done",
+      submitLine: submitted.line,
+      changed,
+      ...said(executed),
+      body: detail + executed.summary,
+    },
+  );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1705,9 +2175,11 @@ export interface JoinOptions {
   device?: string;
   repo?: string;
   role: string;
-  submit?: SubmitMethod;
-  agent?: AgentView;
-  roleDir?: string;
+  submit?: LocalSubmitMethod;
+  /** The agent CLI (`claude`, `codex`, `pi`); legacy view names are mapped by the callers. */
+  agent?: AgentCli;
+  /** How items run: native (default), pty, herdr, or dry (test/demo only, reports failed). */
+  view?: AgentView;
   ui?: boolean;
   /** Opt out of auto control: confirm each master-driven item before it runs. */
   manual?: boolean;
@@ -1760,31 +2232,57 @@ export function register(program: Command, ctx: CliContext): void {
         "how finished items are submitted (default: device policy, else none)",
       ).choices(SUBMIT_METHODS),
     )
+    .option(
+      "--agent <cli>",
+      "agent CLI: claude, codex or pi (default: SKEP_AGENT_CLI, AGENT.md if present, else PATH)",
+    )
     .addOption(
       new Option(
-        "--agent <view>",
-        "how items run: dry, pty, herdr or native (default: SKEP_SESSION_EXEC/SKEP_SESSION_VIEW)",
+        "--view <view>",
+        "how the agent runs: native (default), pty, herdr; dry runs nothing and reports failed",
       ).choices(AGENT_VIEWS),
     )
-    .option("--role-dir <dir>", "directory holding this device's AGENT.md (default: cwd)")
+    .addOption(
+      new Option("--role-dir <dir>", "ignored (AGENT.md is no longer required)").hideHelp(),
+    )
     .option("--ui", "use the full-screen view")
     .option("--manual", "confirm each item before it runs (default: auto, no skep prompt)")
-    .action(async (opts: JoinOptions) => {
-      await joinCommand(sctx, opts);
+    .action(async (opts: Omit<JoinOptions, "agent"> & { agent?: string; roleDir?: string }) => {
+      const { agent, roleDir, ...rest } = opts;
+      const choice = parseAgentFlag(agent);
+      if (choice.notice !== undefined) sctx.stderr.write(`skep: ${choice.notice}\n`);
+      if (roleDir !== undefined) {
+        sctx.stderr.write("skep: --role-dir is ignored; AGENT.md is no longer required\n");
+      }
+      const view = rest.view ?? choice.view;
+      await joinCommand(sctx, {
+        ...rest,
+        ...(choice.cli === undefined ? {} : { agent: choice.cli }),
+        ...(view === undefined ? {} : { view }),
+      });
     });
 
   session
     .command("submit")
-    .description("Submit a finished session item's local branch after a join asked or deferred")
+    .description("Commit, push or open a PR/MR for a finished item's recorded changes")
     .argument("<itemId>", "the item id, e.g. I-1")
     .addOption(
-      new Option("--method <method>", "pr, mr, push, none or skip")
+      new Option("--method <method>", "commit, push, pr, mr, none or skip")
         .choices(SUBMIT_COMMAND_METHODS)
         .makeOptionMandatory(),
     )
     .option("--epoch <n>", "the item's epoch", "1")
     .action(async (itemId: string, opts: SubmitOptions) => {
       await submitCommand(sctx, itemId, opts);
+    });
+
+  session
+    .command("undo")
+    .description("Put the files a session item changed back to their content from before it")
+    .argument("<itemId>", "the item id, e.g. I-1")
+    .option("--force", "also overwrite files that changed again after the item")
+    .action(async (itemId: string, opts: { force?: boolean }) => {
+      await undoCommand(sctx, itemId, opts);
     });
 
   session
@@ -2220,8 +2718,33 @@ async function restoreSessionFile(
  */
 export type JoinControl = "auto" | "manual";
 
+/** The join line naming the agent and where it works (SESSION-UX §2). */
+export function agentLine(agent: ResolvedAgent | null, view: AgentView, dir: string): string {
+  if (agent === null) {
+    return `agent: none · mode: DRY RUN (--view dry): items report failed and nothing changes`;
+  }
+  const how = view === "native" ? "" : ` (${view} view)`;
+  return (
+    `agent: ${agent.cli} (${agentSourceText(agent.source)})${how} · ` +
+    `mode: edits this folder directly (${dir})`
+  );
+}
+
+/**
+ * One line per finished item for the peer's own scrollback: the status, the changed files, and
+ * for a failure the cause and fix (the summary's labelled lines).
+ */
+export function itemHeadline(itemId: string, result: SubResult): string {
+  const lines = result.summary.split("\n");
+  const status = lines[1] ?? "";
+  const keep = lines
+    .slice(2, 8)
+    .filter((line) => /^(changed |no changes|cause: |fix: |full text: )/.test(line));
+  return [`${itemId} ${status}`, ...keep.map((line) => `  ${line}`)].join("\n");
+}
+
 /** The join line's note on what this device will still ask. */
-export function controlText(control: JoinControl, method: SubmitMethod): string {
+export function controlText(control: JoinControl, method: LocalSubmitMethod): string {
   const submit =
     method === "ask" ? "submit: ask after each item that changed the repo" : `submit: ${method}`;
   return control === "auto"
@@ -2230,7 +2753,7 @@ export function controlText(control: JoinControl, method: SubmitMethod): string 
 }
 
 export interface JoinFlowOptions extends Omit<JoinOptions, "ui"> {
-  /** This device's agent CLI chosen by its human; replaces the AGENT.md lookup when set. */
+  /** This device's agent CLI chosen with `/agent`; `--agent` (`agent`) still wins. */
   cli?: AgentCli;
 }
 
@@ -2256,6 +2779,11 @@ export interface JoinFlow {
   readonly role: string;
   /** `auto` unless the human joined with `--manual`. */
   readonly control: JoinControl;
+  /** The agent resolved at join; null only for `--view dry`. */
+  readonly agent: ResolvedAgent | null;
+  readonly view: AgentView;
+  /** The folder items edit directly. */
+  readonly dir: string;
   /** Settles once the channel closed and running items were aborted. */
   readonly closed: Promise<{ reason: string }>;
   /** Abort running items and leave the session. */
@@ -2303,45 +2831,49 @@ export async function joinSessionFlow(
   if (ctx.paths === undefined) throw new Error("skep home is not resolved");
   const paths = ctx.paths;
   const { say, ask, warn } = io;
-  const view = selectAgentView(opts.agent, ctx.env);
-  let agent: AgentSetup | undefined;
-  if (view !== "dry") {
-    agent = {
-      view,
-      cli:
-        opts.cli ??
-        (await agentCliOf(path.resolve(ctx.cwd ?? process.cwd(), opts.roleDir ?? "."), view)),
-      runtime: ctx.agentRuntime ?? loadAgentRuntime,
-      journal: path.join(paths.home, "session", "transcripts"),
-      notify: ctx.notify ?? (await deviceNotifier(paths.deviceToml, warn)),
-    };
-  }
+  const view = selectAgentView(opts.view, ctx.env);
+  const dir = await projectRoot(ctx);
+  // Resolved before connecting: a device without an agent never joins (SESSION-UX §3.2).
+  const resolved =
+    view === "dry"
+      ? null
+      : await resolveAgentCli({
+          ...(opts.agent === undefined ? {} : { flag: opts.agent }),
+          ...(opts.cli === undefined ? {} : { setting: opts.cli }),
+          env: ctx.env,
+          dir,
+          warn,
+        });
+  const agent: AgentSetup = {
+    view,
+    // Dry never starts a CLI; the name only labels the view model.
+    cli: resolved?.cli ?? "claude",
+    runtime: ctx.agentRuntime ?? loadAgentRuntime,
+    journal: path.join(paths.home, "session", "transcripts"),
+    notify: ctx.notify ?? (await deviceNotifier(paths.deviceToml, warn)),
+  };
   const api = await loadSessionApi(ctx);
   // A human override on the command line wins over this device's file policy.
   const method = opts.submit ?? (await loadSubmitPolicy(paths.deviceToml, warn)).method;
   const control: JoinControl = opts.manual === true ? "manual" : "auto";
 
   const joinView = io.createView();
-  let terminalQueue: Promise<unknown> = Promise.resolve();
   const abort = new AbortController();
   let subHandle: SubHandle | undefined;
   const worker: ItemWorker = {
     ctx,
-    root: path.join(paths.home, "session", "worktrees"),
+    dir,
     method,
     ask,
     ...(control === "manual" ? { confirmItems: true } : {}),
-    ...(agent === undefined ? {} : { agent }),
+    agent,
     view: joinView,
     ...(io.viewChoosesSubmit === true
       ? { chooseSubmit: (model: JoinViewModel) => joinView.chooseSubmit(model) }
       : {}),
     peers: [],
-    terminal: (fn) => {
-      const run = terminalQueue.then(fn);
-      terminalQueue = run.catch(() => undefined);
-      return run;
-    },
+    terminal: serialQueue(),
+    serial: serialQueue(),
     signal: abort.signal,
     onAgentState: (id, state) => subHandle?.reportAgent?.(id, state),
   };
@@ -2363,7 +2895,7 @@ export async function joinSessionFlow(
       item: null,
       agent: null,
       tail: "",
-      submit: { policy: method },
+      submit: { policy: method === "commit" ? "none" : method },
     });
   };
   const onProgress: NonNullable<SubOptions["onProgress"]> = (progress) => {
@@ -2463,7 +2995,7 @@ export async function joinSessionFlow(
         const result = await workItem(worker, item);
         say(
           { event: "item-result", itemId: item.itemId, epoch: item.epoch, ...result },
-          () => `item ${item.itemId} ${result.summary.split("\n")[0] ?? ""} (${result.headSha})\n`,
+          () => `${itemHeadline(item.itemId, result)}\n`,
         );
         return result;
       },
@@ -2485,9 +3017,22 @@ export async function joinSessionFlow(
     selfId = peerId;
     if (!roster.has(peerId)) roster.set(peerId, { peerId, device, role, state: "joined" });
     updatePeers();
+    const agentData =
+      resolved === null ? null : { cli: resolved.cli, source: resolved.source, view };
     say(
-      { event: "joined", sessionId, peerId, target: at, control, submit: method },
-      () => `joined session ${sessionId} at ${at} as ${peerId} (${controlText(control, method)})\n`,
+      {
+        event: "joined",
+        sessionId,
+        peerId,
+        target: at,
+        control,
+        submit: method,
+        agent: agentData,
+        dir,
+      },
+      () =>
+        `joined session ${sessionId} at ${at} as ${peerId} (${controlText(control, method)})\n` +
+        `${agentLine(resolved, view, dir)}\n`,
     );
   } catch (error) {
     abort.abort();
@@ -2502,6 +3047,9 @@ export async function joinSessionFlow(
     repo,
     role,
     control,
+    agent: resolved,
+    view,
+    dir,
     closed,
     close: async () => {
       abort.abort();
@@ -2574,20 +3122,6 @@ async function joinCommand(ctx: SessionCliContext, opts: JoinOptions): Promise<v
   }
 }
 
-/** This device's AGENT.md `agent_cli` (D27): the master's plan never names a CLI. */
-async function agentCliOf(roleDir: string, view: AgentView): Promise<AgentCli> {
-  try {
-    return (await loadAgentMd(roleDir)).frontMatter.agent_cli;
-  } catch (error) {
-    if (!(error instanceof ConfigError)) throw error;
-    throw new CliError(
-      "agent_md",
-      `--agent ${view} needs this device's AGENT.md (pass --role-dir): ${error.message}`,
-      EXIT.usage,
-    );
-  }
-}
-
 const NotifyFileSchema = z.object({
   notify: z.object({ ntfy_topic_url: z.string() }).optional(),
 });
@@ -2641,9 +3175,9 @@ class LineJoinView implements JoinView {
     this.out.write(line);
   }
 
-  async chooseSubmit(): Promise<"pr" | "mr" | "push" | "none" | null> {
-    const answer = (await this.ask("Submit this item? [pr/mr/push/none/skip] "))?.trim() ?? "";
-    return DIRECT_METHODS.find((value) => value === answer.toLowerCase()) ?? null;
+  async chooseSubmit(): Promise<"commit" | "pr" | "mr" | "push" | "none" | null> {
+    const answer = (await this.ask(DELTA_ASK))?.trim() ?? "";
+    return ASK_CHOICES.find((value) => value === answer.toLowerCase()) ?? null;
   }
 
   /** The agent reads the terminal directly; a pending prompt must not steal its keystrokes. */
@@ -2659,8 +3193,9 @@ class LineJoinView implements JoinView {
 }
 
 /**
- * The "decide after the task" path: submits an item's local session branch. The master already
- * acked the result, so this never talks to it.
+ * The "decide after the task" path: applies a submit method to an item's recorded changes in
+ * this project (SESSION-UX §3.3). The master already acked the result, so this never talks to
+ * it. A branch left by skep ≤ 0.1.10 is named, never touched or deleted.
  */
 async function submitCommand(
   ctx: SessionCliContext,
@@ -2678,45 +3213,112 @@ async function submitCommand(
       EXIT.usage,
     );
   }
-  const branch = sessionBranch(itemId, epoch);
-  let top: string;
-  let headSha: string;
-  try {
-    top = (await git(ctx, ["rev-parse", "--show-toplevel"])).trim();
-    headSha = (
-      await git(ctx, ["rev-parse", "--verify", `refs/heads/${branch}^{commit}`], top)
-    ).trim();
-  } catch (error) {
+  if (ctx.paths === undefined) throw new Error("skep home is not resolved");
+  const record = await readDeltaRecord(ctx.paths.home, itemId).catch((error: unknown) => {
+    throw new CliError("bad_delta", errorMessage(error));
+  });
+  if (record === null || record.epoch !== epoch) {
+    const dir = await projectRoot(ctx);
+    const legacy = legacySessionBranch(itemId, epoch);
+    const found = await git(ctx, ["rev-parse", "--verify", "--quiet", `refs/heads/${legacy}`], dir)
+      .then(() => true)
+      .catch(() => false);
+    if (found) {
+      throw new CliError(
+        "legacy_branch",
+        `${legacy} is a legacy branch from skep 0.1.x; skep no longer submits it. ` +
+          `Use git directly (for example: git push origin ${legacy}). Nothing was changed or deleted`,
+      );
+    }
     throw new CliError(
-      "no_branch",
-      `no local session branch ${branch}; run this inside the joined repo (${errorMessage(error)})`,
+      "no_delta",
+      `no recorded changes for ${itemId} (epoch ${epoch}) in this project; ` +
+        "run this in the folder the item ran in",
     );
   }
-  let submitted: { submit: SubmitOutcome; detail: string };
+  if (record.undoneAtMs !== undefined) {
+    throw new CliError("undone", `${itemId} was undone; there is nothing to submit`);
+  }
+  const paths = record.files.map((file) => file.path);
+  let submitted: SubmittedDelta;
   if (opts.method === "skip") {
-    submitted = { submit: outcome("ask", "skipped", branch), detail: "" };
+    const branch = await currentBranch(ctx, record.root);
+    const submit = outcome("ask", "skipped", branch);
+    submitted = { submit, line: submitLine(submit), detail: "" };
   } else {
-    const message = (await git(ctx, ["log", "-1", "--format=%B", headSha], top)).trim();
-    const [subject = `session ${itemId}`, ...rest] = message.split("\n");
-    submitted = await submitBranch(ctx, {
-      cwd: top,
-      branch,
+    submitted = await submitDelta(ctx, {
+      dir: record.root,
+      itemId,
       method: opts.method,
-      title: subject,
-      body: new Redactor().redact(rest.join("\n").trim() || subject),
+      paths,
+      title: record.title,
+      body: "",
     });
   }
-  const { submit, detail } = submitted;
-  const data = { itemId, epoch, branch, headSha, submit };
-  const human = () => `${submitLine(submit)}${detail === "" ? "" : `\n${detail}`}\n`;
+  const { submit, detail, line } = submitted;
+  const data = { itemId, epoch, files: paths, submit };
+  const human = () => `${line}${detail === "" ? "" : `\n${detail}`}\n`;
   if (submit.state === "failed") {
     ctx
       .output()
-      .fail(new CliError("submit_failed", detail || `submitting ${branch} failed`), data, human);
+      .fail(new CliError("submit_failed", detail || `submitting ${itemId} failed`), data, human);
     ctx.exitCode = EXIT.error;
     return;
   }
   ctx.output().result(data, human);
+}
+
+/** Restores the files an item changed (SESSION-UX Phase 3). Refuses rather than overwrite. */
+async function undoCommand(
+  ctx: SessionCliContext,
+  itemId: string,
+  opts: { force?: boolean },
+): Promise<void> {
+  const outcome = await undoItem(ctx, itemId, opts);
+  ctx.output().result(
+    {
+      itemId,
+      root: outcome.record.root,
+      restored: outcome.restored,
+      removed: outcome.removed,
+      overwritten: outcome.overwritten,
+    },
+    () => `${undoText(itemId, outcome)}\n`,
+  );
+}
+
+/** `skep session undo` and the shell's `/undo`. */
+export async function undoItem(
+  ctx: SessionCliContext,
+  itemId: string,
+  opts: { force?: boolean } = {},
+): Promise<UndoOutcome> {
+  if (!/^I-\d+$/.test(itemId)) {
+    throw new CliError("bad_item", `invalid item id: ${JSON.stringify(itemId)}`, EXIT.usage);
+  }
+  if (ctx.paths === undefined) throw new Error("skep home is not resolved");
+  try {
+    return await undoDelta(ctx.paths.home, itemId, {
+      ...(opts.force === true ? { force: true } : {}),
+      nowMs: systemClock.nowMs(),
+    });
+  } catch (error) {
+    if (error instanceof UndoRefusedError) throw new CliError("undo_refused", error.message);
+    if (error instanceof DeltaError) throw new CliError("bad_delta", error.message);
+    throw error;
+  }
+}
+
+export function undoText(itemId: string, outcome: UndoOutcome): string {
+  const parts = [
+    ...(outcome.restored.length === 0 ? [] : [`restored ${outcome.restored.join(", ")}`]),
+    ...(outcome.removed.length === 0 ? [] : [`removed ${outcome.removed.join(", ")}`]),
+  ];
+  const forced =
+    outcome.overwritten.length === 0
+      ? ""
+      : `\noverwrote later edits in ${outcome.overwritten.join(", ")} (--force)`;
+  return `undid ${itemId} in ${outcome.record.root}: ${parts.join("; ") || "nothing to restore"}${forced}`;
 }
 
 /** An intent request left this device but no usable reply came back (see `controlAt`). */
@@ -2916,14 +3518,16 @@ export function renderSessionStatus(status: SessionStatus): string {
     lines.push("intents: none");
   } else {
     lines.push("intents:");
+    const devices = new Map(status.peers.map((peer) => [peer.peerId, peer.device]));
     for (const intent of status.intents) {
       lines.push(`  ${intent.intentId}  ${intent.state}  ${intent.text}`);
       if (intent.items.length > 0) {
+        lines.push(`    ${intentRollup(intent.items)}`);
         lines.push(
           table(
             intent.items.map((item) => [
               `  ${item.itemId}`,
-              item.state,
+              item.state === "done" && itemFailed(item) ? "failed" : item.state,
               item.repo,
               item.assignee,
               item.result?.submit === undefined
@@ -2933,6 +3537,13 @@ export function renderSessionStatus(status: SessionStatus): string {
             ]),
           ),
         );
+        // The last result of each item in full: the shell wraps it rather than cutting it.
+        for (const item of intent.items) {
+          if (item.result === undefined) continue;
+          const where = { device: devices.get(item.assignee) ?? item.assignee, repo: item.repo };
+          const block = itemBlock(item.itemId, where, item.result.summary, itemFailed(item));
+          lines.push(...block.split("\n").map((line) => `    ${line}`));
+        }
       }
     }
   }

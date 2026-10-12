@@ -3,6 +3,7 @@ import type { JoinFlow, MasterFlow, SessionStatus } from "../commands/session.js
 import {
   type ExternalMaster,
   explainReason,
+  joinFailureText,
   noMatchText,
   noPeersText,
   SessionController,
@@ -73,6 +74,9 @@ function joinFlow(): JoinFlow {
     repo: "app",
     role: "coding",
     control: "auto",
+    agent: { cli: "claude", source: "PATH" },
+    view: "native",
+    dir: "/work/app",
     closed: new Promise(() => {}),
     close: async () => {},
   };
@@ -278,5 +282,17 @@ describe("SessionController /clean support", () => {
     expect(session.snapshot().mode).toBe("none");
     expect(session.applyProbe(pending, external)).toBe(false);
     expect(session.snapshot().live).toBe(false);
+  });
+});
+
+describe("joinFailureText", () => {
+  it("keeps a message's own fix line, else adds a generic one", () => {
+    expect(joinFailureText(new Error("no agent CLI found\nfix: install one"))).toBe(
+      "join failed: no agent CLI found\nfix: install one",
+    );
+    expect(joinFailureText(new Error("connect ECONNREFUSED 10.0.0.5:7419"))).toBe(
+      "join failed: connect ECONNREFUSED 10.0.0.5:7419\n" +
+        "fix: check the address and join code with the master, then /join again",
+    );
   });
 });

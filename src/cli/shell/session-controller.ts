@@ -321,6 +321,22 @@ export function noMatchText(status: SessionStatus, repos: readonly string[]): st
   );
 }
 
+/**
+ * A failed `/join` as one cause line and one fix line (SESSION-UX §3.4), e.g. no agent CLI on
+ * this device. Messages that already carry a `fix:` line keep it; others get a generic one.
+ */
+export function joinFailureText(error: unknown): string {
+  const message = (error instanceof Error ? error.message : String(error)).trim();
+  const lines = message.split("\n");
+  const fixAt = lines.findIndex((line) => line.startsWith("fix: "));
+  const cause = (fixAt < 0 ? lines : lines.slice(0, fixAt)).join(" ").trim();
+  const fix =
+    fixAt < 0
+      ? "check the address and join code with the master, then /join again"
+      : lines.slice(fixAt).join(" ").slice("fix: ".length);
+  return `join failed: ${cause}\nfix: ${fix}`;
+}
+
 const LEAVE_REASONS: Record<string, string> = {
   heartbeat_timeout: "no heartbeat for 30 s — sleep, Wi-Fi or a firewall",
   connection_closed: "connection lost",

@@ -12,9 +12,7 @@ import os from "node:os";
 import { type Clock, isoUtc, systemClock } from "../../util/clock.js";
 import { AGENT_ORDER } from "../commands/agent-tui.js";
 import {
-  AGENT_VIEWS,
   type AgentCli,
-  type AgentView,
   type ControlEndpoint,
   checkIntent,
   clearStaleSessionFile,
@@ -32,10 +30,12 @@ import {
   renderSessionStatus,
   type SessionCliContext,
   type SessionStatus,
-  selectAgentView,
   startedText,
   startMasterFlow,
   submitIntentAt,
+  undoItem,
+  undoText,
+  writeLastError,
 } from "../commands/session.js";
 import { CliError } from "../output.js";
 import { createTheme, detectColorLevel, detectScheme } from "../theme.js";
@@ -48,6 +48,7 @@ import {
   type ExternalMaster,
   explainReason,
   type IntentRoute,
+  joinFailureText,
   noMatchText,
   QUIET_AFTER_MS,
   SessionController,
@@ -65,7 +66,7 @@ export { parseFlags } from "./flags.js";
 
 /** Lines PgUp/PgDn move the scrollback. */
 const PAGE_LINES = 10;
-const SUBMIT_CHOICES = ["pr", "mr", "push", "none"] as const;
+const SUBMIT_CHOICES = ["commit", "push", "pr", "mr", "none"] as const;
 /** A master in another process is re-read every this many ticks (2 s at 250 ms). */
 const EXTERNAL_POLL_TICKS = 8;
 /** A live master answers `status` well within this; discovery must not stall the ticker. */
@@ -544,6 +545,13 @@ export class Shell {
         run: (_ctx, args) => this.agentCommand(args),
       },
       {
+        name: "undo",
+        description: "put back the files a session item changed in this folder",
+        usage: "<item> [--force]",
+        argsRequired: true,
+        run: (_ctx, args) => this.undoCommand(args),
+      },
+      {
         name: "clean",
         aliases: ["clear"],
         description: "end local session(s) and clear connection state (stay in shell)",
@@ -574,8 +582,10 @@ export class Shell {
       "text without / is sent as an intent to this device's session master (needs a joined peer)",
       "/start: different projects select separate homes and available ports automatically",
       "/start: --listen is the address to bind, --advertise the one peers dial (default: listen)",
-      "/join: auto by default (master drives work, submit none: changes stay local); --manual",
-      "  confirms each item first; --submit pr|mr|push|none|ask overrides device.toml",
+      "/join: the agent edits this folder directly (no worktrees, no branches); auto by default",
+      "  (master drives work, submit none: edits stay in the folder); --manual confirms each",
+      "  item first; --submit commit|push|pr|mr|none|ask overrides device.toml",
+      "/agent: which agent CLI items run; else --agent, SKEP_AGENT_CLI, AGENT.md, or PATH",
       "advanced: `skep tui` opens the raw agent TUI",
     ].join("\n");
   }
@@ -658,8 +668,15 @@ export class Shell {
         this.log(message, "event");
         break;
       case "item-result":
-        // `I-4: <capped, redacted agent summary>`: what the peer's agent actually produced.
-        this.log(`item ${message}`, "event");
+        // `I-4 done · mac (app) · …` with the changed files: what the peer's agent produced.
+        this.log(message, "event");
+        break;
+      case "item-failed":
+        // Uncapped and wrapped: the cause and fix are the point (SESSION-UX §3.4).
+        this.log(message, "error");
+        break;
+      case "intent-done":
+        this.log(message, "event");
         break;
       case "result-reject":
         this.log(`result rejected ${message}`, "error");
@@ -712,10 +729,7 @@ export class Shell {
         return { type: "error", message: "the local master has no join code; /join <code>" };
       }
     }
-    const requested = parsed.agent;
-    if (requested !== undefined && !AGENT_VIEWS.includes(requested as AgentView)) {
-      return { type: "error", message: `--agent must be ${AGENT_VIEWS.join(", ")}` };
-    }
+    for (const note of parsed.notes ?? []) this.log(`skep: ${note}`, "warn");
     const options: JoinFlowOptions = {
       code,
       role: parsed.role ?? "coding",
@@ -724,7 +738,9 @@ export class Shell {
       ...(parsed.device === undefined ? {} : { device: parsed.device }),
       ...(parsed.submit === undefined ? {} : { submit: parsed.submit }),
       ...(parsed.manual === true ? { manual: true } : {}),
-      ...this.agentOptions(requested as AgentView | undefined),
+      ...(parsed.agent === undefined ? {} : { agent: parsed.agent }),
+      ...(parsed.view === undefined ? {} : { view: parsed.view }),
+      ...(this.agentCli === null ? {} : { cli: this.agentCli }),
     };
     const generation = this.session.beginJoin(host ?? "this device's master");
     this.sync();
@@ -732,9 +748,9 @@ export class Shell {
     // A handshake `/clean` cancelled may still talk; it must not reach the screen or the prompt.
     const current = (): boolean => this.session.isJoinCurrent(generation);
     const pending = joinSessionFlow(this.ctx, options, {
-      say: (_data, human) => {
+      say: (data, human) => {
         const text = current() ? human() : "";
-        if (text !== "") this.log(text, "event");
+        if (text !== "") this.log(text, failedItem(data) ? "error" : "event");
       },
       ask: (question) => (current() ? this.ask(question.trim()) : Promise.resolve(null)),
       warn: (message) => {
@@ -753,7 +769,10 @@ export class Shell {
       this.sync();
       // The join is gone, but a master in another process may still run: find it again.
       void this.probeExternal();
-      throw error;
+      const text = joinFailureText(error);
+      const home = this.ctx.paths?.home;
+      const log = home === undefined ? null : await writeLastError(home, text).catch(() => null);
+      return { type: "error", message: log === null ? text : `${text}\nfull text: ${log}` };
     } finally {
       this.cancelJoin = null;
     }
@@ -778,16 +797,6 @@ export class Shell {
     );
     this.sync();
     return { type: "ok" };
-  }
-
-  /** `--agent` wins; a CLI chosen with /agent runs natively so the terminal stays the shell's. */
-  private agentOptions(requested: AgentView | undefined): Pick<JoinFlowOptions, "agent" | "cli"> {
-    if (requested !== undefined) {
-      return { agent: requested, ...(this.agentCli === null ? {} : { cli: this.agentCli }) };
-    }
-    if (this.agentCli === null) return {};
-    const view = selectAgentView(undefined, this.ctx.env);
-    return { agent: view === "dry" ? "native" : view, cli: this.agentCli };
   }
 
   private joinEnded(flow: JoinFlow, reason: string): void {
@@ -871,6 +880,8 @@ export class Shell {
       );
     }
     if (lines.length === 0) lines.push("nothing to clean — no session on this device");
+    // Agents edit the project folder in place: there are no worktrees or branches to remove.
+    lines.push("nothing left on disk: no worktrees or session branches; edits stay in your folder");
     if (problems.length > 0) {
       return {
         type: "error",
@@ -883,9 +894,17 @@ export class Shell {
   private agentCommand(args: string): SlashResult {
     const name = args.trim();
     if (name === "") {
+      const join = this.session.ownJoin;
+      const current =
+        join?.agent != null
+          ? `this join runs ${join.agent.cli}`
+          : this.agentCli !== null
+            ? `the next /join runs ${this.agentCli}`
+            : "not set; /join uses --agent, SKEP_AGENT_CLI, AGENT.md if present, else the first of " +
+              `${AGENT_ORDER.join(", ")} on PATH`;
       return {
         type: "ok",
-        message: `agent: ${this.agentCli ?? "from AGENT.md (dry unless SKEP_SESSION_EXEC=1)"}`,
+        message: `agent: ${current}\n/agent ${AGENT_ORDER.join("|")} sets it for this device`,
       };
     }
     if (!AGENT_ORDER.includes(name as AgentCli)) {
@@ -894,6 +913,18 @@ export class Shell {
     this.agentCli = name as AgentCli;
     const note = this.session.ownJoin === null ? "" : " (applies from the next /join)";
     return { type: "ok", message: `session items will run ${name}${note}` };
+  }
+
+  private async undoCommand(args: string): Promise<SlashResult> {
+    const flags = parseFlags(args, [], ["force"]);
+    const [itemId, extra] = flags.positional;
+    if (itemId === undefined || extra !== undefined) {
+      return { type: "error", message: "usage: /undo <item> [--force], e.g. /undo I-1" };
+    }
+    const outcome = await undoItem(this.ctx, itemId, {
+      ...(flags.switches.has("force") ? { force: true } : {}),
+    });
+    return { type: "ok", message: undoText(itemId, outcome) };
   }
 
   // -------------------------------------------------------------------------------------------
@@ -1109,8 +1140,9 @@ export class ShellJoinView implements JoinView {
     }
   }
 
-  async chooseSubmit(): Promise<"pr" | "mr" | "push" | "none" | null> {
-    const answer = (await this.shell.ask("submit this item? [pr/mr/push/none/skip]"))?.trim() ?? "";
+  async chooseSubmit(): Promise<"commit" | "pr" | "mr" | "push" | "none" | null> {
+    const answer =
+      (await this.shell.ask("submit this item? [commit/push/pr/mr/none/skip]"))?.trim() ?? "";
     return SUBMIT_CHOICES.find((value) => value === answer.toLowerCase()) ?? null;
   }
 
@@ -1160,6 +1192,17 @@ function linkText(silentMs: number, glyphs: string): string {
 
 function sameEndpoint(left: ControlEndpoint, right: ControlEndpoint): boolean {
   return left.listen === right.listen && left.token === right.token;
+}
+
+/** A finished item the peer's own scrollback shows as an error (it carries cause and fix). */
+function failedItem(data: unknown): boolean {
+  if (typeof data !== "object" || data === null) return false;
+  const event = data as { event?: unknown; checks?: { status?: unknown }[] };
+  return (
+    event.event === "item-result" &&
+    Array.isArray(event.checks) &&
+    event.checks.some((check) => check.status === "fail")
+  );
 }
 
 function isNoMatch(error: unknown): boolean {
