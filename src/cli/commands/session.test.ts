@@ -66,7 +66,17 @@ const TOKEN = "0123456789abcdef0123456789abcdef";
 
 afterEach(async () => {
   await Promise.all(servers.splice(0).map((s) => new Promise((r) => s.close(() => r(null)))));
-  await Promise.all(roots.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+  for (const dir of roots.splice(0)) {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        await rm(dir, { recursive: true, force: true });
+        break;
+      } catch (error) {
+        if (attempt === 4) throw error;
+        await new Promise((r) => setTimeout(r, 50 * (attempt + 1)));
+      }
+    }
+  }
 });
 
 async function home(): Promise<string> {

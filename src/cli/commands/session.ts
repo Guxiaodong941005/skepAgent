@@ -2374,11 +2374,12 @@ async function workItemRun(
     try {
       state = await settle();
     } catch (error) {
-      state =
-        worker.signal?.aborted === true
-          ? "no longer watched (the session closed)"
-          : `lost (${errorMessage(error)})`;
+      // Closing the join aborts the watch (R4). Skip further home/folder writes: callers may
+      // already be tearing the sandbox or project session state down.
+      if (worker.signal?.aborted === true) return;
+      state = `lost (${errorMessage(error)})`;
     }
+    if (worker.signal?.aborted === true) return;
     let changedNow: string;
     try {
       const after = await computeDelta(before, io);
