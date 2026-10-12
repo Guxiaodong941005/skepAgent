@@ -11,6 +11,11 @@ protocol rules ([`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §4.4) apply to t
 
 ## [Unreleased]
 
+### Fixed
+
+* Session start errors explain separate `SKEP_HOME`/`--home` directories and unused `--listen`
+  ports for independent projects on one machine; port conflicts name the attempted address.
+
 ## [0.1.8] - 2026-10-10
 
 Join UX for the unified shell: pasteable `/join`, peer auto mode, submit default `none`, and agent summaries on the master.
