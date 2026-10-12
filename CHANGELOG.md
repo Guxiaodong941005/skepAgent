@@ -11,6 +11,16 @@ protocol rules ([`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §4.4) apply to t
 
 ## [Unreleased]
 
+### Changed
+
+* **Slim join paste (JOIN-SLIM).** The line a master prints is now just the code and the host,
+  `/join 1234-5678-9012 203.0.113.7:7419`, and its CLI twin is
+  `skep session join --code 1234-5678-9012 --host 203.0.113.7:7419`. Neither carries `--repo`:
+  the peer's repo defaults to its git top level's directory name and its device to the
+  hostname. The master's repo is named in prose ("from a checkout of app"). `--repo`,
+  `--device`, `--role`, `--agent`, `--view`, `--submit` and `--manual` stay optional
+  overrides, and old `/join --host … --code … --repo …` lines still parse. No wire change.
+
 ## [0.1.11] - 2026-10-12
 
 Session UX rethink (SESSION-UX, [`docs/plans/session-ux-rethink.md`](docs/plans/session-ux-rethink.md)):
