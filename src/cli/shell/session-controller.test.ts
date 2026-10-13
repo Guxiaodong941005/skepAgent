@@ -118,6 +118,8 @@ describe("SessionController", () => {
         role: "-",
         state: "working",
         progress: { phase: "working", done: 1, total: 2, failed: 0, percent: 50, summary: "forms" },
+        // The intent picker routes by the peer's repo (INTENT-PEER).
+        repo: "api",
         silentMs: 3_000,
       },
     ]);

@@ -361,12 +361,15 @@ function peersFromStatus(
   return status.peers.map((peer) => {
     const silentMs = silence.get(peer.peerId);
     const role = peer.role ?? "-";
+    // The intent picker routes by repo; a peer that has not described one yet has none.
+    const repo = peer.repo === null || peer.repo === undefined ? {} : { repo: peer.repo };
     if (peer.progress === undefined) {
       return {
         peerId: peer.peerId,
         device: peer.device,
         role,
         state: "joined",
+        ...repo,
         ...silent(silentMs),
       };
     }
@@ -377,6 +380,7 @@ function peersFromStatus(
       role,
       state: phase,
       progress: { phase, done, total, failed, percent, summary },
+      ...repo,
       ...silent(silentMs),
     };
   });

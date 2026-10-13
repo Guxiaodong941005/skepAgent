@@ -65,6 +65,42 @@ describe("shell frames", () => {
   });
 });
 
+describe("intent peer picker frames", () => {
+  it("keeps the cursor visible when the peer list is taller than the terminal body", () => {
+    const shell = model();
+    shell.picker = {
+      title: "choose peers",
+      rows: Array.from({ length: 30 }, (_, index) => ({
+        label: `peer-${index + 1} device repo`,
+        selected: index === 15,
+      })),
+      cursor: 0,
+    };
+    shell.sessionLive = true;
+    shell.peers = shell.picker.rows.map((_row, index) => ({
+      peerId: `peer-${index + 1}`,
+      device: "device",
+      repo: "repo",
+      role: "coding",
+      state: "joined",
+    }));
+    for (const rows of [10, 12, 24]) {
+      for (const cursor of [0, 1, 15, 28, 29]) {
+        shell.picker.cursor = cursor;
+        const frame = shell.frame(80, rows);
+        const selected = frame.filter((line) => typeof line !== "string" && line.selected);
+        expect(selected).toHaveLength(1);
+        expect(
+          selected.map((line) =>
+            typeof line === "string" ? line : line.spans.map((span) => span.text).join(""),
+          ),
+        ).toEqual([`  ${cursor === 15 ? "[x]" : "[ ]"} peer-${cursor + 1} device repo`]);
+        expect(frame).toHaveLength(rows);
+      }
+    }
+  });
+});
+
 describe("scrollback wrapping (SESSION-UX §3.4)", () => {
   it("a 400-character error wraps onto several rows with the whole text visible", () => {
     const shell = model();

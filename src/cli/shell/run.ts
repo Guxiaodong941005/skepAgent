@@ -99,6 +99,32 @@ interface Question {
   resolve(answer: string | null): void;
 }
 
+interface Picker {
+  peers: ShellPeer[];
+  resolve(peers: ShellPeer[] | null): void;
+}
+
+const REPO_FLAG = /(^|\s)--repo(?:=|\s+)(?:"((?:\\["\\]|[^"\\])*)"|((?!--|")\S+))(?=\s|$)/g;
+
+/**
+ * `/intent [--repo <name>]... <text>`: `--repo` may appear anywhere and repeat; the rest of the
+ * line, spacing kept, is the intent text. Free text never goes through here (INTENT-PEER).
+ */
+export function parseIntentArgs(args: string): { text: string; repos?: string[] } {
+  const repos: string[] = [];
+  const text = args
+    .replace(REPO_FLAG, (_match, _lead: string, quoted: string | undefined, bare: string) => {
+      const repo = quoted === undefined ? bare : quoted.replace(/\\(["\\])/g, "$1");
+      if (repo === "") throw new CliError("usage", "--repo needs a value");
+      repos.push(repo);
+      // The whitespace after the value stays, so the words around the flag stay apart.
+      return "";
+    })
+    .trim();
+  if (/(^|\s)--repo(=|\s|$)/.test(text)) throw new CliError("usage", "--repo needs a value");
+  return repos.length === 0 ? { text } : { text, repos: [...new Set(repos)] };
+}
+
 /** The shell's controller: keys → model, slash commands → session flows, flows → scrollback. */
 export class Shell {
   readonly model = new ShellModel();
@@ -110,6 +136,7 @@ export class Shell {
   private readonly clock: Clock;
   private readonly animate: boolean;
   private readonly questions: Question[] = [];
+  private picker: Picker | null = null;
   private ticker: AbortController | null = null;
   private ticks = 0;
   private listening = false;
@@ -210,8 +237,13 @@ export class Shell {
   // Keys.
 
   private onKey(key: ShellKey): void {
-    const model = this.model;
     if (key.name !== "interrupt") this.interruptArmed = false;
+    if (this.picker !== null) {
+      this.onPickerKey(key);
+      this.render();
+      return;
+    }
+    const model = this.model;
     switch (key.name) {
       case "text":
         model.input = insertText(model.input, key.text);
@@ -255,6 +287,62 @@ export class Shell {
     }
     this.refreshMenu();
     this.render();
+  }
+
+  private onPickerKey(key: ShellKey): void {
+    const picker = this.model.picker;
+    if (picker === null) return;
+    const count = picker.rows.length;
+    switch (key.name) {
+      case "up":
+      case "down":
+        picker.cursor = (picker.cursor + (key.name === "up" ? -1 : 1) + count) % count;
+        break;
+      case "text": {
+        if (!key.text.includes(" ")) break;
+        const row = picker.rows[picker.cursor];
+        if (row !== undefined) row.selected = !row.selected;
+        break;
+      }
+      case "enter":
+        // At least one peer must be chosen; Esc is how the intent is dropped.
+        if (picker.rows.some((row) => row.selected)) this.closePicker(true);
+        break;
+      case "escape":
+      case "interrupt":
+        this.interruptArmed = false;
+        this.closePicker(false);
+        break;
+      default:
+        break;
+    }
+  }
+
+  private closePicker(confirmed: boolean): void {
+    const picker = this.picker;
+    const rows = this.model.picker?.rows ?? [];
+    this.picker = null;
+    this.model.picker = null;
+    picker?.resolve(
+      confirmed ? picker.peers.filter((_peer, index) => rows[index]?.selected === true) : null,
+    );
+  }
+
+  /** Asks which of several connected peers should take an intent; null when cancelled. */
+  private pickPeers(peers: ShellPeer[]): Promise<ShellPeer[] | null> {
+    if (this.quitting !== null || this.cleaning !== null) return Promise.resolve(null);
+    return new Promise((resolve) => {
+      this.picker = { peers, resolve };
+      this.model.picker = {
+        title: "send this intent to which peers?",
+        rows: peers.map((peer) => ({
+          label: `${peer.peerId}  ${peer.device}  ${peer.repo ?? "?"}`,
+          selected: false,
+        })),
+        cursor: 0,
+      };
+      this.render();
+    });
   }
 
   private onEnter(): void {
@@ -349,32 +437,79 @@ export class Shell {
   }
 
   private intentCommand(args: string): Promise<SlashResult> | SlashResult {
-    if (args === "") return { type: "error", message: "usage: /intent <text>" };
-    return this.sendIntent(args);
+    const usage: SlashResult = {
+      type: "error",
+      message: "usage: /intent [--repo <name>]... <text>",
+    };
+    if (args === "") return usage;
+    const { text, repos } = parseIntentArgs(args);
+    if (text === "") return usage;
+    return this.sendIntent(text, repos);
   }
 
-  private async sendIntent(text: string): Promise<SlashResult> {
+  /**
+   * Without `--repo`, several connected peers mean the human picks who takes the intent; the
+   * picked peers' repos become the intent's repos. A lone peer needs no pick: the master routes
+   * a bare intent to it (INTENT-PEER).
+   */
+  private async sendIntent(text: string, explicit?: string[]): Promise<SlashResult> {
     const route = this.session.intentRoute();
     if (route.kind === "refused") return { type: "error", message: route.message };
+    let repos = explicit;
+    const peers = this.session.snapshot().peers;
+    if (repos === undefined && peers.length > 1) {
+      const picked = await this.pickPeers(peers);
+      if (picked === null) return { type: "ok", message: "intent cancelled" };
+      const unknown = picked.filter((peer) => peer.repo === undefined);
+      if (unknown.length > 0) {
+        return {
+          type: "error",
+          message:
+            `repo is unknown for ${unknown.map((peer) => peer.peerId).join(", ")}; intent was not sent\n` +
+            "use /intent --repo <name> <text> to name the repo explicitly",
+        };
+      }
+      const known = [
+        ...new Set(picked.flatMap((peer) => (peer.repo === undefined ? [] : [peer.repo]))),
+      ];
+      repos = known;
+      // A new discovery must not redirect a selection made for the previous master.
+      const current = this.session.intentRoute();
+      if (current.kind === "refused") return { type: "error", message: current.message };
+      const sameMaster =
+        route.kind === "own"
+          ? current.kind === "own" && route.master.handle === current.master.handle
+          : current.kind === "control" &&
+            route.external.status.sessionId === current.external.status.sessionId &&
+            sameEndpoint(route.external.endpoint, current.external.endpoint);
+      if (!sameMaster) {
+        return {
+          type: "error",
+          message:
+            "the session master changed while choosing peers; intent was not sent — check /status and resend",
+        };
+      }
+    }
     try {
       let intentId: string;
       if (route.kind === "own") {
         // The shell owns the master: no detour through session.json and the control port.
-        checkIntent(text, undefined);
-        ({ intentId } = await route.master.handle.submitIntent(text));
+        checkIntent(text, repos);
+        ({ intentId } = await route.master.handle.submitIntent(text, repos));
       } else {
-        const sent = await this.sendExternalIntent(route.external, text);
+        const sent = await this.sendExternalIntent(route.external, text, repos);
         if (sent.type === "error") return sent;
         intentId = sent.intentId;
       }
-      return { type: "ok", message: `intent ${intentId} routed: ${text}` };
+      const to = repos === undefined ? "" : ` (repo ${repos.join(", ")})`;
+      return { type: "ok", message: `intent ${intentId} routed: ${text}${to}` };
     } catch (error) {
       if (isNoMatch(error)) {
         const status = await this.freshStatus(route);
-        const repos = [status?.repo ?? "?"];
+        const named = repos ?? [status?.repo ?? "?"];
         return {
           type: "error",
-          message: status === null ? errorMessage(error) : noMatchText(status, repos),
+          message: status === null ? errorMessage(error) : noMatchText(status, named),
         };
       }
       throw error;
@@ -393,13 +528,14 @@ export class Shell {
   private async sendExternalIntent(
     shown: ExternalMaster,
     text: string,
+    repos?: string[],
   ): Promise<{ type: "ok"; intentId: string } | { type: "error"; message: string }> {
     const published = await readControlEndpoint(this.ctx).catch(() => null);
     if (published === null || !sameEndpoint(published, shown.endpoint)) {
       return this.externalChanged(shown);
     }
     try {
-      const { intentId } = await submitIntentAt(shown.endpoint, text);
+      const { intentId } = await submitIntentAt(shown.endpoint, text, repos);
       return { type: "ok", intentId };
     } catch (error) {
       if (error instanceof CliError && error.code === INTENT_OUTCOME_UNKNOWN) {
@@ -849,6 +985,7 @@ export class Shell {
     const problems: string[] = [];
     for (const question of this.questions.splice(0)) question.resolve(null);
     this.model.question = null;
+    this.closePicker(false);
     // A handshake still running is refused by `joinStarted`, and `joinCommand` closes its flow.
     const dropped = this.session.abortJoin();
     if (dropped !== null) {
@@ -1118,6 +1255,7 @@ export class Shell {
     this.log("leaving…", "muted");
     for (const question of this.questions.splice(0)) question.resolve(null);
     this.model.question = null;
+    this.closePicker(false);
     const problems: string[] = [];
     const join = this.session.ownJoin;
     const master = this.session.ownMaster;

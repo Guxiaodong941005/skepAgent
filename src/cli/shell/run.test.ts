@@ -19,7 +19,7 @@ import {
   type SubHandle,
   type SubOptions,
 } from "../commands/session.js";
-import { parseFlags, Shell, type ShellCliContext } from "./run.js";
+import { parseFlags, parseIntentArgs, Shell, type ShellCliContext } from "./run.js";
 
 type MasterPeer = ReturnType<MasterHandle["status"]>["peers"][number];
 
@@ -93,10 +93,16 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
 function fakeApi(address = { host: "192.168.1.20", port: 7419 }) {
   let masterClosed = deferred<void>();
   const subClosed = deferred<{ reason: string }>();
-  const calls: { master: MasterOptions[]; sub: SubOptions[]; intents: string[] } = {
+  const calls: {
+    master: MasterOptions[];
+    sub: SubOptions[];
+    intents: string[];
+    intentRepos: (string[] | undefined)[];
+  } = {
     master: [],
     sub: [],
     intents: [],
+    intentRepos: [],
   };
   /** Peers the fake master reports in `status()`; tests push into it. */
   const peers: MasterPeer[] = [];
@@ -126,8 +132,9 @@ function fakeApi(address = { host: "192.168.1.20", port: 7419 }) {
           peers: peers.map((peer) => ({ ...peer })),
           intents: intents.map((intent) => ({ ...intent })),
         }),
-        submitIntent: async (text) => {
+        submitIntent: async (text, repos) => {
           calls.intents.push(text);
+          calls.intentRepos.push(repos);
           if (intentError !== null) throw intentError;
           return { intentId: "N-1" };
         },
@@ -489,6 +496,218 @@ describe("unified shell", () => {
     expect(h.fake.calls.intents).toEqual(["add a health check"]);
     expect(h.scrollback()).toContain("intent N-1 routed: add a health check");
     await h.shell.quit();
+  });
+
+  it("passes /intent --repo to the master as the intent's repos (INTENT-PEER)", async () => {
+    const h = await harness();
+    await h.shell.submit("/start --yes --repo futrobomower");
+    h.fake.peers.push(peer("peer-1", "vps", "skepAgent"));
+    await h.shell.submit("/intent --repo skepAgent hello");
+    expect(h.fake.calls.intents).toEqual(["hello"]);
+    expect(h.fake.calls.intentRepos).toEqual([["skepAgent"]]);
+    expect(h.scrollback()).toContain("intent N-1 routed: hello (repo skepAgent)");
+    await h.shell.quit();
+  });
+
+  it("sends a bare intent to a lone peer without asking which peer", async () => {
+    const h = await harness();
+    await h.shell.submit("/start --yes --repo futrobomower");
+    h.fake.peers.push(peer("peer-1", "vps", "skepAgent"));
+    await h.shell.submit("/intent view branch");
+    await h.shell.submit("view branch --repo x");
+    // Free text is never flag-parsed.
+    expect(h.fake.calls.intents).toEqual(["view branch", "view branch --repo x"]);
+    expect(h.fake.calls.intentRepos).toEqual([undefined, undefined]);
+    expect(h.shell.model.picker).toBeNull();
+    await h.shell.quit();
+  });
+
+  it("completes bare and explicit intents in a lone peer's different checkout", async () => {
+    let masterDir = "";
+    let peerDir = "";
+    const h = await harness(undefined, async (dir) => {
+      masterDir = path.join(dir, "futrobomower");
+      peerDir = path.join(dir, "skepAgent");
+      for (const checkout of [masterDir, peerDir]) {
+        await mkdir(checkout);
+        await execFileChecked("git", ["init", "--quiet", checkout]);
+      }
+      return {
+        cwd: masterDir,
+        sessionApi: {
+          startMaster: (options) =>
+            startMaster({ ...options, listen: { host: "127.0.0.1", port: 0 } }),
+          connectSub,
+        },
+      };
+    });
+    let sub: SubHandle | undefined;
+    try {
+      await h.shell.submit("/start --yes");
+      const master = h.shell.session.ownMaster?.handle;
+      const code = master?.status().joinCode;
+      if (master === undefined || master.address === null || !code) {
+        throw new Error("missing listening master");
+      }
+      sub = await connectSub({
+        target: master.address,
+        code,
+        device: "worker",
+        describe: async () => ({
+          repo: path.basename(peerDir),
+          head: "a".repeat(40),
+          role: "coding",
+        }),
+        collectDatalist: async (repo) => {
+          expect(repo).toBe("skepAgent");
+          return [];
+        },
+        onItem: async (item) => {
+          // An injected fake agent process records its real cwd; no vendor CLI is invoked.
+          await execFileChecked(
+            process.execPath,
+            [
+              "-e",
+              'require("node:fs").writeFileSync(process.argv[1], process.cwd())',
+              `${item.itemId}.txt`,
+            ],
+            { cwd: peerDir },
+          );
+          return {
+            repo: item.repo,
+            baseSha: "a".repeat(40),
+            headSha: "a".repeat(40),
+            checks: [{ name: "fake-agent", status: "pass" }],
+            summary: "Recorded peer cwd",
+          };
+        },
+        progress: false,
+        progressIntervalMs: 0,
+      });
+      for (const [index, command] of [
+        "/intent record cwd",
+        "/intent --repo skepAgent record cwd explicitly",
+      ].entries()) {
+        await h.shell.submit(command);
+        await vi.waitFor(() =>
+          expect(master.status().intents[index]?.items[0]?.state).toBe("done"),
+        );
+        const item = master.status().intents[index]?.items[0];
+        expect(item).toMatchObject({ repo: "skepAgent", assignee: sub.peerId });
+        expect(await readFile(path.join(peerDir, `I-${index + 1}.txt`), "utf8")).toBe(peerDir);
+        await expect(readFile(path.join(masterDir, `I-${index + 1}.txt`))).rejects.toThrow(
+          /ENOENT/,
+        );
+        expect(h.shell.model.picker).toBeNull();
+      }
+    } finally {
+      await sub?.close();
+      await h.shell.quit();
+    }
+  });
+
+  it("asks which peers take an intent when several are connected", async () => {
+    const h = await harness();
+    await h.shell.submit("/start --yes --repo app");
+    h.fake.peers.push(peer("peer-1", "vps", "api"), peer("peer-2", "mac", "web"));
+    const sent = h.shell.submit("add a health check");
+    await vi.waitFor(() => expect(h.shell.model.picker).not.toBeNull());
+    expect(h.frame()).toMatch(/\[ \] peer-1\s+vps\s+api/);
+    expect(h.frame()).toMatch(/\[ \] peer-2\s+mac\s+web/);
+    // Enter with nothing selected does nothing.
+    h.stdin.type("\r");
+    expect(h.shell.model.picker).not.toBeNull();
+    h.stdin.type(" ");
+    h.stdin.type("\x1b[B");
+    h.stdin.type(" ");
+    expect(h.frame()).toMatch(/\[x\] peer-2/);
+    h.stdin.type("\r");
+    await sent;
+    expect(h.shell.model.picker).toBeNull();
+    expect(h.fake.calls.intents).toEqual(["add a health check"]);
+    expect(h.fake.calls.intentRepos).toEqual([["api", "web"]]);
+    await h.shell.quit();
+  });
+
+  it("sends nothing when the peer picker is cancelled", async () => {
+    const h = await harness();
+    await h.shell.submit("/start --yes --repo app");
+    h.fake.peers.push(peer("peer-1", "vps", "api"), peer("peer-2", "mac", "web"));
+    const sent = h.shell.submit("/intent add a health check");
+    await vi.waitFor(() => expect(h.shell.model.picker).not.toBeNull());
+    h.stdin.type(" ");
+    h.stdin.type("\x1b");
+    await sent;
+    expect(h.fake.calls.intents).toEqual([]);
+    expect(h.scrollback()).toContain("intent cancelled");
+    await h.shell.quit();
+  });
+
+  it("skips the picker when /intent names its repos", async () => {
+    const h = await harness();
+    await h.shell.submit("/start --yes --repo app");
+    h.fake.peers.push(peer("peer-1", "vps", "api"), peer("peer-2", "mac", "web"));
+    await h.shell.submit("/intent --repo web add a health check");
+    expect(h.fake.calls.intentRepos).toEqual([["web"]]);
+    await h.shell.quit();
+  });
+
+  it.each([false, true])("refuses selected peers with unknown repos (mixed=%s)", async (mixed) => {
+    const h = await harness();
+    try {
+      await h.shell.submit("/start --yes --repo app");
+      h.fake.peers.push(
+        { ...peer("peer-1", "vps", "api"), repo: null },
+        peer("peer-2", "mac", "app"),
+      );
+      const sent = h.shell.submit("/intent add a health check");
+      await vi.waitFor(() => expect(h.shell.model.picker).not.toBeNull());
+      expect(h.frame()).toMatch(/peer-1\s+vps\s+\?/);
+      h.stdin.type(" ");
+      if (mixed) h.stdin.type("\x1b[B ");
+      h.stdin.type("\r");
+      await sent;
+      expect(h.fake.calls.intents).toEqual([]);
+      expect(h.scrollback()).toContain("repo is unknown for peer-1");
+      expect(h.scrollback()).toContain("/intent --repo <name> <text>");
+    } finally {
+      await h.shell.quit();
+    }
+  });
+
+  it("deduplicates repos selected through the picker", async () => {
+    const h = await harness();
+    try {
+      await h.shell.submit("/start --yes --repo app");
+      h.fake.peers.push(peer("peer-1", "vps", "api"), peer("peer-2", "mac", "api"));
+      const sent = h.shell.submit("/intent add a health check");
+      await vi.waitFor(() => expect(h.shell.model.picker).not.toBeNull());
+      h.stdin.type(" \x1b[A \r");
+      await sent;
+      expect(h.fake.calls.intents).toEqual(["add a health check"]);
+      expect(h.fake.calls.intentRepos).toEqual([["api"]]);
+    } finally {
+      await h.shell.quit();
+    }
+  });
+
+  it.each(["interrupt", "clean", "quit"])("cancels the picker on %s", async (cancel) => {
+    const h = await harness();
+    try {
+      await h.shell.submit("/start --yes --repo app");
+      h.fake.peers.push(peer("peer-1", "vps", "api"), peer("peer-2", "mac", "web"));
+      const sent = h.shell.submit("/intent add a health check");
+      await vi.waitFor(() => expect(h.shell.model.picker).not.toBeNull());
+      h.stdin.type(" ");
+      if (cancel === "interrupt") h.stdin.type("\x03");
+      else if (cancel === "clean") await h.shell.submit("/clean");
+      else await h.shell.quit();
+      expect(h.shell.model.picker).toBeNull();
+      await sent;
+      expect(h.fake.calls.intents).toEqual([]);
+    } finally {
+      await h.shell.quit();
+    }
   });
 
   it("refuses an intent while no peer joined, without recording it on the master", async () => {
@@ -891,6 +1110,7 @@ async function externalMaster(id: string, repo: string) {
   const held: (() => void)[] = [];
   let holding = false;
   let port = 0;
+  const peers = [{ ...peer("peer-2", "mac", repo), progress: undefined }];
   const server = await controlServer(async (request) => {
     if (request.token !== accepted) {
       return { type: "control-result", ok: false, error: { code: "bad_token", message: "bad" } };
@@ -907,7 +1127,7 @@ async function externalMaster(id: string, repo: string) {
       repo,
       joinCode: "111122223333",
       joinCodeExpiresAtMs: null,
-      peers: [{ ...peer("peer-2", "mac", repo), progress: undefined }],
+      peers,
       intents: [],
     };
     return { type: "control-result", ok: true, result };
@@ -915,6 +1135,7 @@ async function externalMaster(id: string, repo: string) {
   port = server.port;
   return {
     ...server,
+    peers,
     /** Writes this master into the shell's `session.json`. */
     publish: (dir: string) =>
       writeFile(
@@ -1004,6 +1225,55 @@ describe("external master identity and discovery (review B1-B3)", () => {
     expect(b.intents()).toHaveLength(1);
     expect(h.scrollback()).toContain("intent B-intent-1 routed");
     await h.shell.quit();
+  });
+
+  it("passes explicit repos to the external master's existing control frame", async () => {
+    const a = await externalMaster("A", "app");
+    const h = await harness(undefined, a.publish);
+    try {
+      await waitFor(() => h.shell.session.externalStatus !== null);
+      await h.shell.submit("/intent --repo api --repo web add a health check");
+      expect(a.intents()).toEqual([
+        {
+          type: "control",
+          v: 1,
+          token: "a".repeat(32),
+          op: "intent",
+          text: "add a health check",
+          repos: ["api", "web"],
+        },
+      ]);
+    } finally {
+      await h.shell.quit();
+    }
+  });
+
+  it("does not redirect a picker intent when discovery switches masters", async () => {
+    const a = await externalMaster("A", "app-a");
+    const b = await externalMaster("B", "app-b");
+    a.peers.push({ ...peer("peer-3", "vps", "api"), progress: undefined });
+    const h = await harness(undefined, a.publish);
+    try {
+      await waitFor(() => h.shell.session.externalStatus !== null);
+      const sent = h.shell.submit("add a health check");
+      await vi.waitFor(() => expect(h.shell.model.picker).not.toBeNull());
+      h.stdin.type(" ");
+      await b.publish(h.dir);
+      const shown = h.shell.session.externalStatus;
+      if (shown === null) throw new Error("missing displayed master");
+      h.shell.session.applyProbe(h.shell.session.beginProbe(), {
+        endpoint: { listen: `127.0.0.1:${b.port}`, token: "b".repeat(32) },
+        status: { ...shown, sessionId: "session-B", listen: `127.0.0.1:${b.port}`, peers: b.peers },
+      });
+      h.shell.sync();
+      h.stdin.type("\r");
+      await sent;
+      expect(a.intents()).toEqual([]);
+      expect(b.intents()).toEqual([]);
+      expect(h.scrollback()).toContain("master changed while choosing peers");
+    } finally {
+      await h.shell.quit();
+    }
   });
 
   it("rejects an intent when the shown master's endpoint stopped accepting its token", async () => {
@@ -1397,5 +1667,38 @@ describe("long results in the shell (SESSION-UX R7, R8)", () => {
     expect(frame).toContain("line 11");
     for (const row of frame.split("\n")) expect(row.length).toBeLessThanOrEqual(80);
     await h.shell.quit();
+  });
+});
+
+describe("parseIntentArgs", () => {
+  it("takes repeatable --repo anywhere and keeps the rest as text", () => {
+    expect(parseIntentArgs("--repo skepAgent hello")).toEqual({
+      text: "hello",
+      repos: ["skepAgent"],
+    });
+    expect(parseIntentArgs("--repo=a fix  the bug --repo b")).toEqual({
+      text: "fix  the bug",
+      repos: ["a", "b"],
+    });
+    expect(parseIntentArgs("--repo a --repo a x")).toEqual({ text: "x", repos: ["a"] });
+    expect(parseIntentArgs("plain text")).toEqual({ text: "plain text" });
+  });
+
+  it("rejects --repo without a value", () => {
+    expect(() => parseIntentArgs("hello --repo")).toThrow("--repo needs a value");
+    expect(() => parseIntentArgs("--repo --x hello")).toThrow("--repo needs a value");
+    expect(() => parseIntentArgs("--repo= hello")).toThrow("--repo needs a value");
+    expect(() => parseIntentArgs('--repo="" hello')).toThrow("--repo needs a value");
+  });
+
+  it("parses quoted repo labels without changing the intent's spacing", () => {
+    expect(parseIntentArgs('--repo "my app" fix  the bug')).toEqual({
+      text: "fix  the bug",
+      repos: ["my app"],
+    });
+    expect(parseIntentArgs('fix  the bug --repo="my app" --repo "my app"')).toEqual({
+      text: "fix  the bug",
+      repos: ["my app"],
+    });
   });
 });

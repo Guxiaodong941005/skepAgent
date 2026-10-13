@@ -11,6 +11,23 @@ protocol rules ([`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §4.4) apply to t
 
 ## [Unreleased]
 
+### Fixed
+
+* **Lone peer takes a bare intent (INTENT-PEER).** With exactly one connected peer, an intent
+  without `--repo` is routed to that peer's repo even when it differs from the master's (master
+  in `futrobomower`, peer in `skepAgent` used to fail with `no_match`). An explicit `--repo`
+  that no peer works on still fails with `no_match`.
+* **TUI `/intent --repo` is honoured.** `/intent --repo <name>... <text>` passes the repos to
+  the master (own or over the control port); before, the flag was sent as part of the text and
+  the master's own repo was used. Free text is never flag-parsed.
+
+### Added
+
+* **Peer picker for intents.** With more than one connected peer and no `--repo`, Enter on
+  `/intent <text>` or free text opens a multi-select of `peerId  device  repo` (↑/↓ move,
+  Space toggle, Enter send with at least one selected, Esc cancel). One intent is sent with
+  the selected peers' unique repos. No wire change.
+
 ## [0.1.12] - 2026-10-12
 
 ### Changed
