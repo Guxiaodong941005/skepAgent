@@ -155,6 +155,29 @@ Plan: `docs/plans/tui-scroll-and-herdr-controller.md` (decisions locked 2026-10-
 | ORCH-7 | Multi-peer orchestration in panels: per-repo briefs, cross-group synthesis, partial failures, folding, `/expand` | `feat/orch-7-multipeer-orchestration` (from `feat/orchestrator-multipeer` @ `626ee97`) | `src/orchestrator/**`, `src/core/orchestration/**`, shell wiring (`src/cli/shell/{run,model,transcript}.ts`), `src/cli/commands/session.ts` (8000-char intents, §9.13) | Plan §7 Phase 3 exit, §9.12–§9.15 | done |
 | ORCH-8 | herdr runtime restore | — | — | Dropped (plan §9.8: no real herdr split screen) | dropped |
 
+**Phase 3 exit run (2026-10-13, accepted by the human).** Real run of a local 0.1.13 build of
+`feat/orch-7-multipeer-orchestration`: a master shell on one box (`master-hub`, split layout,
+master agent pi) and three real peers, `box-p1` on `alpha-app`, `vps-p2` on `beta-svc` and
+`vps-p3-v1` on `gamma-lib`. One free-text goal became three per-repo briefs (O-1 → I-1..I-3);
+`vps-p2` was set up to fail (unknown pi model), so the run covered a partial failure: 2 of 3
+done, the failure named with its cause, and a cross-group summary from the master agent.
+Folding, `/expand`, `/fold`, focus and the single/split layouts were exercised on the real
+screens. Evidence: `/root/skep-phase3-exit/` (peers) and `/root/skep-phase3-exit/box-screens/`
+(master screens and raw log).
+
+* **Accepted** as the Phase 3 exit for everything except BLOCKED.
+* **BLOCKED** (a peer agent waiting for its human) did not occur in the real run. It is covered
+  only by the fake-herdr / fake-peer tests (the `blocked` cases in
+  `src/cli/commands/session.test.ts`, `src/session/{progress,master.progress}.test.ts`,
+  and `src/cli/tui.test.ts`), not by a real run.
+* **Seven UI bugs found in the run, fixed on the same branch** (commit after `fce2b72`): a failed
+  run is shown as `failed N of M`, never `done 100%`; peers name their repo and role in v2
+  `peer-info` at join, so headers, footer and `/status` show the repo before any intent; join
+  rejections explain single-use codes and give the fix (codes stay single-use); rotated join
+  codes no longer fill the main panel (header shows the current one, a refused join prints the
+  current paste line); the `/start` text describes per-repo routing; progress lines are one line
+  cut at a word boundary; `/expand` and `/fold` confirm what they changed.
+
 ## Wave 8 — live agent view (D27–D30)
 
 Session mode (`skep session start/join`, SK-615/SK-616, merged for v0.1.1) runs an item with a
