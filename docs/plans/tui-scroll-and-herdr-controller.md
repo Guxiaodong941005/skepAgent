@@ -784,6 +784,29 @@ ORCH-6 follow-up questions, answered by the human on 2026-10-13 (verbatim, norma
     the 120-character progress line, blocked and the ≤4000 redacted result keep flowing as
     today, live output on or off).
 
+Pre-ORCH-7 questions, answered by the human on 2026-10-13 (verbatim, normative):
+
+12. **Q:** Raise the master agent's brief cap (`MAX_BRIEF_CHARS`, 3800) now that v2 intents carry
+    8000 characters?
+    **Answered — locked:** "Brief length: YES, raise the master agent's MAX_BRIEF_CHARS to about
+    7800."
+    Applied: ORCH-7 (`MAX_BRIEF_CHARS` = 8000 − 200 − 2 = 7798, so the longest title, a blank
+    line and the brief fit one v2 intent; per-target briefs share the cap; v1 peers still get
+    the first 4000 characters, title first).
+13. **Q:** Should `skep session intent` (the control path) also accept up to 8000 characters?
+    **Answered — locked:** "`skep session intent`: YES, allow 8000 characters."
+    Applied: ORCH-7 (`checkIntent` limit = session `BRIEF_MAX`; a ≤0.1.13 master that refuses a
+    longer intent as a bad request gets an error that names the 4000-character limit).
+14. **Q:** Live output is streamed only from native runs (no PTY/herdr runtime in this build): is
+    that acceptable for now?
+    **Answered — locked:** "Live output native-only for now: acceptable."
+    Applied: no change; recorded as a known limit of ORCH-6.
+15. **Q:** Branches: move `feat/orchestrator-multipeer` up to `feat/orch-6-protocol-v2`?
+    **Answered — locked:** "Branches: fast-forward `feat/orchestrator-multipeer` to
+    `feat/orch-6-protocol-v2`."
+    Applied: `feat/orchestrator-multipeer` = `626ee97` (a fast-forward from `69e74e8`); ORCH-7
+    branches from there as `feat/orch-7-multipeer-orchestration`.
+
 ---
 
 ## 10. Branches, sequencing, release
