@@ -2,8 +2,43 @@
 
 This document records the package-name decision (v0.1.0), the npm registry re-check, the
 v0.1.0 checklist, the v0.1.1 session-TUI notes, the v0.1.5 peer-progress and TUI notes, the
-v0.1.8 join-UX notes, the v0.1.9 per-project isolation notes, the v0.1.10 SAME-CB notes, the v0.1.11 SESSION-UX notes, the v0.1.12 JOIN-SLIM notes, the v0.1.13 INTENT-PEER notes, and the steps the orchestrator runs. Task agents must not `git push`,
+v0.1.8 join-UX notes, the v0.1.9 per-project isolation notes, the v0.1.10 SAME-CB notes, the v0.1.11 SESSION-UX notes, the v0.1.12 JOIN-SLIM notes, the v0.1.13 INTENT-PEER notes, the v0.1.14 ORCH/SCROLL notes, and the steps the orchestrator runs. Task agents must not `git push`,
 create tags, or `npm publish`.
+
+## v0.1.14 — master orchestrator + TUI scroll + multi-peer panels (2026-10-13)
+
+The human ordered **merge → publish** after the real-device verify (box master + VPS peers via
+reverse tunnel) at `65dca0f` **PASSED** all three small fixes: the `/start` banner invites
+peers "from a checkout of any repo", dev builds report `-dev` while this release ships plain
+`0.1.14`, and a peer's `/status` lists the other peers with their repos. Package name stays
+**`@skepagent/skep`** (public). The published bin is `skep`.
+
+What this tag adds on top of v0.1.13 (details in [`../CHANGELOG.md`](../CHANGELOG.md)):
+
+* **Master orchestrator (ORCH)**: free text in the master shell is refined by the master's
+  own agent CLI into per-repo briefs, dispatched to the peers, and the results synthesized;
+  `/orchestrate [auto|confirm|off|new]`, default `auto` (`off` is the v0.1.13 behavior).
+* **TUI scrolling (SCROLL)**: scrollable transcript with a pinned viewport, `/top` /
+  `/bottom`, and a scrollable OUTPUT pane in `skep ui`.
+* **Split panels for multi-peer joint debugging**: `/layout split`, `/focus`, `/zoom`,
+  `/find`; Skep-owned panels, not herdr panes.
+* **Session protocol v2**: opt-in live output (`/share-output`), briefs up to 8000
+  characters, changed-files lists on results, live output limited to 20 lines / 2 KB per
+  frame and one frame per 500 ms.
+* **Fixes**: a join code absorbs 8 wrong tries (no counter on the master, user-confirmed);
+  `/start` invites peers from any repo; peer `/status` shows other peers' repos; seven UI bugs
+  from the Phase 3 exit run.
+
+Compatibility: upgrade both devices. Protocol v2 is negotiated at join; ≤0.1.13 peers and
+masters still work on v1 (no live output, briefs cut to 4000 characters).
+
+Install:
+
+```bash
+npm install -g @skepagent/skep@0.1.14
+```
+
+---
 
 ## v0.1.13 — lone-peer intent routing + TUI peer picker (2026-10-13)
 

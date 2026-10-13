@@ -11,6 +11,58 @@ protocol rules ([`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §4.4) apply to t
 
 ## [Unreleased]
 
+## [0.1.14] - 2026-10-13
+
+Master orchestrator, TUI scrolling and multi-peer panels (SCROLL, ORCH Phases 0–7,
+[`docs/plans/tui-scroll-and-herdr-controller.md`](docs/plans/tui-scroll-and-herdr-controller.md)).
+Session protocol v2 is negotiated; ≤0.1.13 peers and masters keep working on v1.
+
+### Added
+
+* **TUI scrolling (SCROLL).** The shell transcript is scrollable with a pinned viewport
+  (PgUp/PgDn and the mouse wheel; new output does not yank a scrolled-back view), and
+  `/top` / `/bottom` jump to either end. `skep ui` gains a scrollable OUTPUT pane. Peers now
+  receive full results, peer output and the intent text.
+* **Master orchestrator (ORCH-2..4, ORCH-7).** Free text in the master shell is refined by the
+  master device's own agent CLI (claude, codex or pi, resolved like `/join`; read-only turns)
+  into a brief, dispatched through the same route as `/intent`, and the settled results are
+  synthesized by the same agent conversation. Multi-repo goals become one brief per target
+  repo, partial failures are named, and long results fold (`/expand`, `/fold`).
+  `/orchestrate [auto|confirm|off|new]` (default `auto`; `off` is the v0.1.13 behavior,
+  `SKEP_ORCHESTRATE` overrides per process), plus `/summarize`, `/cancel` and `/history`.
+* **Session protocol v2 (ORCH-6).** A sub opens with `join{v:2}`; a ≤0.1.13 master refuses it
+  before any key exchange and the sub retries once on v1. v2 adds releases in
+  `welcome`/`peer-info`, briefs up to 8000 characters (v1 peers get the first 4000, marked),
+  a changed-files list (paths, change kind, line counts; never content) on each result, and
+  opt-in live output (`/share-output on`, `/join … --share-output`,
+  `skep session join --share-output`; default off, per join, never stored) limited to
+  20 lines / 2 KB per frame and one frame per 500 ms. `skep session status` gains a SKEP
+  column.
+* **Split panels for multi-peer joint debugging (ORCH-5).** `/layout split` shows a main panel
+  plus one panel per connected peer (side by side from 100 columns, stacked below). Tab or
+  `/focus <main|peer|device>` picks the panel to scroll, `/zoom` shows it alone, `/find`
+  scrolls it back to text. Panels are Skep's own views of the one transcript, not herdr panes.
+
+### Fixed
+
+* **A join code absorbs 8 wrong tries.** A wrong or stale code no longer rotates the code at
+  once and cancels other joins in flight; the 8th miss rotates it. A proved code still rotates
+  at once. The master shows no miss counter (user-confirmed).
+* **`/start` invites peers from any repo.** The banner says "from a checkout of any repo"
+  instead of naming only the master's repo.
+* **Peer `/status` shows other peers' repos.** v2 progress relays carry the repo, so a peer
+  lists `alpha-app`, `beta-svc` and so on rather than `?`.
+* **Seven UI bugs from the Phase 3 exit run:** failed runs say "failed N of M"; a v2 peer names
+  its repo and role in `peer-info` so the master routes by them at once; join rejections say
+  why and how to fix; rotated codes are no longer logged in the main panel; the `/start` text
+  describes per-repo routing; progress lines cut at a word boundary; `/expand` and `/fold`
+  confirm what changed.
+
+### Changed
+
+* **Unreleased builds use a `-dev` suffix** (for example `0.1.13-dev`) so they are distinguishable
+  from the published release; this release is plain `0.1.14`.
+
 ## [0.1.13] - 2026-10-13
 
 ### Fixed
@@ -458,7 +510,8 @@ creates the npm org `skepagent` and explicitly says go. See [`docs/RELEASE.md`](
 * Manual lease revoke; no auto-merge. The human holds plan approval, escalation decisions and
   merges.
 
-[Unreleased]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.13...HEAD
+[Unreleased]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.14...HEAD
+[0.1.14]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.13...v0.1.14
 [0.1.13]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.12...v0.1.13
 [0.1.12]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.11...v0.1.12
 [0.1.11]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.10...v0.1.11

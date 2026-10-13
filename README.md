@@ -6,15 +6,16 @@ Skep lets AI coding agents on different machines (laptop, GPU rig, always-on ser
 through an encrypted session channel. Bare `skep` opens the Skep shell. Credentials never leave
 the device that owns them.
 
-> **v0.1.13 — lone-peer intent routing + TUI peer picker.** With one connected peer, a bare
-> `/intent` goes to that peer even when its repo name differs from the master's. In the TUI,
-> `/intent --repo <name>... <text>` is honoured, and with several peers Enter opens a
-> multi-select peer picker. Wire unchanged from 0.1.12.
+> **v0.1.14 — master orchestrator + TUI scroll + multi-peer panels (ORCH / SCROLL).** Free text
+> in the master shell is refined by the master's own agent into per-repo briefs, sent to the
+> peers, and the results are synthesized (`/orchestrate auto|confirm|off`, default `auto`). The
+> transcript scrolls (`/top`, `/bottom`), `/layout split` gives each peer its own panel, and
+> session protocol v2 adds opt-in live output and changed-file lists. v1 peers still work.
 
 ## Install
 
 ```bash
-npm install -g @skepagent/skep@0.1.13
+npm install -g @skepagent/skep@0.1.14
 ```
 
 Requires Node.js ≥ 22.12 (macOS & Linux).

@@ -12,7 +12,6 @@ import type { Notification } from "../../notify/ntfy.js";
 import { connectSub, ListenAddressError, startMaster } from "../../session/index.js";
 import { type ItemStatus, SubResultSchema } from "../../session/messages.js";
 import { runCli } from "../program.js";
-import { SKEP_VERSION } from "../version.js";
 import {
   type AgentRuntime,
   AgentRuntimeUnavailableError,
@@ -1250,14 +1249,14 @@ describe("control commands", () => {
     const status = SessionStatusSchema.parse({
       ...STATUS,
       peers: [
-        { ...peer, peerId: "dev", protocol: 2, version: SKEP_VERSION, shareOutput: true },
+        { ...peer, peerId: "dev", protocol: 2, version: "0.2.0-dev", shareOutput: true },
         { ...peer, peerId: "published", protocol: 2, version: "0.1.13", shareOutput: false },
         { ...peer, peerId: "legacy", protocol: 1, version: null, shareOutput: false },
       ],
     });
     const text = renderSessionStatus(status);
     expect(text).toContain("SKEP");
-    expect(text).toMatch(/dev\s+.*\s0\.1\.13-dev \+live/);
+    expect(text).toMatch(/dev\s+.*\s0\.2\.0-dev \+live/);
     expect(text).toMatch(/published\s+.*\s0\.1\.13\n/);
     expect(text).toMatch(/legacy\s+.*\s≤0\.1\.13\n/);
   });
