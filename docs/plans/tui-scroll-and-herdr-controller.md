@@ -281,14 +281,18 @@ export interface MasterAgent {
   the sanitized env (`AGENT_ENV_KEYS`, D19).
 * **How:** non-interactive, one process per turn, argv only (`execFile`/`spawn`, `shell:false`),
   prompt on stdin, timeout via the injected `Clock`, abort kills the process group. Conversation
-  continuity through each CLI's resume mechanism. Expected (to be **verified in Phase 0**, flags
-  pinned in a spike note, not guessed):
-  * claude: `claude -p --output-format json [--session-id <uuid> | --resume <id>]`, read-only via
-    `--permission-mode plan` or an allow-list of read tools;
-  * codex: `codex exec --json -` then `codex exec resume <thread-id> -`, `--sandbox read-only`;
-  * pi: `pi -p` with its session/continue option, read-only tool set if available.
-  If a CLI has no reliable resume, Skep re-seeds each turn from its own **ledger** (§3.7) — the
-  plan works either way, resume just saves tokens.
+  continuity through each CLI's resume mechanism. **Verified in Phase 0**
+  (`docs/spikes/master-agent-cli.md`, claude 2.1.296, codex-cli 0.160.0, pi 1.0.2):
+  * claude: first turn `claude -p --output-format json --session-id <uuid> --permission-mode
+    plan --tools Read,Grep,Glob`, later turns the same with `--resume <uuid>` (reusing
+    `--session-id` fails "already in use");
+  * codex: `codex exec --json --sandbox read-only --skip-git-repo-check -o <file> -`, id from the
+    `thread.started` event, later turns `codex exec resume --json -c sandbox_mode="read-only"
+    --skip-git-repo-check -o <file> <thread-id> -` (resume has no `--sandbox` flag);
+  * pi: every turn `pi -p --mode json --session-id <uuid> --tools read,grep,find,ls` (creates
+    the session when missing).
+  All three resumed correctly and refused a write. If a resume fails anyway, Skep re-seeds a new
+  conversation from its own **ledger** (§3.7).
 * **Read-only by contract.** Refine and synthesize must not edit the master's working tree.
   Enforced by CLI flags where available, and verified after each turn by `git status
   --porcelain` diff (the same delta machinery as `session-delta.ts`); a change fails the turn
@@ -539,7 +543,10 @@ day-rotated history files with 14-day / 50 MiB retention:
 * herdr: pin a tag, read `LICENSE` at that tag, record `herdr api schema --json` protocol, decide
   whether the SK-620 client can be restored as-is.
 * **Exit:** `docs/spikes/master-agent-cli.md` with pinned argv per CLI and a decision table;
-  ARCHITECTURE D32/D33 drafted; this plan amended where the spike disagrees.
+  ARCHITECTURE D32/D33 drafted; this plan amended where the spike disagrees. **Done
+  2026-10-13**: all three CLIs verified (turn, JSON, id, resume, read-only); herdr v0.9.3 is
+  Apache-2.0 at the tag, protocol 22 = SK-620's; GUI terminal matrix replaced by a superset
+  decoder plus a manual RUNBOOK check (no GUI terminals in the spike environment).
 
 ### Phase 1 — TUI scroll (SCROLL-1..3) · `feat/tui-scroll`
 
