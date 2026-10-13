@@ -25,6 +25,14 @@ Implementation notes (where the code differs from the text below, the code and t
 * ORCH-5 (done): panels are filtered views of the one transcript (D34). The main panel title
   is `main` (`/focus master` also works); `skep ui` keeps its single-agent screen. Split layout
   applies only while a session is live; without one the shell draws the single view.
+* ORCH-6 (done, branch `feat/orch-6-protocol-v2`, D35): v2 intents carry up to 8000 characters
+  on the wire, but the master agent's brief cap (`MAX_BRIEF_CHARS` 3800 in
+  `src/core/orchestration/schemas.ts`) is unchanged; raising it is left to ORCH-7. "Last agent
+  message" is not a separate field: the result summary already ends with it. Control `status`
+  is versioned too (`v:1` old shape, `v:2` new fields, client falls back). Live output is
+  streamed from native runs (the PTY/herdr runtime is not in this build). The master does not
+  disconnect a peer that bursts output; it drops frames beyond a budget of 8, refilled one per
+  500 ms.
 
 Locked decisions in one line each (§9 has the verbatim answers):
 
