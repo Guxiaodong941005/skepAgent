@@ -135,6 +135,23 @@ relay). Provider-config sync (former D17 tasks) was withdrawn and must not be re
 
 ---
 
+## Wave 9 — TUI scroll + herdr-style master controller (D32, D33)
+
+Plan: `docs/plans/tui-scroll-and-herdr-controller.md` (decisions locked 2026-10-13, §9). Spike:
+`docs/spikes/master-agent-cli.md`. No version bump in these branches; the release task decides.
+
+| ID | Title | Branch | Files/area | Acceptance criteria | Status |
+|---|---|---|---|---|---|
+| SCROLL-1 | Transcript, pinned viewport, keys, alternate-scroll | `feat/tui-scroll` | `src/cli/shell/{transcript,scroll,input,model,run}.ts`, `src/cli/tui.ts` (`Screen` modes, EL rendering) | Plan §7 Phase 1 criteria 1, 2, 5, 6, 8, 9; 500K same-session cap | done |
+| SCROLL-2 | Full results (S2), full peer output (S3), peer prompt from intent text (S8) | `feat/tui-scroll` | `src/session/{master,sub,index}.ts` (additive), `src/cli/commands/session.ts`, `src/cli/shell/run.ts` | Criteria 3, 4, 7; S8 ships with the larger change (no patch release) | done |
+| SCROLL-3 | `skep ui` OUTPUT pane scrolls | `feat/tui-scroll` | `src/cli/tui.ts` | S7: PgUp/PgDn/Home/End, wrap, follow | done |
+| ORCH-0 | D32/D33, this table | `feat/master-orchestrator` | `docs/ARCHITECTURE.md`, `docs/DEV-PLAN.md` | Decisions recorded | done |
+| ORCH-1 | Peer prompt from the full intent text | `feat/tui-scroll` (S8) | see SCROLL-2 | Old peers keep working from the title | done |
+| ORCH-2 | Pure orchestration reducer + `RefineOutputSchema` | `feat/master-orchestrator` | `src/core/orchestration/{reducer,schemas}.ts` | Plan §3.3 transitions; ≤2 question rounds | done |
+| ORCH-3 | Master agent adapters (claude, codex, pi), prompts, guard, ledger, 500K cap | `feat/master-orchestrator` | `src/orchestrator/{master-agent,prompts,ledger,orchestrator,settings}.ts` | Criteria 2, 4, 5, 6, 9, 10 | done |
+| ORCH-4 | Shell wiring: free text → orchestrator, `/orchestrate`, `/summarize`, `/cancel`, `/history`, footer | `feat/master-orchestrator` | `src/cli/shell/run.ts`, `src/cli/shell/model.ts`, `test/integration/orchestration.test.ts` | Criteria 1, 3, 7, 8 | done |
+| ORCH-5..8 | Per-repo briefs, `/expand`, `/find`, herdr runtime restore, session protocol v2 (accepted) | `feat/orchestrator-multipeer` | plan §7 Phase 3 | Phase 3 exit criteria | open |
+
 ## Wave 8 — live agent view (D27–D30)
 
 Session mode (`skep session start/join`, SK-615/SK-616, merged for v0.1.1) runs an item with a

@@ -1,10 +1,25 @@
 # Plan: TUI scrollback + herdr-style master controller (SCROLL / ORCH)
 
-Status: **decisions locked (2026-10-13), implementation started.** The parent answered every
-open question in §9; those answers are normative and are applied throughout this document.
-Phase 0 (`spike/master-agent-cli`) and Phase 1 (`feat/tui-scroll`) are in progress; Phase 2
-(`feat/master-orchestrator`) follows. Still no version bump, no tag and no publish from these
-branches (§10). Written against `main` @ `cebee66` (v0.1.13).
+Status: **decisions locked (2026-10-13); Phases 0–2 implemented, Phase 3 open.** The parent
+answered every open question in §9; those answers are normative and are applied throughout this
+document. Phase 0 is done (`spike/master-agent-cli`, `docs/spikes/master-agent-cli.md`), Phase 1
+is done on `feat/tui-scroll` (SCROLL-1..3, S2/S3/S8), Phase 2 v1 is done on
+`feat/master-orchestrator` (ORCH-0..4, branched from `feat/tui-scroll`). Not merged, no version
+bump, no tag and no publish from these branches (§10). Written against `main` @ `cebee66`
+(v0.1.13).
+
+Implementation notes (where the code differs from the text below, the code and this list win):
+
+* No `onIntentChanged` master callback (§3.6): the existing `item-*`/`intent-*` master events,
+  the 250 ms tick and the external-status probe already signal every change, so the
+  orchestrator polls on those and `MasterOptions` stays as it was.
+* `SKEP_ORCHESTRATE=auto|confirm|off` overrides `[orchestrate] mode` per process (scripts,
+  tests). `/cancel <O-n>` stops an orchestration on this side (its intent keeps running).
+* Confirm mode asks in the input line (`enter` send, `e` edit as one line, `n` cancel) rather
+  than binding Esc; Ctrl+C on the question also cancels.
+* `/top` and `/bottom` exist; `/find` stays in Phase 3 with `/expand`.
+* A master agent turn that fails with a non-zero exit while a conversation exists is retried
+  once in a fresh, ledger-seeded conversation; a timeout or unreadable output is not retried.
 
 Locked decisions in one line each (§9 has the verbatim answers):
 
