@@ -150,7 +150,10 @@ Plan: `docs/plans/tui-scroll-and-herdr-controller.md` (decisions locked 2026-10-
 | ORCH-2 | Pure orchestration reducer + `RefineOutputSchema` | `feat/master-orchestrator` | `src/core/orchestration/{reducer,schemas}.ts` | Plan §3.3 transitions; ≤2 question rounds | done |
 | ORCH-3 | Master agent adapters (claude, codex, pi), prompts, guard, ledger, 500K cap | `feat/master-orchestrator` | `src/orchestrator/{master-agent,prompts,ledger,orchestrator,settings}.ts` | Criteria 2, 4, 5, 6, 9, 10 | done |
 | ORCH-4 | Shell wiring: free text → orchestrator, `/orchestrate`, `/summarize`, `/cancel`, `/history`, footer | `feat/master-orchestrator` | `src/cli/shell/run.ts`, `src/cli/shell/model.ts`, `test/integration/orchestration.test.ts` | Criteria 1, 3, 7, 8 | done |
-| ORCH-5..8 | Per-repo briefs, `/expand`, `/find`, herdr runtime restore, session protocol v2 (accepted) | `feat/orchestrator-multipeer` | plan §7 Phase 3 | Phase 3 exit criteria | open |
+| ORCH-5 | Split-panel shell: master + peer panels on today's protocol, focus/zoom, per-panel scroll, `/layout`, `/focus`, `/zoom`, `/find` (D34) | `feat/orchestrator-multipeer` | `src/cli/shell/{panels,model,run,transcript}.ts`, `docs/ARCHITECTURE.md` (D34) | Plan §7 Phase 3 ORCH-5; single layout unchanged | open |
+| ORCH-6 | Session protocol v2: negotiation, peer version, targeted intents, briefs >4000, structured results, opt-in live output (default off, D27 amendment) | `feat/orchestrator-multipeer` | `src/session/**`, `src/cli/commands/session.ts`, shell wiring | Plan §3.6, §9.5, §9.6; mixed v1/v2 matrix | open |
+| ORCH-7 | Multi-peer orchestration in panels: per-repo briefs, cross-group synthesis, partial failures, folding, `/expand` | `feat/orchestrator-multipeer` | `src/orchestrator/**`, `src/core/orchestration/**`, shell wiring | Plan §7 Phase 3 exit | open |
+| ORCH-8 | herdr runtime restore | — | — | Dropped (plan §9.8: no real herdr split screen) | dropped |
 
 ## Wave 8 — live agent view (D27–D30)
 

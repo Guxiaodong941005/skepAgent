@@ -1,12 +1,14 @@
 # Plan: TUI scrollback + herdr-style master controller (SCROLL / ORCH)
 
-Status: **decisions locked (2026-10-13); Phases 0–2 implemented, Phase 3 open.** The parent
-answered every open question in §9; those answers are normative and are applied throughout this
-document. Phase 0 is done (`spike/master-agent-cli`, `docs/spikes/master-agent-cli.md`), Phase 1
-is done on `feat/tui-scroll` (SCROLL-1..3, S2/S3/S8), Phase 2 v1 is done on
-`feat/master-orchestrator` (ORCH-0..4, branched from `feat/tui-scroll`). Not merged, no version
-bump, no tag and no publish from these branches (§10). Written against `main` @ `cebee66`
-(v0.1.13).
+Status: **decisions locked (2026-10-13); Phases 0–2 implemented, Phase 3 rescoped and in
+progress.** The parent answered every open question in §9; those answers are normative and are
+applied throughout this document. Phase 0 is done (`spike/master-agent-cli`,
+`docs/spikes/master-agent-cli.md`), Phase 1 is done on `feat/tui-scroll` (SCROLL-1..3,
+S2/S3/S8), Phase 2 v1 is done on `feat/master-orchestrator` (ORCH-0..4, branched from
+`feat/tui-scroll`). Phase 3 was rewritten around the human's split-panel multi-peer joint-debug
+ask (§0 item 3, §7, §9 questions 6–8) and runs on `feat/orchestrator-multipeer` (branched from
+`feat/master-orchestrator` @ `0693085`). Not merged, no version bump, no tag and no publish from
+these branches (§10). Written against `main` @ `cebee66` (v0.1.13).
 
 Implementation notes (where the code differs from the text below, the code and this list win):
 
@@ -17,7 +19,7 @@ Implementation notes (where the code differs from the text below, the code and t
   tests). `/cancel <O-n>` stops an orchestration on this side (its intent keeps running).
 * Confirm mode asks in the input line (`enter` send, `e` edit as one line, `n` cancel) rather
   than binding Esc; Ctrl+C on the question also cancels.
-* `/top` and `/bottom` exist; `/find` stays in Phase 3 with `/expand`.
+* `/top` and `/bottom` exist; `/find` moves to Phase 3 ORCH-5 (panels), `/expand` to ORCH-7.
 * A master agent turn that fails with a non-zero exit while a conversation exists is retried
   once in a fresh, ledger-seeded conversation; a timeout or unreadable output is not retried.
 
@@ -28,6 +30,10 @@ Locked decisions in one line each (§9 has the verbatim answers):
 * Transcript retention: **same session keeps context, max 500K** (§3.7, §5.1, §5.3).
 * Master agent CLIs for v1: **claude, codex and pi**.
 * Phase 3 wire / session protocol v2: **accepted** (still negotiated, §3.6).
+* Phase 3 panels: remote peer **live output is off by default**, opt-in only; key information
+  (phase, progress line, blocked notices, results) always flows.
+* Phase 3: **no per-peer follow-up from a panel** for now; input always goes to the master.
+* Phase 3: **no real herdr split screen**, not even on one machine; Skep's own panels only.
 
 Normative sources: `docs/PRD-v0.4.md` (product), `docs/ARCHITECTURE.md` (D27–D31 especially),
 prior plans `unified-tui-shell.md`, `tui-session-reliability.md`, `session-ux-rethink.md`,
@@ -52,6 +58,13 @@ The human asked for two things. Both are in scope; neither is shrunk into a smal
    Overall the interaction should feel like **herdr**: a main controller drives other peers'
    agents. Skep additionally supports cross-terminal / cross-device calls. Integrating
    open-source herdr code is on the table and is evaluated in §4.
+3. **Split-panel multi-peer joint debugging (Phase 3, asked 2026-10-13).** Verbatim: 「关于
+   Phase 3 ，我是想根据 herdr 分panel 的方式。来进行多peer 联调。 herdr 是开源的，可以参考它的代码，
+   自己实现么？」 — "For Phase 3, I want multi-peer joint debugging in the herdr split-panel style.
+   herdr is open source — can we reference its code and implement it ourselves?" Answer: yes, as
+   a TypeScript reimplementation of the UX in Skep's own TUI (herdr is Apache-2.0 at v0.9.3 and
+   HEAD; no code is copied, §4). The scope decisions are §9 questions 6–8; the work is §7
+   Phase 3.
 
 ---
 
@@ -437,6 +450,11 @@ need arises to copy code, it requires a new decision record plus a license check
 tag. This keeps D28/D30 intact; only D30's wording needs a note that the shell (not just `skep
 ui`) is a scrolling control screen.
 
+**Superseded for Phase 3 by locked decision §9.8 ("no real herdr split screen"):** Phase 3 is
+option **(A) only**. The herdr runtime is not restored; the split-panel view is Skep's own
+(§7 Phase 3, D34). D28 still describes the optional herdr pane order, but nothing in this plan
+ships it.
+
 ---
 
 ## 5. TUI scroll design (Phase 1)
@@ -618,18 +636,45 @@ day-rotated history files with 14-day / 50 MiB retention:
   10. The conversation is reused across orchestrations of one session and replaced (ledger
       re-seed) once it would exceed 500 000 characters.
 
-### Phase 3 — multi-peer and polish (ORCH-5..8) · `feat/orchestrator-multipeer`
+### Phase 3 — split-panel multi-peer joint debugging (ORCH-5..7) · `feat/orchestrator-multipeer`
 
-* Per-repo briefs (one intent per target, grouped); synthesis across groups; partial-failure
-  wording; per-item folding/expanding in the scrollback (`/expand I-4`); `/find`.
-* Restore the herdr runtime (option C): `src/runtime/herdr.ts`/`pty.ts` from `fdeebae`, fixtures
-  re-recorded on the pinned herdr; master agent optionally in a herdr pane (`a` focuses it).
-* Session protocol v2 negotiation (accepted, locked §9.5): peer version reporting, targeted
-  intents instead of broadcast, briefs >4000 and structured result details — negotiated per
-  §3.6 so ≤0.1.13 peers keep working on v1.
-* **Exit:** three peers on two repos, one failing, one blocked: one coherent summary naming each
-  outcome; herdr view works when installed and falls back cleanly when not; mixed v1/v2 sessions
-  pass the compatibility matrix.
+Rewritten 2026-10-13 for the human's ask (§0 item 3) and locked decisions §9.6–§9.8. The
+original Phase 3 list (per-repo briefs, `/expand`, `/find`, herdr runtime restore, protocol v2)
+is redistributed below; the herdr runtime restore is dropped (§9.8).
+
+* **ORCH-5 — Skep panels on today's protocol (no wire change).** A `/layout split|single` mode
+  in the unified shell: a **master panel** (the whole transcript as today) plus one **peer
+  panel** per connected peer. Wide terminals put the master panel left and the peers stacked
+  right; narrow ones stack them. Each panel scrolls on its own with the shared viewport
+  (`scroll.ts`, D33); `Tab` (empty input, no menu) cycles focus, `/focus <master|peer|device>`
+  names it, `/zoom` shows the focused panel alone, and the scroll keys act on the focused
+  panel. A peer panel shows what already reaches this shell: that peer's join/leave lines, its
+  item results and failures (≤4000, redacted), and a **timeline of its progress reports**
+  (phase + the 120-character progress line, recorded each time it changes; the timeline lives
+  only in the panel, the master panel is unchanged). On a joined shell the device's own panel
+  also gets its own agent output, which is local (D27). Panels render Skep's own text: no
+  terminal emulation, no vendor TUI parsing (D30 stands, amended by D34). `/find <text>` jumps
+  the focused panel to the previous entry containing the text. Input always goes to the master
+  (no per-peer follow-up, §9.7). `skep ui` stays the single-agent screen (D30).
+* **ORCH-6 — session protocol v2 (accepted §9.5).** Negotiation per §3.6 (≤0.1.13 peers stay on
+  v1); peer version reporting; intents sent only to targeted peers instead of broadcast; briefs
+  >4000; structured result details (changed files, checks, last agent message). Plus an
+  **opt-in live output stream** (§9.6): a peer sends a redacted, control-stripped, bounded tail
+  (proposed ≤20 lines / 2 KB per frame, coalesced like progress at 500 ms) **only when its human
+  opted in** (`/share-output on` on the peer, default **off**, not persisted beyond the session
+  unless chosen); the master's peer panel shows it. Off or on, phase changes, blocked notices
+  and results always flow. Needs a D27 amendment written with the code. Peer-level routing is
+  **not** part of v2 (§9.7).
+* **ORCH-7 — multi-peer orchestration in panels.** Per-repo briefs (one intent per target,
+  grouped under one orchestration); synthesis across groups; partial-failure wording; the
+  orchestration's phases and summary shown in the master panel with each brief and result
+  linked to its peer panel; per-item folding and `/expand I-4`.
+* ~~ORCH-8 — herdr runtime restore~~ — dropped by §9.8; no task.
+* **Exit:** three peers on two devices, two repos, one failing and one blocked, in split
+  layout: each peer panel shows its own timeline and outcome, the master panel shows one
+  coherent summary naming each outcome; live output appears in a peer panel only after that
+  peer opted in; mixed v1/v2 sessions pass the compatibility matrix; single layout and `off`
+  mode are unchanged.
 
 ### Phase 4 (later, optional) — agent-driven controller (T2)
 
@@ -642,11 +687,12 @@ separate security review (agent-initiated fan-out, cost limits).
 ## 8. Out of scope for v1 of this work
 
 * Vendoring, forking or embedding herdr code; a terminal multiplexer/emulator inside Skep
-  (D28/D30 stand).
+  (D28/D30 stand). Real herdr panes, including for peers on the same machine (§9.8).
+* Follow-up text typed into a peer panel and sent to that peer only (§9.7, "not for now").
 * Agent-driven control (T2) and any agent-initiated dispatch without Skep in the loop.
 * Raw transcripts or unredacted output crossing the wire; relaxing the 4000-char result cap (D27).
 * Peer-level routing (two peers on the same repo each getting distinct work) — needs a wire
-  change; Phase 3 at the earliest.
+  change; not in Phase 3 (§9.7).
 * Interactive master-agent chat that is not an orchestration (free text answered locally
   without dispatch); the refine step may ask questions, but a general "talk to my agent" mode is
   a separate feature.
@@ -688,6 +734,19 @@ recorded verbatim and are normative for every phase.
    features?
    **Answered — locked:** "Phase 3 wire / protocol v2: **accepted**."
    Applied: §3.6, §6, §7 (Phase 3). Negotiation per §3.6 keeps ≤0.1.13 peers working on v1.
+6. **Q:** In split panels, may remote peers' live agent output (redacted, bounded) appear on the
+   master (a D27 amendment)?
+   **Answered — locked:** "Remote peer live output: **default OFF**; only if the user opts in.
+   Key/important info can still be received."
+   Applied: §7 Phase 3 (ORCH-5 uses only what flows today; ORCH-6 adds the opt-in stream).
+7. **Q:** Is a follow-up typed into one peer's panel, sent to that peer only, required (peer-level
+   routing in v2)?
+   **Answered — locked:** "Per-peer panel follow-up: **not for now**" (「暂时不可以」).
+   Applied: §7 Phase 3 (input always goes to the master), §8.
+8. **Q:** For peers on the same machine, real herdr split panes (herdr installed) or only Skep's
+   panels?
+   **Answered — locked:** "Same-machine: **no real herdr split-screen**; Skep's own panels only."
+   Applied: §4 (Phase 3 is option A only), §7 (ORCH-8 dropped), §8.
 
 ---
 
@@ -697,7 +756,8 @@ recorded verbatim and are normative for every phase.
 * `feat/tui-scroll` (Phase 1; SCROLL-1 → SCROLL-2 → SCROLL-3; SCROLL-3 can run in parallel with
   SCROLL-2, no shared files except `tui.ts` restore steps owned by SCROLL-1)
 * `feat/master-orchestrator` (Phase 2; ORCH-1 and ORCH-2 in parallel, then ORCH-3, then ORCH-4)
-* `feat/orchestrator-multipeer` (Phase 3)
+* `feat/orchestrator-multipeer` (Phase 3; from `feat/master-orchestrator` @ `0693085`;
+  ORCH-5 → ORCH-6 → ORCH-7)
 * Umbrella name if one branch is preferred: `feat/herdr-style-controller`.
 
 Version: no bump in any of these branches (reconfirmed with the locked decisions). Suggested
