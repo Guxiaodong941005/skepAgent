@@ -26,13 +26,24 @@ Implementation notes (where the code differs from the text below, the code and t
   is `main` (`/focus master` also works); `skep ui` keeps its single-agent screen. Split layout
   applies only while a session is live; without one the shell draws the single view.
 * ORCH-6 (done, branch `feat/orch-6-protocol-v2`, D35): v2 intents carry up to 8000 characters
-  on the wire, but the master agent's brief cap (`MAX_BRIEF_CHARS` 3800 in
-  `src/core/orchestration/schemas.ts`) is unchanged; raising it is left to ORCH-7. "Last agent
+  on the wire; the master agent's brief cap was raised in ORCH-7 (§9.12). "Last agent
   message" is not a separate field: the result summary already ends with it. Control `status`
   is versioned too (`v:1` old shape, `v:2` new fields, client falls back). Live output is
   streamed from native runs (the PTY/herdr runtime is not in this build). The master does not
   disconnect a peer that bursts output; it drops frames beyond a budget of 8, refilled one per
   500 ms.
+* ORCH-7 (done, branch `feat/orch-7-multipeer-orchestration` from `feat/orchestrator-multipeer`
+  @ `626ee97`): refine `targets` become groups, one intent per target repo sent with
+  `repos=[repo]` (no picker); no targets keeps the single brief through route and picker. A
+  group that cannot be sent does not stop the others; the request fails only when none was
+  sent. A pure `describeOutcome` tally ("1 of 2 done: …; 1 failed: …; not sent: …") is shown
+  before every summary (a warning on partial failure) and fed to the synthesis prompt
+  (`PROMPT_VERSION` 2). When a peer takes an item the main panel names it and the peer's
+  panel gets the brief. Item results (done / waiting) longer than 8 lines are folded in the
+  main panel; `/expand [I-n|all]` and `/fold [I-n|all]` (not `/collapse`: `/cl` must keep
+  meaning `/clean`); peer panels and failures are never folded. `MAX_BRIEF_CHARS` = 7798,
+  `skep session intent` takes 8000 (§9.12, §9.13). Fold keys are item ids, which restart per
+  session: `/expand I-1` after a second `/start` in one shell opens both I-1 blocks.
 
 Locked decisions in one line each (§9 has the verbatim answers):
 
@@ -48,6 +59,8 @@ Locked decisions in one line each (§9 has the verbatim answers):
 * ORCH-6: `/share-output on` lasts for the **current session only**; live output is **≤20 lines
   / 2 KB per frame, at most once per 500 ms**; the **changed-files list** joins the key
   information that always reaches the master (§9.9–§9.11).
+* ORCH-7: brief cap **about 7800** (7798); `skep session intent` takes **8000**; live output
+  **native-only** for now; `feat/orchestrator-multipeer` fast-forwarded to ORCH-6 (§9.12–§9.15).
 
 Normative sources: `docs/PRD-v0.4.md` (product), `docs/ARCHITECTURE.md` (D27–D31 especially),
 prior plans `unified-tui-shell.md`, `tui-session-reliability.md`, `session-ux-rethink.md`,
