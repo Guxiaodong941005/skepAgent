@@ -12,6 +12,15 @@
 import { execFileSync } from "node:child_process";
 import { type Clock, systemClock } from "../util/clock.js";
 import type { JoinView, JoinViewModel, PeerPhase } from "./commands/session.js";
+import {
+  anchorAt,
+  CountedRows,
+  FOLLOW,
+  type ScrollAnchor,
+  scrollAnchor,
+  viewWindow,
+} from "./shell/scroll.js";
+import { wrapLine } from "./shell/transcript.js";
 import { bold, fg, PLAIN_THEME, type Role, type Span, type Theme } from "./theme.js";
 import { SKEP_VERSION } from "./version.js";
 
@@ -157,31 +166,43 @@ export interface ProcessHooks {
 }
 
 export type Key =
-  | { name: "up" | "down" | "enter" | "quit" }
+  | { name: "up" | "down" | "enter" | "quit" | "pageUp" | "pageDown" | "home" | "end" }
   | { name: "char"; char: string }
   | { name: "other" };
 
 /**
  * Splits one stdin chunk into keys. Raw mode delivers Ctrl-C as a byte rather than a signal, so it
  * decodes to `quit` like `q`. Unknown escape sequences are swallowed whole so their tail bytes are
- * never read as letters.
+ * never read as letters. With `carry`, an escape sequence cut off at the end of the chunk is
+ * returned there instead of decoded, to be prefixed to the next chunk (S9).
  */
-export function decodeKeys(chunk: Buffer | string): Key[] {
-  const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+export function decodeKeys(chunk: Buffer | string, carry?: { rest: string }): Key[] {
+  const text = (carry?.rest ?? "") + (typeof chunk === "string" ? chunk : chunk.toString("utf8"));
+  if (carry !== undefined) carry.rest = "";
   const keys: Key[] = [];
   let i = 0;
   while (i < text.length) {
     const ch = text[i] as string;
     if (ch === "\x1b") {
       const next = text[i + 1];
+      if (
+        carry !== undefined &&
+        text.length > 1 &&
+        (next === undefined || next === "[" || next === "O")
+      ) {
+        // Wait for the rest of a sequence the terminal split across two writes.
+        let end = i + 2;
+        if (next === "[") while (end < text.length && !/[@-~]/.test(text[end] as string)) end++;
+        if (next === undefined || end >= text.length) {
+          carry.rest = text.slice(i);
+          break;
+        }
+      }
       if (next === "[" || next === "O") {
         // CSI/SS3: parameter bytes, then one final byte in @..~.
         let end = i + 2;
-        while (end < text.length && !/[@-~]/.test(text[end] as string)) end++;
-        const final = text[end];
-        keys.push(
-          final === "A" ? { name: "up" } : final === "B" ? { name: "down" } : { name: "other" },
-        );
+        if (next === "[") while (end < text.length && !/[@-~]/.test(text[end] as string)) end++;
+        keys.push(sequenceKey(text.slice(i + 2, end + 1)));
         i = end + 1;
       } else {
         keys.push({ name: "other" });
@@ -196,6 +217,22 @@ export function decodeKeys(chunk: Buffer | string): Key[] {
     i += 1;
   }
   return keys;
+}
+
+/** Arrows, page keys and Home/End in their common CSI/SS3 forms; anything else is `other`. */
+function sequenceKey(body: string): Key {
+  const final = body.slice(-1);
+  const first = body.slice(0, -1).split(";")[0] ?? "";
+  if (final === "A") return { name: "up" };
+  if (final === "B") return { name: "down" };
+  if (final === "H") return { name: "home" };
+  if (final === "F") return { name: "end" };
+  if (final !== "~") return { name: "other" };
+  if (first === "5") return { name: "pageUp" };
+  if (first === "6") return { name: "pageDown" };
+  if (first === "1" || first === "7") return { name: "home" };
+  if (first === "4" || first === "8") return { name: "end" };
+  return { name: "other" };
 }
 
 /** Drops control characters so text from the wire can never move the cursor or restyle. */
@@ -281,8 +318,9 @@ export class Screen {
   private mouse = false;
   /** The next frame clears first: the screen content is unknown (entered, resumed, resized). */
   private dirty = true;
+  private readonly carry = { rest: "" };
   private readonly onData = (chunk: Buffer | string): void => {
-    for (const key of decodeKeys(chunk)) {
+    for (const key of decodeKeys(chunk, this.carry)) {
       if (!this.active) return;
       this.handlers.onKey(key);
     }
@@ -307,6 +345,11 @@ export class Screen {
     },
     private readonly hooks: ProcessHooks = process,
     private readonly theme: Theme = PLAIN_THEME,
+    /**
+     * Alternate-scroll turns the wheel into arrow keys. The shell wants that (arrows scroll its
+     * transcript); `skep ui` does not (arrows move its selection), so it is per screen.
+     */
+    private readonly modes: { alternateScroll?: boolean } = {},
   ) {}
 
   get isActive(): boolean {
@@ -422,7 +465,8 @@ export class Screen {
     if (stdin.isTTY === true) stdin.setRawMode?.(true);
     stdin.on("data", this.onData);
     stdin.resume();
-    stdout.write(`${ALT_SCREEN_ON}${CURSOR_HIDE}${ALT_SCROLL_ON}${this.mouse ? MOUSE_ON : ""}`);
+    const scroll = this.modes.alternateScroll === true ? ALT_SCROLL_ON : "";
+    stdout.write(`${ALT_SCREEN_ON}${CURSOR_HIDE}${scroll}${this.mouse ? MOUSE_ON : ""}`);
     this.active = true;
     this.dirty = true;
   }
@@ -579,6 +623,11 @@ export class TuiModel {
   glyphs: Glyphs = "nerd";
   /** Shown at the right of the header; null hides it. */
   version: string | null = SKEP_VERSION;
+  /** The OUTPUT pane's view of the selected entry's tail; it follows unless paged (S7). */
+  output: ScrollAnchor = FOLLOW;
+  /** Height and width of the OUTPUT pane in the last frame, for paging. */
+  private outputRows = 0;
+  private outputColumns = 80;
 
   animating(): boolean {
     return this.snapshot.peers.some(
@@ -602,7 +651,36 @@ export class TuiModel {
     if (entries.length === 0) return;
     const at = entries.findIndex((e) => e.key === this.selected);
     const next = Math.min(entries.length - 1, Math.max(0, at + delta));
-    this.selected = entries[next]?.key ?? this.selected;
+    const selected = entries[next]?.key ?? this.selected;
+    // Another entry's output starts at its newest lines.
+    if (selected !== this.selected) this.output = FOLLOW;
+    this.selected = selected;
+  }
+
+  /** Pages the OUTPUT pane: positive goes up (older lines). */
+  scrollOutput(pages: number): void {
+    const space = this.outputSpace(this.outputColumns);
+    const step = Math.max(1, this.outputRows - 1);
+    this.output = scrollAnchor(this.output, pages * step, space, this.outputRows);
+  }
+
+  outputToTop(): void {
+    this.output = anchorAt(0, this.outputSpace(this.outputColumns), this.outputRows);
+  }
+
+  outputToBottom(): void {
+    this.output = FOLLOW;
+  }
+
+  /** The selected entry's tail as wrapped rows: nothing is cut at the width (S7). */
+  private outputLines(columns: number): string[][] {
+    const entry = this.current();
+    if (entry === null || entry.tail === "") return [];
+    return entry.tail.split("\n").map((line) => wrapLine(`    ${line}`, columns, "      "));
+  }
+
+  private outputSpace(columns: number): CountedRows {
+    return new CountedRows(this.outputLines(columns).map((rows) => rows.length));
   }
 
   /** What `a`/Enter would do for the selected entry, or null when attaching is not possible. */
@@ -625,6 +703,9 @@ export class TuiModel {
     const keys: { key: string; label: string; pending?: boolean }[] = [];
     const entry = this.current();
     if (this.snapshot.entries.length > 1) keys.push({ key: "↑↓", label: "select" });
+    if (this.outputSpace(this.outputColumns).totalRows > this.outputRows && this.outputRows > 0) {
+      keys.push({ key: "pgup/pgdn", label: "output" });
+    }
     if (this.attachKind(entry) !== null) {
       keys.push({ key: `a/${chrome(this.glyphs).enter}`, label: "attach" });
     }
@@ -688,14 +769,24 @@ export class TuiModel {
       });
     }
 
-    const tail = entry === null || entry.tail === "" ? [] : entry.tail.split("\n");
+    const wrapped = this.outputLines(columns);
+    const tail = wrapped.flat();
     // The OUTPUT rule and the footer take one row each.
-    const room = rows - lines.length - 2;
-    const shown = room > 0 ? tail.slice(-room) : [];
-    const hidden = shown.length < tail.length ? `last ${shown.length} of ${tail.length}` : "";
-    lines.push(rule("OUTPUT", hidden, columns, this.glyphs));
+    const room = Math.max(0, rows - lines.length - 2);
+    this.outputRows = room;
+    this.outputColumns = columns;
+    const space = new CountedRows(wrapped.map((entryRows) => entryRows.length));
+    const view = viewWindow(this.output, space, room);
+    const shown = tail.slice(view.top, view.top + room);
+    const label =
+      this.output.kind === "pinned" && view.below > 0
+        ? `rows ${view.top + 1}-${view.top + shown.length} of ${tail.length}${g.sep}End follows`
+        : shown.length < tail.length
+          ? `last ${shown.length} of ${tail.length}`
+          : "";
+    lines.push(rule("OUTPUT", label, columns, this.glyphs));
     if (tail.length === 0) lines.push(muted("    No output yet"));
-    lines.push(...shown.map((line) => `    ${line}`));
+    lines.push(...shown);
     while (lines.length < rows - 1) lines.push("");
     lines.length = rows - 1;
     lines.push(this.footer(columns));
@@ -1109,6 +1200,17 @@ export class Tui {
     }
     if (key.name === "up" || key.name === "down") {
       model.move(key.name === "up" ? -1 : 1);
+      this.render();
+      return;
+    }
+    if (key.name === "pageUp" || key.name === "pageDown") {
+      model.scrollOutput(key.name === "pageUp" ? 1 : -1);
+      this.render();
+      return;
+    }
+    if (key.name === "home" || key.name === "end") {
+      if (key.name === "home") model.outputToTop();
+      else model.outputToBottom();
       this.render();
       return;
     }

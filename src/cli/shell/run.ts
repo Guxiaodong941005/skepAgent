@@ -194,6 +194,7 @@ export class Shell {
         level: detectColorLevel(ctx.env, this.io.stdout.isTTY === true),
         scheme: detectScheme(ctx.env),
       }),
+      { alternateScroll: true },
     );
     if (ctx.env.SKEP_TUI_MOUSE === "1") this.screen.setMouse(true);
     this.commands = this.buildCommands();

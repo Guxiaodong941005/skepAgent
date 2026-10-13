@@ -24,7 +24,7 @@ exports[`TuiModel colors > matches the golden ascii frame with none color 1`] = 
     tail line 28⎋[K
     tail line 29⎋[K
     tail line 30⎋[K
- ⎋[1m↑↓⎋[0m⎋[2m select⎋[0m⎋[2m | ⎋[0m⎋[1mp⎋[0m⎋[2m pr⎋[0m⎋[2m | ⎋[0m⎋[1mu⎋[0m⎋[2m push⎋[0m⎋[2m | ⎋[0m⎋[1mn⎋[0m⎋[2m none⎋[0m⎋[2m | ⎋[0m⎋[1ms⎋[0m⎋[2m skip⎋[0m⎋[2m | ⎋[0m⎋[1mq⎋[0m⎋[2m quit⎋[0m                       ⎋[2m1/2⎋[0m "
+ ⎋[1m↑↓⎋[0m⎋[2m select⎋[0m⎋[2m | ⎋[0m⎋[1mpgup/pgdn⎋[0m⎋[2m output⎋[0m⎋[2m | ⎋[0m⎋[1mp⎋[0m⎋[2m pr⎋[0m⎋[2m | ⎋[0m⎋[1mu⎋[0m⎋[2m push⎋[0m⎋[2m | ⎋[0m⎋[1mn⎋[0m⎋[2m none⎋[0m⎋[2m | ⎋[0m⎋[1ms⎋[0m⎋[2m skip⎋[0m⎋[2m | ⎋[0m⎋[1mq⎋[0m⎋[2m quit⎋[0m    ⎋[2m1/2⎋[0m "
 `;
 
 exports[`TuiModel colors > matches the golden ascii frame with truecolor color 1`] = `
@@ -51,7 +51,7 @@ exports[`TuiModel colors > matches the golden ascii frame with truecolor color 1
     tail line 28⎋[K
     tail line 29⎋[K
     tail line 30⎋[K
- ⎋[38;2;255;196;48;1m↑↓⎋[0m⎋[38;2;168;173;179m select⎋[0m⎋[38;2;128;134;139m | ⎋[0m⎋[38;2;255;158;87;1mp⎋[0m⎋[38;2;168;173;179m pr⎋[0m⎋[38;2;128;134;139m | ⎋[0m⎋[38;2;255;158;87;1mu⎋[0m⎋[38;2;168;173;179m push⎋[0m⎋[38;2;128;134;139m | ⎋[0m⎋[38;2;255;158;87;1mn⎋[0m⎋[38;2;168;173;179m none⎋[0m⎋[38;2;128;134;139m | ⎋[0m⎋[38;2;255;158;87;1ms⎋[0m⎋[38;2;168;173;179m skip⎋[0m⎋[38;2;128;134;139m | ⎋[0m⎋[38;2;255;196;48;1mq⎋[0m⎋[38;2;168;173;179m quit⎋[0m                       ⎋[38;2;168;173;179m1/2⎋[0m "
+ ⎋[38;2;255;196;48;1m↑↓⎋[0m⎋[38;2;168;173;179m select⎋[0m⎋[38;2;128;134;139m | ⎋[0m⎋[38;2;255;196;48;1mpgup/pgdn⎋[0m⎋[38;2;168;173;179m output⎋[0m⎋[38;2;128;134;139m | ⎋[0m⎋[38;2;255;158;87;1mp⎋[0m⎋[38;2;168;173;179m pr⎋[0m⎋[38;2;128;134;139m | ⎋[0m⎋[38;2;255;158;87;1mu⎋[0m⎋[38;2;168;173;179m push⎋[0m⎋[38;2;128;134;139m | ⎋[0m⎋[38;2;255;158;87;1mn⎋[0m⎋[38;2;168;173;179m none⎋[0m⎋[38;2;128;134;139m | ⎋[0m⎋[38;2;255;158;87;1ms⎋[0m⎋[38;2;168;173;179m skip⎋[0m⎋[38;2;128;134;139m | ⎋[0m⎋[38;2;255;196;48;1mq⎋[0m⎋[38;2;168;173;179m quit⎋[0m    ⎋[38;2;168;173;179m1/2⎋[0m "
 `;
 
 exports[`TuiModel colors > matches the golden nerd frame with none color 1`] = `
@@ -78,7 +78,7 @@ exports[`TuiModel colors > matches the golden nerd frame with none color 1`] = `
     tail line 28⎋[K
     tail line 29⎋[K
     tail line 30⎋[K
- ⎋[1m↑↓⎋[0m⎋[2m select⎋[0m⎋[2m · ⎋[0m⎋[1mp⎋[0m⎋[2m pr⎋[0m⎋[2m · ⎋[0m⎋[1mu⎋[0m⎋[2m push⎋[0m⎋[2m · ⎋[0m⎋[1mn⎋[0m⎋[2m none⎋[0m⎋[2m · ⎋[0m⎋[1ms⎋[0m⎋[2m skip⎋[0m⎋[2m · ⎋[0m⎋[1mq⎋[0m⎋[2m quit⎋[0m                       ⎋[2m1/2⎋[0m "
+ ⎋[1m↑↓⎋[0m⎋[2m select⎋[0m⎋[2m · ⎋[0m⎋[1mpgup/pgdn⎋[0m⎋[2m output⎋[0m⎋[2m · ⎋[0m⎋[1mp⎋[0m⎋[2m pr⎋[0m⎋[2m · ⎋[0m⎋[1mu⎋[0m⎋[2m push⎋[0m⎋[2m · ⎋[0m⎋[1mn⎋[0m⎋[2m none⎋[0m⎋[2m · ⎋[0m⎋[1ms⎋[0m⎋[2m skip⎋[0m⎋[2m · ⎋[0m⎋[1mq⎋[0m⎋[2m quit⎋[0m    ⎋[2m1/2⎋[0m "
 `;
 
 exports[`TuiModel colors > matches the golden nerd frame with truecolor color 1`] = `
@@ -105,5 +105,5 @@ exports[`TuiModel colors > matches the golden nerd frame with truecolor color 1`
     tail line 28⎋[K
     tail line 29⎋[K
     tail line 30⎋[K
- ⎋[38;2;255;196;48;1m↑↓⎋[0m⎋[38;2;168;173;179m select⎋[0m⎋[38;2;128;134;139m · ⎋[0m⎋[38;2;255;158;87;1mp⎋[0m⎋[38;2;168;173;179m pr⎋[0m⎋[38;2;128;134;139m · ⎋[0m⎋[38;2;255;158;87;1mu⎋[0m⎋[38;2;168;173;179m push⎋[0m⎋[38;2;128;134;139m · ⎋[0m⎋[38;2;255;158;87;1mn⎋[0m⎋[38;2;168;173;179m none⎋[0m⎋[38;2;128;134;139m · ⎋[0m⎋[38;2;255;158;87;1ms⎋[0m⎋[38;2;168;173;179m skip⎋[0m⎋[38;2;128;134;139m · ⎋[0m⎋[38;2;255;196;48;1mq⎋[0m⎋[38;2;168;173;179m quit⎋[0m                       ⎋[38;2;168;173;179m1/2⎋[0m "
+ ⎋[38;2;255;196;48;1m↑↓⎋[0m⎋[38;2;168;173;179m select⎋[0m⎋[38;2;128;134;139m · ⎋[0m⎋[38;2;255;196;48;1mpgup/pgdn⎋[0m⎋[38;2;168;173;179m output⎋[0m⎋[38;2;128;134;139m · ⎋[0m⎋[38;2;255;158;87;1mp⎋[0m⎋[38;2;168;173;179m pr⎋[0m⎋[38;2;128;134;139m · ⎋[0m⎋[38;2;255;158;87;1mu⎋[0m⎋[38;2;168;173;179m push⎋[0m⎋[38;2;128;134;139m · ⎋[0m⎋[38;2;255;158;87;1mn⎋[0m⎋[38;2;168;173;179m none⎋[0m⎋[38;2;128;134;139m · ⎋[0m⎋[38;2;255;158;87;1ms⎋[0m⎋[38;2;168;173;179m skip⎋[0m⎋[38;2;128;134;139m · ⎋[0m⎋[38;2;255;196;48;1mq⎋[0m⎋[38;2;168;173;179m quit⎋[0m    ⎋[38;2;168;173;179m1/2⎋[0m "
 `;

@@ -313,6 +313,22 @@ describe("peer progress glyphs", () => {
 });
 
 describe("decodeKeys", () => {
+  it("decodes page keys and Home/End; carries a sequence split across chunks", () => {
+    expect(decodeKeys("\x1b[5~\x1b[6~\x1b[H\x1b[F\x1b[1~\x1b[4~\x1bOH")).toEqual([
+      { name: "pageUp" },
+      { name: "pageDown" },
+      { name: "home" },
+      { name: "end" },
+      { name: "home" },
+      { name: "end" },
+      { name: "home" },
+    ]);
+    const carry = { rest: "" };
+    expect(decodeKeys("x\x1b[5", carry)).toEqual([{ name: "char", char: "x" }]);
+    expect(decodeKeys("~", carry)).toEqual([{ name: "pageUp" }]);
+    expect(decodeKeys("\x1b", carry)).toEqual([{ name: "other" }]);
+  });
+
   it("decodes arrows, Enter, q, Ctrl-C and letters; swallows unknown escapes", () => {
     expect(decodeKeys("\x1b[A\x1b[B\x1bOA\r\nqx\x03A\x1b[1;5C7")).toEqual([
       { name: "up" },
@@ -592,6 +608,46 @@ describe("peer progress ticker", () => {
 describe("TuiJoinView frames", () => {
   const HIVE = "\u{F10CE}";
 
+  it("pages the OUTPUT pane with PgUp/PgDn, Home and End (S7)", () => {
+    const term = fakeTerminal();
+    const view = open(term);
+    const tail = Array.from({ length: 40 }, (_, i) => `line ${i + 1}`).join("\n");
+    view.update(model({ state: "running", tail }));
+    expect(term.frame()[7]).toMatch(/last 15 of 40/);
+    term.press("\x1b[5~");
+    expect(term.frame()[7]).toMatch(/rows 12-26 of 40 · End follows/);
+    expect(term.frame()[8]).toBe("    line 12");
+    term.press("\x1b[H");
+    expect(term.frame()[8]).toBe("    line 1");
+    // New output while paged up does not move the view.
+    view.update(model({ state: "running", tail: `${tail}\nline 41` }));
+    expect(term.frame()[8]).toBe("    line 1");
+    term.press("\x1b[6~\x1b[6~\x1b[6~");
+    expect(term.frame()[7]).toMatch(/last 15 of 41/);
+    term.press("\x1b[H\x1b[F");
+    expect(term.frame()[22]).toBe("    line 41");
+    view.close();
+  });
+
+  it("wraps a long OUTPUT line instead of cutting it (S7)", () => {
+    const term = fakeTerminal();
+    const view = open(term);
+    const words = Array.from({ length: 40 }, (_, n) => `w${String(n).padStart(2, "0")}`);
+    view.update(model({ state: "running", tail: words.join(" ") }));
+    const frame = term.frame();
+    expect(frame.join(" ").match(/w\d{2}/g)).toEqual(words);
+    for (const line of frame) expect(line.endsWith("…")).toBe(false);
+    view.close();
+  });
+
+  it("never turns on alternate-scroll: arrows select entries here", () => {
+    const term = fakeTerminal();
+    const view = open(term);
+    view.update(model({ state: "running" }));
+    expect(term.output()).not.toContain("\x1b[?1007h");
+    view.close();
+  });
+
   it("draws the header, peers, item, agent, tail and footer at 80×24", () => {
     const term = fakeTerminal();
     const view = open(term);
@@ -616,7 +672,7 @@ describe("TuiJoinView frames", () => {
     expect(frame.slice(8, 23)).toEqual(
       Array.from({ length: 15 }, (_, i) => `    line ${40 - 15 + i + 1}`),
     );
-    expect(frame[23]?.trim()).toBe("q quit");
+    expect(frame[23]?.trim()).toBe("pgup/pgdn output · q quit");
     // Every rule spans the width; every line fits; the footer is padded to it.
     for (const at of [1, 3, 7]) expect(width(frame[at] ?? "")).toBe(80);
     for (const line of frame) expect(width(line)).toBeLessThanOrEqual(80);
@@ -1066,7 +1122,7 @@ describe("TuiJoinView keys", () => {
 
     view.resume();
     expect(term.rawModes()).toEqual([true, false, true]);
-    const reentered = term.output().lastIndexOf(`${ENTER_ALT}\x1b[?25l\x1b[?1007h\x1b[2J\x1b[H`);
+    const reentered = term.output().lastIndexOf(`${ENTER_ALT}\x1b[?25l\x1b[2J\x1b[H`);
     expect(reentered).toBeGreaterThan(term.output().lastIndexOf(LEAVE_ALT));
     expect(term.frame()[23]?.trim()).toBe("q quit");
     view.close();
