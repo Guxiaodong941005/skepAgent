@@ -37,6 +37,9 @@ Locked decisions in one line each (§9 has the verbatim answers):
   (phase, progress line, blocked notices, results) always flows.
 * Phase 3: **no per-peer follow-up from a panel** for now; input always goes to the master.
 * Phase 3: **no real herdr split screen**, not even on one machine; Skep's own panels only.
+* ORCH-6: `/share-output on` lasts for the **current session only**; live output is **≤20 lines
+  / 2 KB per frame, at most once per 500 ms**; the **changed-files list** joins the key
+  information that always reaches the master (§9.9–§9.11).
 
 Normative sources: `docs/PRD-v0.4.md` (product), `docs/ARCHITECTURE.md` (D27–D31 especially),
 prior plans `unified-tui-shell.md`, `tui-session-reliability.md`, `session-ux-rethink.md`,
@@ -663,11 +666,12 @@ is redistributed below; the herdr runtime restore is dropped (§9.8).
   v1); peer version reporting; intents sent only to targeted peers instead of broadcast; briefs
   >4000; structured result details (changed files, checks, last agent message). Plus an
   **opt-in live output stream** (§9.6): a peer sends a redacted, control-stripped, bounded tail
-  (proposed ≤20 lines / 2 KB per frame, coalesced like progress at 500 ms) **only when its human
-  opted in** (`/share-output on` on the peer, default **off**, not persisted beyond the session
-  unless chosen); the master's peer panel shows it. Off or on, phase changes, blocked notices
-  and results always flow. Needs a D27 amendment written with the code. Peer-level routing is
-  **not** part of v2 (§9.7).
+  (≤20 lines / 2 KB per frame, at most once per 500 ms, locked §9.10) **only when its human
+  opted in** (`/share-output on` on the peer, default **off**, for the current session only and
+  never remembered on the device, locked §9.9); the master's peer panel shows it. Off or on,
+  phase changes, the 120-character progress line, blocked notices, results and — new in v2 —
+  the **changed-files list** of each result always flow (locked §9.11). Needs a D27 amendment
+  written with the code. Peer-level routing is **not** part of v2 (§9.7).
 * **ORCH-7 — multi-peer orchestration in panels.** Per-repo briefs (one intent per target,
   grouped under one orchestration); synthesis across groups; partial-failure wording; the
   orchestration's phases and summary shown in the master panel with each brief and result
@@ -750,6 +754,27 @@ recorded verbatim and are normative for every phase.
    panels?
    **Answered — locked:** "Same-machine: **no real herdr split-screen**; Skep's own panels only."
    Applied: §4 (Phase 3 is option A only), §7 (ORCH-8 dropped), §8.
+
+ORCH-6 follow-up questions, answered by the human on 2026-10-13 (verbatim, normative):
+
+9. **Q:** Does `/share-output on` on a peer apply to the current session only, or is it
+   remembered on the device?
+   **Answered — locked:** "`/share-output on` applies to the current session only (not
+   remembered on the device)."
+   Applied: §7 Phase 3 ORCH-6 (the opt-in lives on the join; every new join starts with it off;
+   nothing is written to `device.toml`).
+10. **Q:** Live output limits: about 20 lines / 2 KB per frame, at most once per 500 ms?
+    **Answered — locked:** "Live output limits of about 20 lines / 2KB, at most once per 500ms:
+    OK."
+    Applied: §7 Phase 3 ORCH-6 (≤20 lines and ≤2048 UTF-8 bytes per `output` frame, at most one
+    frame per 500 ms per peer, enforced by the sending peer and checked by the master).
+11. **Q:** Which key information must always reach the master, whatever the live-output
+    setting?
+    **Answered — locked:** "Key info that must reach master: yes, ADD the changed-files list (in
+    addition to phase, 120-char status, blocked, final result)."
+    Applied: §7 Phase 3 ORCH-6 (a v2 `result` carries a structured changed-files list; phase,
+    the 120-character progress line, blocked and the ≤4000 redacted result keep flowing as
+    today, live output on or off).
 
 ---
 
