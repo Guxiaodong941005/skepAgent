@@ -805,6 +805,30 @@ describe("unified shell", () => {
     await h.shell.quit();
   });
 
+  it("folds a long result in the main panel; /expand shows it whole (ORCH-7)", async () => {
+    const h = await harness();
+    await h.shell.submit("/start --yes --repo app");
+    const lines = Array.from({ length: 20 }, (_, n) => `  part ${n}`);
+    const onEvent = h.fake.calls.master[0]?.onEvent;
+    onEvent?.({ kind: "item-result", message: `I-7 done · mac (app)\n${lines.join("\n")}` });
+    expect(h.frame()).toContain("13 more lines · /expand I-7");
+    expect(h.frame()).not.toContain("part 19");
+    onEvent?.({ kind: "item-failed", message: `I-8 FAILED · mac (app)\n${lines.join("\n")}` });
+    // A failure is never folded: its cause is the point (SESSION-UX §3.4).
+    expect(h.frame()).not.toContain("/expand I-8");
+    expect(h.frame()).toContain("part 19");
+    await h.shell.submit("/expand I-8");
+    expect(h.scrollback()).toContain("nothing to expand: I-8 is not a folded result");
+    // Bare /expand opens the newest folded result.
+    await h.shell.submit("/expand");
+    await h.shell.submit("/expand I-7");
+    expect(h.scrollback()).toContain("nothing to expand: I-7 is already shown whole");
+    await h.shell.submit("/fold all");
+    await h.shell.submit("/bottom");
+    expect(h.shell.model.setExpanded("I-7", true)).toEqual(["I-7"]);
+    await h.shell.quit();
+  });
+
   it.each(["own", "other process"])(
     "bare /join discovers the %s master in the same default project home",
     async (owner) => {

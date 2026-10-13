@@ -8,7 +8,11 @@
  */
 
 import {
+  type DispatchOutcome,
+  describeOutcome,
+  groupBrief,
   type OrchestrationEvent,
+  type OrchestrationGroup,
   type OrchestrationItem,
   type OrchestrationMode,
   type OrchestrationState,
@@ -35,6 +39,12 @@ export const RESEED_HISTORY = 3;
 
 export type OrchestratorTone = "info" | "event" | "warn" | "error" | "muted";
 
+/** Where a line shows besides the main panel: a peer's panel (ORCH-5), or only there. */
+export interface ShowPlace {
+  peer: string;
+  panelOnly?: boolean;
+}
+
 export type ConfirmAnswer =
   | { action: "send" }
   | { action: "edit"; text: string }
@@ -46,8 +56,11 @@ export interface OrchestratorDeps {
   /** Null disables the ledger (and with it re-seeding and /history). */
   ledger: Ledger | null;
   peers(): PeerTarget[];
-  /** Sends the brief through the shell's intent route; resolves with the intent ids. */
-  dispatch(text: string): Promise<string[]>;
+  /**
+   * Sends one intent through the shell's intent route; resolves with its id. Without `repos` the
+   * route (and its picker) places it; with them it goes to exactly those repos.
+   */
+  dispatch(text: string, repos?: string[]): Promise<string>;
   /** The items of `intentIds` as the master reports them now; null when unknown. */
   items(intentIds: readonly string[]): OrchestrationItem[] | null;
   /**
@@ -57,7 +70,7 @@ export interface OrchestratorDeps {
   guard(): Promise<() => Promise<string[]>>;
   ask(question: string): Promise<string | null>;
   confirm(brief: { title: string; text: string }): Promise<ConfirmAnswer>;
-  show(text: string, tone: OrchestratorTone, gutter?: string): void;
+  show(text: string, tone: OrchestratorTone, gutter?: string, place?: ShowPlace): void;
   /** A phase changed: redraw the footer. */
   changed?(): void;
 }
@@ -69,6 +82,8 @@ interface Run {
   phaseSinceMs: number;
   qa: { question: string; answer: string }[];
   abort: AbortController;
+  /** Items whose peer was already named, so each brief is linked to its panel once. */
+  linked: Set<string>;
   /** The effect loop is running; events from outside only reduce. */
   busy: boolean;
   /** Ledger writes of this run, in order: a late write must never overwrite a newer state. */
@@ -112,6 +127,7 @@ export class Orchestrator {
       phaseSinceMs: now,
       qa: [],
       abort: new AbortController(),
+      linked: new Set(),
       busy: false,
       writes: Promise.resolve(),
       finished,
@@ -145,6 +161,7 @@ export class Orchestrator {
       if (items === null || sameItems(items, run.state.items)) continue;
       const before = run.state.phase;
       this.apply(run, { type: "itemsChanged", items });
+      this.link(run);
       if (run.state.phase === "stalled" && before !== "stalled") {
         const waiting = run.state.items.filter((item) => item.verdict === "pending");
         this.deps.show(
@@ -165,7 +182,10 @@ export class Orchestrator {
       return `${id} is ${run.state.phase}; /summarize applies while it waits for peers`;
     }
     const items = this.deps.items(run.state.intentIds);
-    if (items !== null) this.apply(run, { type: "itemsChanged", items });
+    if (items !== null) {
+      this.apply(run, { type: "itemsChanged", items });
+      this.link(run);
+    }
     this.apply(run, { type: "summarizeNow" });
     if (phaseOf(run) !== "synthesizing") return `${id} has no results yet`;
     void this.drive(run);
@@ -228,6 +248,7 @@ export class Orchestrator {
         const event = await this.effect(run);
         if (event === null) break;
         this.apply(run, event);
+        if (event.type === "itemsChanged") this.link(run);
       }
     } catch (error) {
       // An effect that throws is a bug or a dead dependency: the request fails visibly.
@@ -333,20 +354,68 @@ export class Orchestrator {
     return { type: "confirmed" };
   }
 
+  /**
+   * One intent per group (ORCH-7): a group with a repo goes to exactly that repo, the single
+   * group without one goes where the route and picker place it. A group that cannot be sent does
+   * not stop the others; the synthesis names it.
+   */
   private async dispatchBrief(run: Run): Promise<OrchestrationEvent> {
-    const brief = run.state.brief;
-    if (brief === null) return { type: "dispatchFailed", cause: "no brief" };
-    if (run.state.mode === "auto") this.showBrief(run, "brief → peers");
-    try {
-      const intentIds = await this.deps.dispatch(briefText(brief.title, brief.text));
-      if (intentIds.length === 0) return { type: "dispatchFailed", cause: "nothing was sent" };
-      this.deps.show(
-        `${run.state.id} sent as intent ${intentIds.join(", ")}; waiting for the peers`,
-        "event",
+    const { state } = run;
+    if (state.brief === null || state.groups.length === 0) {
+      return { type: "dispatchFailed", cause: "no brief" };
+    }
+    if (state.mode === "auto") this.showBrief(run, "brief → peers");
+    const outcomes: DispatchOutcome[] = [];
+    for (const group of state.groups) {
+      if (run.abort.signal.aborted) return { type: "cancelled" };
+      const brief = groupBrief(state, group);
+      try {
+        const intentId = await this.deps.dispatch(
+          briefText(brief.title, brief.text),
+          group.repo === null ? undefined : [group.repo],
+        );
+        outcomes.push({ intentId });
+      } catch (error) {
+        outcomes.push({ error: errorMessage(error) });
+      }
+    }
+    const sent = outcomes.flatMap((outcome, index) =>
+      "intentId" in outcome ? [`${groupLabel(state.groups[index])}intent ${outcome.intentId}`] : [],
+    );
+    if (sent.length > 0) {
+      const failed = outcomes.flatMap((outcome, index) =>
+        "error" in outcome ? [`${state.groups[index]?.repo ?? "brief"}: ${outcome.error}`] : [],
       );
-      return { type: "dispatched", intentIds };
-    } catch (error) {
-      return { type: "dispatchFailed", cause: errorMessage(error) };
+      const of = state.groups.length > 1 ? ` ${sent.length} of ${state.groups.length}` : "";
+      this.deps.show(
+        `${state.id} sent${of} as ${sent.join(", ")}; waiting for the peers` +
+          (failed.length === 0 ? "" : `\nnot sent: ${failed.join("; ")}`),
+        failed.length === 0 ? "event" : "warn",
+      );
+    }
+    return { type: "dispatched", outcomes };
+  }
+
+  /**
+   * Names the peer that took each new item, in the main panel, and puts the brief it works on
+   * into that peer's panel, so a brief, its peer and its result read together (ORCH-7).
+   */
+  private link(run: Run): void {
+    const { state } = run;
+    for (const item of state.items) {
+      if (item.peerId === undefined || run.linked.has(item.itemId)) continue;
+      run.linked.add(item.itemId);
+      const group = state.groups.find((entry) => entry.intentId === item.intentId);
+      const peer = `${item.peerId}${item.device === undefined ? "" : ` (${item.device})`}`;
+      this.deps.show(
+        `${state.id} ${item.itemId} (${item.repo}) → ${peer}; its panel shows the brief and progress`,
+        "muted",
+      );
+      if (group === undefined) continue;
+      const brief = groupBrief(state, group);
+      const place = { peer: item.peerId, panelOnly: true };
+      this.deps.show(`${state.id} ${item.itemId} brief:`, "event", undefined, place);
+      this.deps.show(briefText(brief.title, brief.text), "info", "  │ ", place);
     }
   }
 
@@ -358,8 +427,17 @@ export class Orchestrator {
     );
     const prompt = synthesisPrompt({
       userText: state.userText,
-      brief: state.brief === null ? "(none)" : briefText(state.brief.title, state.brief.text),
+      groups: state.groups.map((group) => {
+        const brief = groupBrief(state, group);
+        return {
+          repo: group.repo,
+          intentId: group.intentId,
+          error: group.error,
+          text: briefText(brief.title, brief.text),
+        };
+      }),
       items: state.items,
+      outcome: describeOutcome(state),
     });
     try {
       return { type: "synthesized", text: await this.turn(run, prompt) };
@@ -437,15 +515,26 @@ export class Orchestrator {
       .map((record) => historyLine(record.state));
   }
 
+  /** Every brief in full (locked §9.1: auto shows what leaves the device), one per group. */
   private showBrief(run: Run, label: string): void {
-    const brief = run.state.brief;
-    if (brief === null) return;
-    this.deps.show(`${run.state.id} ${label}:`, "event");
-    this.deps.show(briefText(brief.title, brief.text), "info", "  │ ");
+    const { state } = run;
+    if (state.brief === null) return;
+    for (const group of state.groups) {
+      const brief = groupBrief(state, group);
+      const repo = group.repo === null ? "" : ` (repo ${group.repo})`;
+      this.deps.show(`${state.id} ${label}${repo}:`, "event");
+      this.deps.show(briefText(brief.title, brief.text), "info", "  │ ");
+    }
   }
 
   private finish(run: Run): void {
     const { state } = run;
+    // Skep's own tally first: every outcome is named even when the agent's summary is not.
+    const outcome = describeOutcome(state);
+    const partial =
+      state.groups.some((group) => group.error !== null) ||
+      state.items.some((item) => item.verdict !== "done");
+    this.deps.show(`${state.id} outcome: ${outcome}`, partial ? "warn" : "event");
     if (state.synthesis !== null) {
       this.deps.show(`${state.id} summary:`, "event");
       this.deps.show(state.synthesis, "info", "  │ ");
@@ -507,6 +596,11 @@ function phaseOf(run: Run): OrchestrationState["phase"] {
 
 function sameItems(a: readonly OrchestrationItem[], b: readonly OrchestrationItem[]): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
+}
+
+/** `web → ` for a group with a target repo; nothing for the single brief. */
+function groupLabel(group: OrchestrationGroup | undefined): string {
+  return group === undefined || group.repo === null ? "" : `${group.repo} → `;
 }
 
 function oneLine(text: string): string {

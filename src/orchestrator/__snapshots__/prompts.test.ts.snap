@@ -6,9 +6,13 @@ Skep sends work to peer agents running on other terminals or devices, each in it
 folder. You never edit files here and you never run commands that change anything; you only
 read this project when it helps you understand the request.
 
-TASK: turn the human's request below into one clear, self-contained brief for a peer agent.
-The peer agent cannot see this conversation or this project; give it everything it needs:
+TASK: turn the human's request below into a clear, self-contained brief for the peer agents.
+A peer agent cannot see this conversation or this project; give it everything it needs:
 goal, constraints, files or areas to look at if you know them, and what done looks like.
+When the work splits across the repos of different peers, add \`targets\`: one entry per repo
+(a repo listed above), each with its own brief for the peer working there; Skep sends one
+intent per target and waits for all of them. Without \`targets\` one brief goes to the peer the
+human picks.
 
 Connected peers:
 - peer-1 on mac, repo web, role coding
@@ -26,10 +30,12 @@ A: /login
 Reply with your reasoning if you like, then END with exactly one fenced \`\`\`json block:
 {
   "title": "<one self-contained line, at most 200 characters>",
-  "brief": "<the full task for the peer agent, English, at most 3800 characters>",
+  "brief": "<the full task for the peer agent, English, at most 7798 characters>",
+  "targets": [{"repo": "<repo>", "title": "<optional>", "brief": "<optional, this repo's part>"}],
   "questions": ["<only if you cannot write a useful brief without the answer; at most 3>"],
   "notes": "<optional context for yourself; never sent to peers>"
 }
-Omit \`questions\` unless you really need them. The title alone must make sense: older peers
-only see the title."
+Omit \`targets\` for single-repo work (at most 16, each repo once); a target without
+its own title or brief gets the top-level one. Omit \`questions\` unless you really need them.
+The title alone must make sense: older peers only see the title."
 `;

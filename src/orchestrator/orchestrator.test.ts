@@ -6,7 +6,12 @@ import type { OrchestrationItem } from "../core/orchestration/reducer.js";
 import type { Clock } from "../util/clock.js";
 import { Ledger } from "./ledger.js";
 import { MASTER_CONTEXT_MAX_CHARS, type MasterAgent, MasterAgentError } from "./master-agent.js";
-import { type ConfirmAnswer, Orchestrator, type OrchestratorDeps } from "./orchestrator.js";
+import {
+  type ConfirmAnswer,
+  Orchestrator,
+  type OrchestratorDeps,
+  type ShowPlace,
+} from "./orchestrator.js";
 
 const clock: Clock = {
   monotonicMs: () => 1_000,
@@ -58,8 +63,9 @@ function harness(
     answers?: (string | null)[];
   } = {},
 ) {
-  const shown: { text: string; tone: string }[] = [];
+  const shown: { text: string; tone: string; place?: ShowPlace }[] = [];
   const dispatched: string[] = [];
+  const dispatchedRepos: (string[] | undefined)[] = [];
   let items: OrchestrationItem[] | null = null;
   const answers = extra.answers ?? [];
   const deps: OrchestratorDeps = {
@@ -67,15 +73,17 @@ function harness(
     clock,
     ledger: null,
     peers: () => [{ peerId: "peer-1", device: "mac", repo: "app", role: "coding" }],
-    dispatch: async (text) => {
+    dispatch: async (text, repos) => {
       dispatched.push(text);
-      return [`intent-${dispatched.length}`];
+      dispatchedRepos.push(repos);
+      return `intent-${dispatched.length}`;
     },
     items: () => items,
     guard: async () => async () => [],
     ask: async () => answers.shift() ?? null,
     confirm: async () => extra.confirmWith ?? { action: "send" },
-    show: (text, tone) => shown.push({ text, tone }),
+    show: (text, tone, _gutter, place) =>
+      shown.push({ text, tone, ...(place === undefined ? {} : { place }) }),
     ...extra,
   };
   const orchestrator = new Orchestrator(deps);
@@ -83,7 +91,18 @@ function harness(
     orchestrator,
     shown,
     dispatched,
-    text: () => shown.map((line) => line.text).join("\n"),
+    dispatchedRepos,
+    /** What the main panel shows: panel-only lines are left out. */
+    text: () =>
+      shown
+        .filter((line) => line.place?.panelOnly !== true)
+        .map((line) => line.text)
+        .join("\n"),
+    panel: (peer: string) =>
+      shown
+        .filter((line) => line.place?.peer === peer)
+        .map((line) => line.text)
+        .join("\n"),
     setItems(next: OrchestrationItem[]) {
       items = next;
       orchestrator.poll();
@@ -262,5 +281,139 @@ describe("Orchestrator (plan §3.2)", () => {
     expect(h.orchestrator.cancel(id)).toBeNull();
     expect(h.text()).toContain(`${id} cancelled here; intent intent-1 keeps running on the peers`);
     expect(h.orchestrator.active()).toEqual([]);
+  });
+
+  describe("multi-peer (ORCH-7)", () => {
+    const SPLIT =
+      "```json\n" +
+      JSON.stringify({
+        title: "Remember the last user",
+        brief: "Shared context: the login page should remember the last user.",
+        targets: [
+          { repo: "web", brief: "Prefill the login form from localStorage." },
+          { repo: "api", title: "Expose the last user", brief: "Add GET /last-user." },
+          { repo: "docs" },
+        ],
+      }) +
+      "\n```";
+    const peers = () => [
+      { peerId: "peer-1", device: "mac", repo: "web", role: "coding" },
+      { peerId: "peer-2", device: "vps", repo: "api", role: "coding" },
+    ];
+    /** docs has no peer: its intent is refused like `/intent --repo docs` would be. */
+    const dispatch =
+      (sent: { text: string; repos?: string[] }[]) => async (text: string, repos?: string[]) => {
+        if (repos?.[0] === "docs")
+          throw new Error("None of the 2 connected peer(s) works on repo docs");
+        sent.push({ text, ...(repos === undefined ? {} : { repos }) });
+        return `N-${sent.length}`;
+      };
+    const web = (verdict: OrchestrationItem["verdict"], summary?: string): OrchestrationItem => ({
+      intentId: "N-1",
+      itemId: "I-1",
+      verdict,
+      repo: "web",
+      device: "mac",
+      peerId: "peer-1",
+      ...(summary === undefined ? {} : { summary }),
+    });
+    const api = (verdict: OrchestrationItem["verdict"], summary?: string): OrchestrationItem => ({
+      intentId: "N-2",
+      itemId: "I-2",
+      verdict,
+      repo: "api",
+      device: "vps",
+      peerId: "peer-2",
+      ...(summary === undefined ? {} : { summary }),
+    });
+
+    it("sends one intent per target repo, names what was not sent, and synthesizes across groups", async () => {
+      const agent = new FakeAgent([SPLIT, "web is done; api failed its tests; docs had no peer."]);
+      const sent: { text: string; repos?: string[] }[] = [];
+      const h = harness(agent, { peers, dispatch: dispatch(sent) });
+      const { id, done: finished } = h.orchestrator.start("remember the last user", "auto");
+      await vi.waitFor(() => expect(h.orchestrator.get(id)?.phase).toBe("awaiting"));
+      expect(sent).toEqual([
+        {
+          text: "Remember the last user\n\nPrefill the login form from localStorage.",
+          repos: ["web"],
+        },
+        { text: "Expose the last user\n\nAdd GET /last-user.", repos: ["api"] },
+      ]);
+      // Every brief is shown in full before it leaves (locked §9.1), one per repo.
+      expect(h.text()).toContain(`${id} brief → peers (repo web):`);
+      expect(h.text()).toContain(`${id} brief → peers (repo docs):`);
+      expect(h.text()).toContain(
+        `${id} sent 2 of 3 as web → intent N-1, api → intent N-2; waiting for the peers\n` +
+          "not sent: docs: None of the 2 connected peer(s) works on repo docs",
+      );
+
+      h.setItems([web("running"), api("running")]);
+      // Each brief is linked to the peer that took it, and lands in that peer's panel.
+      expect(h.text()).toContain(
+        `${id} I-1 (web) → peer-1 (mac); its panel shows the brief and progress`,
+      );
+      expect(h.panel("peer-2")).toBe(
+        `${id} I-2 brief:\nExpose the last user\n\nAdd GET /last-user.`,
+      );
+      expect(h.panel("peer-1")).toContain("Prefill the login form");
+      expect(h.text()).not.toContain("I-2 brief:");
+
+      h.setItems([web("done", "prefilled"), api("failed", "cause: tests failed")]);
+      const state = await finished;
+      expect(state.phase).toBe("done");
+      const synth = agent.turns[1]?.prompt ?? "";
+      expect(synth).toContain(
+        "The brief you sent for repo web:\n<<<BRIEF\nRemember the last user\n\nPrefill",
+      );
+      expect(synth).toMatch(/Intent N-2 for repo api:\n<<<RESULT I-2 · failed · vps \(api\)/);
+      expect(synth).toContain(
+        "It was NOT sent: None of the 2 connected peer(s) works on repo docs.",
+      );
+      expect(synth).toContain(
+        "Skep's tally: 1 of 2 done: I-1 web on mac; 1 failed: I-2 api on vps; not sent: docs",
+      );
+      expect(synth).toContain("do not call the request done while a part failed");
+      const outcome = h.shown.find((line) => line.text.startsWith(`${id} outcome:`));
+      expect(outcome).toMatchObject({ tone: "warn" });
+      expect(h.text()).toContain(`${id} summary:\nweb is done; api failed its tests`);
+      // A link is said once per item, however often the items change.
+      expect(h.text().match(/I-1 \(web\) → peer-1/g)).toHaveLength(1);
+    });
+
+    it("a blocked peer stalls the group; /summarize names the waiting item", async () => {
+      const agent = new FakeAgent([SPLIT, "summary"]);
+      const h = harness(agent, { peers, dispatch: dispatch([]) });
+      const { id } = h.orchestrator.start("x", "auto");
+      await vi.waitFor(() => expect(h.orchestrator.get(id)?.phase).toBe("awaiting"));
+      h.setItems([web("done", "ok"), api("pending", "approve the migration")]);
+      expect(h.orchestrator.get(id)?.phase).toBe("stalled");
+      expect(h.orchestrator.summarize(id)).toBeNull();
+      await vi.waitFor(() => expect(h.orchestrator.get(id)?.phase).toBe("done"));
+      expect(agent.turns[1]?.prompt).toContain("1 waiting for a human: I-2 api on vps");
+    });
+
+    it("nothing sent fails the request with each repo's cause", async () => {
+      const h = harness(new FakeAgent([SPLIT]), {
+        peers,
+        dispatch: async () => {
+          throw new Error("no peers");
+        },
+      });
+      const state = await h.orchestrator.start("x", "auto").done;
+      expect(state.failure).toEqual({
+        stage: "dispatch",
+        cause: "web: no peers; api: no peers; docs: no peers",
+      });
+      expect(h.text()).toContain("dispatch failed: web: no peers; api: no peers; docs: no peers");
+    });
+
+    it("without targets the single brief goes where the route places it", async () => {
+      const h = harness(new FakeAgent([BRIEF]));
+      h.orchestrator.start("x", "auto");
+      await vi.waitFor(() => expect(h.dispatched).toHaveLength(1));
+      expect(h.dispatchedRepos).toEqual([undefined]);
+      expect(h.text()).toContain("sent as intent intent-1; waiting for the peers");
+    });
   });
 });

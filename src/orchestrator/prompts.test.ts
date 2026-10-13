@@ -21,7 +21,8 @@ describe("master agent prompts", () => {
     const prompt = synthesisPrompt(
       {
         userText: "u",
-        brief: "b",
+        groups: [{ repo: null, intentId: "i", error: null, text: "b" }],
+        outcome: "1 of 2 done: I-1 web on mac; 1 failed: I-2 api on ?",
         items: [
           {
             intentId: "i",

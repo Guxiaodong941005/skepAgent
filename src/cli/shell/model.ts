@@ -52,6 +52,8 @@ export { wrapLine } from "./transcript.js";
 
 export const MAX_BEE_ROWS = 3;
 export const MAX_MENU_ROWS = 6;
+/** Lines of a folded block (an item result) the main view shows before `/expand` (ORCH-7). */
+export const FOLD_LINES = 8;
 /** Below this the shell cannot show the input and footer, so only a notice is drawn. */
 export const SHELL_MIN_ROWS = Math.min(10, MIN_ROWS);
 
@@ -126,29 +128,86 @@ export class ShellModel {
   private bodyHeight = 0;
   private readonly mainRows: TranscriptRows;
   private readonly panels = new Map<string, PeerPanel>();
+  /** Folded blocks the human expanded with `/expand` (ORCH-7). */
+  private readonly expanded = new Set<string>();
+  /** Keys of blocks that were folded, oldest first. */
+  private readonly foldable: string[] = [];
 
   constructor(transcript: Transcript = new Transcript()) {
     this.transcript = transcript;
-    // A peer's progress timeline belongs to its panel only; the main view stays as it was.
-    this.mainRows = new TranscriptRows(transcript, (entry) => entry.panelOnly !== true);
+    // A peer's progress timeline belongs to its panel only; folded rest lines wait for /expand.
+    this.mainRows = new TranscriptRows(transcript, (entry) => this.inMain(entry));
   }
 
-  /** The main view's retained entries, oldest first (the drop marker is not one). */
+  private inMain(entry: TranscriptEntry): boolean {
+    if (entry.panelOnly === true) return false;
+    if (entry.fold === undefined || entry.foldPart === undefined) return true;
+    const open = this.expanded.has(entry.fold);
+    return entry.foldPart === "rest" ? open : !open;
+  }
+
+  /** The main view's retained entries, oldest first, unfolded (no marker, no fold hints). */
   get scrollback(): readonly { text: string; tone: ShellTone }[] {
     return this.transcript
       .entries()
-      .filter((entry) => entry.panelOnly !== true)
+      .filter((entry) => entry.panelOnly !== true && entry.foldPart !== "hint")
       .map((entry) => ({ text: `${entry.gutter ?? ""}${entry.text}`, tone: entry.tone }));
   }
 
   /**
    * Appends one or more lines; a multi-line text becomes several entries. A pinned reader keeps
    * the same rows: the anchor names an entry, so output below never moves the view (§5.1).
+   *
+   * With `tag.fold` a block longer than {@link FOLD_LINES} shows only its head in the main view,
+   * then one hint line; `/expand <key>` shows the rest. Peer panels always show it whole.
    */
   append(text: string, tone: ShellTone = "info", gutter?: string, tag?: EntryTag): void {
-    for (const line of text.replace(/\n+$/, "").split("\n")) {
-      this.transcript.append(line, tone, gutter, tag);
+    const lines = text.replace(/\n+$/, "").split("\n");
+    const key = tag?.fold;
+    if (key === undefined || lines.length <= FOLD_LINES + 1) {
+      // A short block stays whole; its key without a fold part changes nothing.
+      for (const line of lines) this.transcript.append(line, tone, gutter, tag);
+      return;
     }
+    if (!this.foldable.includes(key)) this.foldable.push(key);
+    const where = tag?.peer === undefined ? "" : ` or the ${tag.peer} panel`;
+    lines.forEach((line, index) => {
+      if (index === FOLD_LINES) {
+        const more = lines.length - FOLD_LINES;
+        this.transcript.append(`… ${more} more lines · /expand ${key}${where}`, "muted", gutter, {
+          fold: key,
+          foldPart: "hint",
+        });
+      }
+      const part = index < FOLD_LINES ? {} : { foldPart: "rest" as const };
+      this.transcript.append(line, tone, gutter, { ...tag, ...part });
+    });
+  }
+
+  /** `key` names a block the main view folds (expanded or not). */
+  hasFold(key: string): boolean {
+    return this.foldable.includes(key);
+  }
+
+  /**
+   * Shows (or folds again) a block in the main view. `key` null means the newest folded block;
+   * `all` every one. Returns the keys it changed, empty when `key` names no folded block.
+   */
+  setExpanded(key: string | null, open: boolean): string[] {
+    const changes = (entry: string) => this.expanded.has(entry) !== open;
+    const keys =
+      key === "all"
+        ? this.foldable.filter(changes)
+        : [key ?? this.foldable.findLast(changes)].filter(
+            (entry): entry is string =>
+              entry !== undefined && this.foldable.includes(entry) && changes(entry),
+          );
+    for (const entry of keys) {
+      if (open) this.expanded.add(entry);
+      else this.expanded.delete(entry);
+    }
+    if (keys.length > 0) this.mainRows.refilter();
+    return keys;
   }
 
   /**
@@ -246,7 +305,10 @@ export class ShellModel {
     let panel = this.panels.get(id);
     if (panel === undefined) {
       panel = {
-        rows: new TranscriptRows(this.transcript, (entry) => entry.peer === id),
+        rows: new TranscriptRows(
+          this.transcript,
+          (entry) => entry.peer === id && entry.foldPart !== "hint",
+        ),
         anchor: FOLLOW,
         width: this.width,
         height: 0,

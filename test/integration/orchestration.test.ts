@@ -118,7 +118,7 @@ describe("orchestration over a real session", () => {
           role: peer.role ?? "coding",
           ...(peer.repo === null ? {} : { repo: peer.repo }),
         })),
-      dispatch: async (text) => [(await m.submitIntent(text, ["app", "api"])).intentId],
+      dispatch: async (text) => (await m.submitIntent(text, ["app", "api"])).intentId,
       items: (intentIds) => {
         const status = m.status();
         const devices = new Map(status.peers.map((peer) => [peer.peerId, peer.device]));

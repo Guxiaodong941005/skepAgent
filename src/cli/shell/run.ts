@@ -584,8 +584,9 @@ export class Shell {
           role: peer.role,
           ...(peer.repo === undefined ? {} : { repo: peer.repo }),
         })),
-      dispatch: async (brief) => {
-        const sent = await this.deliverIntent(brief);
+      dispatch: async (brief, repos) => {
+        // Target repos skip the picker, as `/intent --repo` does (ORCH-7 per-repo briefs).
+        const sent = await this.deliverIntent(brief, repos);
         if (!sent.ok) {
           const { result } = sent;
           throw new Error(
@@ -594,7 +595,7 @@ export class Shell {
               : "the intent was not sent",
           );
         }
-        return [sent.intentId];
+        return sent.intentId;
       },
       items: (intentIds) => this.orchestrationItems(intentIds),
       guard: () => treeChangeCheck(this.ctx, cwd),
@@ -612,7 +613,7 @@ export class Shell {
         }
         return { action: "cancel" };
       },
-      show: (text, tone, gutter) => this.log(text, tone, gutter),
+      show: (text, tone, gutter, place) => this.log(text, tone, gutter, place),
       changed: () => this.sync(),
     });
     this.log(
@@ -639,6 +640,7 @@ export class Shell {
           verdict: itemVerdict(item),
           repo: item.repo,
           ...(device === undefined ? {} : { device }),
+          peerId: item.assignee,
           ...(item.result === undefined ? {} : { summary: item.result.summary }),
         });
       }
@@ -995,6 +997,18 @@ export class Shell {
         run: (_ctx, args) => this.findCommand(args),
       },
       {
+        name: "expand",
+        description: "show a folded result whole in the main panel (newest when none named)",
+        usage: "[I-n|all]",
+        run: (_ctx, args) => this.foldCommand(args, true),
+      },
+      {
+        name: "fold",
+        description: "fold a result shown with /expand again",
+        usage: "[I-n|all]",
+        run: (_ctx, args) => this.foldCommand(args, false),
+      },
+      {
         name: "mouse",
         description: "wheel via mouse reporting (on) or the terminal's arrows (off)",
         usage: "[on|off]",
@@ -1041,6 +1055,8 @@ export class Shell {
       "  tab (empty input) or /focus picks the panel the scroll keys move; typed text still goes",
       "  to the master; a peer's live agent output shows in its panel only after that peer",
       "  opts in (/share-output on there, or /join … --share-output; this session only)",
+      "results: a long one is folded in the main panel; /expand I-4 (or /expand all) shows it",
+      "  whole, /fold folds it again; the peer's panel always shows it whole",
       "advanced: `skep tui` opens the raw agent TUI",
     ].join("\n");
   }
@@ -1139,13 +1155,16 @@ export class Shell {
         break;
       case "item-result":
         // `I-4 done · mac (app) · …` with the changed files: what the peer's agent produced.
-        log(message, "event");
+        // The main panel folds a long one (ORCH-7); its peer panel shows it whole.
+        this.log(message, "event", undefined, { ...tag, ...itemFold(message) });
         break;
       case "item-failed":
         // Uncapped and wrapped: the cause and fix are the point (SESSION-UX §3.4).
         log(message, "error");
         break;
       case "item-pending":
+        this.log(message, "warn", undefined, { ...tag, ...itemFold(message) });
+        break;
       case "intent-waiting":
         // An agent waits for a human in its pane: not finished, and the focus command matters.
         log(message, "warn");
@@ -1520,6 +1539,23 @@ export class Shell {
     // The echoed command line contains the text too; it is not what the human is looking for.
     if (this.model.findBack(query, (text) => text.startsWith("> /find"))) return { type: "ok" };
     return { type: "error", message: `find: no earlier line contains "${query}"` };
+  }
+
+  /** `/expand` and `/fold`: per-item folding of long results in the main panel (ORCH-7). */
+  private foldCommand(args: string, open: boolean): SlashResult {
+    const word = args.trim();
+    const key = word === "" ? null : word.toLowerCase() === "all" ? "all" : word.toUpperCase();
+    const changed = this.model.setExpanded(key, open);
+    if (changed.length > 0) return { type: "ok" };
+    const verb = open ? "expand" : "fold";
+    const state = open ? "folded" : "expanded";
+    let why = `no ${state} result in this session`;
+    if (key !== null && key !== "all") {
+      why = this.model.hasFold(key)
+        ? `${key} is already ${open ? "shown whole" : "folded"}`
+        : `${key} is not a folded result (short results and failures are never folded)`;
+    }
+    return { type: "error", message: `nothing to ${verb}: ${why}` };
   }
 
   private mouseCommand(args: string): SlashResult {
@@ -1938,6 +1974,12 @@ const PHASE_LABELS: Record<string, string> = {
 function formatSeconds(ms: number): string {
   const seconds = Math.max(0, Math.floor(ms / 1000));
   return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+}
+
+/** The fold key of an item block (`I-4 done · …`); `item-failed` never asks (SESSION-UX §3.4). */
+function itemFold(message: string): { fold?: string } {
+  const itemId = /^(I-\d+)\b/.exec(message)?.[1];
+  return itemId === undefined ? {} : { fold: itemId };
 }
 
 function historyEntry(id: string, state: OrchestrationState): string {

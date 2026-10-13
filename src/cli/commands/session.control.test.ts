@@ -126,6 +126,41 @@ describe("submitIntentAt outcome", () => {
   });
 });
 
+describe("intent length (locked plan §9.13)", () => {
+  const endpoint = (port: number) => ({ listen: `127.0.0.1:${port}`, token: TOKEN });
+
+  it("sends up to 8000 characters and refuses more before connecting", async () => {
+    const port = await server((socket) =>
+      reply(socket, { type: "control-result", ok: true, result: { intentId: "N-1" } }),
+    );
+    await expect(submitIntentAt(endpoint(port), "x".repeat(8_000))).resolves.toEqual({
+      intentId: "N-1",
+    });
+    await expect(submitIntentAt(endpoint(port), "x".repeat(8_001))).rejects.toMatchObject({
+      code: "bad_intent",
+      message: "intent text must be 1..8000 chars",
+    });
+  });
+
+  it("explains an older master's refusal of a long intent", async () => {
+    const port = await server((socket) =>
+      reply(socket, {
+        type: "control-result",
+        ok: false,
+        error: { code: "bad_request", message: "Invalid first frame" },
+      }),
+    );
+    const error = await submitIntentAt(endpoint(port), "x".repeat(5_000)).catch((e: unknown) => e);
+    expect(error).toMatchObject({ code: "bad_request" });
+    expect((error as Error).message).toContain(
+      "refused a 5000-character intent; a master on skep ≤0.1.13 takes at most 4000",
+    );
+    // A short intent keeps the master's own words.
+    const short = await submitIntentAt(endpoint(port), "x").catch((e: unknown) => e);
+    expect((short as Error).message).toBe("Invalid first frame");
+  });
+});
+
 describe("clearStaleSessionFile", () => {
   async function home(content?: string): Promise<{ ctx: CliContext; file: string }> {
     const dir = await mkdtemp(path.join(tmpdir(), "skep-clean-"));

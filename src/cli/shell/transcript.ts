@@ -27,12 +27,22 @@ export interface TranscriptEntry {
   readonly peer?: string;
   /** Shown only in {@link peer}'s panel, never in the main view (e.g. its progress timeline). */
   readonly panelOnly?: true;
+  /** The block this line belongs to (an item id, `I-4`) when the main view may fold it (ORCH-7). */
+  readonly fold?: string;
+  /**
+   * `rest`: hidden in the main view until the block is expanded. `hint`: the main view's
+   * "… n more lines" line, shown only while folded and never in a peer panel.
+   */
+  readonly foldPart?: "hint" | "rest";
 }
 
 /** Where an entry shows besides the main view; see {@link TranscriptEntry.peer}. */
 export interface EntryTag {
   peer?: string;
   panelOnly?: boolean;
+  /** A foldable block's key; the model splits the block into head, hint and rest. */
+  fold?: string;
+  foldPart?: "hint" | "rest";
 }
 
 /** Continuation rows of a wrapped entry sit this much deeper than its first row. */
@@ -106,6 +116,8 @@ export class Transcript {
       ...(gutter === undefined ? {} : { gutter }),
       ...(tag?.peer === undefined ? {} : { peer: tag.peer }),
       ...(tag?.peer !== undefined && tag.panelOnly === true ? { panelOnly: true as const } : {}),
+      ...(tag?.fold === undefined ? {} : { fold: tag.fold }),
+      ...(tag?.fold === undefined || tag.foldPart === undefined ? {} : { foldPart: tag.foldPart }),
     };
     this.items.push(entry);
     this.chars += text.length;
@@ -206,6 +218,12 @@ export class TranscriptRows implements RowSpace {
       }
     }
     this.scanned = last;
+  }
+
+  /** The filter's answer changed for old entries (a block was expanded): rebuild the view. */
+  refilter(): void {
+    // The eviction path rebuilds seqs and offsets; wrapped rows stay cached per seq.
+    this.evictions = -1;
   }
 
   get totalRows(): number {

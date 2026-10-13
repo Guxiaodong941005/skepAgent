@@ -6,9 +6,16 @@
 
 import { z } from "zod";
 
-/** The wire intent text is at most 4000 characters; the title line and a blank line come first. */
-export const MAX_BRIEF_CHARS = 3_800;
+/** A v2 intent carries at most 8000 characters (session `BRIEF_MAX`, D35). */
+export const MAX_INTENT_CHARS = 8_000;
 export const MAX_TITLE_CHARS = 200;
+/**
+ * "About 7800" (locked plan §9.12): the longest title, a blank line and the brief still fit one
+ * v2 intent. A v1 peer gets the first 4000 characters, title first (`wireText`).
+ */
+export const MAX_BRIEF_CHARS = MAX_INTENT_CHARS - MAX_TITLE_CHARS - 2;
+/** One intent per target repo (plan §7 Phase 3 ORCH-7); an intent names at most 16 repos. */
+export const MAX_TARGETS = 16;
 export const MAX_QUESTIONS = 3;
 
 export const RefineOutputSchema = z.strictObject({
@@ -16,15 +23,23 @@ export const RefineOutputSchema = z.strictObject({
   title: z.string().trim().min(1).max(MAX_TITLE_CHARS),
   /** The full task for the peer agent, English. */
   brief: z.string().trim().min(1).max(MAX_BRIEF_CHARS),
-  /** Phase 3: per-repo briefs. v1 accepts and records them; dispatch uses one brief. */
+  /**
+   * Per-repo briefs (ORCH-7): one intent per target, sent with `repos=[repo]`. A target without
+   * its own title or brief uses the top-level one.
+   */
   targets: z
     .array(
       z.strictObject({
         repo: z.string().trim().min(1).max(200),
+        title: z.string().trim().min(1).max(MAX_TITLE_CHARS).optional(),
         brief: z.string().trim().min(1).max(MAX_BRIEF_CHARS).optional(),
       }),
     )
-    .max(16)
+    .max(MAX_TARGETS)
+    // Two intents for one repo would reach the same peer as two separate tasks.
+    .refine((targets) => new Set(targets.map((target) => target.repo)).size === targets.length, {
+      message: "each repo may appear in targets once",
+    })
     .optional(),
   /** Asked to the human before dispatch. */
   questions: z.array(z.string().trim().min(1).max(500)).max(MAX_QUESTIONS).optional(),

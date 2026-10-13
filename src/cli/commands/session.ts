@@ -53,6 +53,7 @@ import {
   startMaster,
 } from "../../session/index.js";
 import { intentRollup, itemBlock, itemVerdict } from "../../session/master.js";
+import { BRIEF_MAX } from "../../session/messages.js";
 import { type Clock, isoUtc, systemClock } from "../../util/clock.js";
 import { execFileChecked } from "../../util/exec.js";
 import { atomicWrite, safeJoin } from "../../util/fs.js";
@@ -92,7 +93,12 @@ const CONTROL_TIMEOUT_MS = 10_000;
  */
 const INTENT_CONTROL_TIMEOUT_MS = 40_000;
 const MAX_FRAME_BYTES = 65_536;
-const MAX_INTENT_TEXT = 4_000;
+/**
+ * The v2 intent limit (locked plan §9.13); v1 peers get the first 4000 characters
+ * (`wireText`), and a ≤0.1.13 master rejects a longer control intent as a bad request.
+ */
+const MAX_INTENT_TEXT = BRIEF_MAX;
+const V1_INTENT_TEXT = 4_000;
 const MAX_INTENT_REPOS = 16;
 const MAX_DATALIST_PATH = 1_024;
 
@@ -3758,7 +3764,20 @@ async function controlAt(
     }
     throw error;
   }
-  if (!reply.ok) throw new CliError(reply.error.code, reply.error.message, EXIT.rejected);
+  if (!reply.ok) {
+    // A ≤0.1.13 master only parses intents up to 4000 characters; say so rather than echo its
+    // generic parse error (locked plan §9.13).
+    const chars = op.op === "intent" && typeof op.text === "string" ? op.text.length : 0;
+    if (reply.error.code === "bad_request" && chars > V1_INTENT_TEXT) {
+      throw new CliError(
+        "bad_request",
+        `the session master refused a ${chars}-character intent; a master on ` +
+          `skep ≤0.1.13 takes at most ${V1_INTENT_TEXT} — shorten it or upgrade that device`,
+        EXIT.rejected,
+      );
+    }
+    throw new CliError(reply.error.code, reply.error.message, EXIT.rejected);
+  }
   return reply.result;
 }
 

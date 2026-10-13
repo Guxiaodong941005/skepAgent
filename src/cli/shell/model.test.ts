@@ -1,6 +1,6 @@
 // Frame goldens of the shell (ASCII glyphs, 80x24) for each session truth the controller exposes.
 import { describe, expect, it } from "vitest";
-import { ShellModel, wrapLine } from "./model.js";
+import { FOLD_LINES, ShellModel, wrapLine } from "./model.js";
 
 function text(model: ShellModel): string {
   return model
@@ -300,6 +300,71 @@ describe("split panels (ORCH-5)", () => {
     expect(lines().join("\n")).toContain("> fix the login bug");
     expect(shell.findBack("login bug")).toBe(false);
     expect(shell.findBack("nothing like this")).toBe(false);
+  });
+});
+
+describe("per-item folding (ORCH-7)", () => {
+  const block = (lines: number) =>
+    [
+      "I-4 done · mac (app)",
+      ...Array.from({ length: lines - 1 }, (_, n) => `  line ${n + 1}`),
+    ].join("\n");
+
+  function folded() {
+    const shell = model();
+    shell.sessionLive = true;
+    shell.peers = [{ peerId: "peer-1", device: "mac", role: "coding", state: "joined" }];
+    shell.append(block(FOLD_LINES + 5), "event", undefined, { peer: "peer-1", fold: "I-4" });
+    shell.append("after the result", "info");
+    const frame = (columns = 120, rows = 40) =>
+      shell
+        .frame(columns, rows)
+        .map((line) => (typeof line === "string" ? line : line.spans.map((s) => s.text).join("")));
+    return { shell, frame };
+  }
+
+  it("the main view shows the head and one hint; the rest waits for /expand", () => {
+    const { frame } = folded();
+    const text = frame().join("\n");
+    expect(text).toContain(`line ${FOLD_LINES - 1}`);
+    expect(text).not.toContain(`line ${FOLD_LINES}\n`);
+    expect(text).not.toMatch(new RegExp(`line ${FOLD_LINES + 4}\\b`));
+    expect(text).toContain("… 5 more lines · /expand I-4 or the peer-1 panel");
+    expect(text).toContain("after the result");
+  });
+
+  it("/expand shows the rest in place and drops the hint; folding again restores it", () => {
+    const { shell, frame } = folded();
+    expect(shell.setExpanded("I-4", true)).toEqual(["I-4"]);
+    const open = frame().join("\n");
+    expect(open).toMatch(new RegExp(`line ${FOLD_LINES + 4}\\n\\s*after the result`));
+    expect(open).not.toContain("more lines");
+    expect(shell.setExpanded("I-4", true)).toEqual([]);
+    expect(shell.setExpanded(null, false)).toEqual(["I-4"]);
+    expect(frame().join("\n")).toContain("… 5 more lines");
+    expect(shell.setExpanded("I-9", true)).toEqual([]);
+    expect(shell.setExpanded("all", true)).toEqual(["I-4"]);
+  });
+
+  it("the peer panel always shows the whole block, never the hint", () => {
+    const { shell, frame } = folded();
+    shell.layout = "split";
+    const peerColumn = frame()
+      .filter((line) => line[66] === "|")
+      .map((line) => line.slice(67))
+      .join("\n");
+    expect(peerColumn).toContain(`line ${FOLD_LINES + 4}`);
+    expect(peerColumn).not.toContain("more lines");
+  });
+
+  it("a short block is not folded and the scrollback keeps every line", () => {
+    const shell = model();
+    shell.append(block(FOLD_LINES + 1), "event", undefined, { fold: "I-5" });
+    expect(shell.setExpanded("I-5", true)).toEqual([]);
+    const { shell: long } = folded();
+    const lines = long.scrollback.map((entry) => entry.text);
+    expect(lines).toContain(`  line ${FOLD_LINES + 4}`);
+    expect(lines.some((line) => line.includes("more lines"))).toBe(false);
   });
 });
 

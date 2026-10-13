@@ -11,6 +11,11 @@
  * ```
  * `confirming` exists only in mode `confirm`; the default `auto` (locked decision §9.1) goes
  * straight from a valid refine to `dispatching`.
+ *
+ * A refine with `targets` splits the work into groups, one intent per target repo (plan §7
+ * Phase 3, ORCH-7); without targets there is one group the shell's route and picker place. The
+ * orchestration waits on every intent that was sent and synthesizes across all groups, those
+ * that could not be sent included.
  */
 
 import type { RefineOutput } from "./schemas.js";
@@ -42,8 +47,23 @@ export interface OrchestrationItem {
   repo: string;
   /** Peer device, when the status names it. */
   device?: string;
+  /** The peer the item is assigned to (its panel id), when the status names it. */
+  peerId?: string;
   /** The received summary (≤4000, redacted on master and peer); absent until a result. */
   summary?: string;
+}
+
+/** One intent of an orchestration: a target repo with its own brief, or the single brief. */
+export interface OrchestrationGroup {
+  /** The target repo; null for the single brief the route (and picker) places. */
+  repo: string | null;
+  /** Overrides of the top-level title and brief; null uses the top-level one. */
+  title: string | null;
+  brief: string | null;
+  /** Set once the intent was sent. */
+  intentId: string | null;
+  /** Why this group's intent was not sent. */
+  error: string | null;
 }
 
 export interface OrchestrationState {
@@ -59,6 +79,9 @@ export interface OrchestrationState {
   refine: RefineOutput | null;
   /** The brief that is (or was) sent: the refine's, or the human's edit in `confirm` mode. */
   brief: { title: string; text: string } | null;
+  /** Set with the brief; one per intent to send. */
+  groups: OrchestrationGroup[];
+  /** The intents that were sent, in group order. */
   intentIds: string[];
   items: OrchestrationItem[];
   synthesis: string | null;
@@ -73,12 +96,15 @@ export type OrchestrationEvent =
   | { type: "answered"; text: string }
   | { type: "confirmed"; brief?: { title: string; text: string } }
   | { type: "cancelled" }
-  | { type: "dispatched"; intentIds: string[] }
+  /** One outcome per group, in group order. */
+  | { type: "dispatched"; outcomes: DispatchOutcome[] }
   | { type: "dispatchFailed"; cause: string }
   | { type: "itemsChanged"; items: OrchestrationItem[] }
   | { type: "summarizeNow" }
   | { type: "synthesized"; text: string }
   | { type: "synthFailed"; cause: string };
+
+export type DispatchOutcome = { intentId: string } | { error: string };
 
 export function startOrchestration(
   id: string,
@@ -95,6 +121,7 @@ export function startOrchestration(
     questions: [],
     refine: null,
     brief: null,
+    groups: [],
     intentIds: [],
     items: [],
     synthesis: null,
@@ -154,9 +181,7 @@ export function reduceOrchestration(
         brief: event.brief ?? state.brief,
       };
     case "dispatching":
-      if (event.type === "dispatched") {
-        return { ...state, phase: "awaiting", intentIds: [...event.intentIds] };
-      }
+      if (event.type === "dispatched") return dispatched(state, event.outcomes);
       if (event.type === "dispatchFailed") {
         return { ...state, phase: "failed", failure: { stage: "dispatch", cause: event.cause } };
       }
@@ -208,7 +233,100 @@ function refining(state: OrchestrationState, event: OrchestrationEvent): Orchest
     refine: output,
     questions: [],
     brief: { title: output.title, text: output.brief },
+    groups:
+      output.targets === undefined || output.targets.length === 0
+        ? [{ repo: null, title: null, brief: null, intentId: null, error: null }]
+        : output.targets.map((target) => ({
+            repo: target.repo,
+            title: target.title ?? null,
+            brief: target.brief ?? null,
+            intentId: null,
+            error: null,
+          })),
   };
+}
+
+function dispatched(state: OrchestrationState, outcomes: DispatchOutcome[]): OrchestrationState {
+  const groups = state.groups.map((group, index) => {
+    const outcome = outcomes[index] ?? { error: "not sent" };
+    return "intentId" in outcome
+      ? { ...group, intentId: outcome.intentId, error: null }
+      : { ...group, intentId: null, error: outcome.error };
+  });
+  const intentIds = groups.flatMap((group) => (group.intentId === null ? [] : [group.intentId]));
+  if (intentIds.length === 0) {
+    // Nothing reached a peer: the request failed as a whole, with every group's cause.
+    const cause = groups
+      .map((group) => (group.repo === null ? group.error : `${group.repo}: ${group.error}`))
+      .join("; ");
+    return { ...state, groups, phase: "failed", failure: { stage: "dispatch", cause } };
+  }
+  return { ...state, groups, intentIds, phase: "awaiting" };
+}
+
+/** The title and brief a group's intent carries. */
+export function groupBrief(
+  state: Pick<OrchestrationState, "brief">,
+  group: OrchestrationGroup,
+): { title: string; text: string } {
+  return {
+    title: group.title ?? state.brief?.title ?? "",
+    text: group.brief ?? state.brief?.text ?? "",
+  };
+}
+
+const VERDICT_WORDS: Record<ItemVerdict, string> = {
+  done: "done",
+  failed: "failed",
+  "submit-failed": "submit failed",
+  pending: "waiting for a human",
+  declined: "declined",
+  running: "still running",
+};
+const VERDICT_ORDER: readonly ItemVerdict[] = [
+  "done",
+  "failed",
+  "submit-failed",
+  "declined",
+  "pending",
+  "running",
+];
+
+/**
+ * Skep's own tally of an orchestration, naming every outcome: `2 of 4 items done: I-4 web on
+ * dev-b, …; 1 failed: …; not sent: docs (cause)`. It is shown with the summary whatever the
+ * master agent wrote, so a partial failure is never left to the agent's wording (ORCH-7).
+ */
+export function describeOutcome(state: OrchestrationState): string {
+  const parts: string[] = [];
+  const total = state.items.length;
+  for (const verdict of VERDICT_ORDER) {
+    const items = state.items.filter((item) => item.verdict === verdict);
+    if (items.length === 0) continue;
+    const named = items
+      .map((item) => `${item.itemId} ${item.repo} on ${item.device ?? item.peerId ?? "?"}`)
+      .join(", ");
+    // "2 of 3 done" makes a partial success plain; the other verdicts are counted as they are.
+    const count =
+      verdict === "done" && items.length < total ? `${items.length} of ${total}` : items.length;
+    parts.push(`${count} ${VERDICT_WORDS[verdict]}: ${named}`);
+  }
+  const unsent = state.groups.filter((group) => group.error !== null);
+  if (unsent.length > 0) {
+    parts.push(
+      `not sent: ${unsent.map((group) => `${group.repo ?? "brief"} (${group.error})`).join(", ")}`,
+    );
+  }
+  const waiting = state.groups.filter(
+    (group) =>
+      group.intentId !== null && !state.items.some((item) => item.intentId === group.intentId),
+  );
+  if (waiting.length > 0) {
+    parts.push(
+      `no item yet: ${waiting.map((group) => `${group.repo ?? "brief"} (intent ${group.intentId})`).join(", ")}`,
+    );
+  }
+  return parts.length === 0 ? "no results" : parts.join("; ");
 }
 
 function withItems(state: OrchestrationState, items: OrchestrationItem[]): OrchestrationState {

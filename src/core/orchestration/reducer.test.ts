@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  describeOutcome,
+  groupBrief,
   itemsProgress,
   MAX_QUESTION_ROUNDS,
   type OrchestrationEvent,
@@ -8,7 +10,13 @@ import {
   reduceOrchestration,
   startOrchestration,
 } from "./reducer.js";
-import { briefText, parseRefineOutput } from "./schemas.js";
+import {
+  briefText,
+  MAX_BRIEF_CHARS,
+  MAX_INTENT_CHARS,
+  MAX_TITLE_CHARS,
+  parseRefineOutput,
+} from "./schemas.js";
 
 const refined = (extra: Record<string, unknown> = {}): OrchestrationEvent => ({
   type: "refined",
@@ -36,7 +44,7 @@ describe("orchestration reducer (plan §3.3)", () => {
       title: "Remember the last user",
       text: "Store the last login name.",
     });
-    state = run(state, { type: "dispatched", intentIds: ["intent-1"] });
+    state = run(state, { type: "dispatched", outcomes: [{ intentId: "intent-1" }] });
     expect(state.phase).toBe("awaiting");
     state = run(state, { type: "itemsChanged", items: [item("running")] });
     expect(state.phase).toBe("awaiting");
@@ -89,7 +97,7 @@ describe("orchestration reducer (plan §3.3)", () => {
   it("a pending item stalls; /summarize synthesizes with what exists; it can still settle", () => {
     const awaiting = run(startOrchestration("O-1", "x", "auto"), refined(), {
       type: "dispatched",
-      intentIds: ["intent-1"],
+      outcomes: [{ intentId: "intent-1" }],
     });
     const stalled = run(awaiting, {
       type: "itemsChanged",
@@ -108,7 +116,7 @@ describe("orchestration reducer (plan §3.3)", () => {
     const state = run(
       startOrchestration("O-1", "x", "auto"),
       refined(),
-      { type: "dispatched", intentIds: ["intent-1"] },
+      { type: "dispatched", outcomes: [{ intentId: "intent-1" }] },
       { type: "itemsChanged", items: [item("failed")] },
       { type: "synthFailed", cause: "timed out" },
     );
@@ -119,7 +127,10 @@ describe("orchestration reducer (plan §3.3)", () => {
   it("is plain JSON and never mutates its input", () => {
     const start = startOrchestration("O-1", "x", "auto");
     const frozen = JSON.stringify(start);
-    const next = run(start, refined(), { type: "dispatched", intentIds: ["intent-1"] });
+    const next = run(start, refined(), {
+      type: "dispatched",
+      outcomes: [{ intentId: "intent-1" }],
+    });
     expect(JSON.stringify(start)).toBe(frozen);
     expect(JSON.parse(JSON.stringify(next))).toEqual(next);
   });
@@ -129,6 +140,93 @@ describe("orchestration reducer (plan §3.3)", () => {
     expect(itemsProgress([item("done"), item("running")])).toBe("running");
     expect(itemsProgress([item("done"), item("declined"), item("submit-failed")])).toBe("settled");
     expect(itemsProgress([item("failed"), item("pending")])).toBe("stalled");
+  });
+});
+
+describe("per-repo groups (ORCH-7)", () => {
+  const targets = [
+    { repo: "web", brief: "Remember the name in the login form." },
+    { repo: "api", title: "Return the last user", brief: "Add GET /last-user." },
+    { repo: "docs" },
+  ];
+
+  it("a refine without targets has one group the route places", () => {
+    const state = run(startOrchestration("O-1", "x", "auto"), refined());
+    expect(state.groups).toEqual([
+      { repo: null, title: null, brief: null, intentId: null, error: null },
+    ]);
+    expect(groupBrief(state, state.groups[0] as never)).toEqual(state.brief);
+  });
+
+  it("targets become one group each; a target without its own text uses the top-level one", () => {
+    const state = run(startOrchestration("O-1", "x", "auto"), refined({ targets }));
+    expect(state.groups.map((group) => group.repo)).toEqual(["web", "api", "docs"]);
+    const [web, api, docs] = state.groups.map((group) => groupBrief(state, group));
+    expect(web).toEqual({
+      title: "Remember the last user",
+      text: "Remember the name in the login form.",
+    });
+    expect(api).toEqual({ title: "Return the last user", text: "Add GET /last-user." });
+    expect(docs).toEqual(state.brief);
+  });
+
+  it("a partial dispatch awaits what was sent and keeps why the rest was not", () => {
+    const state = run(startOrchestration("O-1", "x", "auto"), refined({ targets }), {
+      type: "dispatched",
+      outcomes: [{ intentId: "N-1" }, { error: "no peer works on repo api" }, { intentId: "N-2" }],
+    });
+    expect(state.phase).toBe("awaiting");
+    expect(state.intentIds).toEqual(["N-1", "N-2"]);
+    expect(state.groups.map((group) => [group.intentId, group.error])).toEqual([
+      ["N-1", null],
+      [null, "no peer works on repo api"],
+      ["N-2", null],
+    ]);
+  });
+
+  it("nothing sent fails the dispatch with every group's cause", () => {
+    const state = run(startOrchestration("O-1", "x", "auto"), refined({ targets }), {
+      type: "dispatched",
+      outcomes: [{ error: "e1" }, { error: "e2" }],
+    });
+    expect(state.phase).toBe("failed");
+    expect(state.failure).toEqual({
+      stage: "dispatch",
+      cause: "web: e1; api: e2; docs: not sent",
+    });
+  });
+
+  it("describeOutcome names every item and every brief that was not sent", () => {
+    const state = run(
+      startOrchestration("O-1", "x", "auto"),
+      refined({ targets }),
+      {
+        type: "dispatched",
+        outcomes: [{ intentId: "N-1" }, { intentId: "N-2" }, { error: "no peer for docs" }],
+      },
+      {
+        type: "itemsChanged",
+        items: [
+          { intentId: "N-1", itemId: "I-1", verdict: "done", repo: "web", device: "mac" },
+          { intentId: "N-2", itemId: "I-2", verdict: "failed", repo: "api", device: "vps" },
+          { intentId: "N-2", itemId: "I-3", verdict: "pending", repo: "api", peerId: "peer-3" },
+        ],
+      },
+    );
+    expect(describeOutcome(state)).toBe(
+      "1 of 3 done: I-1 web on mac; 1 failed: I-2 api on vps; " +
+        "1 waiting for a human: I-3 api on peer-3; not sent: docs (no peer for docs)",
+    );
+  });
+
+  it("describeOutcome names an intent no peer took yet", () => {
+    const state = run(startOrchestration("O-1", "x", "auto"), refined({ targets }), {
+      type: "dispatched",
+      outcomes: [{ intentId: "N-1" }, { intentId: "N-2" }, { intentId: "N-3" }],
+    });
+    expect(describeOutcome(state)).toBe(
+      "no item yet: web (intent N-1), api (intent N-2), docs (intent N-3)",
+    );
   });
 });
 
@@ -153,12 +251,32 @@ describe("RefineOutputSchema", () => {
       ok: false,
     });
     expect(parseRefineOutput('```json\n{"title":"","brief":"b"}\n```').ok).toBe(false);
-    const long = JSON.stringify({ title: "t", brief: "b".repeat(3_801) });
+    const long = JSON.stringify({ title: "t", brief: "b".repeat(MAX_BRIEF_CHARS + 1) });
     expect(parseRefineOutput(long).ok).toBe(false);
     expect(parseRefineOutput("no json here")).toEqual({
       ok: false,
       reason: expect.stringContaining("no fenced ```json block"),
     });
+  });
+
+  it("fits the longest title and brief into one v2 intent (locked §9.12: about 7800)", () => {
+    expect(MAX_BRIEF_CHARS).toBe(7_798);
+    const title = "t".repeat(MAX_TITLE_CHARS);
+    const brief = "b".repeat(MAX_BRIEF_CHARS);
+    expect(parseRefineOutput(JSON.stringify({ title, brief })).ok).toBe(true);
+    expect(briefText(title, brief)).toHaveLength(MAX_INTENT_CHARS);
+  });
+
+  it("takes per-repo targets, each repo once", () => {
+    const ok = { title: "t", brief: "b", targets: [{ repo: "web" }, { repo: "api", brief: "x" }] };
+    expect(parseRefineOutput(JSON.stringify(ok)).ok).toBe(true);
+    const twice = { title: "t", brief: "b", targets: [{ repo: "web" }, { repo: "web" }] };
+    expect(parseRefineOutput(JSON.stringify(twice))).toEqual({
+      ok: false,
+      reason: expect.stringContaining("each repo may appear in targets once"),
+    });
+    const extra = { title: "t", brief: "b", targets: [{ repo: "web", peer: "peer-2" }] };
+    expect(parseRefineOutput(JSON.stringify(extra)).ok).toBe(false);
   });
 
   it("puts the title line first on the wire", () => {
