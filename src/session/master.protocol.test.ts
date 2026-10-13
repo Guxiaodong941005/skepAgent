@@ -4,7 +4,7 @@ import { createConnection, createServer, type Server } from "node:net";
 import { Duplex } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { encodeFrame, FrameDecoder } from "./codec.js";
-import { createEphemeral, deriveKeys } from "./handshake.js";
+import { confirmation, createEphemeral, deriveKeys, JoinRejectedError } from "./handshake.js";
 import {
   type MasterEvent,
   type MasterHandle,
@@ -17,6 +17,7 @@ import {
   type SubResult,
   startMaster,
 } from "./index.js";
+import { MAX_CODE_MISSES } from "./master.js";
 import { connectSub } from "./sub.js";
 
 const TOKEN = "a".repeat(32);
@@ -241,6 +242,128 @@ describe("negotiation", () => {
     expect(keys(1).th).toEqual(keys(undefined).th);
     expect(keys(2).th).not.toEqual(keys(1).th);
     expect(keys(2).confirmS).not.toEqual(keys(1).confirmS);
+  });
+});
+
+/**
+ * A join driven frame by frame, stopped after the master's challenge, so a test can hold it in
+ * flight while other joins run. `confirm()` proves `code` and resolves with the master's answer.
+ */
+async function challenged(
+  m: MasterHandle,
+  code: string,
+): Promise<{ confirm: () => Promise<string> }> {
+  const sub = createEphemeral({ bytes: (n: number) => new Uint8Array(n).fill(3) });
+  const nonce = Buffer.alloc(16, 5);
+  const socket = createConnection({ host: "127.0.0.1", port: m.address?.port ?? 0 });
+  const decoder = new FrameDecoder();
+  const frames: Record<string, string>[] = [];
+  let wake = () => {};
+  socket.on("data", (chunk: Buffer) => {
+    for (const frame of decoder.push(chunk)) frames.push(JSON.parse(frame.toString("utf8")));
+    wake();
+  });
+  const next = async () => {
+    while (frames.length === 0) await new Promise<void>((resolve) => (wake = resolve));
+    return frames.shift() as Record<string, string>;
+  };
+  const send = (value: unknown) => socket.write(encodeFrame(Buffer.from(JSON.stringify(value))));
+  send({
+    type: "join",
+    v: 2,
+    device: "held",
+    pub: sub.pub.toString("base64"),
+    nonce: nonce.toString("base64"),
+  });
+  const challenge = await next();
+  if (challenge.type !== "join-challenge") throw new Error(`unexpected ${challenge.type}`);
+  const masterPub = Buffer.from(challenge.pub ?? "", "base64");
+  const keys = deriveKeys({
+    privateKey: sub.privateKey,
+    remotePub: masterPub,
+    subPub: sub.pub,
+    subNonce: nonce,
+    masterPub,
+    masterNonce: Buffer.from(challenge.nonce ?? "", "base64"),
+    device: "held",
+    code,
+    protocol: 2,
+  });
+  return {
+    confirm: async () => {
+      send({ type: "join-confirm", mac: confirmation(keys, "sub").toString("base64") });
+      const answer = await next();
+      socket.destroy();
+      return answer.type === "join-reject" ? `join-reject:${answer.reason}` : String(answer.type);
+    },
+  };
+}
+
+/** The current code with its last digit changed: well-formed, never the master's. */
+function wrong(code: string): string {
+  return `${code.slice(0, -1)}${(Number(code.slice(-1)) + 1) % 10}`;
+}
+
+describe("wrong join codes (Phase 3 exit run, bug 3)", () => {
+  async function guess(m: MasterHandle, code: string): Promise<unknown> {
+    return connectSub({
+      target: { host: "127.0.0.1", port: m.address?.port ?? 0 },
+      code,
+      device: "guess",
+      describe: async () => ({ repo: "app", head: "c".repeat(40), role: "coding" }),
+      collectDatalist: async () => [],
+      onItem: async () => null,
+    }).then(
+      (handle) => {
+        subs.push(handle);
+        return "joined";
+      },
+      (error: unknown) => error,
+    );
+  }
+
+  it("refuses a wrong code as bad_code and keeps the current code valid", async () => {
+    const events: MasterEvent[] = [];
+    const m = await master(events);
+    const code = m.status().joinCode ?? "";
+    const error = await guess(m, wrong(code));
+    expect(error).toBeInstanceOf(JoinRejectedError);
+    expect((error as JoinRejectedError).reason).toBe("bad_code");
+    expect(m.status().joinCode).toBe(code);
+    await vi.waitFor(() =>
+      expect(events).toContainEqual({
+        kind: "join-failed",
+        message: "Join from guess (127.0.0.1) ended: bad_code",
+      }),
+    );
+    // The code the master still shows admits the next device.
+    await join(m, "box", "app");
+    expect(m.status().joinCode).not.toBe(code);
+  });
+
+  it("does not cancel a join in flight on the current code", async () => {
+    const m = await master();
+    const code = m.status().joinCode ?? "";
+    const held = await challenged(m, code);
+    expect(await guess(m, wrong(code))).toBeInstanceOf(JoinRejectedError);
+    expect(await held.confirm()).toBe("join-accept");
+    await vi.waitFor(() => expect(m.status().peers.map((p) => p.device)).toEqual(["held"]));
+  });
+
+  it(`rotates the code on the ${MAX_CODE_MISSES}th wrong try, expiring joins in flight`, async () => {
+    const m = await master();
+    const code = m.status().joinCode ?? "";
+    const held = await challenged(m, code);
+    for (let miss = 1; miss < MAX_CODE_MISSES; miss++) {
+      expect(await guess(m, wrong(code))).toBeInstanceOf(JoinRejectedError);
+      expect(m.status().joinCode).toBe(code);
+    }
+    expect(await guess(m, wrong(code))).toBeInstanceOf(JoinRejectedError);
+    expect(m.status().joinCode).not.toBe(code);
+    expect(await held.confirm()).toBe("join-reject:expired");
+    // A fresh code starts with a clean count.
+    expect(await guess(m, wrong(m.status().joinCode ?? ""))).toBeInstanceOf(JoinRejectedError);
+    await join(m, "box", "app");
   });
 });
 

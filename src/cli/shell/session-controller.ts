@@ -348,14 +348,15 @@ const LEAVE_REASONS: Record<string, string> = {
 };
 
 /**
- * A refused join as the master's human sees it. Join codes are single-use (a proved or wrong
- * code rotates it), so a peer pasting a code from an earlier join is the usual cause.
+ * A refused join as the master's human sees it. Join codes are single-use (a proved code
+ * rotates; a wrong try only counts, up to 8), so a peer pasting a code from an earlier join is the
+ * usual cause.
  */
 const JOIN_FAILED_REASONS: Record<string, string> = {
   bad_code: "wrong or outdated join code (each code admits one device)",
   expired:
-    "the code changed before this join finished (another device joined or tried a wrong code, " +
-    "or it expired)",
+    "the code changed before this join finished (another device joined, the code took 8 wrong " +
+    "tries, or it expired)",
   declined: "declined here",
   busy: "too many joins at once",
   no_code: "no join code was active",

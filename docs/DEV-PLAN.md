@@ -177,6 +177,12 @@ screens. Evidence: `/root/skep-phase3-exit/` (peers) and `/root/skep-phase3-exit
   codes no longer fill the main panel (header shows the current one, a refused join prints the
   current paste line); the `/start` text describes per-repo routing; progress lines are one line
   cut at a word boundary; `/expand` and `/fold` confirm what they changed.
+* **Follow-up to bug 3:** a wrong or stale code no longer rotates the join code at once. It
+  counts as a miss on the current code, and the code rotates on the 8th miss
+  (`MAX_CODE_MISSES`), so one bad paste no longer cancels other joins in flight (they used to
+  fail with `expired`). A proved code still rotates at once (one device per code). Each guess
+  is still 1 in 10^12. Tests: the "wrong join codes" cases in
+  `src/session/master.protocol.test.ts`. A real two-device re-check of bugs 2 and 3 is pending.
 
 ## Wave 8 — live agent view (D27–D30)
 

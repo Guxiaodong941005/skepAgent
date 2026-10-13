@@ -14,9 +14,9 @@ export class JoinCodeError extends Error {
   override readonly name = "JoinCodeError";
 }
 /**
- * Why a master refused a join, and what the human does next. A join code admits one device and
- * the master shows a new one after every join and every wrong try (a proved or guessed code is
- * never reusable), so a code that worked a minute ago is the usual cause, not a typo.
+ * Why a master refused a join, and what the human does next. A join code admits one device: the
+ * master shows a new one after every join (and after 8 wrong tries), so a code that worked a
+ * minute ago is the usual cause, not a typo. A wrong try does not disturb other joins.
  */
 const REJECT_TEXT: Record<JoinRejectReason, { cause: string; fix: string }> = {
   no_code: {
@@ -32,7 +32,8 @@ const REJECT_TEXT: Record<JoinRejectReason, { cause: string; fix: string }> = {
   expired: {
     cause:
       "the join code stopped being valid before this join finished: it expired, another " +
-      "device joined or tried a wrong code meanwhile, or the master's human did not answer in time",
+      "device joined with it or 8 wrong tries used it up meanwhile, or the master's human did " +
+      "not answer in time",
     fix: "ask for the master's current code (its header shows it; /status prints the paste line), then join again",
   },
   declined: {

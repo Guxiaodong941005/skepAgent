@@ -271,7 +271,17 @@ interface ActiveCode {
   code: string;
   expiresAt: number;
   expiresAtMs: number;
+  /** Wrong join-confirm MACs proved against this code so far (see {@link MAX_CODE_MISSES}). */
+  misses: number;
 }
+
+/**
+ * Wrong tries one join code absorbs before it rotates. A guess is an online try at 1 in 10^12
+ * (12 digits), and 8 of them against one code change that by nothing measurable; rotating on
+ * every miss instead let one stale or mistyped paste cancel the other joins in flight (Phase 3
+ * exit run, bug 3). A proved code still rotates at once: it admits one device.
+ */
+export const MAX_CODE_MISSES = 8;
 
 export async function startMaster(o: MasterOptions): Promise<MasterHandle> {
   const master = new SessionMaster(o);
@@ -575,7 +585,10 @@ class SessionMaster implements MasterHandle {
               confirmation(challenge.keys, "sub"),
             )
           ) {
-            this.rotateCode();
+            // Count the miss instead of rotating: other joins on this code keep going. The code
+            // is burned only once it has absorbed MAX_CODE_MISSES wrong tries.
+            challenge.code.misses += 1;
+            if (challenge.code.misses >= MAX_CODE_MISSES) this.rotateCode();
             rejectJoin("bad_code");
             return;
           }
@@ -1034,6 +1047,7 @@ class SessionMaster implements MasterHandle {
       code: generateJoinCode(this.random),
       expiresAt: this.clock.monotonicMs() + this.ttlMs,
       expiresAtMs: this.clock.nowMs() + this.ttlMs,
+      misses: 0,
     };
     this.cancelCode = this.timer(this.ttlMs, () => this.rotateCode());
     this.options.onJoinCode({ code: this.code.code, expiresAtMs: this.code.expiresAtMs });

@@ -319,7 +319,7 @@ describe("joinFailureText", () => {
     expect(text).toMatch(/^join failed: Session join rejected \(bad_code\): .*no longer current/);
     expect(text).toContain("\nfix: ask for the master's current code");
     expect(joinFailureText(new JoinRejectedError("expired"))).toContain(
-      "another device joined or tried a wrong code meanwhile",
+      "another device joined with it or 8 wrong tries used it up meanwhile",
     );
   });
 
