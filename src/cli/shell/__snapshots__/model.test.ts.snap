@@ -107,3 +107,36 @@ exports[`shell frames > no session: no peer rows, ever 1`] = `
   (no session — /start or /join)
   / commands | enter send | pgup/pgdn/wheel scroll | ctrl+c clear | /quit"
 `;
+
+exports[`split panels (ORCH-5) > draws the main panel left and one titled panel per peer right, each row exactly wide 1`] = `
+"  skep   session master · code 1234-5678-9012 · 192.168.1.20:7419                                            v0.0.0-test
+  device  laptop | cwd  ~/app | peers 2
+-- > main --------------------------------------------------------|-- peer-1 | mac | coding | working 50% 1/2 · editing…
+                                                                  |                                                     
+                                                                  |                                                     
+                                                                  |                                                     
+                                                                  |                                                     
+                                                                  |                                                     
+                                                                  |                                                     
+                                                                  |                                                     
+                                                                  |                                                     
+                                                                  |                                                     
+                                                                  |  I-1 done · mac (app)                               
+                                                                  |  working 50% 1/2 · editing api.ts                   
+                                                                  |-- peer-2 | vps | web | idle ------------------------
+                                                                  |                                                     
+                                                                  |                                                     
+                                                                  |                                                     
+                                                                  |                                                     
+                                                                  |                                                     
+                                                                  |                                                     
+                                                                  |                                                     
+  > fix the login bug                                             |                                                     
+  I-1 done · mac (app)                                            |                                                     
+  I-2 FAILED · vps (web)                                          |  I-2 FAILED · vps (web)                             
+> _
+  ----------------------------------------------------------------------------------------------------------------------
+  mac     coding  ~b>  [####....] 50% 1/2 working  editing api.ts
+  vps     web     .    [........] 0% 0/0 idle  
+  / commands | enter send | tab panel | pgup/pgdn scroll | /layout single"
+`;

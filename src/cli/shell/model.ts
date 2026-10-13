@@ -21,10 +21,32 @@ import {
 } from "../tui.js";
 import { SKEP_VERSION } from "../version.js";
 import { logoLine, welcomeLines } from "./logo.js";
-import { anchorAt, FOLLOW, type ScrollAnchor, scrollAnchor, viewWindow } from "./scroll.js";
+import {
+  fitLine,
+  joinCells,
+  MAIN_PANEL,
+  type PanelRect,
+  progressNote,
+  type ShellLayout,
+  splitLayout,
+} from "./panels.js";
+import {
+  anchorAt,
+  FOLLOW,
+  locateRow,
+  type ScrollAnchor,
+  scrollAnchor,
+  viewWindow,
+} from "./scroll.js";
 import { QUIET_AFTER_MS } from "./session-controller.js";
 import type { SlashCommand } from "./slash.js";
-import { Transcript, TranscriptRows, type TranscriptTone } from "./transcript.js";
+import {
+  type EntryTag,
+  Transcript,
+  type TranscriptEntry,
+  TranscriptRows,
+  type TranscriptTone,
+} from "./transcript.js";
 
 export { wrapLine } from "./transcript.js";
 
@@ -50,6 +72,14 @@ export interface ShellHeader {
   cwd: string;
   /** e.g. `no session`, `master · code 4821-0937-5520`, `joined · peer-2`. */
   session: string;
+}
+
+/** A peer panel's view: its own layout of the transcript, anchor and size in the last frame. */
+interface PeerPanel {
+  rows: TranscriptRows;
+  anchor: ScrollAnchor;
+  width: number;
+  height: number;
 }
 
 const TONE_ROLES: Record<ShellTone, Role> = {
@@ -82,23 +112,32 @@ export class ShellModel {
   /** Live orchestration phases, e.g. `O-1 master agent refining 12s`; null when none run. */
   orchestration: string | null = null;
   version: string | null = SKEP_VERSION;
+  /** `split` shows a panel per peer next to the main one (ORCH-5, D34). */
+  layout: ShellLayout = "single";
+  /** The panel the scroll keys move: {@link MAIN_PANEL} or a peer id. */
+  focus: string = MAIN_PANEL;
+  /** The focused panel takes the whole body. */
+  zoomed = false;
   /**
-   * Width and body height of the last frame. A wrapped entry spans several rows, so scrolling is
-   * counted in rows at the current width, not in entries (SESSION-UX R7).
+   * Width and body height of the main view in the last frame. A wrapped entry spans several
+   * rows, so scrolling is counted in rows at the current width, not in entries (SESSION-UX R7).
    */
   private width = 80;
   private bodyHeight = 0;
-  private readonly layout: TranscriptRows;
+  private readonly mainRows: TranscriptRows;
+  private readonly panels = new Map<string, PeerPanel>();
 
   constructor(transcript: Transcript = new Transcript()) {
     this.transcript = transcript;
-    this.layout = new TranscriptRows(transcript);
+    // A peer's progress timeline belongs to its panel only; the main view stays as it was.
+    this.mainRows = new TranscriptRows(transcript, (entry) => entry.panelOnly !== true);
   }
 
-  /** The retained entries, oldest first (the drop marker is not one). */
+  /** The main view's retained entries, oldest first (the drop marker is not one). */
   get scrollback(): readonly { text: string; tone: ShellTone }[] {
     return this.transcript
       .entries()
+      .filter((entry) => entry.panelOnly !== true)
       .map((entry) => ({ text: `${entry.gutter ?? ""}${entry.text}`, tone: entry.tone }));
   }
 
@@ -106,42 +145,115 @@ export class ShellModel {
    * Appends one or more lines; a multi-line text becomes several entries. A pinned reader keeps
    * the same rows: the anchor names an entry, so output below never moves the view (§5.1).
    */
-  append(text: string, tone: ShellTone = "info", gutter?: string): void {
+  append(text: string, tone: ShellTone = "info", gutter?: string, tag?: EntryTag): void {
     for (const line of text.replace(/\n+$/, "").split("\n")) {
-      this.transcript.append(line, tone, gutter);
+      this.transcript.append(line, tone, gutter, tag);
     }
   }
 
-  /** Rendered rows between the bottom of the body and the newest row. */
-  get scroll(): number {
-    return viewWindow(this.anchor, this.rows(), this.bodyHeight).below;
+  /**
+   * The panel the keys act on: the focused one while split, if it still exists (a peer that left
+   * takes its panel with it), else the main view.
+   */
+  get activePanel(): string {
+    if (this.layout !== "split" || this.focus === MAIN_PANEL) return MAIN_PANEL;
+    return this.peers.some((peer) => peer.peerId === this.focus) ? this.focus : MAIN_PANEL;
   }
 
-  /** Moves the view by `rows` rendered rows (positive is up), within the transcript. */
+  /** Rendered rows between the bottom of the active panel's body and its newest row. */
+  get scroll(): number {
+    const id = this.activePanel;
+    return viewWindow(this.anchorOf(id), this.rows(id), this.heightOf(id)).below;
+  }
+
+  /** Moves the active panel by `rows` rendered rows (positive is up), within its entries. */
   scrollBy(rows: number): void {
-    this.anchor = scrollAnchor(this.anchor, rows, this.rows(), this.bodyHeight);
+    const id = this.activePanel;
+    this.setAnchor(id, scrollAnchor(this.anchorOf(id), rows, this.rows(id), this.heightOf(id)));
   }
 
   scrollToTop(): void {
-    this.anchor = anchorAt(0, this.rows(), this.bodyHeight);
+    const id = this.activePanel;
+    this.setAnchor(id, anchorAt(0, this.rows(id), this.heightOf(id)));
   }
 
   scrollToBottom(): void {
+    this.setAnchor(this.activePanel, FOLLOW);
+  }
+
+  /** The main view follows new output again, whichever panel has the focus. */
+  followMain(): void {
     this.anchor = FOLLOW;
   }
 
   /** One page: the body less one row, so the reader keeps a line of context. */
   pageRows(): number {
-    return Math.max(1, this.bodyHeight - 1);
+    return Math.max(1, this.heightOf(this.activePanel) - 1);
   }
 
   /** The largest scroll: the first rendered row at the top of the body. */
   maxScroll(): number {
-    return Math.max(0, this.rows().totalRows - this.bodyHeight);
+    const id = this.activePanel;
+    return Math.max(0, this.rows(id).totalRows - this.heightOf(id));
   }
 
-  private rows(): TranscriptRows {
-    return this.layout.sync(this.width);
+  /**
+   * Pins the active panel to the newest entry before the top of its view whose text contains
+   * `query` (case-insensitive), passing over entries `skip` rejects (the echoed `/find` itself).
+   * False when there is none; the view then stays.
+   */
+  findBack(query: string, skip: (text: string) => boolean = () => false): boolean {
+    const id = this.activePanel;
+    const space = this.rows(id);
+    const needle = query.toLowerCase();
+    if (needle === "" || space.entryCount === 0) return false;
+    const height = this.heightOf(id);
+    const { top } = viewWindow(this.anchorOf(id), space, height);
+    // Following: the whole visible page counts as already seen only once something is pinned.
+    let index =
+      this.anchorOf(id).kind === "bottom" ? space.entryCount - 1 : locateRow(space, top) - 1;
+    for (; index >= 0; index--) {
+      const entry = space.entry(index) as TranscriptEntry;
+      const text = `${entry.gutter ?? ""}${entry.text}`;
+      if (!skip(text) && text.toLowerCase().includes(needle)) {
+        this.setAnchor(id, { kind: "pinned", seq: entry.seq, row: 0 });
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private anchorOf(id: string): ScrollAnchor {
+    return id === MAIN_PANEL ? this.anchor : this.panel(id).anchor;
+  }
+
+  private setAnchor(id: string, anchor: ScrollAnchor): void {
+    if (id === MAIN_PANEL) this.anchor = anchor;
+    else this.panel(id).anchor = anchor;
+  }
+
+  private heightOf(id: string): number {
+    return id === MAIN_PANEL ? this.bodyHeight : this.panel(id).height;
+  }
+
+  private rows(id: string = MAIN_PANEL): TranscriptRows {
+    if (id === MAIN_PANEL) return this.mainRows.sync(this.width);
+    const panel = this.panel(id);
+    return panel.rows.sync(panel.width);
+  }
+
+  private panel(id: string): PeerPanel {
+    let panel = this.panels.get(id);
+    if (panel === undefined) {
+      panel = {
+        rows: new TranscriptRows(this.transcript, (entry) => entry.peer === id),
+        anchor: FOLLOW,
+        width: this.width,
+        height: 0,
+      };
+      this.panels.set(id, panel);
+    }
+    return panel;
   }
 
   animating(): boolean {
@@ -195,7 +307,8 @@ export class ShellModel {
     const bodyRows = Math.max(0, rows - lines.length - 1 - 1 - bee.length - 1);
     this.width = columns;
     this.bodyHeight = bodyRows;
-    const body = this.bodyLines(bodyRows);
+    const split = this.layout === "split" && this.sessionLive;
+    const body = split ? this.splitBody(columns, bodyRows) : this.bodyLines(bodyRows);
     const rule = this.ruleLine(columns);
     const overlay =
       this.picker === null ? this.menuLines() : this.pickerLines(this.picker, bodyRows);
@@ -209,13 +322,19 @@ export class ShellModel {
     );
   }
 
-  private bodyLines(count: number): Line[] {
+  private bodyLines(count: number, id: string = MAIN_PANEL): Line[] {
     let visible: Line[];
-    if (this.transcript.length === 0) {
+    const space = this.rows(id);
+    if (id === MAIN_PANEL && space.entryCount === 0) {
       visible = welcomeLines(this.glyphs).slice(-count);
+    } else if (space.entryCount === 0) {
+      visible = [{ spans: [fg("on-surface-variant", `  (nothing from ${id} yet)`)] }].slice(
+        0,
+        count,
+      );
+      return [...visible, ...Array<Line>(Math.max(0, count - visible.length)).fill("")];
     } else {
-      const space = this.rows();
-      const { top } = viewWindow(this.anchor, space, count);
+      const { top } = viewWindow(this.anchorOf(id), space, count);
       visible = space.window(top, count).map(({ entry, text }) => ({
         spans: [fg(TONE_ROLES[entry.tone], text)],
       }));
@@ -224,15 +343,85 @@ export class ShellModel {
   }
 
   /**
+   * The body as panels (ORCH-5): each panel is a title row over its own view of the transcript,
+   * and body rows are the panels' rows joined left to right.
+   */
+  private splitBody(columns: number, rows: number): Line[] {
+    const peers = this.peers.map((peer) => peer.peerId);
+    const focus = this.activePanel;
+    const layout = splitLayout(columns, rows, peers, focus, this.zoomed);
+    const cells = layout.panels.map((rect) => {
+      const height = Math.max(0, rect.height - 1);
+      if (rect.id === MAIN_PANEL) {
+        this.width = rect.width;
+        this.bodyHeight = height;
+      } else {
+        const panel = this.panel(rect.id);
+        panel.width = rect.width;
+        panel.height = height;
+      }
+      const title = this.panelTitle(rect, focus, rect.id === MAIN_PANEL ? layout.hidden : []);
+      const lines = rect.height === 0 ? [] : [title, ...this.bodyLines(height, rect.id)];
+      return { rect, lines: lines.map((line) => fitLine(line, rect.width)) };
+    });
+    const separator = fg("outline", this.glyphs === "nerd" ? "│" : "|");
+    const out: Line[] = [];
+    for (let row = 0; row < rows; row++) {
+      const here = cells
+        .filter(({ rect }) => row >= rect.top && row < rect.top + rect.height)
+        .sort((left, right) => left.rect.left - right.rect.left)
+        .map(({ rect, lines }) => ({ spans: lines[row - rect.top] ?? [] }));
+      out.push(joinCells(here, separator));
+    }
+    return out;
+  }
+
+  /** `── > peer-2 · mac · coding · working 40% ───`: the focused title is bold. */
+  private panelTitle(rect: PanelRect, focus: string, hidden: readonly string[]): Line {
+    const g = chrome(this.glyphs);
+    const focused = rect.id === focus;
+    const mark = focused ? (this.glyphs === "nerd" ? "▸ " : "> ") : "";
+    // Next to the name, so a long progress line cannot push it out of a narrow panel.
+    const scrolled = this.anchorOf(rect.id).kind === "pinned" ? [`scrolled`] : [];
+    let parts: string[];
+    if (rect.id === MAIN_PANEL) {
+      const more = hidden.length === 0 ? [] : [`+${hidden.length} more (tab)`];
+      parts = [MAIN_PANEL, ...scrolled, ...more];
+    } else {
+      const peer = this.peers.find((entry) => entry.peerId === rect.id);
+      parts =
+        peer === undefined
+          ? [rect.id, ...scrolled]
+          : [
+              peer.peerId,
+              ...scrolled,
+              peer.device,
+              peer.role,
+              progressNote(peer.state, peer.progress),
+            ];
+    }
+    const text = ` ${mark}${parts.join(g.sep)} `;
+    const fill = Math.max(0, rect.width - 2 - displayWidth(text));
+    return {
+      spans: [
+        fg("outline", g.rule.repeat(2)),
+        focused ? bold(text, "primary") : fg("on-surface-variant", text),
+        fg("outline", g.rule.repeat(fill)),
+      ],
+    };
+  }
+
+  /**
    * The rule under the input; while the view is pinned it says how much is above and below and
    * how to follow again (S6).
    */
   private ruleLine(columns: number): Line {
     const g = chrome(this.glyphs);
-    if (this.anchor.kind === "bottom" || this.transcript.length === 0) {
+    const id = this.activePanel;
+    if (this.anchorOf(id).kind === "bottom" || this.rows(id).entryCount === 0) {
       return { spans: [fg("outline", `  ${g.rule.repeat(Math.max(0, columns - 2))}`)] };
     }
-    const { above, below } = viewWindow(this.anchor, this.rows(), this.bodyHeight);
+    const { above, below } = viewWindow(this.anchorOf(id), this.rows(id), this.heightOf(id));
     const [up, down] = this.glyphs === "nerd" ? ["↑", "↓"] : ["^", "v"];
     const label = ` ${up} ${above} lines above${g.sep}${down} ${below} lines below — End to follow `;
     const fill = Math.max(0, columns - 4 - displayWidth(label));
@@ -371,7 +560,9 @@ export class ShellModel {
                 "tab/enter accept",
                 "esc close",
               ]
-            : ["/ commands", "enter send", "pgup/pgdn/wheel scroll", "ctrl+c clear", "/quit"];
+            : this.layout === "split" && this.sessionLive
+              ? ["/ commands", "enter send", "tab panel", "pgup/pgdn scroll", "/layout single"]
+              : ["/ commands", "enter send", "pgup/pgdn/wheel scroll", "ctrl+c clear", "/quit"];
     return { spans: [fg("on-surface-variant", `  ${keys.join(separator)}`)] };
   }
 }

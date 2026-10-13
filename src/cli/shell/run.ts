@@ -72,6 +72,7 @@ import {
 } from "./input.js";
 import { JOIN_USAGE, parseJoinArgs } from "./join-args.js";
 import { ShellModel, type ShellPeer, type ShellTone } from "./model.js";
+import { cycleFocus, MAIN_PANEL, progressNote, resolvePanel } from "./panels.js";
 import {
   type ExternalMaster,
   explainReason,
@@ -89,6 +90,7 @@ import {
   type SlashCommand,
   type SlashResult,
 } from "./slash.js";
+import type { EntryTag } from "./transcript.js";
 
 export { parseFlags } from "./flags.js";
 
@@ -190,6 +192,10 @@ export class Shell {
   private readonly modeLoaded: Promise<void>;
   /** Created on the first orchestrated request: it resolves the master agent CLI. */
   private orchestrator: Orchestrator | null = null;
+  /** The last progress line recorded in each peer's panel timeline (ORCH-5). */
+  private readonly timeline = new Map<string, string>();
+  /** The last `/find` text, so a bare `/find` looks further back. */
+  private findQuery = "";
 
   private readonly decoder = new ShellKeyDecoder();
   /** Cancels the wait that turns a held partial escape sequence into an Esc key. */
@@ -355,7 +361,12 @@ export class Shell {
         model.scrollToBottom();
         break;
       case "tab":
-        this.acceptMenu();
+        // Tab completes a command; with nothing typed in split layout it moves the focus.
+        if (model.menu.length === 0 && model.input === "" && model.layout === "split") {
+          model.focus = cycleFocus(model.activePanel, this.panelIds());
+        } else {
+          this.acceptMenu();
+        }
         break;
       case "escape":
         this.menuDismissed = true;
@@ -448,7 +459,7 @@ export class Shell {
     this.model.input = "";
     // The human just said something: show it and what follows. An empty Enter keeps the view,
     // and so does a scroll command, which would otherwise undo itself.
-    if (text.trim() !== "" && !/^\/(top|bottom)\s*$/.test(text.trim())) this.model.scrollToBottom();
+    if (text.trim() !== "" && !/^\/(top|bottom|find)\b/.test(text.trim())) this.model.followMain();
     this.menuDismissed = false;
     // Failures are logged into the scrollback by `dispatch`; nothing is left to report here.
     this.submit(text).catch(() => undefined);
@@ -953,6 +964,30 @@ export class Shell {
         },
       },
       {
+        name: "layout",
+        description: "split: a panel per peer next to the main one; single: one transcript",
+        usage: "[split|single]",
+        run: (_ctx, args) => this.layoutCommand(args),
+      },
+      {
+        name: "focus",
+        description: "the panel the scroll keys move (tab cycles)",
+        usage: "<main|peer-id|device>",
+        argsRequired: true,
+        run: (_ctx, args) => this.focusCommand(args),
+      },
+      {
+        name: "zoom",
+        description: "show the focused panel alone, or all panels again",
+        run: () => this.zoomCommand(),
+      },
+      {
+        name: "find",
+        description: "scroll the focused panel back to text (again: further back)",
+        usage: "[text]",
+        run: (_ctx, args) => this.findCommand(args),
+      },
+      {
         name: "mouse",
         description: "wheel via mouse reporting (on) or the terminal's arrows (off)",
         usage: "[on|off]",
@@ -995,6 +1030,9 @@ export class Shell {
       "  item first; --submit commit|push|pr|mr|none|ask overrides device.toml",
       "/agent: which agent CLI items run; else --agent, SKEP_AGENT_CLI, AGENT.md, or PATH",
       "scroll: PgUp/PgDn, Shift+arrows, wheel or arrows (no menu open), Home/End; End follows",
+      "panels: /layout split shows one panel per peer (its results and progress timeline);",
+      "  tab (empty input) or /focus picks the panel the scroll keys move; typed text still goes",
+      "  to the master; remote peers' live output is not shown (off by default)",
       "advanced: `skep tui` opens the raw agent TUI",
     ].join("\n");
   }
@@ -1050,6 +1088,9 @@ export class Shell {
   private masterEvent(event: { kind: string; message: string; full?: string }): void {
     const { kind } = event;
     const message = event.full ?? event.message;
+    // Peer lines go to that peer's panel as well (ORCH-5); the main view is unchanged.
+    const tag = this.eventPeer(kind, message);
+    const log = (text: string, tone: ShellTone): void => this.log(text, tone, undefined, tag);
     switch (kind) {
       case "progress":
         break;
@@ -1063,50 +1104,67 @@ export class Shell {
           own === null || own.joinCode === null
             ? "/join <code>"
             : formatJoinPaste({ host: own.advertise, code: own.joinCode });
-        this.log(`${text}\nit can rejoin with the current code: ${rejoin}`, "error");
+        log(`${text}\nit can rejoin with the current code: ${rejoin}`, "error");
         break;
       }
       case "join-failed":
       case "error":
-        this.log(message, "error");
+        log(message, "error");
         break;
       case "fingerprint":
-        this.log(`fingerprint ${message}`, "event");
+        log(`fingerprint ${message}`, "event");
         break;
       case "planned":
-        this.log(`intent ${message} planned`, "event");
+        log(`intent ${message} planned`, "event");
         break;
       case "joined":
-        this.log(message, "event");
+        log(message, "event");
         break;
       case "item-result":
         // `I-4 done · mac (app) · …` with the changed files: what the peer's agent produced.
-        this.log(message, "event");
+        log(message, "event");
         break;
       case "item-failed":
         // Uncapped and wrapped: the cause and fix are the point (SESSION-UX §3.4).
-        this.log(message, "error");
+        log(message, "error");
         break;
       case "item-pending":
       case "intent-waiting":
         // An agent waits for a human in its pane: not finished, and the focus command matters.
-        this.log(message, "warn");
+        log(message, "warn");
         break;
       case "intent-failed":
-        this.log(message, "error");
+        log(message, "error");
         break;
       case "intent-done":
-        this.log(message, "event");
+        log(message, "event");
         break;
       case "result-reject":
-        this.log(`result rejected ${message}`, "error");
+        log(`result rejected ${message}`, "error");
         break;
       default:
-        this.log(`${kind} ${message}`, "event");
+        log(`${kind} ${message}`, "event");
     }
     // A result or a finished intent may settle an orchestration: no need to wait for the tick.
     if (kind.startsWith("item-") || kind.startsWith("intent-")) this.orchestrator?.poll();
     this.sync();
+  }
+
+  /** The peer a master event is about: `Peer peer-2 …` lines, or the assignee of `I-4 …`. */
+  private eventPeer(kind: string, message: string): EntryTag | undefined {
+    if (kind === "joined" || kind === "left") {
+      const peer = /^Peer (\S+)/.exec(message)?.[1];
+      return peer === undefined ? undefined : { peer };
+    }
+    if (!kind.startsWith("item-")) return undefined;
+    const itemId = /^(I-\d+)\b/.exec(message)?.[1];
+    const status = this.session.ownMaster?.handle.status();
+    if (itemId === undefined || status === undefined) return undefined;
+    for (const intent of status.intents) {
+      const item = intent.items.find((entry) => entry.itemId === itemId);
+      if (item !== undefined) return { peer: item.assignee };
+    }
+    return undefined;
   }
 
   private masterEnded(flow: MasterFlow, message: string): void {
@@ -1349,6 +1407,61 @@ export class Shell {
    * Full mouse reporting scrolls with the wheel in terminals that do not turn it into arrows, but
    * native selection then needs Shift (§5.2), so it is opt-in and off by default.
    */
+  private layoutCommand(args: string): SlashResult {
+    const model = this.model;
+    const word = args.trim().toLowerCase();
+    if (word !== "" && word !== "split" && word !== "single") {
+      return { type: "error", message: "usage: /layout [split|single]" };
+    }
+    model.layout = word === "" ? (model.layout === "split" ? "single" : "split") : word;
+    model.zoomed = false;
+    if (model.layout === "single") {
+      model.focus = MAIN_PANEL;
+      return { type: "ok", message: "layout single" };
+    }
+    // Panels show what already reaches this shell; a peer's live agent output stays on its
+    // device unless that peer opts in (plan §9.6, protocol v2).
+    const note = model.sessionLive
+      ? `${model.peers.length} peer panel(s)`
+      : "panels appear once a session is live";
+    return {
+      type: "ok",
+      message: `layout split · ${note}; tab or /focus moves between panels, /zoom enlarges one`,
+    };
+  }
+
+  private focusCommand(args: string): SlashResult {
+    const model = this.model;
+    const id = resolvePanel(args, model.peers);
+    if (id === null) {
+      const known = [MAIN_PANEL, ...this.panelIds()].join(", ");
+      return { type: "error", message: `no single panel matches "${args}" (panels: ${known})` };
+    }
+    if (model.layout !== "split") model.layout = "split";
+    model.focus = id;
+    return { type: "ok" };
+  }
+
+  private zoomCommand(): SlashResult {
+    const model = this.model;
+    if (model.layout !== "split") {
+      model.layout = "split";
+      model.zoomed = true;
+    } else {
+      model.zoomed = !model.zoomed;
+    }
+    return { type: "ok" };
+  }
+
+  private findCommand(args: string): SlashResult {
+    const query = args.trim() === "" ? this.findQuery : args.trim();
+    if (query === "") return { type: "error", message: "usage: /find <text>" };
+    this.findQuery = query;
+    // The echoed command line contains the text too; it is not what the human is looking for.
+    if (this.model.findBack(query, (text) => text.startsWith("> /find"))) return { type: "ok" };
+    return { type: "error", message: `find: no earlier line contains "${query}"` };
+  }
+
   private mouseCommand(args: string): SlashResult {
     const value = args.trim().toLowerCase();
     if (value === "") {
@@ -1480,11 +1593,39 @@ export class Shell {
     this.model.header = { ...this.model.header, session: view.live ? view.label : "no session" };
     this.model.sessionLive = view.live;
     this.model.peers = view.peers;
+    this.recordTimeline(view.peers);
     this.model.link =
       view.linkSilentMs === null ? null : linkText(view.linkSilentMs, this.model.glyphs);
     this.refreshMenu();
     this.render();
     this.maybeTick();
+  }
+
+  /**
+   * Each peer's panel keeps a timeline of what its progress reports said: a line whenever the
+   * phase, counts or progress text change. Panel-only, so the main view stays as it was.
+   */
+  private recordTimeline(peers: readonly ShellPeer[]): void {
+    // A peer that left starts a fresh timeline line if it comes back.
+    for (const id of this.timeline.keys()) {
+      if (!peers.some((peer) => peer.peerId === id)) this.timeline.delete(id);
+    }
+    for (const peer of peers) {
+      const note = progressNote(peer.state, peer.progress);
+      if (this.timeline.get(peer.peerId) === note) continue;
+      this.timeline.set(peer.peerId, note);
+      this.model.append(note, "muted", undefined, { peer: peer.peerId, panelOnly: true });
+    }
+  }
+
+  /** Peer panel ids in roster order. */
+  private panelIds(): string[] {
+    return this.model.peers.map((peer) => peer.peerId);
+  }
+
+  /** The peer id this shell joined as, for its own agent's lines; null when not joined. */
+  ownPeerId(): string | null {
+    return this.session.ownJoin?.handle.peerId ?? null;
   }
 
   /** `O-1 master agent refining 12s · O-2 waiting for peers 3m 4s` for the footer. */
@@ -1572,8 +1713,8 @@ export class Shell {
   // -------------------------------------------------------------------------------------------
   // Terminal.
 
-  log(text: string, tone: ShellTone = "info", gutter?: string): void {
-    this.model.append(text, tone, gutter);
+  log(text: string, tone: ShellTone = "info", gutter?: string, tag?: EntryTag): void {
+    this.model.append(text, tone, gutter, tag);
     this.render();
   }
 
@@ -1660,20 +1801,23 @@ export class ShellJoinView implements JoinView {
     const { item, agent } = model;
     if (item === null) return;
     const key = `${item.itemId}-e${item.epoch}`;
+    // This device's own agent output also goes to its own panel (local only, D27).
+    const own = this.shell.ownPeerId();
+    const tag = own === null ? undefined : { peer: own };
     if (agent !== null) {
       const watch =
         agent.focusCommand === undefined ? "" : `; watch with: ${agent.focusCommand.join(" ")}`;
       const line = `${item.itemId}: agent ${agent.cli} (${agent.view}) ${agent.state}${watch}`;
       if (this.states.get(key) !== line) {
         this.states.set(key, line);
-        this.shell.log(line, agent.state === "failed" ? "error" : "event");
+        this.shell.log(line, agent.state === "failed" ? "error" : "event", undefined, tag);
       }
     }
     const terminal = agent?.state === "done" || agent?.state === "failed";
     // A finished run brings its whole local output; the 4000-character tail is only its end (S3).
     const output = model.transcript ?? model.tail;
     for (const line of this.newTailLines(key, output, terminal || model.transcript !== undefined)) {
-      this.shell.log(line, "muted", `${item.itemId} │ `);
+      this.shell.log(line, "muted", `${item.itemId} │ `, tag);
     }
   }
 

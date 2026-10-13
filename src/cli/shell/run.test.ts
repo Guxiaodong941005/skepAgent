@@ -2053,3 +2053,162 @@ describe("parseIntentArgs", () => {
     });
   });
 });
+
+describe("split panels (ORCH-5)", () => {
+  function frameText(h: Awaited<ReturnType<typeof harness>>, columns = 120, rows = 30): string[] {
+    return h.shell.model
+      .frame(columns, rows)
+      .map((line) => (typeof line === "string" ? line : line.spans.map((s) => s.text).join("")));
+  }
+  const peerColumn = (lines: string[]) =>
+    lines
+      .filter((line) => line[66] === "|")
+      .map((line) => line.slice(67))
+      .join("\n");
+
+  async function master() {
+    const h = await harness();
+    await h.shell.submit("/start --yes --repo app");
+    h.fake.peers.push(peer("peer-1", "mac", "app"), peer("peer-2", "vps", "web"));
+    h.fake.intents.push({
+      intentId: "N-1",
+      text: "fix login",
+      state: "planned",
+      items: [
+        {
+          itemId: "I-4",
+          repo: "web",
+          assignee: "peer-2",
+          epoch: 1,
+          title: "fix login",
+          datalistEntries: 0,
+          state: "claimed",
+        },
+      ],
+    });
+    h.shell.sync();
+    return h;
+  }
+
+  it("/layout split shows a panel per peer with its results and progress timeline", async () => {
+    const h = await master();
+    expect(await h.shell.submit("/layout split")).toBeUndefined();
+    expect(h.scrollback()).toContain("layout split · 2 peer panel(s)");
+    const onEvent = h.fake.calls.master[0]?.onEvent;
+    onEvent?.({ kind: "item-failed", message: "I-4 FAILED · vps (web)\n  cause: tests fail" });
+    onEvent?.({ kind: "joined", message: "Peer peer-1 joined" });
+    const status = h.fake.peers[1];
+    if (status !== undefined) {
+      status.progress = {
+        phase: "working",
+        done: 0,
+        total: 1,
+        failed: 0,
+        percent: 0,
+        summary: "running npm test",
+      };
+    }
+    h.shell.sync();
+    const lines = frameText(h);
+    const column = peerColumn(lines);
+    expect(column).toContain("I-4 FAILED · vps (web)");
+    expect(column).toContain("cause: tests fail");
+    expect(column).toContain("Peer peer-1 joined");
+    expect(column).toContain("working 0% 0/1 · running npm test");
+    // The main view is the same transcript as before: results yes, progress timeline no.
+    expect(h.scrollback()).toContain("I-4 FAILED · vps (web)");
+    expect(h.scrollback()).not.toContain("running npm test");
+    const panel = h.shell.model.transcript
+      .entries()
+      .filter((entry) => entry.peer === "peer-2")
+      .map((entry) => entry.text);
+    expect(panel).toEqual([
+      "idle",
+      "I-4 FAILED · vps (web)",
+      "  cause: tests fail",
+      expect.stringContaining("running npm test"),
+    ]);
+    await h.shell.quit();
+  });
+
+  it("Tab on an empty input cycles the focus and the scroll keys follow it", async () => {
+    const h = await master();
+    await h.shell.submit("/layout split");
+    const onEvent = h.fake.calls.master[0]?.onEvent;
+    for (let n = 0; n < 40; n++) onEvent?.({ kind: "joined", message: `Peer peer-1 joined ${n}` });
+    frameText(h);
+    h.stdin.type("\t");
+    expect(h.shell.model.focus).toBe("peer-1");
+    h.stdin.type("\x1b[5~");
+    expect(h.shell.model.anchor.kind).toBe("bottom");
+    expect(h.shell.model.scroll).toBeGreaterThan(0);
+    h.stdin.type("\t");
+    expect(h.shell.model.focus).toBe("peer-2");
+    h.stdin.type("\t");
+    expect(h.shell.model.focus).toBe("main");
+    // With a command typed, Tab still completes it.
+    h.stdin.type("/zo");
+    h.stdin.type("\t");
+    expect(h.shell.model.input).toBe("/zoom");
+    await h.shell.quit();
+  });
+
+  it("/focus names a panel by peer or device, /zoom toggles, /layout single resets", async () => {
+    const h = await master();
+    await h.shell.submit("/focus vps");
+    expect(h.shell.model.layout).toBe("split");
+    expect(h.shell.model.focus).toBe("peer-2");
+    await h.shell.submit("/focus nowhere");
+    expect(h.scrollback()).toContain(
+      'no single panel matches "nowhere" (panels: main, peer-1, peer-2)',
+    );
+    await h.shell.submit("/zoom");
+    expect(h.shell.model.zoomed).toBe(true);
+    const zoomed = frameText(h).join("\n");
+    expect(zoomed).toMatch(/> peer-2 \| vps/);
+    expect(zoomed).not.toMatch(/-- main/);
+    await h.shell.submit("/layout single");
+    expect(h.shell.model).toMatchObject({ layout: "single", focus: "main", zoomed: false });
+    await h.shell.submit("/layout sideways");
+    expect(h.scrollback()).toContain("usage: /layout [split|single]");
+    await h.shell.quit();
+  });
+
+  it("/find scrolls back to earlier text, again further back, and says when nothing matches", async () => {
+    const h = await master();
+    h.shell.log("needle one");
+    for (let n = 0; n < 40; n++) h.shell.log(`hay ${n}`);
+    h.shell.log("needle two");
+    for (let n = 0; n < 40; n++) h.shell.log(`more hay ${n}`);
+    frameText(h, 80, 24);
+    await h.shell.submit("/find needle");
+    expect(frameText(h, 80, 24).join("\n")).toContain("needle two");
+    await h.shell.submit("/find");
+    expect(frameText(h, 80, 24).join("\n")).toContain("needle one");
+    await h.shell.submit("/find");
+    expect(h.scrollback()).toContain('find: no earlier line contains "needle"');
+    await h.shell.quit();
+  });
+
+  it("a joined shell puts its own agent's output in its own panel", async () => {
+    const h = await harness();
+    await h.shell.submit("/join 1234-5678-9012 --host 192.168.1.20:7419 --repo app");
+    expect(h.shell.ownPeerId()).toBe("peer-1");
+    const view = new ShellJoinView(h.shell, 1);
+    h.shell.joinRoster(1, [
+      { peerId: "peer-1", device: "laptop", role: "coding", state: "working" },
+    ]);
+    view.update({
+      peers: [{ peerId: "peer-1", device: "laptop", role: "coding", state: "working" }],
+      item: { itemId: "I-2", title: "t", repo: "app", epoch: 1 },
+      agent: { cli: "claude", view: "native", state: "running" },
+      tail: "compiling\n",
+      submit: { policy: "none" },
+    });
+    const own = h.shell.model.transcript.entries().filter((entry) => entry.peer === "peer-1");
+    expect(own.map((entry) => entry.text)).toEqual(
+      expect.arrayContaining(["I-2: agent claude (native) running", "compiling"]),
+    );
+    await h.shell.quit();
+  });
+});

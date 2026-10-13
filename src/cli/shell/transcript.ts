@@ -23,6 +23,16 @@ export interface TranscriptEntry {
   /** Repeated on every wrapped row, e.g. `I-4 │ ` for an agent tail line. */
   readonly gutter?: string;
   readonly marker?: true;
+  /** The peer whose panel shows this entry too (plan §7 Phase 3, ORCH-5). */
+  readonly peer?: string;
+  /** Shown only in {@link peer}'s panel, never in the main view (e.g. its progress timeline). */
+  readonly panelOnly?: true;
+}
+
+/** Where an entry shows besides the main view; see {@link TranscriptEntry.peer}. */
+export interface EntryTag {
+  peer?: string;
+  panelOnly?: boolean;
 }
 
 /** Continuation rows of a wrapped entry sit this much deeper than its first row. */
@@ -83,12 +93,19 @@ export class Transcript {
     return Math.min(Math.max(0, seq - this.firstSeq()), length - 1);
   }
 
-  append(text: string, tone: TranscriptTone, gutter?: string): TranscriptEntry {
+  /** Sequence number of the newest entry ever appended (-1 when none). */
+  get lastSeq(): number {
+    return this.nextSeq - 1;
+  }
+
+  append(text: string, tone: TranscriptTone, gutter?: string, tag?: EntryTag): TranscriptEntry {
     const entry: TranscriptEntry = {
       seq: this.nextSeq++,
       tone,
       text,
       ...(gutter === undefined ? {} : { gutter }),
+      ...(tag?.peer === undefined ? {} : { peer: tag.peer }),
+      ...(tag?.peer !== undefined && tag.panelOnly === true ? { panelOnly: true as const } : {}),
     };
     this.items.push(entry);
     this.chars += text.length;
@@ -131,6 +148,9 @@ export class Transcript {
  * extended incrementally on append, so a frame costs O(visible rows + log n) instead of
  * re-wrapping the history (S10). A width change clears the cache; an eviction rebuilds only
  * the offsets.
+ *
+ * With a `filter` the layout is a view of the entries it accepts (a panel, ORCH-5); the drop
+ * marker is in every view, because what it reports is true for all of them.
  */
 export class TranscriptRows implements RowSpace {
   private width = -1;
@@ -138,8 +158,15 @@ export class TranscriptRows implements RowSpace {
   private first = 0;
   private readonly cache = new Map<number, string[]>();
   private starts: number[] = [0];
+  /** Seqs of the entries in this view, oldest first; contiguous only without a filter. */
+  private seqs: number[] = [];
+  /** The newest transcript seq already considered for {@link seqs}. */
+  private scanned = -1;
 
-  constructor(private readonly transcript: Transcript) {}
+  constructor(
+    private readonly transcript: Transcript,
+    private readonly filter?: (entry: TranscriptEntry) => boolean,
+  ) {}
 
   /** Brings the layout up to date with the transcript at `width` columns. */
   sync(width: number): this {
@@ -156,11 +183,29 @@ export class TranscriptRows implements RowSpace {
       for (const seq of this.cache.keys()) if (seq < first + 1) this.cache.delete(seq);
       this.first = first;
       this.starts = [0];
+      this.seqs = [];
+      this.scanned = first - 1;
     }
-    for (let index = this.starts.length - 1; index < transcript.length; index++) {
+    this.scan();
+    for (let index = this.starts.length - 1; index < this.seqs.length; index++) {
       this.starts.push((this.starts[index] ?? 0) + this.rows(index).length);
     }
     return this;
+  }
+
+  /** Adds the entries appended since the last sync that this view shows. */
+  private scan(): void {
+    const transcript = this.transcript;
+    const last = transcript.lastSeq;
+    if (last <= this.scanned) return;
+    for (let index = transcript.indexOfSeq(this.scanned + 1); index < transcript.length; index++) {
+      const entry = transcript.at(index) as TranscriptEntry;
+      if (entry.seq <= this.scanned) continue;
+      if (entry.marker === true || this.filter === undefined || this.filter(entry)) {
+        this.seqs.push(entry.seq);
+      }
+    }
+    this.scanned = last;
   }
 
   get totalRows(): number {
@@ -172,11 +217,19 @@ export class TranscriptRows implements RowSpace {
   }
 
   seqAt(index: number): number {
-    return this.transcript.at(index)?.seq ?? this.first;
+    return this.seqs[index] ?? this.first;
   }
 
+  /** The first entry at or after `seq`, clamped into the view (an evicted seq maps to the first). */
   indexOfSeq(seq: number): number {
-    return this.transcript.indexOfSeq(seq);
+    let low = 0;
+    let high = this.seqs.length;
+    while (low < high) {
+      const middle = (low + high) >> 1;
+      if ((this.seqs[middle] ?? 0) < seq) low = middle + 1;
+      else high = middle;
+    }
+    return Math.min(low, Math.max(0, this.seqs.length - 1));
   }
 
   rowStart(index: number): number {
@@ -187,9 +240,16 @@ export class TranscriptRows implements RowSpace {
     return this.rowStart(index + 1) - this.rowStart(index);
   }
 
+  /** Entry `index` of this view. */
+  entry(index: number): TranscriptEntry | undefined {
+    const seq = this.seqs[index];
+    if (seq === undefined) return undefined;
+    return this.transcript.at(this.transcript.indexOfSeq(seq));
+  }
+
   /** The wrapped rows of entry `index` at the synced width. */
   rows(index: number): string[] {
-    const entry = this.transcript.at(index);
+    const entry = this.entry(index);
     if (entry === undefined) return [];
     const cached = this.cache.get(entry.seq);
     if (cached !== undefined) return cached;
@@ -205,7 +265,7 @@ export class TranscriptRows implements RowSpace {
     let index = locateRow(this, top);
     let row = top - this.rowStart(index);
     while (out.length < count && index < this.entryCount) {
-      const entry = this.transcript.at(index) as TranscriptEntry;
+      const entry = this.entry(index) as TranscriptEntry;
       const rows = this.rows(index);
       for (; row < rows.length && out.length < count; row++) {
         out.push({ entry, text: rows[row] as string });

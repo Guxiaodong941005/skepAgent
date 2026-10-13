@@ -176,3 +176,133 @@ describe("scrollback wrapping (SESSION-UX §3.4)", () => {
     ]);
   });
 });
+
+describe("split panels (ORCH-5)", () => {
+  const progress = (phase: "idle" | "working", summary: string) => ({
+    phase,
+    done: phase === "working" ? 1 : 0,
+    total: phase === "working" ? 2 : 0,
+    failed: 0,
+    percent: phase === "working" ? 50 : 0,
+    summary,
+  });
+
+  function split(columns = 120, rows = 30): { shell: ShellModel; lines: () => string[] } {
+    const shell = model();
+    shell.sessionLive = true;
+    shell.header.session = "master · code 1234-5678-9012 · 192.168.1.20:7419";
+    shell.peers = [
+      {
+        peerId: "peer-1",
+        device: "mac",
+        role: "coding",
+        state: "joined",
+        progress: progress("working", "editing api.ts"),
+      },
+      {
+        peerId: "peer-2",
+        device: "vps",
+        role: "web",
+        state: "joined",
+        progress: progress("idle", ""),
+      },
+    ];
+    shell.layout = "split";
+    shell.append("> fix the login bug", "muted");
+    shell.append("I-1 done · mac (app)", "event", undefined, { peer: "peer-1" });
+    shell.append("working 50% 1/2 · editing api.ts", "muted", undefined, {
+      peer: "peer-1",
+      panelOnly: true,
+    });
+    shell.append("I-2 FAILED · vps (web)", "error", undefined, { peer: "peer-2" });
+    const lines = () =>
+      shell
+        .frame(columns, rows)
+        .map((line) => (typeof line === "string" ? line : line.spans.map((s) => s.text).join("")));
+    return { shell, lines };
+  }
+
+  it("draws the main panel left and one titled panel per peer right, each row exactly wide", () => {
+    const { lines } = split();
+    const frame = lines();
+    expect(frame.every((line) => displayWidthOf(line) <= 120)).toBe(true);
+    const body = frame.filter((line) => line[66] === "|");
+    expect(body.length).toBeGreaterThan(10);
+    expect(body.every((line) => displayWidthOf(line) === 120)).toBe(true);
+    const text = frame.join("\n");
+    expect(text).toMatch(/> main/);
+    expect(text).toMatch(/peer-1 \| mac \| coding \| working 50% 1\/2 · editing/);
+    expect(text).toMatch(/peer-2 \| vps \| web \| idle/);
+    expect(frame.join("\n")).toMatchSnapshot();
+  });
+
+  it("a peer panel shows its own entries and timeline; the main view never shows the timeline", () => {
+    const { shell, lines } = split();
+    const right = (line: string) => line.slice(67);
+    const left = (line: string) => line.slice(0, 66);
+    const frame = lines().filter((line) => line[66] === "|");
+    const peerColumn = frame.map(right).join("\n");
+    expect(peerColumn).toContain("I-1 done · mac (app)");
+    expect(peerColumn).toContain("I-2 FAILED · vps (web)");
+    const mainColumn = frame.map(left).join("\n");
+    expect(mainColumn).toContain("> fix the login bug");
+    expect(mainColumn).toContain("I-1 done");
+    expect(mainColumn).not.toContain("editing api.ts");
+    expect(shell.scrollback.map((entry) => entry.text)).not.toContain(
+      "working 50% 1/2 · editing api.ts",
+    );
+    // Single layout ignores the tags: the same main view as before panels existed.
+    shell.layout = "single";
+    const single = lines().join("\n");
+    expect(single).toContain("I-2 FAILED");
+    expect(single).not.toContain("1/2 · editing api.ts\n");
+  });
+
+  it("stacks the panels on an 80-column terminal", () => {
+    const { lines } = split(80, 30);
+    const frame = lines();
+    expect(frame.some((line) => line.includes("|  "))).toBe(false);
+    const titles = frame.filter((line) => /^-- (> )?(main|peer-\d)/.test(line));
+    expect(titles.map((line) => line.slice(3, 12))).toEqual([
+      "> main --",
+      "peer-1 | ",
+      "peer-2 | ",
+    ]);
+  });
+
+  it("scroll keys move only the focused panel; zoom shows it alone", () => {
+    const { shell, lines } = split();
+    for (let n = 0; n < 60; n++)
+      shell.append(`peer-1 line ${n}`, "info", undefined, { peer: "peer-1" });
+    lines();
+    shell.focus = "peer-1";
+    expect(shell.activePanel).toBe("peer-1");
+    shell.scrollBy(5);
+    lines();
+    expect(shell.anchor.kind).toBe("bottom");
+    expect(shell.scroll).toBe(5);
+    expect(lines().join("\n")).toMatch(/> peer-1 \| scrolled \| mac/);
+    shell.zoomed = true;
+    const zoomed = lines();
+    expect(zoomed.some((line) => line[66] === "|")).toBe(false);
+    expect(zoomed.join("\n")).not.toContain("> fix the login bug");
+    // A focused peer that left gives the keys back to the main view.
+    shell.peers = shell.peers.filter((peer) => peer.peerId !== "peer-1");
+    expect(shell.activePanel).toBe("main");
+  });
+
+  it("findBack pins the focused panel to the newest earlier match", () => {
+    const { shell, lines } = split(120, 24);
+    for (let n = 0; n < 80; n++) shell.append(`filler ${n}`, "info");
+    lines();
+    expect(shell.findBack("login bug")).toBe(true);
+    expect(shell.anchor).toMatchObject({ kind: "pinned", row: 0 });
+    expect(lines().join("\n")).toContain("> fix the login bug");
+    expect(shell.findBack("login bug")).toBe(false);
+    expect(shell.findBack("nothing like this")).toBe(false);
+  });
+});
+
+function displayWidthOf(line: string): number {
+  return [...line].length;
+}

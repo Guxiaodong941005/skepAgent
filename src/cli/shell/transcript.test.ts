@@ -106,6 +106,52 @@ describe("TranscriptRows", () => {
   });
 });
 
+describe("TranscriptRows with a filter (panels, ORCH-5)", () => {
+  it("lays out only the accepted entries and keeps up with appends", () => {
+    const transcript = new Transcript();
+    transcript.append("main only", "info");
+    transcript.append("peer-1 result", "event", undefined, { peer: "peer-1" });
+    transcript.append("peer-1 progress", "muted", undefined, { peer: "peer-1", panelOnly: true });
+    const main = new TranscriptRows(transcript, (entry) => entry.panelOnly !== true).sync(80);
+    const peer = new TranscriptRows(transcript, (entry) => entry.peer === "peer-1").sync(80);
+    expect(main.window(0, 10).map((row) => row.entry.text)).toEqual(["main only", "peer-1 result"]);
+    expect(peer.window(0, 10).map((row) => row.entry.text)).toEqual([
+      "peer-1 result",
+      "peer-1 progress",
+    ]);
+    transcript.append("peer-1 later", "event", undefined, { peer: "peer-1" });
+    expect(peer.sync(80).entryCount).toBe(3);
+    expect(main.sync(80).entryCount).toBe(3);
+    // A panel-only tag without a peer would show nowhere: it is stored as a main entry.
+    expect(
+      transcript.append("x", "info", undefined, { panelOnly: true }).panelOnly,
+    ).toBeUndefined();
+  });
+
+  it("maps seqs that are not in the view to the next entry that is", () => {
+    const transcript = new Transcript();
+    for (let n = 0; n < 6; n++) {
+      transcript.append(`e${n}`, "info", undefined, n % 2 === 0 ? { peer: "p" } : undefined);
+    }
+    const view = new TranscriptRows(transcript, (entry) => entry.peer === "p").sync(80);
+    expect([view.seqAt(0), view.seqAt(1), view.seqAt(2)]).toEqual([0, 2, 4]);
+    expect(view.indexOfSeq(1)).toBe(1);
+    expect(view.indexOfSeq(4)).toBe(2);
+    expect(view.indexOfSeq(99)).toBe(2);
+  });
+
+  it("shows the drop marker in every view after eviction", () => {
+    const transcript = new Transcript(40);
+    for (let n = 0; n < 10; n++) {
+      transcript.append(`entry-${n}`, "info", undefined, n % 2 === 0 ? { peer: "p" } : undefined);
+    }
+    const view = new TranscriptRows(transcript, (entry) => entry.peer === "p").sync(80);
+    const texts = view.window(0, 20).map((row) => row.entry.text);
+    expect(texts[0]).toContain(DROPPED_MARKER);
+    expect(texts.slice(1).every((text) => ["entry-6", "entry-8"].includes(text))).toBe(true);
+  });
+});
+
 describe("viewport anchors", () => {
   it("pins by entry: output below and a resize keep the same top entry", () => {
     const transcript = new Transcript();

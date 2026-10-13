@@ -22,6 +22,9 @@ Implementation notes (where the code differs from the text below, the code and t
 * `/top` and `/bottom` exist; `/find` moves to Phase 3 ORCH-5 (panels), `/expand` to ORCH-7.
 * A master agent turn that fails with a non-zero exit while a conversation exists is retried
   once in a fresh, ledger-seeded conversation; a timeout or unreadable output is not retried.
+* ORCH-5 (done): panels are filtered views of the one transcript (D34). The main panel title
+  is `main` (`/focus master` also works); `skep ui` keeps its single-agent screen. Split layout
+  applies only while a session is live; without one the shell draws the single view.
 
 Locked decisions in one line each (§9 has the verbatim answers):
 
