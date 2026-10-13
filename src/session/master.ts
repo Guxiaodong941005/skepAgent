@@ -14,7 +14,7 @@ import {
   generateJoinCode,
   type KeyMaterial,
 } from "./handshake.js";
-import type { MasterHandle, MasterOptions } from "./index.js";
+import type { MasterEvent, MasterHandle, MasterOptions } from "./index.js";
 import {
   type ControlResult,
   DeviceSchema,
@@ -23,14 +23,18 @@ import {
   IntentInputSchema,
   type ItemStatus,
   type JoinRejectReason,
+  type OutputMsg,
   type ProgressMsg,
   ProgressMsgSchema,
+  type ProtocolVersion,
   type SessionMsg,
-  SessionMsgSchema,
   type SessionStatus,
   SessionStatusSchema,
+  sessionSchema,
   TokenSchema,
+  VersionSchema,
 } from "./messages.js";
+import { outputFrame } from "./output.js";
 import type { PeerPath } from "./path.js";
 import {
   deriveProgress,
@@ -197,10 +201,31 @@ export class NoMatchError extends Error {
   }
 }
 
+/** v1 peers (≤0.1.13) accept at most this much intent text (plan §3.6). */
+const V1_TEXT_MAX = 4000;
+/**
+ * Live output a peer may send in a burst before frames are dropped: senders keep one frame per
+ * 500 ms (locked plan §9.10), but TCP may deliver a stalled run of them at once.
+ */
+const OUTPUT_BURST = 8;
+const OUTPUT_REFILL_MS = 500;
+
+/** The intent text a peer of `protocol` can parse: v1 gets the head, marked when cut. */
+export function wireText(text: string, protocol: ProtocolVersion): string {
+  if (protocol === 2 || text.length <= V1_TEXT_MAX) return text;
+  return `${text.slice(0, V1_TEXT_MAX - 1)}…`;
+}
+
 interface Peer {
   peerId: string;
   device: string;
   path: PeerPath;
+  protocol: ProtocolVersion;
+  /** From v2 `peer-info`; null until it arrives and on v1. */
+  version: string | null;
+  /** The peer's human opted in to live output (v2 only, D35). */
+  shareOutput: boolean;
+  output: { tokens: number; atMs: number };
   joinedOrder: number;
   wire: SessionWire;
   repo: string | null;
@@ -272,6 +297,7 @@ class SessionMaster implements MasterHandle {
   private readonly ttlMs: number;
   private readonly datalistMs: number;
   private readonly progressMs: number;
+  private readonly version: string;
   private readonly wires = new Set<SessionWire>();
   private readonly unauthenticated = new Set<SessionWire>();
   private readonly peers = new Map<string, Peer>();
@@ -292,6 +318,7 @@ class SessionMaster implements MasterHandle {
     this.ttlMs = positiveDuration(options.joinCodeTtlMs, 600_000);
     this.datalistMs = positiveDuration(options.datalistTimeoutMs, 30_000);
     this.progressMs = progressInterval(options.progressIntervalMs);
+    this.version = VersionSchema.parse(options.version ?? "unknown");
     this.sessionId = `session-${Buffer.from(this.random.bytes(16)).toString("hex")}`;
     this.closed = new Promise((resolve) => {
       this.resolveClosed = resolve;
@@ -358,11 +385,15 @@ class SessionMaster implements MasterHandle {
         repo: peer.repo,
         head: peer.head,
         role: peer.role,
+        protocol: peer.protocol,
+        version: peer.version,
+        shareOutput: peer.shareOutput,
         progress: deriveProgress(this.allItems(), peer.peerId, peer.progress.reported),
       })),
       intents: this.intents.map(({ intentId, text, state, items }) => ({
         intentId,
-        text,
+        // The control status keeps the v1 limit, so an older local client still parses it.
+        text: wireText(text, 1),
         state,
         items,
       })),
@@ -387,7 +418,7 @@ class SessionMaster implements MasterHandle {
         explicitRepos: input.repos !== undefined,
         state: "open",
         items: [],
-        waiting: new Set(this.peers.keys()),
+        waiting: new Set(this.recipients(input.repos)),
         candidates: [],
         requests: [],
         routing: false,
@@ -400,10 +431,26 @@ class SessionMaster implements MasterHandle {
       // unresponsive earlier peer cannot keep routing open forever.
       intent.cancel = this.timer(this.datalistMs, () => this.route(intent));
       for (const peer of this.peers.values()) {
-        peer.wire.send({ type: "intent", intentId: intent.intentId, text: intent.text });
+        if (!intent.waiting.has(peer.peerId)) continue;
+        peer.wire.send({
+          type: "intent",
+          intentId: intent.intentId,
+          text: wireText(intent.text, peer.protocol),
+        });
       }
       if (intent.waiting.size === 0) this.route(intent);
     });
+  }
+
+  /**
+   * Who receives an intent (ORCH-6): with named repos, only peers whose described repo is one of
+   * them or that have not described one yet; a bare intent still reaches everyone, because the
+   * lone-peer fallback may route it to any repo (INTENT-PEER).
+   */
+  private recipients(repos: readonly string[] | undefined): string[] {
+    return [...this.peers.values()]
+      .filter((peer) => repos === undefined || peer.repo === null || repos.includes(peer.repo))
+      .map((peer) => peer.peerId);
   }
 
   attach(stream: Duplex, path: PeerPath): void {
@@ -417,7 +464,12 @@ class SessionMaster implements MasterHandle {
     }
     let phase: "first" | "confirm" | "approval" | "control" | "session" = "first";
     let peer: Peer | null = null;
-    let challenge: { code: ActiveCode; keys: KeyMaterial; device: string } | null = null;
+    let challenge: {
+      code: ActiveCode;
+      keys: KeyMaterial;
+      device: string;
+      protocol: ProtocolVersion;
+    } | null = null;
     const wire = new SessionWire(
       stream,
       this.clock,
@@ -490,12 +542,14 @@ class SessionMaster implements MasterHandle {
             masterNonce,
             device: first.device,
             code: this.code.code,
+            protocol: first.v,
           });
-          challenge = { code: this.code, keys, device: first.device };
+          challenge = { code: this.code, keys, device: first.device, protocol: first.v };
           phase = "confirm";
+          // Answer in the version asked for: a v1 sub parses only `v:1` (plan §3.6).
           wire.send({
             type: "join-challenge",
-            v: 1,
+            v: first.v,
             pub: ephemeral.pub.toString("base64"),
             nonce: masterNonce.toString("base64"),
           });
@@ -525,7 +579,7 @@ class SessionMaster implements MasterHandle {
           // including when the human declines; a proved code is never reusable.
           this.rotateCode();
           phase = "approval";
-          const { keys, device } = challenge;
+          const { keys, device, protocol } = challenge;
           const fp = fingerprint(keys.th);
           this.event("fingerprint", `${device}: ${fp}`);
           void Promise.resolve()
@@ -549,6 +603,10 @@ class SessionMaster implements MasterHandle {
                 peerId: `peer-${joinedOrder}`,
                 device,
                 path: { ...path },
+                protocol,
+                version: null,
+                shareOutput: false,
+                output: { tokens: OUTPUT_BURST, atMs: this.clock.monotonicMs() },
                 joinedOrder,
                 wire,
                 repo: null,
@@ -568,7 +626,16 @@ class SessionMaster implements MasterHandle {
               };
               peer = joined;
               this.peers.set(peer.peerId, peer);
-              wire.send({ type: "welcome", sessionId: this.sessionId, peerId: peer.peerId });
+              wire.send(
+                protocol === 2
+                  ? {
+                      type: "welcome",
+                      sessionId: this.sessionId,
+                      peerId: peer.peerId,
+                      version: this.version,
+                    }
+                  : { type: "welcome", sessionId: this.sessionId, peerId: peer.peerId },
+              );
               wire.startHeartbeat(this.heartbeatMs);
               this.event("joined", `Peer ${peer.peerId} joined`);
               this.progressChanged(peer);
@@ -578,7 +645,7 @@ class SessionMaster implements MasterHandle {
               if (wire.active) rejectJoin("declined");
             });
         } else if (phase === "session" && peer) {
-          const message = SessionMsgSchema.parse(value);
+          const message: SessionMsg = sessionSchema(peer.protocol).parse(value);
           this.receive(peer, message);
           if (wire.active) wire.received();
         } else {
@@ -693,9 +760,52 @@ class SessionMaster implements MasterHandle {
       this.progressChanged(peer);
     } else if (message.type === "progress") {
       this.receiveProgress(peer, message);
+    } else if (message.type === "peer-info") {
+      this.receivePeerInfo(peer, message.version, message.shareOutput);
+    } else if (message.type === "output") {
+      this.receiveOutput(peer, message);
     } else {
       throw new ChannelError("Message is not allowed from a sub");
     }
+  }
+
+  private receivePeerInfo(peer: Peer, version: string, share: boolean): void {
+    peer.version = version;
+    if (share === peer.shareOutput) return;
+    peer.shareOutput = share;
+    // The master's human sees who opted in: live output is a choice on the other device (D35).
+    this.event(
+      "share-output",
+      share
+        ? `Peer ${peer.peerId} (${peer.device}) shares its live agent output`
+        : `Peer ${peer.peerId} (${peer.device}) stopped sharing its live agent output`,
+      undefined,
+      { peerId: peer.peerId },
+    );
+  }
+
+  private receiveOutput(peer: Peer, message: OutputMsg): void {
+    // Sharing is the sub's human's choice; a frame without it is a protocol violation.
+    if (!peer.shareOutput) throw new ChannelError("Live output was not opted in");
+    const item = this.allItems().find((entry) => entry.itemId === message.itemId);
+    if (item?.assignee !== peer.peerId) throw new ChannelError("Live output for a foreign item");
+    const budget = peer.output;
+    const now = this.clock.monotonicMs();
+    budget.tokens = Math.min(
+      OUTPUT_BURST,
+      budget.tokens + Math.floor((now - budget.atMs) / OUTPUT_REFILL_MS),
+    );
+    budget.atMs = now - ((now - budget.atMs) % OUTPUT_REFILL_MS);
+    if (budget.tokens === 0) return;
+    budget.tokens -= 1;
+    // Clean and redact again on this side, independently of the sub (ARCHITECTURE §16).
+    const frame = outputFrame(message.lines, message.skipped);
+    if (frame.lines.length === 0) return;
+    const skipped = frame.skipped === 0 ? [] : [`… ${frame.skipped} line(s) not shown`];
+    this.event("peer-output", [...skipped, ...frame.lines].join("\n"), undefined, {
+      peerId: peer.peerId,
+      itemId: message.itemId,
+    });
   }
 
   private route(intent: Intent): void {
@@ -965,8 +1075,18 @@ class SessionMaster implements MasterHandle {
     }
   }
 
-  private event(kind: string, message: string, full?: string): void {
-    this.options.onEvent?.(full === undefined ? { kind, message } : { kind, message, full });
+  private event(
+    kind: string,
+    message: string,
+    full?: string,
+    about?: Pick<MasterEvent, "peerId" | "itemId">,
+  ): void {
+    this.options.onEvent?.({
+      kind,
+      message,
+      ...(full === undefined ? {} : { full }),
+      ...about,
+    });
   }
 
   async close(): Promise<void> {

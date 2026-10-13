@@ -16,6 +16,11 @@ import {
 } from "./handshake.js";
 import type { AgentProgressState, SubHandle, SubOptions } from "./index.js";
 import {
+  CHANGED_CAP,
+  CHANGED_MAX_FILES,
+  type Changed,
+  ChangedSchema,
+  ControlResultSchema,
   DATALIST_CAP,
   type DatalistEntry,
   DatalistEntrySchema,
@@ -23,11 +28,15 @@ import {
   DeviceSchema,
   HandshakeMsgSchema,
   type PlanItem,
+  PROTOCOL_LATEST,
   type ProgressMsg,
+  type ProtocolVersion,
   type SessionMsg,
-  SessionMsgSchema,
   SubResultSchema,
+  sessionSchema,
+  VersionSchema,
 } from "./messages.js";
+import { OutputTap } from "./output.js";
 import {
   type PeerProgress,
   ProgressCoalescer,
@@ -63,7 +72,53 @@ export function prepareDatalist(input: DatalistEntry[]): {
   return { entries, truncated: entries.length < values.length };
 }
 
+/** Redacted paths that fit the wire cap; files beyond it are still counted in `total`. */
+export function prepareChanged(input: Changed): Changed {
+  const value = ChangedSchema.parse(input);
+  const redactor = new Redactor();
+  const files: Changed["files"] = [];
+  let bytes = 2;
+  for (const file of value.files) {
+    const entry = { ...file, path: redactor.redact(file.path).slice(0, 512) };
+    const size = Buffer.byteLength(JSON.stringify(entry), "utf8") + (files.length ? 1 : 0);
+    if (files.length === CHANGED_MAX_FILES || bytes + size > CHANGED_CAP) break;
+    files.push(entry);
+    bytes += size;
+  }
+  return { files, total: value.total, partial: value.partial };
+}
+
+/** The master answered `join{v:2}` the way a ≤0.1.13 master answers any unknown first frame. */
+export class OlderMasterError extends Error {
+  override readonly name = "OlderMasterError";
+  constructor() {
+    super("The master runs Skep 0.1.13 or older, which speaks session protocol v1 only");
+  }
+}
+
+export const OLDER_MASTER_NOTE =
+  "master is older (≤0.1.13); orchestration features limited (no long briefs, changed-file " +
+  "lists or live output)";
+
+/**
+ * Joins with the newest protocol. A v1 master rejects `join{v:2}` before any key exchange, so the
+ * join code is untouched and one retry with `v:1` is safe (plan §3.6). A caller-supplied stream
+ * cannot be reopened; it fails with {@link OlderMasterError} instead.
+ */
 export async function connectSub(o: SubOptions): Promise<SubHandle> {
+  const protocol = o.protocol ?? PROTOCOL_LATEST;
+  try {
+    return await connectOnce(o, protocol);
+  } catch (error) {
+    if (!(error instanceof OlderMasterError) || protocol === 1 || o.target === undefined) {
+      throw error;
+    }
+    o.onEvent?.({ kind: "protocol", message: OLDER_MASTER_NOTE });
+    return connectOnce(o, 1);
+  }
+}
+
+async function connectOnce(o: SubOptions, protocol: ProtocolVersion): Promise<SubHandle> {
   const code = normalizeJoinCode(o.code);
   DeviceSchema.parse(o.device);
   if (Boolean(o.stream) === Boolean(o.target))
@@ -82,6 +137,12 @@ export async function connectSub(o: SubOptions): Promise<SubHandle> {
   const heartbeatMs = positiveDuration(o.heartbeatMs, 10_000);
   const progressMs = progressInterval(o.progressIntervalMs);
   const sendsProgress = o.progress !== false;
+  const version = VersionSchema.parse(o.version ?? "unknown");
+  const schema = sessionSchema(protocol);
+  let olderMaster = false;
+  let masterVersion: string | null = null;
+  // Off unless this device's human opted in, for this session only (locked plan §9.9).
+  let shareOutput = protocol === 2 && o.shareOutput === true;
   const ephemeral = createEphemeral(random);
   const subNonce = Buffer.from(random.bytes(16));
   const stream = o.stream ?? createConnection(o.target ?? { host: "", port: 0 });
@@ -126,6 +187,17 @@ export async function connectSub(o: SubOptions): Promise<SubHandle> {
       if (wire.active) wire.send({ type: "progress", ...value });
     },
   });
+  const tap = new OutputTap({
+    intervalMs: progressMs,
+    monotonicMs: () => clock.monotonicMs(),
+    schedule: (ms, fn) => wire.timer(ms, fn),
+    send: (itemId, frame) => {
+      if (wire.active && shareOutput) wire.send({ type: "output", itemId, ...frame });
+    },
+  });
+  const sendPeerInfo = () => {
+    if (protocol === 2 && wire.active) wire.send({ type: "peer-info", version, shareOutput });
+  };
   const progressChanged = () => {
     if (!handle || !wire.active) return;
     const value = subProgress(
@@ -237,8 +309,9 @@ export async function connectSub(o: SubOptions): Promise<SubHandle> {
             return o.onItem({ ...work.item }, intentText === undefined ? {} : { intentText });
           })
           .then((value) => {
+            tap.finish(work.item.itemId);
             if (!wire.active || value === null) return;
-            const result = SubResultSchema.parse(value);
+            const { changed, ...result } = SubResultSchema.parse(value);
             if (result.repo !== work.item.repo)
               throw new ChannelError("Item result repository differs from assignment");
             work.state = "sent";
@@ -248,6 +321,10 @@ export async function connectSub(o: SubOptions): Promise<SubHandle> {
               epoch: work.item.epoch,
               ...result,
               summary: new Redactor().redact(result.summary).slice(0, 4000),
+              // A v1 master rejects unknown keys; the summary's `changed …` line still names them.
+              ...(protocol === 2 && changed !== undefined
+                ? { changed: prepareChanged(changed) }
+                : {}),
             });
           })
           .catch(callbackFailed);
@@ -288,6 +365,16 @@ export async function connectSub(o: SubOptions): Promise<SubHandle> {
     clock,
     (frame) => {
       const value = wire.read(frame);
+      if (phase === "challenge" && protocol > 1) {
+        // A ≤0.1.13 master answers an unknown first frame with a control error and hangs up.
+        const older = ControlResultSchema.safeParse(value);
+        if (older.success && !older.data.ok && older.data.error.code === "bad_request") {
+          cancelFirst();
+          olderMaster = true;
+          wire.finish("older_master");
+          return;
+        }
+      }
       if (phase === "challenge" || phase === "accept") {
         cancelFirst();
         const message = HandshakeMsgSchema.parse(value);
@@ -297,6 +384,8 @@ export async function connectSub(o: SubOptions): Promise<SubHandle> {
           return;
         }
         if (phase === "challenge" && message.type === "join-challenge") {
+          if (message.v !== protocol)
+            throw new ChannelError("Master answered in another protocol version");
           keys = deriveKeys({
             privateKey: ephemeral.privateKey,
             remotePub: Buffer.from(message.pub, "base64"),
@@ -306,6 +395,7 @@ export async function connectSub(o: SubOptions): Promise<SubHandle> {
             masterNonce: Buffer.from(message.nonce, "base64"),
             device: o.device,
             code,
+            protocol,
           });
           fp = fingerprint(keys.th);
           o.onFingerprint?.(fp);
@@ -319,10 +409,12 @@ export async function connectSub(o: SubOptions): Promise<SubHandle> {
           phase = "welcome";
         } else throw new ChannelError("Unexpected handshake message");
       } else {
-        const message = SessionMsgSchema.parse(value);
+        const message: SessionMsg = schema.parse(value);
         if (phase === "welcome") {
           if (message.type !== "welcome")
             throw new ChannelError("First encrypted message must be welcome");
+          if ("version" in message && typeof message.version === "string")
+            masterVersion = message.version;
           phase = "session";
           cancelHandshake();
           handle = {
@@ -342,8 +434,26 @@ export async function connectSub(o: SubOptions): Promise<SubHandle> {
               progressChanged();
             },
             silenceMs: () => wire.silenceMs(),
+            protocol,
+            masterVersion: () => masterVersion,
+            sharingOutput: () => shareOutput,
+            shareOutput: (on) => {
+              if (protocol !== 2) throw new OlderMasterError();
+              if (!wire.active || on === shareOutput) return;
+              shareOutput = on;
+              if (!on) tap.clear();
+              sendPeerInfo();
+            },
+            reportOutput: (itemId, chunk) => {
+              if (!shareOutput || !wire.active || chunk === "") return;
+              // Only an item this peer is running; late chunks after its result are dropped.
+              if (items.get(itemId)?.state !== "working") return;
+              tap.push(itemId, chunk);
+            },
           };
           wire.startHeartbeat(heartbeatMs);
+          // Before any progress: the master learns this peer's release and output choice first.
+          sendPeerInfo();
           // The first progress frame is the opt-in for relays (plan §2.6).
           progressChanged();
           resolveReady(handle);
@@ -354,8 +464,13 @@ export async function connectSub(o: SubOptions): Promise<SubHandle> {
       }
     },
     (reason) => {
+      tap.clear();
       if (!handle)
-        rejectReady(new ChannelError(`Session connection ended before welcome: ${reason}`));
+        rejectReady(
+          olderMaster
+            ? new OlderMasterError()
+            : new ChannelError(`Session connection ended before welcome: ${reason}`),
+        );
       resolveClosed({ reason });
       event("disconnected", reason);
     },
@@ -368,7 +483,7 @@ export async function connectSub(o: SubOptions): Promise<SubHandle> {
   try {
     wire.send({
       type: "join",
-      v: 1,
+      v: protocol,
       device: o.device,
       pub: ephemeral.pub.toString("base64"),
       nonce: subNonce.toString("base64"),

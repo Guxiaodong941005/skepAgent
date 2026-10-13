@@ -11,6 +11,27 @@ const EpochSchema = z.number().int().min(1);
 const RoleSchema = z.string().regex(/^[a-z][a-z0-9-]{0,31}$/);
 const TextSchema = z.string().min(1).max(4000);
 
+/**
+ * Session protocol versions (plan §3.6, ORCH-6). A v2 sub opens with `join{v:2}`; a v2 master
+ * answers in the version it was asked for and only sends v2 frames to v2 peers. A v1 master
+ * (≤0.1.13) rejects `v:2` as a bad first frame and the sub retries once with `v:1`.
+ */
+export const PROTOCOL_VERSIONS = [1, 2] as const;
+export type ProtocolVersion = (typeof PROTOCOL_VERSIONS)[number];
+export const PROTOCOL_LATEST: ProtocolVersion = 2;
+const ProtocolSchema = z.union([z.literal(1), z.literal(2)]);
+/** A Skep release as a peer reports it (`0.2.0`, `0.2.0-rc.1+abc`); display only. */
+export const VersionSchema = z.string().regex(/^[0-9A-Za-z][0-9A-Za-z.+-]{0,31}$/);
+/** v2 intent text: a brief may exceed the v1 limit; still far inside one frame (D27). */
+export const BRIEF_MAX = 8000;
+const BriefSchema = z.string().min(1).max(BRIEF_MAX);
+/** Live output per `output` frame (locked plan §9.10). */
+export const OUTPUT_MAX_LINES = 20;
+export const OUTPUT_MAX_BYTES = 2048;
+/** Changed files per result: the list, not the content (locked plan §9.11). */
+export const CHANGED_MAX_FILES = 200;
+export const CHANGED_CAP = 16_384;
+
 function base64(bytes: number) {
   // Node's decoder accepts noncanonical encodings; the wire contract does not.
   return z.string().refine((value) => {
@@ -20,7 +41,8 @@ function base64(bytes: number) {
 }
 
 export const IntentInputSchema = z.strictObject({
-  text: TextSchema,
+  // v1 peers receive at most the first 4000 characters (master.ts `wireText`).
+  text: BriefSchema,
   repos: z.array(RepoRefSchema).min(1).max(16).optional(),
 });
 const ControlStatusSchema = z.strictObject({
@@ -38,7 +60,7 @@ const ControlIntentSchema = z.strictObject({
 });
 export const JoinSchema = z.strictObject({
   type: z.literal("join"),
-  v: z.literal(1),
+  v: ProtocolSchema,
   device: DeviceSchema,
   pub: base64(32),
   nonce: base64(16),
@@ -58,7 +80,7 @@ export const HandshakeMsgSchema = z.discriminatedUnion("type", [
   JoinSchema,
   z.strictObject({
     type: z.literal("join-challenge"),
-    v: z.literal(1),
+    v: ProtocolSchema,
     pub: base64(32),
     nonce: base64(16),
   }),
@@ -121,6 +143,31 @@ export const SubmitOutcomeSchema = z
     { message: "url is required when state is opened and only allowed then", path: ["url"] },
   );
 export type SubmitOutcome = z.infer<typeof SubmitOutcomeSchema>;
+export const ChangedFileSchema = z.strictObject({
+  path: z.string().min(1).max(512),
+  change: z.enum(["added", "modified", "deleted"]),
+  /** Line counts; null for binary or unrecorded content. */
+  added: z.number().int().nonnegative().nullable(),
+  removed: z.number().int().nonnegative().nullable(),
+});
+export type ChangedFile = z.infer<typeof ChangedFileSchema>;
+/**
+ * The files an item changed (v2 results, locked plan §9.11): paths and line counts only, never
+ * content. `total` counts every changed file, `files` the first that fit the cap; `partial` means
+ * the peer compared only part of the tree.
+ */
+export const ChangedSchema = z
+  .strictObject({
+    files: z.array(ChangedFileSchema).max(CHANGED_MAX_FILES),
+    total: z.number().int().nonnegative().max(1_000_000),
+    partial: z.boolean(),
+  })
+  .refine((value) => value.files.length <= value.total, "files must not exceed total")
+  .refine(
+    (value) => Buffer.byteLength(JSON.stringify(value.files), "utf8") <= CHANGED_CAP,
+    `Serialized changed files must fit in ${CHANGED_CAP} bytes`,
+  );
+export type Changed = z.infer<typeof ChangedSchema>;
 export const SubResultSchema = z.strictObject({
   repo: RepoRefSchema,
   baseSha: ShaSchema,
@@ -136,15 +183,20 @@ export const SubResultSchema = z.strictObject({
   summary: z.string().max(4000),
   // Optional so peers that predate structured submit outcomes still parse.
   submit: SubmitOutcomeSchema.optional(),
+  // v2 only on the wire; a sub talking to a v1 master drops it.
+  changed: ChangedSchema.optional(),
 });
 export type SubResult = z.infer<typeof SubResultSchema>;
+/** The v1 result frame (≤0.1.13): no changed-files list. */
 export const ResultMsgSchema = z.strictObject({
   type: z.literal("result"),
   itemId: ItemIdSchema,
   epoch: EpochSchema,
-  ...SubResultSchema.shape,
+  ...SubResultSchema.omit({ changed: true }).shape,
 });
-export type ResultMsg = z.infer<typeof ResultMsgSchema>;
+/** The v2 result: the v1 fields plus the changed-files list. */
+export const ResultMsgV2Schema = ResultMsgSchema.extend({ changed: ChangedSchema.optional() });
+export type ResultMsg = z.infer<typeof ResultMsgV2Schema>;
 export const ClaimRejectReasonSchema = z.enum([
   "not_assignee",
   "stale_epoch",
@@ -201,10 +253,26 @@ export const ProgressMsgSchema = progressRules(
 );
 export type ProgressMsg = z.infer<typeof ProgressMsgSchema>;
 
-export const SessionMsgSchema = z.discriminatedUnion("type", [
-  z.strictObject({ type: z.literal("welcome"), sessionId: IdSchema, peerId: IdSchema }),
+const OutputLinesSchema = z
+  .array(z.string().max(OUTPUT_MAX_BYTES))
+  .min(1)
+  .max(OUTPUT_MAX_LINES)
+  .refine(
+    (lines) => Buffer.byteLength(lines.join("\n"), "utf8") <= OUTPUT_MAX_BYTES,
+    `Output lines must fit in ${OUTPUT_MAX_BYTES} bytes`,
+  );
+/** One live-output frame: new complete lines of one item's agent, redacted (plan §9.6). */
+export const OutputMsgSchema = z.strictObject({
+  type: z.literal("output"),
+  itemId: ItemIdSchema,
+  lines: OutputLinesSchema,
+  /** Lines printed since the previous frame that did not fit this one. */
+  skipped: z.number().int().nonnegative().max(1_000_000),
+});
+export type OutputMsg = z.infer<typeof OutputMsgSchema>;
+
+const sessionMembers = [
   z.strictObject({ type: z.literal("heartbeat"), seq: z.number().int().nonnegative() }),
-  z.strictObject({ type: z.literal("intent"), intentId: IdSchema, text: TextSchema }),
   z.strictObject({ type: z.literal("capability"), intentId: IdSchema, ...DescriptionSchema.shape }),
   z.strictObject({ type: z.literal("datalist-request"), intentId: IdSchema, requestId: IdSchema }),
   z.strictObject({
@@ -228,7 +296,6 @@ export const SessionMsgSchema = z.discriminatedUnion("type", [
     itemId: ItemIdSchema,
     reason: ClaimRejectReasonSchema,
   }),
-  ResultMsgSchema,
   z.strictObject({ type: z.literal("result-ack"), itemId: ItemIdSchema }),
   z.strictObject({
     type: z.literal("result-reject"),
@@ -237,14 +304,49 @@ export const SessionMsgSchema = z.discriminatedUnion("type", [
   }),
   ProgressMsgSchema,
   z.strictObject({ type: z.literal("bye"), reason: z.string().min(1).max(500) }),
+] as const;
+
+/** v1 frames, exactly as ≤0.1.13 speaks them: every member strict. */
+export const SessionMsgSchema = z.discriminatedUnion("type", [
+  z.strictObject({ type: z.literal("welcome"), sessionId: IdSchema, peerId: IdSchema }),
+  z.strictObject({ type: z.literal("intent"), intentId: IdSchema, text: TextSchema }),
+  ...sessionMembers,
+  ResultMsgSchema,
 ]);
-export type SessionMsg = z.infer<typeof SessionMsgSchema>;
+/**
+ * v2 frames (ORCH-6): the welcome names the master's release, a sub reports its own release and
+ * live-output choice in `peer-info`, intents carry briefs up to {@link BRIEF_MAX}, results may
+ * list changed files, and an opted-in sub sends `output`.
+ */
+export const SessionMsgV2Schema = z.discriminatedUnion("type", [
+  z.strictObject({
+    type: z.literal("welcome"),
+    sessionId: IdSchema,
+    peerId: IdSchema,
+    version: VersionSchema,
+  }),
+  z.strictObject({ type: z.literal("intent"), intentId: IdSchema, text: BriefSchema }),
+  ...sessionMembers,
+  ResultMsgV2Schema,
+  z.strictObject({
+    type: z.literal("peer-info"),
+    version: VersionSchema,
+    shareOutput: z.boolean(),
+  }),
+  OutputMsgSchema,
+]);
+export type SessionMsg = z.infer<typeof SessionMsgSchema> | z.infer<typeof SessionMsgV2Schema>;
+
+/** The frame schema of a negotiated protocol version. */
+export function sessionSchema(v: ProtocolVersion) {
+  return v === 2 ? SessionMsgV2Schema : SessionMsgSchema;
+}
 export type ClaimMsg = Extract<SessionMsg, { type: "claim" }>;
 export type DatalistMsg = Extract<SessionMsg, { type: "datalist" }>;
 
 export const ItemStatusSchema = PlanItemSchema.extend({
   state: z.enum(["planned", "claimed", "done", "failed"]),
-  result: ResultMsgSchema.omit({ type: true }).optional(),
+  result: ResultMsgV2Schema.omit({ type: true }).optional(),
 });
 export type ItemStatus = z.infer<typeof ItemStatusSchema>;
 export const SessionStatusSchema = z.strictObject({
@@ -265,6 +367,10 @@ export const SessionStatusSchema = z.strictObject({
       repo: RepoRefSchema.nullable(),
       head: ShaSchema.nullable(),
       role: RoleSchema.nullable(),
+      // Optional: a status from a ≤0.1.13 master has neither (ORCH-6).
+      protocol: ProtocolSchema.optional(),
+      version: VersionSchema.nullable().optional(),
+      shareOutput: z.boolean().optional(),
       progress: progressRules(z.strictObject({ phase: PeerPhaseSchema, ...progressFields })),
     }),
   ),

@@ -6,6 +6,7 @@ import {
   HandshakeMsgSchema,
   ProgressMsgSchema,
   SessionMsgSchema,
+  SessionMsgV2Schema,
   SessionStatusSchema,
   SubmitOutcomeSchema,
   SubResultSchema,
@@ -185,8 +186,11 @@ function withUnknownKeys(value: unknown): unknown[] {
 
 it("rejects malformed base64, roles, SHA, limits and protocol versions", () => {
   const join = { type: "join", v: 1, device: "app", pub, nonce };
+  // v2 is negotiated (ORCH-6); anything else is still a bad first frame.
+  expect(FirstFrameSchema.safeParse({ ...join, v: 2 }).success).toBe(true);
   for (const change of [
-    { v: 2 },
+    { v: 3 },
+    { v: 0 },
     { device: "App" },
     { pub: `${pub}\n` },
     { pub: pub.slice(0, -1) },
@@ -197,7 +201,7 @@ it("rejects malformed base64, roles, SHA, limits and protocol versions", () => {
   const control = { type: "control", v: 1, token, op: "intent", text: "Work" };
   for (const change of [
     { text: "" },
-    { text: "x".repeat(4001) },
+    { text: "x".repeat(8001) },
     { repos: [] },
     { repos: Array(17).fill("app") },
     { token: token.toUpperCase() },
@@ -312,5 +316,78 @@ describe("peer progress", () => {
         }).success,
       ).toBe(false);
     }
+  });
+});
+
+describe("protocol v2 (ORCH-6)", () => {
+  const changed = {
+    files: [{ path: "src/a.ts", change: "modified", added: 1, removed: 2 }],
+    total: 3,
+    partial: false,
+  };
+  const output = { type: "output", itemId: "I-1", lines: ["ok"], skipped: 0 };
+  const info = { type: "peer-info", version: "0.2.0", shareOutput: true };
+  const welcome = { type: "welcome", sessionId: "s", peerId: "peer-1" };
+
+  it("keeps v1 strict: no v2 frames or fields on a v1 session", () => {
+    for (const frame of [
+      output,
+      info,
+      { ...welcome, version: "0.2.0" },
+      { ...result, changed },
+      { type: "intent", intentId: "i", text: "x".repeat(4001) },
+    ]) {
+      expect(SessionMsgSchema.safeParse(frame).success).toBe(false);
+    }
+  });
+
+  it("accepts the v2 frames and fields", () => {
+    for (const frame of [
+      output,
+      info,
+      { ...welcome, version: "0.2.0" },
+      { ...result, changed },
+      { type: "intent", intentId: "i", text: "x".repeat(8000) },
+    ]) {
+      expect(SessionMsgV2Schema.safeParse(frame).success).toBe(true);
+    }
+    // A v2 welcome must name the master's release.
+    expect(SessionMsgV2Schema.safeParse(welcome).success).toBe(false);
+  });
+
+  it("bounds live output to 20 lines and 2 KB", () => {
+    const bad = [
+      { lines: [] },
+      { lines: Array(21).fill("x") },
+      { lines: ["x".repeat(2049)] },
+      { lines: ["x".repeat(1100), "y".repeat(1100)] },
+      { skipped: -1 },
+      { itemId: "item" },
+      { extra: true },
+    ];
+    for (const change of bad) {
+      expect(SessionMsgV2Schema.safeParse({ ...output, ...change }).success).toBe(false);
+    }
+  });
+
+  it("bounds changed files and rejects unknown keys", () => {
+    for (const change of [
+      { total: 0 },
+      { files: Array(201).fill(changed.files[0]) },
+      { files: [{ ...changed.files[0], content: "x" }] },
+      { files: [{ ...changed.files[0], change: "renamed" }] },
+    ]) {
+      expect(
+        SessionMsgV2Schema.safeParse({ ...result, changed: { ...changed, ...change } }).success,
+      ).toBe(false);
+    }
+  });
+
+  it("accepts a status with and without the v2 peer fields", () => {
+    const [peer] = status.peers;
+    if (!peer) throw new Error("fixture has a peer");
+    const v2 = { ...peer, protocol: 2, version: "0.2.0", shareOutput: false };
+    expect(SessionStatusSchema.safeParse({ ...status, peers: [v2] }).success).toBe(true);
+    expect(SessionStatusSchema.safeParse(status).success).toBe(true);
   });
 });

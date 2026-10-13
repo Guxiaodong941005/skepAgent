@@ -8,7 +8,7 @@ import {
   type KeyObject,
 } from "node:crypto";
 import type { RandomSource } from "../util/random.js";
-import type { JoinRejectReason } from "./messages.js";
+import type { JoinRejectReason, ProtocolVersion } from "./messages.js";
 
 export class JoinCodeError extends Error {
   override readonly name = "JoinCodeError";
@@ -68,6 +68,12 @@ export interface DeriveKeysOptions {
   masterNonce: Buffer;
   device: string;
   code: string;
+  /**
+   * The protocol the join asked for (default 1). It labels the transcript and the key schedule,
+   * so a `join{v:2}` rewritten to `v:1` on the way fails key confirmation instead of silently
+   * downgrading (ORCH-6). Version 1 derives exactly the ≤0.1.13 keys.
+   */
+  protocol?: ProtocolVersion;
 }
 
 export function deriveKeys(o: DeriveKeysOptions): KeyMaterial {
@@ -81,6 +87,7 @@ export function deriveKeys(o: DeriveKeysOptions): KeyMaterial {
     throw new HandshakeError("Invalid X25519 public key or handshake nonce length");
   }
   const code = normalizeJoinCode(o.code);
+  const label = `skep-session-v${o.protocol ?? 1}`;
   try {
     const shared = diffieHellman({
       privateKey: o.privateKey,
@@ -93,7 +100,7 @@ export function deriveKeys(o: DeriveKeysOptions): KeyMaterial {
     const th = createHash("sha256")
       .update(
         Buffer.concat([
-          Buffer.from("skep-session-v1"),
+          Buffer.from(label),
           o.subPub,
           o.subNonce,
           o.masterPub,
@@ -104,13 +111,7 @@ export function deriveKeys(o: DeriveKeysOptions): KeyMaterial {
       .digest();
     const salt = createHash("sha256").update(`skep-join-code${code}`, "ascii").digest();
     const okm = Buffer.from(
-      hkdfSync(
-        "sha256",
-        shared,
-        salt,
-        Buffer.concat([Buffer.from("skep-session-v1 keys"), th]),
-        128,
-      ),
+      hkdfSync("sha256", shared, salt, Buffer.concat([Buffer.from(`${label} keys`), th]), 128),
     );
     shared.fill(0);
     return {

@@ -2,8 +2,11 @@ import type { Duplex } from "node:stream";
 import type { Clock } from "../util/clock.js";
 import type { RandomSource } from "../util/random.js";
 import type {
+  Changed,
+  ChangedFile,
   DatalistEntry,
   PlanItem,
+  ProtocolVersion,
   SessionStatus,
   SubmitMethod,
   SubmitOutcome,
@@ -32,7 +35,9 @@ export interface MasterOptions {
    * `message` is the operator line (a successful result capped for plain scrollback); `full`,
    * when present, is the same block uncapped for screens that scroll (SCROLL-2, S2).
    */
-  onEvent?(e: { kind: string; message: string; full?: string }): void;
+  onEvent?(e: MasterEvent): void;
+  /** This device's Skep release, sent to v2 peers in `welcome` (ORCH-6). */
+  version?: string;
   clock?: Clock;
   random?: RandomSource;
   heartbeatMs?: number;
@@ -40,6 +45,18 @@ export interface MasterOptions {
   datalistTimeoutMs?: number;
   /** Peer progress coalescing window per subject (default 500 ms; 0 disables coalescing). */
   progressIntervalMs?: number;
+}
+
+/**
+ * One master event. `peerId` names the peer an event is about when the master knows it (v2
+ * `share-output` and `peer-output`); `itemId` the item a `peer-output` belongs to.
+ */
+export interface MasterEvent {
+  kind: string;
+  message: string;
+  full?: string;
+  peerId?: string;
+  itemId?: string;
 }
 
 export interface MasterHandle {
@@ -75,6 +92,15 @@ export interface SubOptions {
   onItem(item: PlanItem, context?: ItemContext): Promise<SubResult | null>;
   onFingerprint?(fp: string): void;
   onEvent?(e: { kind: string; message: string }): void;
+  /** Session protocol to offer (default 2). A v1 master makes a TCP join retry once with 1. */
+  protocol?: ProtocolVersion;
+  /** This device's Skep release, reported to a v2 master in `peer-info`. */
+  version?: string;
+  /**
+   * Start with live output shared (v2 only, default false). The choice belongs to this join and
+   * is never stored on the device (locked plan §9.9).
+   */
+  shareOutput?: boolean;
   clock?: Clock;
   random?: RandomSource;
   heartbeatMs?: number;
@@ -103,19 +129,37 @@ export interface SubHandle {
   reportAgent?(itemId: string, state: AgentProgressState): void;
   /** Milliseconds since the master was last heard from. Optional like `reportAgent`. */
   silenceMs?(): number;
+  /** The negotiated session protocol. Optional like `reportAgent`. */
+  readonly protocol?: ProtocolVersion;
+  /** The master's Skep release from a v2 welcome; null on v1. */
+  masterVersion?(): string | null;
+  sharingOutput?(): boolean;
+  /**
+   * Turn live output on or off for the rest of this session. Throws `OlderMasterError` on a v1
+   * session; the master has no way to receive it.
+   */
+  shareOutput?(on: boolean): void;
+  /**
+   * Raw output of a running item's agent. Sent only while sharing is on, as complete lines,
+   * control-stripped, redacted and bounded (plan §9.10); otherwise dropped here.
+   */
+  reportOutput?(itemId: string, chunk: string): void;
 }
 
 export { JoinRejectedError, normalizeJoinCode } from "./handshake.js";
 export { ListenAddressError, startMaster } from "./master.js";
 export { SubmitOutcomeSchema } from "./messages.js";
 export { assertSamePath, PathMismatchError } from "./path.js";
-export { connectSub } from "./sub.js";
+export { connectSub, OLDER_MASTER_NOTE, OlderMasterError } from "./sub.js";
 export type {
+  Changed,
+  ChangedFile,
   DatalistEntry,
   PeerPath,
   PeerPhase,
   PeerProgress,
   PlanItem,
+  ProtocolVersion,
   SessionStatus,
   SubmitMethod,
   SubmitOutcome,
