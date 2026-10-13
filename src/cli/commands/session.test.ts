@@ -26,6 +26,7 @@ import {
   formatJoinCli,
   herdrAgentName,
   type ItemWorker,
+  itemTask,
   type JoinFlow,
   type JoinView,
   type JoinViewModel,
@@ -2709,6 +2710,50 @@ describe("workItem with a live agent", () => {
     const home = box.env.HOME ?? "";
     expect(await readFile(path.join(home, "codex-args.txt"), "utf8")).toBe("exec\n-\n");
     expect(await readFile(path.join(home, "codex-stdin.txt"), "utf8")).toBe(PROMPT);
+  });
+
+  it("native: the agent works from the intent's full text, not the 200-character title (S8)", async () => {
+    const box = await sandbox();
+    await stubAgent(box, "codex", 'echo "native output"');
+    const c = capture(box.home, { env: box.env, cwd: box.repo });
+    const worker = itemWorker(box, c, "native", fakeRuntime(), { method: "none" });
+    if (worker.agent !== undefined) worker.agent.cli = "codex";
+    const text = `make the login page remember the last user. ${"Details follow. ".repeat(60)}END`;
+    const item = { ...ITEM, title: text.slice(0, 200) };
+    await workItem(worker, item, { intentText: text });
+    const stdin = await readFile(path.join(box.env.HOME ?? "", "codex-stdin.txt"), "utf8");
+    expect(stdin.startsWith(`${text}\n\n`)).toBe(true);
+    expect(stdin).toContain("END");
+  });
+
+  it("itemTask keeps the title when the text is missing or belongs to another intent", () => {
+    const item = { ...ITEM, title: "add a health check" };
+    expect(itemTask(item, {})).toBe("add a health check");
+    expect(itemTask(item, { intentText: "  " })).toBe("add a health check");
+    expect(itemTask(item, { intentText: "something else entirely" })).toBe("add a health check");
+    expect(itemTask(item, { intentText: "add a health check\n\nwith /healthz" })).toBe(
+      "add a health check\n\nwith /healthz",
+    );
+  });
+
+  it("native: a finished run hands the view its whole output, beyond the 4000-char tail (S3)", async () => {
+    const box = await sandbox();
+    await stubAgent(
+      box,
+      "codex",
+      'i=1; while [ $i -le 5000 ]; do echo "output line $i"; i=$((i+1)); done',
+    );
+    const c = capture(box.home, { env: box.env, cwd: box.repo });
+    const log = recordingView();
+    const worker = itemWorker(box, c, "native", fakeRuntime(), { method: "none", view: log.view });
+    if (worker.agent !== undefined) worker.agent.cli = "codex";
+    const result = await workItem(worker, ITEM);
+    expect(result.summary.length).toBeLessThanOrEqual(4000);
+    const last = log.models.at(-1);
+    expect(last?.tail.length).toBeLessThanOrEqual(4000);
+    expect(last?.transcript).toContain("output line 1\n");
+    expect(last?.transcript).toContain("output line 5000");
+    expect((last?.transcript ?? "").length).toBeGreaterThan(50_000);
   });
 
   it("herdr: start, prompt, wait, read 200 lines in the project folder; done submits", async () => {

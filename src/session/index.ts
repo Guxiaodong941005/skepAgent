@@ -28,7 +28,11 @@ export interface MasterOptions {
     family: "IPv4" | "IPv6";
   }): Promise<boolean>;
   onJoinCode(info: { code: string; expiresAtMs: number }): void;
-  onEvent?(e: { kind: string; message: string }): void;
+  /**
+   * `message` is the operator line (a successful result capped for plain scrollback); `full`,
+   * when present, is the same block uncapped for screens that scroll (SCROLL-2, S2).
+   */
+  onEvent?(e: { kind: string; message: string; full?: string }): void;
   clock?: Clock;
   random?: RandomSource;
   heartbeatMs?: number;
@@ -53,6 +57,10 @@ export interface MasterHandle {
   readonly closed: Promise<void>;
 }
 
+export interface ItemContext {
+  intentText?: string;
+}
+
 export interface SubOptions {
   stream?: Duplex;
   target?: { host: string; port: number };
@@ -60,7 +68,11 @@ export interface SubOptions {
   device: string;
   describe(): Promise<{ repo: string; head: string; role: string }>;
   collectDatalist(repo: string): Promise<DatalistEntry[]>;
-  onItem(item: PlanItem): Promise<SubResult | null>;
+  /**
+   * `intentText` is the full text of the item's intent from the `intent` frame (≤4000), when it
+   * was received; the plan item's `title` is only its first 200 characters (S8).
+   */
+  onItem(item: PlanItem, context?: ItemContext): Promise<SubResult | null>;
   onFingerprint?(fp: string): void;
   onEvent?(e: { kind: string; message: string }): void;
   clock?: Clock;

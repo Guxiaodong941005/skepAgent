@@ -19,7 +19,7 @@ import {
   type SubHandle,
   type SubOptions,
 } from "../commands/session.js";
-import { parseFlags, parseIntentArgs, Shell, type ShellCliContext } from "./run.js";
+import { parseFlags, parseIntentArgs, Shell, type ShellCliContext, ShellJoinView } from "./run.js";
 
 type MasterPeer = ReturnType<MasterHandle["status"]>["peers"][number];
 
@@ -776,6 +776,22 @@ describe("unified shell", () => {
     expect(failed?.tone).toBe("error");
     expect(h.scrollback()).toContain("result rejected I-5: stale_epoch");
     expect(h.scrollback()).not.toMatch(/^progress/m);
+    await h.shell.quit();
+  });
+
+  it("shows a 4000-character peer summary in full (S2)", async () => {
+    const h = await harness();
+    await h.shell.submit("/start --yes --repo app");
+    const lines = Array.from({ length: 45 }, (_, n) => `  part ${n} ${"y".repeat(80)}`);
+    const full = `I-7 done · mac (app)\n${lines.join("\n")}`;
+    expect(full.length).toBeGreaterThan(3_900);
+    h.fake.calls.master[0]?.onEvent?.({
+      kind: "item-result",
+      message: "I-7 done · mac (app)\n  part 0 …",
+      full,
+    });
+    expect(h.scrollback()).toContain(full);
+    expect(h.scrollback()).not.toContain("part 0 …");
     await h.shell.quit();
   });
 
@@ -1751,6 +1767,28 @@ describe("transcript scrolling (SCROLL Phase 1)", () => {
     h.stdin.type("5~");
     expect(h.shell.model.input).toBe("");
     expect(h.shell.model.anchor.kind).toBe("pinned");
+    await h.shell.quit();
+  });
+
+  it("a peer's finished native run shows its whole local output, not the last 4000 chars (S3)", async () => {
+    const h = await harness();
+    const generation = h.shell.session.beginJoin("192.168.1.20:7419");
+    const view = new ShellJoinView(h.shell, generation);
+    const lines = Array.from({ length: 2_000 }, (_, n) => `agent says ${n} ${"z".repeat(20)}`);
+    const transcript = `agent exited 0\n${lines.join("\n")}`;
+    view.update({
+      peers: [],
+      item: { itemId: "I-3", title: "t", repo: "app", epoch: 1 },
+      agent: { cli: "codex", view: "native", state: "done" },
+      tail: transcript.slice(-4_000),
+      transcript,
+      submit: { policy: "none" },
+    });
+    const shown = h.shell.model.scrollback.filter((entry) => entry.text.startsWith("I-3 │ "));
+    expect(shown.map((entry) => entry.text)).toEqual([
+      "I-3 │ agent exited 0",
+      ...lines.map((line) => `I-3 │ ${line}`),
+    ]);
     await h.shell.quit();
   });
 

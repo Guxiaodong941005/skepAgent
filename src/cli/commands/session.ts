@@ -34,6 +34,7 @@ import type { ProcessExit } from "../../runtime/types.js";
 import {
   connectSub,
   type DatalistEntry,
+  type ItemContext,
   ListenAddressError,
   type MasterHandle,
   type MasterOptions,
@@ -1018,6 +1019,11 @@ export interface JoinViewModel {
   } | null;
   /** Already redacted and control-stripped, at most 4000 characters. */
   tail: string;
+  /**
+   * Everything the agent printed in a finished run, redacted and control-stripped, for a view
+   * that scrolls (S3). Local only: it never leaves this device (D27); the master gets `tail`.
+   */
+  transcript?: string;
   submit: { policy: SubmitMethod; outcome?: SubmitOutcome };
 }
 
@@ -1445,6 +1451,7 @@ async function executeItem(
   item: PlanItem,
   dir: string,
   report: RunContext["report"],
+  context: ItemContext = {},
 ): Promise<Executed> {
   const { ctx } = worker;
   const setup = worker.agent;
@@ -1465,8 +1472,10 @@ async function executeItem(
     setup,
     item,
     dir,
-    // The item title is the task; the preamble keeps the agent in place and asks for a summary.
-    prompt: `${item.title}\n\n${PROMPT_PREAMBLE}\n`,
+    // The intent's full text is the task (S8); the plan title is only its first 200 characters
+    // and is all an older master lets us see. The preamble keeps the agent in place and asks
+    // for a summary.
+    prompt: `${itemTask(item, context)}\n\n${PROMPT_PREAMBLE}\n`,
     env: {
       ...pickEnv(ctx, AGENT_ENV_KEYS),
       SKEP_SESSION_ITEM: item.itemId,
@@ -1557,6 +1566,17 @@ async function executeItem(
     };
   }
   return { status: "ok", summary: `${note}agent ${agent.status}\n${tail}`, full, said };
+}
+
+/**
+ * What the agent is asked to do: the intent's full text when the sub received it, else the plan
+ * item's title. The title is the text's first 200 characters, so the full text is used only when
+ * it really is this item's intent (it starts with the title).
+ */
+export function itemTask(item: PlanItem, context: ItemContext): string {
+  const text = context.intentText?.trim() ?? "";
+  if (text === "" || !text.startsWith(item.title.trim())) return item.title;
+  return text;
 }
 
 /** The agent could not even start: name the missing binary rather than a raw spawn error. */
@@ -2000,16 +2020,20 @@ const ASK_CHOICES = ["commit", ...DIRECT_METHODS] as const;
  * edit the folder once the human answers it. The item keeps its place in the serial queue until
  * that agent settles or the join closes, so the next item never runs beside it (R4).
  */
-export async function workItem(worker: ItemWorker, item: PlanItem): Promise<SubResult> {
+export async function workItem(
+  worker: ItemWorker,
+  item: PlanItem,
+  context: ItemContext = {},
+): Promise<SubResult> {
   const { serial } = worker;
   if (serial === undefined) {
-    const { result, hold } = await workItemNow(worker, item);
+    const { result, hold } = await workItemNow(worker, item, context);
     void hold.catch(() => undefined);
     return result;
   }
   return new Promise<SubResult>((resolve, reject) => {
     serial(async () => {
-      const { result, hold } = await workItemNow(worker, item);
+      const { result, hold } = await workItemNow(worker, item, context);
       resolve(result);
       await hold;
     }).catch(reject);
@@ -2019,9 +2043,10 @@ export async function workItem(worker: ItemWorker, item: PlanItem): Promise<SubR
 async function workItemNow(
   worker: ItemWorker,
   item: PlanItem,
+  context: ItemContext,
 ): Promise<{ result: SubResult; hold: Promise<void> }> {
   let hold: Promise<void> = Promise.resolve();
-  const result = await workItemRun(worker, item, (settled) => {
+  const result = await workItemRun(worker, item, context, (settled) => {
     hold = settled;
   });
   return { result, hold };
@@ -2030,6 +2055,7 @@ async function workItemNow(
 async function workItemRun(
   worker: ItemWorker,
   item: PlanItem,
+  context: ItemContext,
   holdUntil: (settled: Promise<void>) => void,
 ): Promise<SubResult> {
   const { ctx } = worker;
@@ -2044,6 +2070,7 @@ async function workItemRun(
   let agentState: JoinAgentState = "starting";
   let focusCommand: readonly string[] | undefined;
   let tail = "";
+  let transcript: string | undefined;
   const show = (submit?: SubmitOutcome): JoinViewModel => ({
     peers: worker.peers ?? [],
     item: { itemId: item.itemId, title: item.title, repo: item.repo, epoch: item.epoch },
@@ -2057,6 +2084,7 @@ async function workItemRun(
             ...(focusCommand === undefined ? {} : { focusCommand }),
           },
     tail,
+    ...(transcript === undefined ? {} : { transcript }),
     submit: { policy: wireMethod, ...(submit === undefined ? {} : { outcome: submit }) },
   });
   const report = (state: JoinAgentState, focus?: readonly string[]): void => {
@@ -2189,7 +2217,7 @@ async function workItemRun(
 
   let executed: Executed;
   try {
-    executed = await executeItem(worker, item, dir, report);
+    executed = await executeItem(worker, item, dir, report, context);
   } catch (error) {
     // After an accepted prompt a herdr failure is final: never replayed natively (§11.4).
     executed = {
@@ -2201,6 +2229,7 @@ async function workItemRun(
     };
   }
   tail = clean(executed.summary).slice(-MAX_SUMMARY);
+  if (executed.full !== "") transcript = clean(executed.full);
 
   let delta: ItemDelta = { files: [], partial: false };
   let deltaProblem = "";
@@ -2555,8 +2584,8 @@ export interface StartMasterFlowOptions extends StartOptions {
   acceptJoin(request: JoinRequest): Promise<boolean>;
   /** A rotated join code, after the flow resolved; the first one is on the returned flow. */
   onJoinCode?(joinCode: string, expiresAtMs: number): void;
-  /** Protocol events of the master (peer joined, intent planned, ...). */
-  onEvent?(event: { kind: string; message: string }): void;
+  /** Protocol events of the master (peer joined, intent planned, ...); see MasterOptions. */
+  onEvent?(event: { kind: string; message: string; full?: string }): void;
 }
 
 export interface MasterFlow {
@@ -3231,12 +3260,12 @@ export async function joinSessionFlow(
           .filter((file) => file.length > 0 && file.length <= MAX_DATALIST_PATH)
           .map((file) => ({ kind: "path" as const, path: file }));
       },
-      onItem: async (item) => {
+      onItem: async (item, context) => {
         say(
           { event: "item", item },
           () => `item ${item.itemId} (epoch ${item.epoch}, ${item.repo}): ${item.title}\n`,
         );
-        const result = await workItem(worker, item);
+        const result = await workItem(worker, item, context);
         say(
           { event: "item-result", itemId: item.itemId, epoch: item.epoch, ...result },
           () => `${itemHeadline(item.itemId, result)}\n`,

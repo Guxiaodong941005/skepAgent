@@ -838,8 +838,13 @@ export class Shell {
     };
   }
 
-  /** Master protocol events → scrollback. Footer-only changes (progress) just redraw. */
-  private masterEvent({ kind, message }: { kind: string; message: string }): void {
+  /**
+   * Master protocol events → transcript. Footer-only changes (progress) just redraw. The shell
+   * scrolls, so a result is shown whole (`full`), not the plain-CLI cap (S2).
+   */
+  private masterEvent(event: { kind: string; message: string; full?: string }): void {
+    const { kind } = event;
+    const message = event.full ?? event.message;
     switch (kind) {
       case "progress":
         break;
@@ -1382,7 +1387,9 @@ export class ShellJoinView implements JoinView {
       }
     }
     const terminal = agent?.state === "done" || agent?.state === "failed";
-    for (const line of this.newTailLines(key, model.tail, terminal)) {
+    // A finished run brings its whole local output; the 4000-character tail is only its end (S3).
+    const output = model.transcript ?? model.tail;
+    for (const line of this.newTailLines(key, output, terminal || model.transcript !== undefined)) {
       this.shell.log(line, "muted", `${item.itemId} │ `);
     }
   }

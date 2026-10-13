@@ -420,6 +420,39 @@ describe("peer progress relay", () => {
     ).toBe("2 done · 2 failed · 1 running · 4 files changed");
   });
 
+  it("hands the sub's onItem the intent's full text, not just the 200-character title (S8)", async () => {
+    const m = await master();
+    const contexts: { title: string; intentText?: string }[] = [];
+    const text = `rename the config loader. ${"More context for the agent. ".repeat(20)}END`;
+    expect(text.length).toBeGreaterThan(200);
+    await join(m, "mac", "app", {
+      onItem: async (item, context) => {
+        contexts.push({ title: item.title, ...context });
+        return null;
+      },
+    });
+    await m.submitIntent(text);
+    await vi.waitFor(() => expect(contexts).toHaveLength(1));
+    expect(contexts[0]?.title).toBe(text.slice(0, 200));
+    expect(contexts[0]?.intentText).toBe(text);
+  });
+
+  it("a successful result event carries the whole summary for scrolling screens (S2)", async () => {
+    const events: { kind: string; message: string; full?: string }[] = [];
+    const m = await master({ onEvent: (e) => events.push(e) });
+    const body = Array.from({ length: 40 }, (_, n) => `summary line ${n} ${"x".repeat(80)}`);
+    const summary = `done · claude · 1s\n${body.join("\n")}`.slice(0, 4000);
+    await join(m, "mac", "app", { work: async (item) => ({ ...resultFor(item), summary }) });
+    await m.submitIntent("write a long report");
+    await vi.waitFor(() => expect(events.some((e) => e.kind === "item-result")).toBe(true));
+    const event = events.find((e) => e.kind === "item-result");
+    // The plain CLI line stays capped; `full` has every line the peer sent.
+    expect(event?.message).toContain("…");
+    const kept = summary.split("\n").slice(1);
+    for (const line of kept) expect(event?.full).toContain(line.trimEnd());
+    expect(event?.full).not.toContain("…");
+  });
+
   it("emits one intent-done roll-up when every item finished", async () => {
     const events: { kind: string; message: string }[] = [];
     const m = await master({ onEvent: (e) => events.push(e) });

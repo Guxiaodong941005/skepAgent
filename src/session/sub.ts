@@ -101,7 +101,9 @@ export async function connectSub(o: SubOptions): Promise<SubHandle> {
   });
   const descriptions = new Map<string, z.infer<typeof DescriptionSchema> | null>();
   const requests = new Set<string>();
-  const items = new Map<string, { item: PlanItem; state: SubItemState }>();
+  const items = new Map<string, { item: PlanItem; state: SubItemState; intentId: string }>();
+  /** Each intent's full text: the agent works from it, not from the 200-character title (S8). */
+  const intentTexts = new Map<string, string>();
   const agents = new Map<string, AgentProgressState>();
   let everBlocked = false;
   let role: string | null = null;
@@ -171,6 +173,7 @@ export async function connectSub(o: SubOptions): Promise<SubHandle> {
       case "intent": {
         if (descriptions.has(message.intentId)) throw new ChannelError("Duplicate intent");
         descriptions.set(message.intentId, null);
+        intentTexts.set(message.intentId, message.text);
         event("intent", new Redactor().redact(message.text));
         void Promise.resolve()
           .then(() => o.describe())
@@ -215,7 +218,7 @@ export async function connectSub(o: SubOptions): Promise<SubHandle> {
           if (items.has(item.itemId) || item.repo !== descriptions.get(message.intentId)?.repo) {
             throw new ChannelError("Duplicate item or plan for an undescribed repository");
           }
-          items.set(item.itemId, { item, state: "claiming" });
+          items.set(item.itemId, { item, state: "claiming", intentId: message.intentId });
           wire.send({ type: "claim", itemId: item.itemId, epoch: item.epoch });
         }
         event("plan", message.planId);
@@ -229,7 +232,10 @@ export async function connectSub(o: SubOptions): Promise<SubHandle> {
         event("claim-ack", message.itemId);
         progressChanged();
         void Promise.resolve()
-          .then(() => o.onItem({ ...work.item }))
+          .then(() => {
+            const intentText = intentTexts.get(work.intentId);
+            return o.onItem({ ...work.item }, intentText === undefined ? {} : { intentText });
+          })
           .then((value) => {
             if (!wire.active || value === null) return;
             const result = SubResultSchema.parse(value);

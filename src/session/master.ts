@@ -671,18 +671,17 @@ class SessionMaster implements MasterHandle {
         // The operator reads the peer agent's outcome here instead of on the peer's machine.
         const stored = change.items.find((item) => item.itemId === message.itemId);
         const verdict = stored === undefined ? "done" : itemVerdict(stored);
+        const where = { device: peer.device, repo: message.repo };
+        const summary = stored?.result?.summary ?? "";
         this.event(
           verdict === "failed" || verdict === "submit-failed"
             ? "item-failed"
             : verdict === "pending"
               ? "item-pending"
               : "item-result",
-          itemBlock(
-            message.itemId,
-            { device: peer.device, repo: message.repo },
-            stored?.result?.summary ?? "",
-            verdict,
-          ),
+          itemBlock(message.itemId, where, summary, verdict),
+          // A scrolling shell shows the whole received summary (S2); still ≤4000 and redacted.
+          itemBlock(message.itemId, where, summary, verdict, { full: true }),
         );
         if (intent) this.intentFinished(intent);
       } else if (change.reply.type === "result-reject") {
@@ -966,8 +965,8 @@ class SessionMaster implements MasterHandle {
     }
   }
 
-  private event(kind: string, message: string): void {
-    this.options.onEvent?.({ kind, message });
+  private event(kind: string, message: string, full?: string): void {
+    this.options.onEvent?.(full === undefined ? { kind, message } : { kind, message, full });
   }
 
   async close(): Promise<void> {
