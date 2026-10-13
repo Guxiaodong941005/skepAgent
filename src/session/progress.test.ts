@@ -9,6 +9,7 @@ import {
   progressInterval,
   type SubAgentState,
   subProgress,
+  summaryLine,
 } from "./progress.js";
 
 function item(itemId: string, state: ItemStatus["state"], extra: Partial<ItemStatus> = {}) {
@@ -134,6 +135,41 @@ describe("deriveProgress", () => {
     expect(
       deriveProgress([item("I-1", "claimed", { title: "t".repeat(200) })], "peer-1", null).summary,
     ).toHaveLength(120);
+  });
+});
+
+describe("summaryLine", () => {
+  // The real Phase 3 exit run: a brief's 200-character title, headline then `Goal: …`.
+  const brief =
+    "Add NOTES.md describing alpha-app and append Phase 3 exit test to README.md\n\n" +
+    "Goal: Document alpha-app and append the Phase 3 exit test marker to README.md.";
+
+  it("keeps only the first non-blank line", () => {
+    expect(summaryLine(brief)).toBe(
+      "Add NOTES.md describing alpha-app and append Phase 3 exit test to README.md",
+    );
+    expect(summaryLine("\n  \n  editing api.ts  \r\nnext")).toBe("editing api.ts");
+    expect(summaryLine("")).toBe("");
+  });
+
+  it("cuts a long line at a word boundary with an ellipsis", () => {
+    const line = `${"word ".repeat(30)}end`;
+    const cut = summaryLine(line);
+    expect(cut.length).toBeLessThanOrEqual(120);
+    expect(cut.endsWith("word…")).toBe(true);
+    expect(summaryLine("x".repeat(200))).toBe(`${"x".repeat(119)}…`);
+  });
+
+  it("applies to both the master's and the sub's progress line", () => {
+    expect(
+      deriveProgress([item("I-1", "claimed", { title: brief })], "peer-1", null).summary,
+    ).not.toContain("Goal");
+    const value = subProgress(
+      [{ itemId: "I-1", title: brief, state: "working" }],
+      new Map(),
+      false,
+    );
+    expect(value.summary).not.toContain("\n");
   });
 });
 

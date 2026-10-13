@@ -101,6 +101,12 @@ export interface SubOptions {
    * is never stored on the device (locked plan §9.9).
    */
   shareOutput?: boolean;
+  /**
+   * The repo and role this join works on, reported to a v2 master in `peer-info` so it can show
+   * and route by them before the first intent; `describe` still answers each intent.
+   */
+  repo?: string;
+  role?: string;
   clock?: Clock;
   random?: RandomSource;
   heartbeatMs?: number;

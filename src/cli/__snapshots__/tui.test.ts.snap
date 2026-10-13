@@ -7,7 +7,7 @@ exports[`TuiModel colors > matches the golden ascii frame with none color 1`] = 
 ⎋[7m> laptop  coding    I-3 e1  claude/pty  running                                 ⎋[0m
   laptop  ⎋[2mcoding    ⎋[0mI-4 e2  codex/herdr  ⎋[1mblocked⎋[0m⎋[K
   vps     ⎋[2mbackend   ⎋[0m⎋[1mb!> ⎋[0m  ⎋[2m[⎋[0m⎋[1m######⎋[0m⎋[2m..⎋[0m⎋[2m]⎋[0m ⎋[1m 75%⎋[0m⎋[2m  6/8⎋[0m  ⎋[1mblocked⎋[0m  migrate users⎋[K
-  mac     ⎋[2mfrontend  ⎋[0mok    ⎋[2m[⎋[0m⎋[1m########⎋[0m⎋[2m]⎋[0m ⎋[1m100%⎋[0m⎋[2m  8/8⎋[0m  done⎋[1m (1 failed)⎋[0m⎋[K
+  mac     ⎋[2mfrontend  ⎋[0m⎋[1mok  ⎋[0m  ⎋[2m[⎋[0m⎋[1m########⎋[0m⎋[2m]⎋[0m ⎋[1mfailed 1 of 8⎋[0m⎋[K
 ⎋[2m-- ⎋[0m⎋[1;2mITEM⎋[0m⎋[2m --------------------------------------------------------⎋[0m⎋[2m I-3 | epoch 1 ⎋[0m⎋[2m-⎋[0m
 ⎋[2m  Item    ⎋[0mI-3 (web)  add a health check⎋[K
 ⎋[2m  Agent   ⎋[0mclaude⎋[2m | ⎋[0m⎋[2mview ⎋[0mpty⎋[2m | ⎋[0m⎋[1mrunning⎋[0m⎋[K
@@ -34,7 +34,7 @@ exports[`TuiModel colors > matches the golden ascii frame with truecolor color 1
 ⎋[7m> laptop  coding    I-3 e1  claude/pty  running                                 ⎋[0m
   laptop  ⎋[38;2;168;173;179mcoding    ⎋[0mI-4 e2  ⎋[38;2;215;166;232mcodex/herdr⎋[0m  ⎋[38;2;255;158;87mblocked⎋[0m⎋[K
   vps     ⎋[38;2;168;173;179mbackend   ⎋[0m⎋[38;2;255;158;87mb!> ⎋[0m  ⎋[38;2;128;134;139m[⎋[0m⎋[38;2;255;196;48m######⎋[0m⎋[38;2;128;134;139m..⎋[0m⎋[38;2;128;134;139m]⎋[0m ⎋[1m 75%⎋[0m⎋[38;2;168;173;179m  6/8⎋[0m  ⎋[38;2;255;158;87mblocked⎋[0m  migrate users⎋[K
-  mac     ⎋[38;2;168;173;179mfrontend  ⎋[0m⎋[38;2;139;212;158mok  ⎋[0m  ⎋[38;2;128;134;139m[⎋[0m⎋[38;2;255;138;128m########⎋[0m⎋[38;2;128;134;139m]⎋[0m ⎋[1m100%⎋[0m⎋[38;2;168;173;179m  8/8⎋[0m  ⎋[38;2;139;212;158mdone⎋[0m⎋[38;2;255;138;128m (1 failed)⎋[0m⎋[K
+  mac     ⎋[38;2;168;173;179mfrontend  ⎋[0m⎋[38;2;255;138;128mok  ⎋[0m  ⎋[38;2;128;134;139m[⎋[0m⎋[38;2;255;138;128m########⎋[0m⎋[38;2;128;134;139m]⎋[0m ⎋[38;2;255;138;128mfailed 1 of 8⎋[0m⎋[K
 ⎋[38;2;128;134;139m-- ⎋[0m⎋[38;2;168;173;179;1mITEM⎋[0m⎋[38;2;128;134;139m --------------------------------------------------------⎋[0m⎋[38;2;168;173;179m I-3 | epoch 1 ⎋[0m⎋[38;2;128;134;139m-⎋[0m
 ⎋[38;2;168;173;179m  Item    ⎋[0mI-3 (web)  add a health check⎋[K
 ⎋[38;2;168;173;179m  Agent   ⎋[0m⎋[38;2;215;166;232mclaude⎋[0m⎋[38;2;128;134;139m | ⎋[0m⎋[38;2;168;173;179mview ⎋[0mpty⎋[38;2;128;134;139m | ⎋[0m⎋[38;2;255;196;48mrunning⎋[0m⎋[K
@@ -61,7 +61,7 @@ exports[`TuiModel colors > matches the golden nerd frame with none color 1`] = `
 ⎋[7m> laptop  coding    I-3 e1  claude/pty  running                                 ⎋[0m
   laptop  ⎋[2mcoding    ⎋[0mI-4 e2  codex/herdr  ⎋[1mblocked⎋[0m⎋[K
   vps     ⎋[2mbackend   ⎋[0m⎋[1m󰾡! ⎋[0m  ⎋[2m[⎋[0m⎋[1m██████⎋[0m⎋[2m░░⎋[0m⎋[2m]⎋[0m ⎋[1m 75%⎋[0m⎋[2m  6/8⎋[0m  ⎋[1mblocked⎋[0m  migrate users⎋[K
-  mac     ⎋[2mfrontend  ⎋[0m󱃎    ⎋[2m[⎋[0m⎋[1m████████⎋[0m⎋[2m]⎋[0m ⎋[1m100%⎋[0m⎋[2m  8/8⎋[0m  done⎋[1m (1 failed)⎋[0m⎋[K
+  mac     ⎋[2mfrontend  ⎋[0m⎋[1m󱃎  ⎋[0m  ⎋[2m[⎋[0m⎋[1m████████⎋[0m⎋[2m]⎋[0m ⎋[1mfailed 1 of 8⎋[0m⎋[K
 ⎋[2m── ⎋[0m⎋[1;2mITEM⎋[0m⎋[2m ────────────────────────────────────────────────────────⎋[0m⎋[2m I-3 · epoch 1 ⎋[0m⎋[2m─⎋[0m
 ⎋[2m  Item    ⎋[0mI-3 (web)  add a health check⎋[K
 ⎋[2m  Agent   ⎋[0mclaude⎋[2m · ⎋[0m⎋[2mview ⎋[0mpty⎋[2m · ⎋[0m⎋[1mrunning⎋[0m⎋[K
@@ -88,7 +88,7 @@ exports[`TuiModel colors > matches the golden nerd frame with truecolor color 1`
 ⎋[7m> laptop  coding    I-3 e1  claude/pty  running                                 ⎋[0m
   laptop  ⎋[38;2;168;173;179mcoding    ⎋[0mI-4 e2  ⎋[38;2;215;166;232mcodex/herdr⎋[0m  ⎋[38;2;255;158;87mblocked⎋[0m⎋[K
   vps     ⎋[38;2;168;173;179mbackend   ⎋[0m⎋[38;2;255;158;87m󰾡! ⎋[0m  ⎋[38;2;128;134;139m[⎋[0m⎋[38;2;255;196;48m██████⎋[0m⎋[38;2;128;134;139m░░⎋[0m⎋[38;2;128;134;139m]⎋[0m ⎋[1m 75%⎋[0m⎋[38;2;168;173;179m  6/8⎋[0m  ⎋[38;2;255;158;87mblocked⎋[0m  migrate users⎋[K
-  mac     ⎋[38;2;168;173;179mfrontend  ⎋[0m⎋[38;2;139;212;158m󱃎  ⎋[0m  ⎋[38;2;128;134;139m[⎋[0m⎋[38;2;255;138;128m████████⎋[0m⎋[38;2;128;134;139m]⎋[0m ⎋[1m100%⎋[0m⎋[38;2;168;173;179m  8/8⎋[0m  ⎋[38;2;139;212;158mdone⎋[0m⎋[38;2;255;138;128m (1 failed)⎋[0m⎋[K
+  mac     ⎋[38;2;168;173;179mfrontend  ⎋[0m⎋[38;2;255;138;128m󱃎  ⎋[0m  ⎋[38;2;128;134;139m[⎋[0m⎋[38;2;255;138;128m████████⎋[0m⎋[38;2;128;134;139m]⎋[0m ⎋[38;2;255;138;128mfailed 1 of 8⎋[0m⎋[K
 ⎋[38;2;128;134;139m── ⎋[0m⎋[38;2;168;173;179;1mITEM⎋[0m⎋[38;2;128;134;139m ────────────────────────────────────────────────────────⎋[0m⎋[38;2;168;173;179m I-3 · epoch 1 ⎋[0m⎋[38;2;128;134;139m─⎋[0m
 ⎋[38;2;168;173;179m  Item    ⎋[0mI-3 (web)  add a health check⎋[K
 ⎋[38;2;168;173;179m  Agent   ⎋[0m⎋[38;2;215;166;232mclaude⎋[0m⎋[38;2;128;134;139m · ⎋[0m⎋[38;2;168;173;179mview ⎋[0mpty⎋[38;2;128;134;139m · ⎋[0m⎋[38;2;255;196;48mrunning⎋[0m⎋[K

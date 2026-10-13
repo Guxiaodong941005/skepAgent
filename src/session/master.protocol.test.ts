@@ -168,6 +168,20 @@ describe("negotiation", () => {
     );
   });
 
+  it("a v2 peer names its repo and role at join, before any intent (Phase 3 exit run)", async () => {
+    const events: MasterEvent[] = [];
+    const m = await master(events);
+    await join(m, "box", "alpha-app", { repo: "alpha-app", role: "coding" });
+    await vi.waitFor(() =>
+      expect(m.status().peers[0]).toMatchObject({ repo: "alpha-app", role: "coding" }),
+    );
+    // The shell redraws its roster on a progress event.
+    expect(events.some((event) => event.kind === "progress")).toBe(true);
+    // A peer that does not say keeps the old behavior: unknown until its first capability.
+    await join(m, "pad", "web");
+    expect(m.status().peers[1]).toMatchObject({ repo: null, role: null });
+  });
+
   it("a v1 sub (≤0.1.13 behavior) joins a v2 master on v1", async () => {
     const m = await master();
     const sub = await join(m, "box", "app", { protocol: 1 });
@@ -242,6 +256,19 @@ describe("intents", () => {
     await vi.waitFor(() => expect(app.items).toHaveLength(2));
     expect(web.items).toHaveLength(1);
     expect(m.status().intents.find((i) => i.intentId === second.intentId)?.items).toHaveLength(1);
+  });
+
+  it("routes by the repo a peer named at join, without a first intent to learn it", async () => {
+    const m = await master();
+    const app = await join(m, "box", "app", { repo: "app", work: async (item) => result(item) });
+    const web = await join(m, "pad", "web", { repo: "web", work: async (item) => result(item) });
+    await vi.waitFor(() =>
+      expect(m.status().peers.map((peer) => peer.repo)).toEqual(["app", "web"]),
+    );
+    await m.submitIntent("only web", ["web"]);
+    await vi.waitFor(() => expect(web.items).toHaveLength(1));
+    expect(app.items).toHaveLength(0);
+    expect(app.events.filter((event) => event.kind === "intent")).toHaveLength(0);
   });
 
   it("gives a v2 peer the whole long brief and a v1 peer its first 4000 characters", async () => {

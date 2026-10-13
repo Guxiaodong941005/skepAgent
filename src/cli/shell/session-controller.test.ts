@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
+import { JoinRejectedError } from "../../session/index.js";
 import type { JoinFlow, MasterFlow, SessionStatus } from "../commands/session.js";
 import {
   type ExternalMaster,
+  explainJoinFailure,
   explainReason,
   joinFailureText,
   noMatchText,
@@ -285,7 +287,42 @@ describe("SessionController /clean support", () => {
   });
 });
 
+describe("explainJoinFailure", () => {
+  const paste = "/join 1234-5678-9012 10.0.0.1:7419";
+
+  it("spells out a refused join and hands over the current code", () => {
+    expect(explainJoinFailure("Join from vps (10.0.0.9) ended: bad_code", paste)).toBe(
+      "Join from vps (10.0.0.9) ended: bad_code: wrong or outdated join code " +
+        `(each code admits one device)\nit can retry with the current code: ${paste}`,
+    );
+    expect(explainJoinFailure("Join from vps (10.0.0.9) ended: expired", paste)).toContain(
+      "the code changed before this join finished",
+    );
+  });
+
+  it("offers no retry line for a declined join or without a code; leaves other reasons", () => {
+    expect(explainJoinFailure("Join from vps (10.0.0.9) ended: declined", paste)).toBe(
+      "Join from vps (10.0.0.9) ended: declined: declined here",
+    );
+    expect(explainJoinFailure("Join from vps (10.0.0.9) ended: bad_code", null)).not.toContain(
+      "retry",
+    );
+    expect(explainJoinFailure("Join from 10.0.0.9 ended: first_frame_timeout", paste)).toBe(
+      "Join from 10.0.0.9 ended: first_frame_timeout",
+    );
+  });
+});
+
 describe("joinFailureText", () => {
+  it("turns a master's refusal into a cause and the fix (single-use codes)", () => {
+    const text = joinFailureText(new JoinRejectedError("bad_code"));
+    expect(text).toMatch(/^join failed: Session join rejected \(bad_code\): .*no longer current/);
+    expect(text).toContain("\nfix: ask for the master's current code");
+    expect(joinFailureText(new JoinRejectedError("expired"))).toContain(
+      "another device joined or tried a wrong code meanwhile",
+    );
+  });
+
   it("keeps a message's own fix line, else adds a generic one", () => {
     expect(joinFailureText(new Error("no agent CLI found\nfix: install one"))).toBe(
       "join failed: no agent CLI found\nfix: install one",

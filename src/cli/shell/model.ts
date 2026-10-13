@@ -12,6 +12,8 @@ import {
   chrome,
   column,
   displayWidth,
+  failedRun,
+  failedText,
   fitSpans,
   type Glyphs,
   type Line,
@@ -438,7 +440,7 @@ export class ShellModel {
     return out;
   }
 
-  /** `── > peer-2 · mac · coding · working 40% ───`: the focused title is bold. */
+  /** `── > peer-2 · mac · api · coding · working 40% ───`: the focused title is bold. */
   private panelTitle(rect: PanelRect, focus: string, hidden: readonly string[]): Line {
     const g = chrome(this.glyphs);
     const focused = rect.id === focus;
@@ -458,6 +460,7 @@ export class ShellModel {
               peer.peerId,
               ...scrolled,
               peer.device,
+              ...(peer.repo === undefined ? [] : [peer.repo]),
               peer.role,
               progressNote(peer.state, peer.progress),
             ];
@@ -558,18 +561,25 @@ export class ShellModel {
       Math.max(6, ...shown.map((peer) => displayWidth(peer.device))),
     );
     const roleWidth = Math.min(10, Math.max(6, ...shown.map((peer) => displayWidth(peer.role))));
+    // Only a master knows its peers' repos; a joined shell's rows keep the old columns.
+    const repos = shown.some((peer) => peer.repo !== undefined);
+    const repoWidth = Math.min(
+      16,
+      Math.max(6, ...shown.map((peer) => displayWidth(peer.repo ?? "-"))),
+    );
     const lines: Line[] = shown.map((peer) => {
       const progress = peer.progress;
       const phase = progress?.phase ?? "idle";
       const spans: Span[] = [
         { text: `  ${column(peer.device, deviceWidth)}  ` },
+        ...(repos ? [{ text: `${column(peer.repo ?? "-", repoWidth)}  ` }] : []),
         fg("on-surface-variant", `${column(peer.role, roleWidth)}  `),
         fg("primary", `${beeLane(phase, this.beat, this.glyphs)} `),
       ];
       if (progress === undefined) {
         spans.push(chip(peer.state), { text: "  " }, ...this.presence(peer));
       } else {
-        const failed = progress.phase === "done" && progress.failed > 0;
+        const failed = failedRun(progress);
         if (columns >= 60) {
           spans.push(
             fg("outline", "["),
@@ -577,13 +587,16 @@ export class ShellModel {
             fg("outline", "] "),
           );
         }
-        spans.push(bold(`${progress.percent}%`));
-        if (columns >= 70) {
-          spans.push(fg("on-surface-variant", ` ${progress.done}/${progress.total}`));
+        if (failed) {
+          spans.push(fg("error", failedText(progress)), { text: "  " });
+        } else {
+          spans.push(bold(`${progress.percent}%`));
+          if (columns >= 70) {
+            spans.push(fg("on-surface-variant", ` ${progress.done}/${progress.total}`));
+          }
+          spans.push({ text: " " }, chip(phase), { text: "  " });
         }
-        spans.push({ text: " " }, chip(phase), { text: "  " });
         spans.push(...this.presence(peer));
-        if (failed) spans.push(fg("error", `(${progress.failed} failed)  `));
         spans.push({ text: progress.summary });
       }
       return { spans };

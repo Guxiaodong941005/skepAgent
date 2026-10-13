@@ -236,6 +236,40 @@ describe("split panels (ORCH-5)", () => {
     expect(frame.join("\n")).toMatchSnapshot();
   });
 
+  it("names a master's peer repo in its panel title and footer row (Phase 3 exit run)", () => {
+    const { shell, lines } = split();
+    shell.peers = shell.peers.map((peer) =>
+      peer.peerId === "peer-1" ? { ...peer, repo: "alpha-app" } : peer,
+    );
+    const text = lines().join("\n");
+    expect(text).toMatch(/peer-1 \| mac \| alpha-app \| coding \| working/);
+    // A peer that has not named one shows `-` in the footer column.
+    expect(text).toMatch(/ mac {5}alpha-app {2}coding/);
+    expect(text).toMatch(/ vps {5}- {10}web/);
+  });
+
+  it("titles and lists a finished peer with a failed item as failed, not done", () => {
+    const { shell, lines } = split();
+    const failed = {
+      phase: "done" as const,
+      done: 1,
+      total: 1,
+      failed: 1,
+      percent: 100,
+      summary: "",
+    };
+    shell.peers = shell.peers.map((peer) =>
+      peer.peerId === "peer-2" ? { ...peer, state: "done", progress: failed } : peer,
+    );
+    const frame = lines();
+    const title = frame.find((line) => line.includes("peer-2 |")) ?? "";
+    expect(title).toContain("failed 1 of 1");
+    expect(title).not.toContain("done");
+    const row = frame.find((line) => /^ {2}vps /.test(line)) ?? "";
+    expect(row).toContain("failed 1 of 1");
+    expect(row).not.toMatch(/100%|done/);
+  });
+
   it("a peer panel shows its own entries and timeline; the main view never shows the timeline", () => {
     const { shell, lines } = split();
     const right = (line: string) => line.slice(67);

@@ -567,6 +567,19 @@ const STATE_ROLES: Readonly<Record<string, Role>> = {
   left: "error",
 };
 
+/**
+ * A finished run with a failed item reads as failed, never as done: the wire phase `done` only
+ * means every assigned item finished, and a failed item counts as finished (peer-progress §3).
+ */
+export function failedRun(progress: { phase: string; failed: number }): boolean {
+  return progress.phase === "done" && progress.failed > 0;
+}
+
+/** `failed 1 of 3` for a failed run, so the count is not mistaken for finished work. */
+export function failedText(progress: { failed: number; total: number }): string {
+  return `failed ${progress.failed} of ${progress.total}`;
+}
+
 export function chip(state: string): Span {
   return {
     text: state,
@@ -887,8 +900,8 @@ export class TuiModel {
    * columns and the bar below 60 (§2.3); the summary is last and takes what room is left.
    */
   private strip(progress: NonNullable<TuiPeer["progress"]>, columns: number, used: number): Span[] {
-    const phaseRole = chip(progress.phase).role ?? "on-surface";
-    const failed = progress.phase === "done" && progress.failed > 0;
+    const failed = failedRun(progress);
+    const phaseRole = chip(failed ? "failed" : progress.phase).role ?? "on-surface";
     const spans: Span[] = [
       fg(phaseRole, beeLane(progress.phase, this.beat, this.glyphs)),
       { text: "  " },
@@ -903,12 +916,15 @@ export class TuiModel {
         { text: " " },
       );
     }
-    spans.push(bold(`${String(progress.percent).padStart(3)}%`));
-    if (columns >= 70) {
-      spans.push(fg("on-surface-variant", `  ${progress.done}/${progress.total}`));
+    if (failed) {
+      spans.push(fg("error", failedText(progress)));
+    } else {
+      spans.push(bold(`${String(progress.percent).padStart(3)}%`));
+      if (columns >= 70) {
+        spans.push(fg("on-surface-variant", `  ${progress.done}/${progress.total}`));
+      }
+      spans.push({ text: "  " }, chip(progress.phase));
     }
-    spans.push({ text: "  " }, chip(progress.phase));
-    if (failed) spans.push(fg("error", ` (${progress.failed} failed)`));
     const summary = printable(progress.summary);
     // Two columns for the "> " mark, two for the gap; a summary cut below 6 columns says nothing.
     if (summary !== "" && columns - 2 - used - spansWidth(spans) - 2 >= 6) {

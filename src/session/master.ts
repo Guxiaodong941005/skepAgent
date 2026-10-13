@@ -24,6 +24,7 @@ import {
   type ItemStatus,
   type JoinRejectReason,
   type OutputMsg,
+  type PeerInfoMsg,
   type ProgressMsg,
   ProgressMsgSchema,
   type ProtocolVersion,
@@ -764,7 +765,7 @@ class SessionMaster implements MasterHandle {
     } else if (message.type === "progress") {
       this.receiveProgress(peer, message);
     } else if (message.type === "peer-info") {
-      this.receivePeerInfo(peer, message.version, message.shareOutput);
+      this.receivePeerInfo(peer, message);
     } else if (message.type === "output") {
       this.receiveOutput(peer, message);
     } else {
@@ -772,8 +773,16 @@ class SessionMaster implements MasterHandle {
     }
   }
 
-  private receivePeerInfo(peer: Peer, version: string, share: boolean): void {
+  private receivePeerInfo(peer: Peer, info: PeerInfoMsg): void {
+    const { version, shareOutput: share, repo, role } = info;
     peer.version = version;
+    // The join's own label until an intent's `capability` describes the peer (that one wins).
+    if ((repo !== undefined && repo !== peer.repo) || (role !== undefined && role !== peer.role)) {
+      peer.repo = repo ?? peer.repo;
+      peer.role = role ?? peer.role;
+      this.event("progress", peer.peerId);
+      this.progressChanged(peer);
+    }
     if (share === peer.shareOutput) return;
     peer.shareOutput = share;
     // The master's human sees who opted in: live output is a choice on the other device (D35).

@@ -315,8 +315,8 @@ export const SessionMsgSchema = z.discriminatedUnion("type", [
   ResultMsgSchema,
 ]);
 /**
- * v2 frames (ORCH-6): the welcome names the master's release, a sub reports its own release and
- * live-output choice in `peer-info`, intents carry briefs up to {@link BRIEF_MAX}, results may
+ * v2 frames (ORCH-6): the welcome names the master's release, a sub reports its own release,
+ * live-output choice, repo and role in `peer-info`, intents carry briefs up to {@link BRIEF_MAX}, results may
  * list changed files, and an opted-in sub sends `output`.
  */
 export const SessionMsgV2Schema = z.discriminatedUnion("type", [
@@ -333,6 +333,12 @@ export const SessionMsgV2Schema = z.discriminatedUnion("type", [
     type: z.literal("peer-info"),
     version: VersionSchema,
     shareOutput: z.boolean(),
+    /**
+     * The repo and role this join works on, known at join time, so the master can show and
+     * route by them before the first intent's `capability`. Optional: earlier v2 builds omit it.
+     */
+    repo: RepoRefSchema.optional(),
+    role: RoleSchema.optional(),
   }),
   OutputMsgSchema,
 ]);
@@ -343,6 +349,7 @@ export function sessionSchema(v: ProtocolVersion) {
   return v === 2 ? SessionMsgV2Schema : SessionMsgSchema;
 }
 export type ClaimMsg = Extract<SessionMsg, { type: "claim" }>;
+export type PeerInfoMsg = Extract<SessionMsg, { type: "peer-info" }>;
 export type DatalistMsg = Extract<SessionMsg, { type: "datalist" }>;
 
 export const ItemStatusSchema = PlanItemSchema.extend({

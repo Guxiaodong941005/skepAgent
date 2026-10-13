@@ -167,7 +167,12 @@ async function connectOnce(o: SubOptions, protocol: ProtocolVersion): Promise<Su
   const intentTexts = new Map<string, string>();
   const agents = new Map<string, AgentProgressState>();
   let everBlocked = false;
-  let role: string | null = null;
+  // What this join works on, for `peer-info`; each intent's `describe` answer stays authoritative.
+  const label = {
+    ...(o.repo === undefined ? {} : { repo: o.repo }),
+    ...(o.role === undefined ? {} : { role: o.role }),
+  };
+  let role: string | null = o.role ?? null;
   let lastSelf: PeerProgress | null = null;
   const event = (kind: string, message: string) => o.onEvent?.({ kind, message });
   const callbackFailed = () => {
@@ -196,7 +201,8 @@ async function connectOnce(o: SubOptions, protocol: ProtocolVersion): Promise<Su
     },
   });
   const sendPeerInfo = () => {
-    if (protocol === 2 && wire.active) wire.send({ type: "peer-info", version, shareOutput });
+    if (protocol === 2 && wire.active)
+      wire.send({ type: "peer-info", version, shareOutput, ...label });
   };
   const progressChanged = () => {
     if (!handle || !wire.active) return;

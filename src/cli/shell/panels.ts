@@ -6,7 +6,7 @@
  */
 
 import type { Span } from "../theme.js";
-import { displayWidth, fitSpans, type Line } from "../tui.js";
+import { displayWidth, failedRun, failedText, fitSpans, type Line } from "../tui.js";
 
 /** The main panel's id; peer panels use the peer id (`peer-2`), which never equals it. */
 export const MAIN_PANEL = "main";
@@ -121,12 +121,20 @@ export function resolvePanel(
  */
 export function progressNote(
   state: string,
-  progress?: { phase: string; done: number; total: number; percent: number; summary: string },
+  progress?: {
+    phase: string;
+    done: number;
+    total: number;
+    failed: number;
+    percent: number;
+    summary: string;
+  },
 ): string {
   if (progress === undefined) return state;
+  const summary = progress.summary === "" ? "" : ` · ${progress.summary}`;
+  if (failedRun(progress)) return `${failedText(progress)}${summary}`;
   const counts =
     progress.total === 0 ? "" : ` ${progress.percent}% ${progress.done}/${progress.total}`;
-  const summary = progress.summary === "" ? "" : ` · ${progress.summary}`;
   return `${progress.phase}${counts}${summary}`;
 }
 

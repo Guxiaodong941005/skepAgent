@@ -3301,6 +3301,9 @@ export async function joinSessionFlow(
       onFingerprint: showFingerprint,
       onProgress,
       version: SKEP_VERSION,
+      // The master shows and routes by these from the join on (v2 `peer-info`).
+      repo,
+      role,
       ...(opts.shareOutput === true ? { shareOutput: true } : {}),
       // A sub that hangs up on purpose (a failed describe/datalist callback) says so here;
       // otherwise the human only sees the close reason.
@@ -3930,7 +3933,12 @@ export function sessionStatusSections(status: SessionStatus): StatusSection[] {
           p.repo ?? "-",
           p.head === null ? "-" : p.head.slice(0, 12),
           p.role ?? "-",
-          p.progress === undefined ? "-" : `${p.progress.phase} ${p.progress.percent}%`,
+          p.progress === undefined
+            ? "-"
+            : // A finished run with a failed item is not "done" (Phase 3 exit run).
+              p.progress.phase === "done" && p.progress.failed > 0
+              ? `failed ${p.progress.failed} of ${p.progress.total}`
+              : `${p.progress.phase} ${p.progress.percent}%`,
           peerRelease(p),
         ]),
       ]),

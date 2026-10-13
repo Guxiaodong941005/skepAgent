@@ -347,6 +347,35 @@ const LEAVE_REASONS: Record<string, string> = {
   protocol_error: "protocol error — are both devices on the same skep version?",
 };
 
+/**
+ * A refused join as the master's human sees it. Join codes are single-use (a proved or wrong
+ * code rotates it), so a peer pasting a code from an earlier join is the usual cause.
+ */
+const JOIN_FAILED_REASONS: Record<string, string> = {
+  bad_code: "wrong or outdated join code (each code admits one device)",
+  expired:
+    "the code changed before this join finished (another device joined or tried a wrong code, " +
+    "or it expired)",
+  declined: "declined here",
+  busy: "too many joins at once",
+  no_code: "no join code was active",
+};
+
+/**
+ * `Join from mac (10.0.0.2) ended: bad_code` with the cause spelled out and, when the peer can
+ * simply retry, the current paste line (rotated codes are not printed on their own any more).
+ */
+export function explainJoinFailure(message: string, paste: string | null): string {
+  const at = message.lastIndexOf(": ");
+  if (at < 0) return message;
+  const reason = message.slice(at + 2);
+  const text = JOIN_FAILED_REASONS[reason];
+  if (text === undefined) return message;
+  const retry =
+    paste === null || reason === "declined" ? "" : `\nit can retry with the current code: ${paste}`;
+  return `${message.slice(0, at + 2)}${reason}: ${text}${retry}`;
+}
+
 /** A close reason with a human explanation, e.g. `heartbeat_timeout: no heartbeat for 30 s …`. */
 export function explainReason(reason: string): string {
   const text = LEAVE_REASONS[reason];

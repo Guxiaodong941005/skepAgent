@@ -476,7 +476,7 @@ describe("peer progress strips", () => {
       };
       view.update(snapshot);
       expect(term.frame()[2]).toContain("\u{F10CE}");
-      expect(term.frame()[2]).toContain("[████████] 100%  8/8  done (1 failed)");
+      expect(term.frame()[2]).toContain("[████████] failed 1 of 8");
       expect(term.frame()[3]).toBe("> laptop  coding   I-1 e1  codex/pty  running");
     } finally {
       view.close();
@@ -812,7 +812,7 @@ describe("TuiJoinView frames", () => {
       "> laptop        coding      I-3 e1  claude/pty  running",
       "  laptop        coding      I-4 e2  codex/herdr  blocked",
       "  vps           backend     󰾡!   [██████░░]  75%  6/8  blocked  migrate users",
-      "  mac           frontend    󱃎    [████████] 100%  8/8  done (1 failed)",
+      "  mac           frontend    󱃎    [████████] failed 1 of 8",
     ]);
     expect(plain(m.frame(100, 40))[7]).toBe("  a-very-long…  a-very-lo…  joined");
   });
@@ -930,9 +930,11 @@ describe("TuiModel colors", () => {
     expect(working).toContain(`${sgr("primary")}working${RESET}`);
     expect(blocked).toContain(`${sgr("warning")}${NF_MD_BEE}!`);
     expect(blocked).toContain(`${sgr("warning")}blocked${RESET}`);
-    expect(done).toContain(`${sgr("success")}${NF_MD_BEEHIVE}`);
+    // A finished run with a failed item reads as failed, not done (Phase 3 exit run).
+    expect(done).toContain(`${sgr("error")}${NF_MD_BEEHIVE}`);
     expect(done).toContain(`${sgr("error")}████████${RESET}`);
-    expect(done).toContain(`${sgr("success")}done${RESET}${sgr("error")} (1 failed)${RESET}`);
+    expect(done).toContain(`${sgr("error")}failed 1 of 8${RESET}`);
+    expect(done).not.toContain("done");
     expect(frame[0]).toContain(`${TRUECOLOR.sgr({ role: "primary", bold: true })}skep`);
   });
 

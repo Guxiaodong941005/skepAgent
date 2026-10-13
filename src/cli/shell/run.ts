@@ -24,7 +24,7 @@ import {
 } from "../../orchestrator/settings.js";
 import type { MasterEvent } from "../../session/index.js";
 import { itemVerdict } from "../../session/master.js";
-import { type Clock, isoUtc, systemClock } from "../../util/clock.js";
+import { type Clock, systemClock } from "../../util/clock.js";
 import { execFileChecked } from "../../util/exec.js";
 import { cryptoRandom } from "../../util/random.js";
 import { AGENT_ORDER } from "../commands/agent-tui.js";
@@ -76,6 +76,7 @@ import { ShellModel, type ShellPeer, type ShellTone } from "./model.js";
 import { cycleFocus, MAIN_PANEL, progressNote, resolvePanel } from "./panels.js";
 import {
   type ExternalMaster,
+  explainJoinFailure,
   explainReason,
   type IntentRoute,
   joinFailureText,
@@ -97,6 +98,13 @@ export { parseFlags } from "./flags.js";
 
 /** Rows one mouse wheel notch scrolls (SGR mouse reports; alternate-scroll sends arrows). */
 const WHEEL_ROWS = 3;
+/**
+ * The last line of `/start`. Goals go through the master agent, which briefs peers per repo
+ * (ORCH-7); the old "a peer on the same repo" rule no longer describes routing.
+ */
+const GOAL_HINT =
+  "peers on other repos can join too; type a goal: the master agent splits it by repo and " +
+  "briefs the peers on each one (/orchestrate off sends your text as it is)";
 const SUBMIT_CHOICES = ["commit", "push", "pr", "mr", "none"] as const;
 /** A master in another process is re-read every this many ticks (2 s at 250 ms). */
 const EXTERNAL_POLL_TICKS = 8;
@@ -1083,14 +1091,9 @@ export class Shell {
         );
         return answer !== null && /^\s*y(es)?\s*$/i.test(answer);
       },
-      onJoinCode: (code, expiresAtMs) => {
-        // A rotated code invalidates the line pasted earlier, so the new one is printed in full.
-        const own = this.session.ownMaster;
-        const paste =
-          own === null ? "" : `\npaste: ${formatJoinPaste({ host: own.advertise, code })}`;
-        this.log(`join code: ${code}${expiry(expiresAtMs)}${paste}`, "event");
-        this.sync();
-      },
+      // A code rotates after every join (single-use): the header shows the current one and
+      // `/status` its paste line. Logging each rotation filled the main panel (Phase 3 exit run).
+      onJoinCode: () => this.sync(),
       onEvent: (event) => this.masterEvent(event),
     });
     this.session.setMaster(flow);
@@ -1101,7 +1104,7 @@ export class Shell {
     this.sync();
     return {
       type: "ok",
-      message: `${startedText(flow)}intents need at least one joined peer working on the same repo`,
+      message: `${startedText(flow)}${GOAL_HINT}`,
     };
   }
 
@@ -1140,7 +1143,15 @@ export class Shell {
         log(`${text}\nit can rejoin with the current code: ${rejoin}`, "error");
         break;
       }
-      case "join-failed":
+      case "join-failed": {
+        const own = this.session.ownMaster;
+        const paste =
+          own === null || own.joinCode === null
+            ? null
+            : formatJoinPaste({ host: own.advertise, code: own.joinCode });
+        log(explainJoinFailure(message, paste), "error");
+        break;
+      }
       case "error":
         log(message, "error");
         break;
@@ -1546,7 +1557,17 @@ export class Shell {
     const word = args.trim();
     const key = word === "" ? null : word.toLowerCase() === "all" ? "all" : word.toUpperCase();
     const changed = this.model.setExpanded(key, open);
-    if (changed.length > 0) return { type: "ok" };
+    // The block may sit far above the bottom of the main panel, so the change is not visible
+    // where the human is looking: say what changed and where (Phase 3 exit run).
+    if (changed.length > 0) {
+      const names = changed.join(", ");
+      return {
+        type: "ok",
+        message: open
+          ? `expanded ${names}: shown whole in place above (pgup or /find to scroll to it); /fold ${changed.length === 1 ? names : "all"} folds it again`
+          : `folded ${names} in the main panel; its peer panel still shows it whole`,
+      };
+    }
     const verb = open ? "expand" : "fold";
     const state = open ? "folded" : "expanded";
     let why = `no ${state} result in this session`;
@@ -2019,10 +2040,6 @@ function failedItem(data: unknown): boolean {
 function isNoMatch(error: unknown): boolean {
   if (error instanceof CliError) return error.code === "no_match";
   return error instanceof Error && error.name === "NoMatchError";
-}
-
-function expiry(expiresAtMs: number | null): string {
-  return expiresAtMs === null ? "" : ` (expires ${isoUtc(expiresAtMs)})`;
 }
 
 function displayPath(dir: string, home: string | undefined): string {

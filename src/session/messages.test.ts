@@ -353,6 +353,12 @@ describe("protocol v2 (ORCH-6)", () => {
     }
     // A v2 welcome must name the master's release.
     expect(SessionMsgV2Schema.safeParse(welcome).success).toBe(false);
+    // `peer-info` may name the join's repo and role; both are validated like a capability.
+    expect(SessionMsgV2Schema.safeParse({ ...info, repo: "app", role: "coding" }).success).toBe(
+      true,
+    );
+    expect(SessionMsgV2Schema.safeParse({ ...info, repo: "" }).success).toBe(false);
+    expect(SessionMsgV2Schema.safeParse({ ...info, role: "Bad Role" }).success).toBe(false);
   });
 
   it("bounds live output to 20 lines and 2 KB", () => {

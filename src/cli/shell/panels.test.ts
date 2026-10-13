@@ -92,11 +92,19 @@ describe("panel text", () => {
       phase: "working",
       done: 1,
       total: 4,
+      failed: 0,
       percent: 25,
       summary: "editing api.ts",
     };
     expect(progressNote("joined", progress)).toBe("working 25% 1/4 · editing api.ts");
     expect(progressNote("joined", { ...progress, total: 0, summary: "" })).toBe("working");
+  });
+
+  it("says failed, not done, when a finished run has a failed item", () => {
+    const done = { phase: "done", done: 1, total: 1, failed: 0, percent: 100, summary: "" };
+    expect(progressNote("done", done)).toBe("done 100% 1/1");
+    expect(progressNote("done", { ...done, failed: 1 })).toBe("failed 1 of 1");
+    expect(progressNote("done", { ...done, done: 3, total: 3, failed: 1 })).toBe("failed 1 of 3");
   });
 
   it("cuts or pads a line to exactly its cell width", () => {

@@ -13,10 +13,43 @@ import type { JoinRejectReason, ProtocolVersion } from "./messages.js";
 export class JoinCodeError extends Error {
   override readonly name = "JoinCodeError";
 }
+/**
+ * Why a master refused a join, and what the human does next. A join code admits one device and
+ * the master shows a new one after every join and every wrong try (a proved or guessed code is
+ * never reusable), so a code that worked a minute ago is the usual cause, not a typo.
+ */
+const REJECT_TEXT: Record<JoinRejectReason, { cause: string; fix: string }> = {
+  no_code: {
+    cause: "the master has no join code right now (it is shutting down)",
+    fix: "start or find the session master again, then join with its current code",
+  },
+  bad_code: {
+    cause:
+      "the master did not accept this join code: it is mistyped or no longer current " +
+      "(each code admits one device; the master shows a new one after every join)",
+    fix: "ask for the master's current code (its header shows it; /status prints the paste line), then join again",
+  },
+  expired: {
+    cause:
+      "the join code stopped being valid before this join finished: it expired, another " +
+      "device joined or tried a wrong code meanwhile, or the master's human did not answer in time",
+    fix: "ask for the master's current code (its header shows it; /status prints the paste line), then join again",
+  },
+  declined: {
+    cause: "the master's human declined this device",
+    fix: "ask them to accept it, then join again with the master's current code",
+  },
+  busy: {
+    cause: "the master is busy with other joins",
+    fix: "wait a few seconds, then join again with the master's current code",
+  },
+};
+
 export class JoinRejectedError extends Error {
   override readonly name = "JoinRejectedError";
   constructor(readonly reason: JoinRejectReason) {
-    super(`Session join rejected: ${reason}`);
+    const { cause, fix } = REJECT_TEXT[reason];
+    super(`Session join rejected (${reason}): ${cause}\nfix: ${fix}`);
   }
 }
 export class HandshakeError extends Error {

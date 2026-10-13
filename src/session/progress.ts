@@ -48,6 +48,21 @@ export interface ReportedProgress {
 
 export const SUMMARY_MAX = 120;
 
+/**
+ * A progress line from free text: its first non-blank line, cut to {@link SUMMARY_MAX} at a word
+ * boundary with `…`. Item titles are the first 200 characters of a brief, so they often hold a
+ * headline, a blank line and the start of `Goal: …`; a plain slice showed half a word on a line
+ * of its own.
+ */
+export function summaryLine(text: string): string {
+  const line = (text.split(/\r?\n/).find((entry) => entry.trim() !== "") ?? "").trim();
+  if (line.length <= SUMMARY_MAX) return line;
+  const cut = line.slice(0, SUMMARY_MAX - 1);
+  const space = cut.lastIndexOf(" ");
+  // A single huge word (a path, a URL) is cut where it must be rather than dropped.
+  return `${(space >= SUMMARY_MAX / 2 ? cut.slice(0, space) : cut).trimEnd()}…`;
+}
+
 /** Default 500 ms (plan §2.5); 0 disables coalescing, which tests use. */
 export function progressInterval(value: number | undefined): number {
   const result = value ?? 500;
@@ -103,7 +118,7 @@ export function deriveProgress(
     total,
     failed,
     percent: percentOf(done, total),
-    summary: subject ? subject.summary.slice(0, SUMMARY_MAX) : "",
+    summary: subject ? summaryLine(subject.summary) : "",
     ...(subject ? { itemId: subject.itemId } : {}),
   };
 }
@@ -142,7 +157,7 @@ export function subProgress(
     total: counted.length,
     failed,
     percent: percentOf(finished.length, counted.length),
-    summary: active ? active.title.slice(0, SUMMARY_MAX) : "",
+    summary: active ? summaryLine(active.title) : "",
     ...(active ? { itemId: active.itemId } : {}),
   };
 }

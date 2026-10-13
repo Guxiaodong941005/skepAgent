@@ -353,9 +353,24 @@ describe("unified shell", () => {
     expect(h.scrollback()).toContain("session master listening on 192.168.1.20:7419 (repo app)");
     expect(h.scrollback()).toContain("peers dial 203.0.113.7:7419");
     expect(h.scrollback()).toContain("paste into skep: /join 1234-5678-9012 203.0.113.7:7419");
-    // A rotated code comes with a fresh paste line on the advertise address.
+    // The welcome describes per-repo routing, not the old same-repo rule (Phase 3 exit run).
+    expect(h.scrollback()).toContain("the master agent splits it by repo");
+    expect(h.scrollback()).not.toContain("working on the same repo");
+    // A code rotates after every join: the header shows it, the main panel stays quiet.
     h.fake.calls.master[0]?.onJoinCode?.({ code: "999988887777", expiresAtMs: 0 });
-    expect(h.scrollback()).toContain("paste: /join 9999-8888-7777 203.0.113.7:7419");
+    expect(h.scrollback()).not.toContain("9999-8888-7777");
+    // A refused join explains itself and hands over the current paste line on the advertise
+    // address, which is what the peer needs to retry (Phase 3 exit run).
+    h.fake.calls.master[0]?.onEvent?.({
+      kind: "join-failed",
+      message: "Join from vps (10.0.0.9) ended: bad_code",
+    });
+    expect(h.scrollback()).toContain(
+      "Join from vps (10.0.0.9) ended: bad_code: wrong or outdated join code",
+    );
+    expect(h.scrollback()).toContain(
+      "it can retry with the current code: /join 9999-8888-7777 203.0.113.7:7419",
+    );
     await h.shell.quit();
   });
 
@@ -378,7 +393,7 @@ describe("unified shell", () => {
       expect(h.scrollback()).toContain("session master listening on 192.168.1.20:7420");
       expect(h.scrollback()).toContain("/join 1234-5678-9012 192.168.1.20:7420");
       h.fake.calls.master[0]?.onJoinCode?.({ code: "999988887777", expiresAtMs: 0 });
-      expect(h.scrollback()).toContain("/join 9999-8888-7777 192.168.1.20:7420");
+      expect(h.scrollback()).not.toContain("9999-8888-7777");
       await h.shell.submit("/clean");
       expect(h.shell.session.snapshot().mode).toBe("none");
       await expect(readFile(path.join(h.dir, "session.json"))).rejects.toThrow(/ENOENT/);
@@ -447,6 +462,8 @@ describe("unified shell", () => {
     await h.shell.submit("/clean");
     await h.shell.submit('/join --host 192.168.1.20:7419 --code 1234-5678-9012 --repo "my app"');
     expect(h.fake.calls.sub[0]?.code).toBe("123456789012");
+    // The master learns the join's repo and role at once, not at the first intent.
+    expect(h.fake.calls.sub[0]).toMatchObject({ repo: "my app", role: "coding" });
     expect(h.scrollback()).toContain("joined session S-1 at 192.168.1.20:7419 as peer-1");
     await h.shell.quit();
   });
@@ -821,9 +838,12 @@ describe("unified shell", () => {
     expect(h.scrollback()).toContain("nothing to expand: I-8 is not a folded result");
     // Bare /expand opens the newest folded result.
     await h.shell.submit("/expand");
+    // The block may be far above: the command itself says what changed (Phase 3 exit run).
+    expect(h.scrollback()).toContain("expanded I-7: shown whole in place above");
     await h.shell.submit("/expand I-7");
     expect(h.scrollback()).toContain("nothing to expand: I-7 is already shown whole");
     await h.shell.submit("/fold all");
+    expect(h.scrollback()).toContain("folded I-7 in the main panel");
     await h.shell.submit("/bottom");
     expect(h.shell.model.setExpanded("I-7", true)).toEqual(["I-7"]);
     await h.shell.quit();
@@ -1139,7 +1159,8 @@ describe("unified shell", () => {
     });
     await waitFor(() => h.shell.model.sessionLive);
     expect(h.frame()).toContain("master (other process) · code 1111-2222-3333");
-    expect(h.frame()).toMatch(/mac\s+coding/);
+    // A master's footer names each peer's repo (Phase 3 exit run).
+    expect(h.frame()).toMatch(/mac\s+app\s+coding/);
     await h.shell.submit("add a health check");
     expect(control.requests).toContainEqual(
       expect.objectContaining({ op: "intent", text: "add a health check" }),
