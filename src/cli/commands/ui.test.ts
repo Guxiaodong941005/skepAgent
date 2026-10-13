@@ -8,6 +8,7 @@ import { skepPaths } from "../../config/paths.js";
 import type { Clock } from "../../util/clock.js";
 import { buildProgram, runCli } from "../program.js";
 import { type ProcessHooks, TuiJoinView } from "../tui.js";
+import { SKEP_VERSION } from "../version.js";
 import type { SessionStatus } from "./session.js";
 import { joinViewFactory, masterSnapshot, type UiCliContext } from "./ui.js";
 
@@ -233,7 +234,8 @@ describe("skep ui on a master", () => {
     const run = runCli(["ui"], c.ctx);
     await until(() => time.sleeping() === 1);
     let frame = term.frame();
-    expect(frame[0]).toMatch(/^ skep {3}session s-1 \| device hub \| role master +v\d+\.\d+\.\d+$/);
+    expect(frame[0]).toMatch(/^ skep {3}session s-1 \| device hub \| role master +v/);
+    expect(frame[0]?.endsWith(`v${SKEP_VERSION}`)).toBe(true);
     expect(frame[1]).toMatch(/^-- PEERS -+ 2 peers -$/);
     expect(frame.slice(2, 4)).toEqual([
       "> laptop  coding  I-1 e1  claimed",

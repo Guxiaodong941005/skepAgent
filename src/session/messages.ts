@@ -252,7 +252,11 @@ export const ProgressMsgSchema = progressRules(
     ...progressFields,
   }),
 );
-export type ProgressMsg = z.infer<typeof ProgressMsgSchema>;
+/** v2 relays include the subject's repo; older masters may omit it. */
+export const ProgressMsgV2Schema = ProgressMsgSchema.safeExtend({
+  repo: RepoRefSchema.optional(),
+});
+export type ProgressMsg = z.infer<typeof ProgressMsgV2Schema>;
 
 const OutputLinesSchema = z
   .array(z.string().max(OUTPUT_MAX_BYTES))
@@ -303,7 +307,6 @@ const sessionMembers = [
     itemId: ItemIdSchema,
     reason: ResultRejectReasonSchema,
   }),
-  ProgressMsgSchema,
   z.strictObject({ type: z.literal("bye"), reason: z.string().min(1).max(500) }),
 ] as const;
 
@@ -312,6 +315,7 @@ export const SessionMsgSchema = z.discriminatedUnion("type", [
   z.strictObject({ type: z.literal("welcome"), sessionId: IdSchema, peerId: IdSchema }),
   z.strictObject({ type: z.literal("intent"), intentId: IdSchema, text: TextSchema }),
   ...sessionMembers,
+  ProgressMsgSchema,
   ResultMsgSchema,
 ]);
 /**
@@ -328,6 +332,7 @@ export const SessionMsgV2Schema = z.discriminatedUnion("type", [
   }),
   z.strictObject({ type: z.literal("intent"), intentId: IdSchema, text: BriefSchema }),
   ...sessionMembers,
+  ProgressMsgV2Schema,
   ResultMsgV2Schema,
   z.strictObject({
     type: z.literal("peer-info"),

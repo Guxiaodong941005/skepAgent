@@ -235,14 +235,14 @@ describe("texts", () => {
     expect(noMatchText(status(), ["app"])).toContain("no peers joined yet");
   });
 
-  it("gives the slim /join line, naming the repo as prose, when no peer joined", () => {
-    const text = noPeersText("203.0.113.7:7419", "123456789012", "app");
+  it("gives the slim /join line for any repo when no peer joined", () => {
+    const text = noPeersText("203.0.113.7:7419", "123456789012");
     expect(text).toContain("paste into skep: /join 1234-5678-9012 203.0.113.7:7419");
     expect(text).toContain("skep session join --code 1234-5678-9012 --host 203.0.113.7:7419");
-    expect(text).toContain("from a checkout of app,");
+    expect(text).toContain("from a checkout of any repo,");
     expect(text).not.toContain("--repo");
-    expect(noPeersText("h:1", null, "app")).toContain(
-      "on another device, from a checkout of app: /join <code> h:1",
+    expect(noPeersText("h:1", null)).toContain(
+      "on another device, from a checkout of any repo: /join <code> h:1",
     );
   });
 

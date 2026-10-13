@@ -116,16 +116,14 @@ describe("the pasteable /join line round-trips", () => {
     );
   });
 
-  it("names the master's repo as prose, never as a --repo flag", () => {
-    const hint = joinHint({ host: "h:1", code: "863217270308", repo: "skep-agent" });
+  it("lets peers join from any repo, without a --repo flag", () => {
+    const hint = joinHint({ host: "h:1", code: "863217270308" });
     expect(hint).toBe(
-      "on another device, from a checkout of skep-agent, paste into skep: " +
+      "on another device, from a checkout of any repo, paste into skep: " +
         "/join 8632-1727-0308 h:1\n" +
         "or from a shell: skep session join --code 8632-1727-0308 --host h:1",
     );
-    const odd = joinHint({ host: "h:1", code: "863217270308", repo: "a\nb" });
-    expect(odd).toContain('from a checkout of "a\\nb"');
-    expect(odd).not.toContain("--repo");
+    expect(hint).not.toContain("--repo");
   });
 
   it("refuses an unterminated quote", () => {

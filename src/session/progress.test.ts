@@ -349,6 +349,12 @@ describe("ProgressCoalescer", () => {
     coalescer.push(base);
     coalescer.push({ ...base, role: "backend" });
     coalescer.push({ ...base, role: "backend" });
-    expect(sent.map((p) => p.role)).toEqual([null, "backend"]);
+    coalescer.push({ ...base, role: "backend", repo: "beta-svc" });
+    coalescer.push({ ...base, role: "backend", repo: "beta-svc" });
+    expect(sent).toEqual([
+      base,
+      { ...base, role: "backend" },
+      { ...base, role: "backend", repo: "beta-svc" },
+    ]);
   });
 });

@@ -542,12 +542,12 @@ export function repoLabel(repo: string): string {
 }
 
 /**
- * What a master prints so a peer can join: the paste line first, then its CLI twin. The repo is
- * prose, not a flag: routing matches the joiner's own checkout (JOIN-SLIM).
+ * What a master prints so a peer can join: the paste line first, then its CLI twin. Peers may
+ * join from any repo; the master agent splits goals by repo (ORCH-7).
  */
-export function joinHint(target: JoinTarget & { repo: string }): string {
+export function joinHint(target: JoinTarget): string {
   return (
-    `on another device, from a checkout of ${repoLabel(target.repo)}, ` +
+    "on another device, from a checkout of any repo, " +
     `paste into skep: ${formatJoinPaste(target)}\n` +
     `or from a shell: ${formatJoinCli(target)}`
   );
@@ -2874,7 +2874,7 @@ async function startCommand(ctx: SessionCliContext, opts: StartOptions): Promise
 export function startedText(flow: MasterFlow): string {
   const { listen, advertise, repo, joinCode, joinCodeExpiresAtMs } = flow;
   const dial = advertise === listen ? "" : `peers dial ${advertise}\n`;
-  const hint = joinCode === null ? "" : `${joinHint({ host: advertise, code: joinCode, repo })}\n`;
+  const hint = joinCode === null ? "" : `${joinHint({ host: advertise, code: joinCode })}\n`;
   return (
     `session master listening on ${listen} (repo ${repo})\n${dial}` +
     `join code: ${joinCode ?? "none"}${expiryText(joinCodeExpiresAtMs)}\n${hint}`
@@ -3258,6 +3258,7 @@ export async function joinSessionFlow(
         peerId,
         device: progress.self ? device : progress.device,
         role: progress.self ? role : (progress.role ?? "-"),
+        ...(progress.self ? { repo } : progress.repo === undefined ? {} : { repo: progress.repo }),
         state: phase,
         progress: {
           phase,

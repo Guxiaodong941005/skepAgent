@@ -20,6 +20,7 @@ import {
   type SubHandle,
   type SubOptions,
 } from "../commands/session.js";
+import { SKEP_VERSION } from "../version.js";
 import { parseFlags, parseIntentArgs, Shell, type ShellCliContext, ShellJoinView } from "./run.js";
 
 type MasterPeer = ReturnType<MasterHandle["status"]>["peers"][number];
@@ -332,12 +333,16 @@ describe("unified shell", () => {
     const h = await harness();
     await h.shell.submit("/start --yes --repo app");
     expect(h.fake.calls.master).toHaveLength(1);
+    expect(h.fake.calls.master[0]?.version).toBe(SKEP_VERSION);
+    expect(h.frame()).toContain(`v${SKEP_VERSION}`);
     expect(h.scrollback()).toContain("join code: 1234-5678-9012");
     expect(h.scrollback()).toContain("paste into skep: /join 1234-5678-9012 192.168.1.20:7419");
     expect(h.scrollback()).toContain(
       "skep session join --code 1234-5678-9012 --host 192.168.1.20:7419",
     );
     expect(h.scrollback()).not.toContain("peers dial");
+    expect(h.scrollback()).toContain("from a checkout of any repo, paste into skep:");
+    expect(h.scrollback()).not.toContain("from a checkout of app");
     expect(h.frame()).toContain("master · code 1234-5678-9012");
     expect(h.frame()).toContain("(no peers yet)");
     const written = JSON.parse(await readFile(path.join(h.dir, "session.json"), "utf8"));
@@ -447,12 +452,12 @@ describe("unified shell", () => {
     await h.shell.quit();
   });
 
-  it("names a repo with spaces as prose and still takes it as a quoted --repo override", async () => {
+  it("accepts a quoted repo override while inviting peers from any repo", async () => {
     const h = await harness();
     await h.shell.submit('/start --yes --repo "my app"');
-    // The repo is prose now; the paste line carries only the code and the host.
+    // The master's repo is not a join requirement; the paste carries only the code and host.
     expect(h.scrollback()).toContain(
-      'from a checkout of "my app", paste into skep: /join 1234-5678-9012 192.168.1.20:7419',
+      "from a checkout of any repo, paste into skep: /join 1234-5678-9012 192.168.1.20:7419",
     );
     const printed = h
       .scrollback()
@@ -921,6 +926,7 @@ describe("unified shell", () => {
     const h = await harness();
     await h.shell.submit("/join 192.168.30.182:7419 8632-1727-0308 --repo app");
     expect(h.fake.calls.sub[0]?.code).toBe("863217270308");
+    expect(h.fake.calls.sub[0]?.version).toBe(SKEP_VERSION);
     expect(h.fake.calls.sub[0]?.target).toEqual({ host: "192.168.30.182", port: 7419 });
     expect(h.frame()).toContain("joined 192.168.30.182:7419 as peer-1");
     await h.shell.submit("add a health check");
@@ -928,6 +934,51 @@ describe("unified shell", () => {
     await h.shell.submit("/status");
     expect(h.scrollback()).toContain("joined 192.168.30.182:7419 as peer-1 (role coding)");
     await h.shell.quit();
+  });
+
+  it("/status on a peer shows relayed repos and marks unknown repos", async () => {
+    const h = await harness();
+    try {
+      await h.shell.submit("/join 1234-5678-9012 h:1 --repo own-app");
+      const sub = h.fake.calls.sub[0];
+      if (sub === undefined) throw new Error("no join");
+      const progress = {
+        phase: "idle" as const,
+        done: 0,
+        total: 0,
+        failed: 0,
+        percent: 0,
+        summary: "",
+      };
+      sub.onProgress?.({
+        ...progress,
+        peerId: "peer-1",
+        device: "self",
+        role: "coding",
+        self: true,
+      });
+      sub.onProgress?.({
+        ...progress,
+        peerId: "peer-2",
+        device: "vps",
+        role: "backend",
+        repo: "beta-svc",
+        self: false,
+      });
+      sub.onProgress?.({
+        ...progress,
+        peerId: "peer-3",
+        device: "laptop",
+        role: null,
+        self: false,
+      });
+      await h.shell.submit("/status");
+      expect(h.scrollback()).toMatch(/peer-1\s+\S+\s+repo own-app\s+coding\s+idle 0%/);
+      expect(h.scrollback()).toContain("peer-2  vps  repo beta-svc  backend  idle 0%");
+      expect(h.scrollback()).toContain("peer-3  laptop  repo ?  -  idle 0%");
+    } finally {
+      await h.shell.quit();
+    }
   });
 
   it("keeps peer-2 joined after an intent with the same device name and a non-git cwd", async () => {

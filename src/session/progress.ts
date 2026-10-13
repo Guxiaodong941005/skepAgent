@@ -20,6 +20,8 @@ export interface PeerProgress {
   peerId: string;
   device: string;
   role: string | null;
+  /** The subject's repo on v2 relays; absent until known or from a v1 master. */
+  repo?: string;
   phase: RelayPhase;
   /** Assigned items finished (done or failed). */
   done: number;
@@ -35,7 +37,7 @@ export interface PeerProgress {
 }
 
 /** Progress without the master-filled identity: the sub→master shape and the status shape. */
-export type ProgressValue = Omit<PeerProgress, "peerId" | "device" | "role" | "phase"> & {
+export type ProgressValue = Omit<PeerProgress, "peerId" | "device" | "role" | "repo" | "phase"> & {
   phase: PeerPhase;
 };
 
@@ -167,6 +169,7 @@ const PROGRESS_KEYS = [
   "peerId",
   "device",
   "role",
+  "repo",
   "phase",
   "done",
   "total",

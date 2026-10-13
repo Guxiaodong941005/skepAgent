@@ -275,6 +275,16 @@ describe("peer progress", () => {
     ).toBe(true);
   });
 
+  it("accepts repo only in v2 relays and keeps them strict", () => {
+    const relay = { ...progressRelay, repo: "beta-svc" };
+    expect(SessionMsgV2Schema.parse(relay)).toEqual(relay);
+    expect(SessionMsgV2Schema.parse(progressRelay)).toEqual(progressRelay);
+    expect(SessionMsgSchema.safeParse(relay).success).toBe(false);
+    expect(SessionMsgV2Schema.safeParse({ ...relay, repo: "" }).success).toBe(false);
+    expect(SessionMsgV2Schema.safeParse({ ...relay, extra: true }).success).toBe(false);
+    expect(SessionMsgV2Schema.safeParse({ ...relay, percent: 99 }).success).toBe(false);
+  });
+
   it("runs the count refinements inside the discriminated union", () => {
     for (const change of [
       { done: 4, total: 3, percent: 133 },

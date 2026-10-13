@@ -27,6 +27,7 @@ import {
   type PeerInfoMsg,
   type ProgressMsg,
   ProgressMsgSchema,
+  ProgressMsgV2Schema,
   type ProtocolVersion,
   type SessionMsg,
   type SessionStatus,
@@ -928,6 +929,7 @@ class SessionMaster implements MasterHandle {
       message.peerId !== undefined ||
       message.device !== undefined ||
       message.role !== undefined ||
+      message.repo !== undefined ||
       message.phase === "left"
     )
       throw new ChannelError("Progress from a sub must not name a peer");
@@ -942,7 +944,8 @@ class SessionMaster implements MasterHandle {
       state.optIn = true;
       // The first frame is the opt-in: answer with everyone else's current strip, uncoalesced.
       for (const other of this.peers.values()) {
-        if (other !== peer) peer.wire.send(progressFrame(this.effectiveProgress(other)));
+        if (other !== peer)
+          peer.wire.send(progressFrame(this.effectiveProgress(other), peer.protocol));
       }
     } else if (
       state.reported &&
@@ -962,6 +965,7 @@ class SessionMaster implements MasterHandle {
       peerId: peer.peerId,
       device: peer.device,
       role: peer.role,
+      ...(peer.repo === null ? {} : { repo: peer.repo }),
       ...deriveProgress(this.allItems(), peer.peerId, peer.progress.reported),
     };
   }
@@ -978,9 +982,9 @@ class SessionMaster implements MasterHandle {
 
   /** Fan out a strip about `subject` to every opted-in peer except the subject (no echo). */
   private relay(subject: Peer, value: PeerProgress): void {
-    const frame = progressFrame(value);
     for (const other of this.peers.values()) {
-      if (other !== subject && other.progress.optIn && other.wire.active) other.wire.send(frame);
+      if (other !== subject && other.progress.optIn && other.wire.active)
+        other.wire.send(progressFrame(value, other.protocol));
     }
   }
 
@@ -1135,9 +1139,12 @@ class SessionMaster implements MasterHandle {
   }
 }
 
-function progressFrame(value: PeerProgress): ProgressMsg {
+function progressFrame(value: PeerProgress, protocol: ProtocolVersion): ProgressMsg {
   // Parse on the way out: a derivation bug must fail here, not disconnect the receiving sub.
-  return ProgressMsgSchema.parse({ type: "progress", ...value });
+  if (protocol === 2) return ProgressMsgV2Schema.parse({ type: "progress", ...value });
+  // Published v1 peers reject unknown keys, including repo (ARCHITECTURE D35).
+  const { repo: _repo, ...v1 } = value;
+  return ProgressMsgSchema.parse({ type: "progress", ...v1 });
 }
 
 function controlError(

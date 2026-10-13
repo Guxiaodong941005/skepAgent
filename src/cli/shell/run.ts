@@ -882,7 +882,7 @@ export class Shell {
         const progress = peer.progress;
         const state =
           progress === undefined ? peer.state : `${progress.phase} ${progress.percent}%`;
-        return `  ${peer.peerId}  ${peer.device}  ${peer.role}  ${state}`;
+        return `  ${peer.peerId}  ${peer.device}  repo ${peer.repo ?? "?"}  ${peer.role}  ${state}`;
       }),
       "",
       "intents and the full status live on the master's device",

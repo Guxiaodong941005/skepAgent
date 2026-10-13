@@ -8,7 +8,7 @@
  */
 
 import type { ControlEndpoint, JoinFlow, MasterFlow, SessionStatus } from "../commands/session.js";
-import { formatJoinCode, joinHint, repoLabel } from "../commands/session.js";
+import { formatJoinCode, joinHint } from "../commands/session.js";
 import { quoteSlashWord } from "./flags.js";
 import type { ShellPeer } from "./model.js";
 
@@ -291,7 +291,7 @@ export class SessionController {
     if (view.peers.length === 0) {
       return {
         kind: "refused",
-        message: noPeersText(master.advertise, master.joinCode, master.repo),
+        message: noPeersText(master.advertise, master.joinCode),
       };
     }
     if (this.master !== null) return { kind: "own", master: this.master };
@@ -301,17 +301,17 @@ export class SessionController {
 }
 
 /** `host` is the address peers dial (the master's advertise address). */
-export function noPeersText(host: string, joinCode: string | null, repo: string): string {
+export function noPeersText(host: string, joinCode: string | null): string {
   const hint =
     joinCode === null
-      ? `on another device, from a checkout of ${repoLabel(repo)}: /join <code> ${quoteSlashWord(host)}`
-      : joinHint({ host, code: joinCode, repo });
+      ? `on another device, from a checkout of any repo: /join <code> ${quoteSlashWord(host)}`
+      : joinHint({ host, code: joinCode });
   return `no peers joined yet — nothing can take this intent\n${hint}`;
 }
 
 /** Why routing found no peer, naming each connected peer's repo (`?` until it described one). */
 export function noMatchText(status: SessionStatus, repos: readonly string[]): string {
-  if (status.peers.length === 0) return noPeersText(status.listen, status.joinCode, status.repo);
+  if (status.peers.length === 0) return noPeersText(status.listen, status.joinCode);
   const peers = status.peers.map(
     (peer) => `${peer.peerId} ${peer.device}: repo ${peer.repo ?? "?"}`,
   );

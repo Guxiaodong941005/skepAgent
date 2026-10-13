@@ -1,5 +1,7 @@
 // Peer progress over a real master and two real subs on 127.0.0.1:0 (plan §7.1).
+import { duplexPair } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { SKEP_VERSION } from "../cli/version.js";
 import type { Clock } from "../util/clock.js";
 import { SecureChannel } from "./channel.js";
 import {
@@ -88,6 +90,15 @@ async function master(extra: Partial<MasterOptions> = {}): Promise<MasterHandle>
   return handle;
 }
 
+function memoryTransport(master: MasterHandle) {
+  const [masterStream, subStream] = duplexPair();
+  // A destroyed end of this test transport closes its partner, as a disconnected socket does.
+  masterStream.on("close", () => subStream.destroy());
+  subStream.on("close", () => masterStream.destroy());
+  master.attach(masterStream, { address: "127.0.0.1", family: "IPv4" });
+  return subStream;
+}
+
 async function join(
   m: MasterHandle,
   device: string,
@@ -97,7 +108,9 @@ async function join(
   } = {},
 ): Promise<Joined> {
   const code = m.status().joinCode;
-  if (code === null || m.address === null) throw new Error("master has no join code");
+  const address = m.address;
+  if (code === null || (address === null && extra.stream === undefined))
+    throw new Error("master has no join code or transport");
   const { work, ...options } = extra;
   const joined: Joined = {
     handle: undefined as unknown as SubHandle,
@@ -108,7 +121,9 @@ async function join(
       joined.seen.filter((p) => !p.self && (peerId === undefined || p.peerId === peerId)),
   };
   const handle = await connectSub({
-    target: { host: "127.0.0.1", port: m.address.port },
+    ...(options.stream === undefined && address !== null
+      ? { target: { host: "127.0.0.1", port: address.port } }
+      : {}),
     code,
     device,
     describe: async () => ({
@@ -147,6 +162,36 @@ function resultFor(item: PlanItem): SubResult {
 }
 
 describe("peer progress relay", () => {
+  it("relays repos on v2 before intents while preserving strict v1 frames", async () => {
+    const m = await master({ listen: undefined, version: SKEP_VERSION });
+    const memoryJoin = (device: string, repo: string, options: Partial<SubOptions> = {}) => {
+      return join(m, device, repo, { ...options, stream: memoryTransport(m) });
+    };
+    const a = await memoryJoin("mac", "app", {
+      version: SKEP_VERSION,
+      repo: "app",
+      role: "backend",
+    });
+    const legacy = await memoryJoin("old", "api", { protocol: 1 });
+    const b = await memoryJoin("vps", "web", { repo: "web", role: "web" });
+    expect(a.handle.protocol).toBe(2);
+    expect(a.handle.masterVersion?.()).toBe(SKEP_VERSION);
+    expect(m.status().peers[0]?.version).toBe(SKEP_VERSION);
+    await vi.waitFor(() => {
+      expect(a.relays(b.handle.peerId).at(-1)).toMatchObject({ repo: "web", role: "web" });
+      expect(b.relays(a.handle.peerId).at(-1)).toMatchObject({ repo: "app", role: "backend" });
+      expect(legacy.relays(b.handle.peerId).at(-1)).toMatchObject({ role: "web" });
+    });
+    expect(m.status().intents).toEqual([]);
+    expect(legacy.handle.protocol).toBe(1);
+    expect(legacy.relays().every((relay) => relay.repo === undefined)).toBe(true);
+    expect(legacy.closed).toBe(false);
+    await m.submitIntent("describe the legacy repo", ["api"]);
+    await vi.waitFor(() =>
+      expect(a.relays(legacy.handle.peerId).at(-1)).toMatchObject({ repo: "api", role: "web" }),
+    );
+  });
+
   it("opts both subs in and snapshots the earlier peer to the later one", async () => {
     const m = await master();
     const a = await join(m, "mac", "app");
@@ -256,36 +301,38 @@ describe("peer progress relay", () => {
     expect(m.status().peers).toHaveLength(2);
   });
 
-  it("disconnects a sub whose progress names a peer", async () => {
-    const m = await master();
-    const seal = SecureChannel.prototype.seal;
-    vi.spyOn(SecureChannel.prototype, "seal").mockImplementation(function (
-      this: SecureChannel,
-      obj: unknown,
-    ) {
-      const frame = obj as { type?: string; peerId?: string };
-      // Only sub→master progress lacks a peerId; forge one there.
-      return seal.call(
-        this,
-        frame.type === "progress" && frame.peerId === undefined
-          ? { ...frame, peerId: "peer-9" }
-          : obj,
-      );
-    });
-    const code = m.status().joinCode;
-    if (code === null || m.address === null) throw new Error("master has no join code");
-    const sub = await connectSub({
-      target: { host: "127.0.0.1", port: m.address.port },
-      code,
-      device: "mac",
-      describe: async () => ({ repo: "app", head: "c".repeat(40), role: "backend" }),
-      collectDatalist: async () => [],
-      onItem: async () => null,
-    });
-    subs.push(sub);
-    await expect(sub.closed).resolves.toEqual({ reason: "connection_closed" });
-    await vi.waitFor(() => expect(m.status().peers).toEqual([]));
-  });
+  it.each([{ peerId: "peer-9" }, { repo: "forged-repo" }])(
+    "disconnects a sub whose progress forges identity: %j",
+    async (identity) => {
+      const m = await master({ listen: undefined });
+      const stream = memoryTransport(m);
+      const seal = SecureChannel.prototype.seal;
+      vi.spyOn(SecureChannel.prototype, "seal").mockImplementation(function (
+        this: SecureChannel,
+        obj: unknown,
+      ) {
+        const frame = obj as { type?: string; peerId?: string };
+        // Only sub→master progress lacks a peerId; forge identity on that direction.
+        return seal.call(
+          this,
+          frame.type === "progress" && frame.peerId === undefined ? { ...frame, ...identity } : obj,
+        );
+      });
+      const code = m.status().joinCode;
+      if (code === null) throw new Error("master has no join code");
+      const sub = await connectSub({
+        stream,
+        code,
+        device: "mac",
+        describe: async () => ({ repo: "app", head: "c".repeat(40), role: "backend" }),
+        collectDatalist: async () => [],
+        onItem: async () => null,
+      });
+      subs.push(sub);
+      await expect(sub.closed).resolves.toEqual({ reason: "connection_closed" });
+      await vi.waitFor(() => expect(m.status().peers).toEqual([]));
+    },
+  );
 
   it("disconnects a sub that receives a relay naming itself", async () => {
     const m = await master();
