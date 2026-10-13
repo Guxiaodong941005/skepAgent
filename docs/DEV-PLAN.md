@@ -183,6 +183,8 @@ screens. Evidence: `/root/skep-phase3-exit/` (peers) and `/root/skep-phase3-exit
   fail with `expired`). A proved code still rotates at once (one device per code). Each guess
   is still 1 in 10^12. Tests: the "wrong join codes" cases in
   `src/session/master.protocol.test.ts`. A real two-device re-check of bugs 2 and 3 is pending.
+* **ORCH-7 user decisions:** the join-code wrong-try limit stays at **8**; no wrong-try counter
+  is shown on the master.
 
 ## Wave 8 — live agent view (D27–D30)
 
