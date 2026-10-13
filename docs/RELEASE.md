@@ -2,8 +2,38 @@
 
 This document records the package-name decision (v0.1.0), the npm registry re-check, the
 v0.1.0 checklist, the v0.1.1 session-TUI notes, the v0.1.5 peer-progress and TUI notes, the
-v0.1.8 join-UX notes, the v0.1.9 per-project isolation notes, the v0.1.10 SAME-CB notes, the v0.1.11 SESSION-UX notes, the v0.1.12 JOIN-SLIM notes, and the steps the orchestrator runs. Task agents must not `git push`,
+v0.1.8 join-UX notes, the v0.1.9 per-project isolation notes, the v0.1.10 SAME-CB notes, the v0.1.11 SESSION-UX notes, the v0.1.12 JOIN-SLIM notes, the v0.1.13 INTENT-PEER notes, and the steps the orchestrator runs. Task agents must not `git push`,
 create tags, or `npm publish`.
+
+## v0.1.13 — lone-peer intent routing + TUI peer picker (2026-10-13)
+
+The human ordered **merge → publish** after Codex review **PASS_WITH_NOTES** (R1–R5 fixed on
+the feature tip; no unresolved blocking finding, see
+[`reviews/intent-peer-pick.md`](reviews/intent-peer-pick.md)). Package name stays
+**`@skepagent/skep`** (public). The published bin is `skep`.
+
+What this tag adds on top of v0.1.12 (details in [`../CHANGELOG.md`](../CHANGELOG.md)):
+
+* **Lone peer takes a bare intent**: with exactly one connected peer, `/intent <text>`
+  without `--repo` is routed to that peer's repo even when its name differs from the
+  master's. An explicit `--repo` that no peer works on still fails with `no_match`.
+* **TUI `/intent --repo` is honoured**: `/intent --repo <name>... <text>` passes the repos
+  to the master instead of sending the flag as part of the text. Free text is never
+  flag-parsed.
+* **Multi-peer picker**: with more than one connected peer and no `--repo`, Enter on
+  `/intent <text>` or free text opens a multi-select of `peerId  device  repo` (↑/↓ move,
+  Space toggle, Enter send, Esc cancel); one intent goes out with the selected peers'
+  unique repos.
+
+Compatibility: upgrade both devices. Wire protocol unchanged.
+
+Install:
+
+```bash
+npm install -g @skepagent/skep@0.1.13
+```
+
+---
 
 ## v0.1.12 — slim join paste (2026-10-12)
 

@@ -6,15 +6,15 @@ Skep lets AI coding agents on different machines (laptop, GPU rig, always-on ser
 through an encrypted session channel. Bare `skep` opens the Skep shell. Credentials never leave
 the device that owns them.
 
-> **v0.1.12 — slim join paste.** The master's `/join` line is just the code and the host
-> (`/join 1234-5678-9012 203.0.113.7:7419`); the peer's repo and device default to its
-> checkout's directory name and hostname. `--repo`/`--device` stay optional overrides, and
-> old `/join --host … --code … --repo …` lines still parse. Wire unchanged from 0.1.11.
+> **v0.1.13 — lone-peer intent routing + TUI peer picker.** With one connected peer, a bare
+> `/intent` goes to that peer even when its repo name differs from the master's. In the TUI,
+> `/intent --repo <name>... <text>` is honoured, and with several peers Enter opens a
+> multi-select peer picker. Wire unchanged from 0.1.12.
 
 ## Install
 
 ```bash
-npm install -g @skepagent/skep@0.1.12
+npm install -g @skepagent/skep@0.1.13
 ```
 
 Requires Node.js ≥ 22.12 (macOS & Linux).

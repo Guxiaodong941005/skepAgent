@@ -11,6 +11,8 @@ protocol rules ([`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §4.4) apply to t
 
 ## [Unreleased]
 
+## [0.1.13] - 2026-10-13
+
 ### Fixed
 
 * **Lone peer takes a bare intent (INTENT-PEER).** With exactly one connected peer, an intent
@@ -456,7 +458,10 @@ creates the npm org `skepagent` and explicitly says go. See [`docs/RELEASE.md`](
 * Manual lease revoke; no auto-merge. The human holds plan approval, escalation decisions and
   merges.
 
-[Unreleased]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.10...HEAD
+[Unreleased]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.13...HEAD
+[0.1.13]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.12...v0.1.13
+[0.1.12]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.11...v0.1.12
+[0.1.11]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.10...v0.1.11
 [0.1.10]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.7...v0.1.8
