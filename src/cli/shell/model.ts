@@ -21,23 +21,19 @@ import {
 } from "../tui.js";
 import { SKEP_VERSION } from "../version.js";
 import { logoLine, welcomeLines } from "./logo.js";
+import { anchorAt, FOLLOW, type ScrollAnchor, scrollAnchor, viewWindow } from "./scroll.js";
 import { QUIET_AFTER_MS } from "./session-controller.js";
 import type { SlashCommand } from "./slash.js";
+import { Transcript, TranscriptRows, type TranscriptTone } from "./transcript.js";
 
-export const SCROLLBACK_CAP = 1_000;
+export { wrapLine } from "./transcript.js";
+
 export const MAX_BEE_ROWS = 3;
 export const MAX_MENU_ROWS = 6;
 /** Below this the shell cannot show the input and footer, so only a notice is drawn. */
 export const SHELL_MIN_ROWS = Math.min(10, MIN_ROWS);
 
-export type ShellTone = "info" | "event" | "warn" | "error" | "muted";
-/**
- * Tones whose lines wrap to the terminal width instead of being cut: the one message that
- * explains a failure is usually the long one (SESSION-UX §3.4). Others keep one row each.
- */
-const WRAPPED_TONES: ReadonlySet<ShellTone> = new Set(["warn", "error"]);
-/** Continuation rows of a wrapped line sit this much deeper than its first row. */
-const HANGING_INDENT = "    ";
+export type ShellTone = TranscriptTone;
 /** A footer row; `silentMs` is the time since the peer was last heard from, when known. */
 /** `repo` is known only for a master's own roster (from its status), never for a joined shell. */
 export type ShellPeer = JoinViewModel["peers"][number] & { silentMs?: number; repo?: string };
@@ -66,9 +62,10 @@ const TONE_ROLES: Record<ShellTone, Role> = {
 
 export class ShellModel {
   header: ShellHeader = { device: "-", cwd: "-", session: "no session" };
-  scrollback: { text: string; tone: ShellTone }[] = [];
-  /** Rendered rows scrolled up from the bottom (PgUp/PgDn); see {@link scrollBy}. */
-  scroll = 0;
+  /** Everything this shell session showed (locked §9.3: same session, max 500K characters). */
+  readonly transcript: Transcript;
+  /** Follows new output, or is pinned to an entry while the human reads older rows (§5.1). */
+  anchor: ScrollAnchor = FOLLOW;
   input = "";
   menu: SlashCommand[] = [];
   menuIndex = 0;
@@ -89,30 +86,60 @@ export class ShellModel {
    */
   private width = 80;
   private bodyHeight = 0;
+  private readonly layout: TranscriptRows;
 
-  /** Appends one or more lines; a multi-line text becomes several scrollback lines. */
-  append(text: string, tone: ShellTone = "info"): void {
-    const added: { text: string; tone: ShellTone }[] = [];
-    for (const line of text.replace(/\n+$/, "").split("\n")) added.push({ text: line, tone });
-    this.scrollback.push(...added);
-    if (this.scrollback.length > SCROLLBACK_CAP) {
-      this.scrollback.splice(0, this.scrollback.length - SCROLLBACK_CAP);
-    }
-    // A reader scrolled up keeps looking at the same rows while new ones arrive below.
-    if (this.scroll > 0) {
-      const rows = added.reduce((sum, entry) => sum + this.entryRows(entry, this.width).length, 0);
-      this.scrollBy(rows);
+  constructor(transcript: Transcript = new Transcript()) {
+    this.transcript = transcript;
+    this.layout = new TranscriptRows(transcript);
+  }
+
+  /** The retained entries, oldest first (the drop marker is not one). */
+  get scrollback(): readonly { text: string; tone: ShellTone }[] {
+    return this.transcript
+      .entries()
+      .map((entry) => ({ text: `${entry.gutter ?? ""}${entry.text}`, tone: entry.tone }));
+  }
+
+  /**
+   * Appends one or more lines; a multi-line text becomes several entries. A pinned reader keeps
+   * the same rows: the anchor names an entry, so output below never moves the view (§5.1).
+   */
+  append(text: string, tone: ShellTone = "info", gutter?: string): void {
+    for (const line of text.replace(/\n+$/, "").split("\n")) {
+      this.transcript.append(line, tone, gutter);
     }
   }
 
-  /** Moves the view by `rows` rendered rows (positive is up), within the scrollback. */
+  /** Rendered rows between the bottom of the body and the newest row. */
+  get scroll(): number {
+    return viewWindow(this.anchor, this.rows(), this.bodyHeight).below;
+  }
+
+  /** Moves the view by `rows` rendered rows (positive is up), within the transcript. */
   scrollBy(rows: number): void {
-    this.scroll = Math.min(Math.max(0, this.scroll + rows), this.maxScroll());
+    this.anchor = scrollAnchor(this.anchor, rows, this.rows(), this.bodyHeight);
+  }
+
+  scrollToTop(): void {
+    this.anchor = anchorAt(0, this.rows(), this.bodyHeight);
+  }
+
+  scrollToBottom(): void {
+    this.anchor = FOLLOW;
+  }
+
+  /** One page: the body less one row, so the reader keeps a line of context. */
+  pageRows(): number {
+    return Math.max(1, this.bodyHeight - 1);
   }
 
   /** The largest scroll: the first rendered row at the top of the body. */
   maxScroll(): number {
-    return Math.max(0, this.sourceLines(this.width).length - this.bodyHeight);
+    return Math.max(0, this.rows().totalRows - this.bodyHeight);
+  }
+
+  private rows(): TranscriptRows {
+    return this.layout.sync(this.width);
   }
 
   animating(): boolean {
@@ -158,15 +185,11 @@ export class ShellModel {
     const hint = this.hintLine();
     const prompt = this.question === null ? "> " : `${this.question} `;
     const input = this.inputLine(columns, prompt);
-    const rule: Line = {
-      spans: [fg("outline", `  ${g.rule.repeat(Math.max(0, columns - 2))}`)],
-    };
     const bodyRows = Math.max(0, rows - lines.length - 1 - 1 - bee.length - 1);
     this.width = columns;
     this.bodyHeight = bodyRows;
-    // A resize changes how many rows the scrollback wraps into.
-    this.scroll = Math.min(this.scroll, this.maxScroll());
-    const body = this.bodyLines(bodyRows, columns);
+    const body = this.bodyLines(bodyRows);
+    const rule = this.ruleLine(columns);
     const overlay =
       this.picker === null ? this.menuLines() : this.pickerLines(this.picker, bodyRows);
     const menu = bodyRows === 0 ? [] : overlay.slice(-bodyRows);
@@ -179,25 +202,40 @@ export class ShellModel {
     );
   }
 
-  private entryRows(entry: { text: string; tone: ShellTone }, columns: number): string[] {
-    return WRAPPED_TONES.has(entry.tone)
-      ? wrapLine(`  ${entry.text}`, columns, `  ${HANGING_INDENT}`)
-      : [`  ${entry.text}`];
-  }
-
-  private sourceLines(columns: number): Line[] {
-    if (this.scrollback.length === 0) return welcomeLines(this.glyphs);
-    return this.scrollback.flatMap((entry) => {
-      const role = TONE_ROLES[entry.tone];
-      return this.entryRows(entry, columns).map((row) => ({ spans: [fg(role, row)] }));
-    });
-  }
-
-  private bodyLines(count: number, columns: number): Line[] {
-    const source = this.sourceLines(columns);
-    const end = Math.max(0, source.length - this.scroll);
-    const visible = source.slice(Math.max(0, end - count), end);
+  private bodyLines(count: number): Line[] {
+    let visible: Line[];
+    if (this.transcript.length === 0) {
+      visible = welcomeLines(this.glyphs).slice(-count);
+    } else {
+      const space = this.rows();
+      const { top } = viewWindow(this.anchor, space, count);
+      visible = space.window(top, count).map(({ entry, text }) => ({
+        spans: [fg(TONE_ROLES[entry.tone], text)],
+      }));
+    }
     return [...Array<Line>(Math.max(0, count - visible.length)).fill(""), ...visible];
+  }
+
+  /**
+   * The rule under the input; while the view is pinned it says how much is above and below and
+   * how to follow again (S6).
+   */
+  private ruleLine(columns: number): Line {
+    const g = chrome(this.glyphs);
+    if (this.anchor.kind === "bottom" || this.transcript.length === 0) {
+      return { spans: [fg("outline", `  ${g.rule.repeat(Math.max(0, columns - 2))}`)] };
+    }
+    const { above, below } = viewWindow(this.anchor, this.rows(), this.bodyHeight);
+    const [up, down] = this.glyphs === "nerd" ? ["↑", "↓"] : ["^", "v"];
+    const label = ` ${up} ${above} lines above${g.sep}${down} ${below} lines below — End to follow `;
+    const fill = Math.max(0, columns - 4 - displayWidth(label));
+    return {
+      spans: [
+        fg("outline", `  ${g.rule.repeat(2)}`),
+        fg("tertiary", label),
+        fg("outline", g.rule.repeat(fill)),
+      ],
+    };
   }
 
   private menuLines(): Line[] {
@@ -326,41 +364,7 @@ export class ShellModel {
                 "tab/enter accept",
                 "esc close",
               ]
-            : ["/ commands", "enter send", "pgup/pgdn scroll", "ctrl+c clear", "/quit"];
+            : ["/ commands", "enter send", "pgup/pgdn/wheel scroll", "ctrl+c clear", "/quit"];
     return { spans: [fg("on-surface-variant", `  ${keys.join(separator)}`)] };
   }
-}
-
-/**
- * Splits `text` into rows of at most `width` columns, breaking at the last space that fits (or
- * mid-word when none does). Rows after the first start with `indent`. Nothing is dropped.
- */
-export function wrapLine(text: string, width: number, indent: string): string[] {
-  const clean = truncate(text, Number.MAX_SAFE_INTEGER);
-  if (width <= displayWidth(indent) + 1 || displayWidth(clean) <= width) return [clean];
-  const rows: string[] = [];
-  let rest = clean;
-  let prefix = "";
-  while (displayWidth(prefix + rest) > width) {
-    const room = width - displayWidth(prefix);
-    let used = 0;
-    let cut = 0;
-    let lastSpace = -1;
-    const chars = [...rest];
-    // Spaces of the leading indent are no break points: a row would come out empty.
-    const lead = rest.length - rest.trimStart().length;
-    for (let i = 0; i < chars.length; i++) {
-      const w = displayWidth(chars[i] ?? "");
-      if (used + w > room) break;
-      used += w;
-      cut = i + 1;
-      if (chars[i] === " " && i > lead) lastSpace = i;
-    }
-    const at = lastSpace > 0 ? lastSpace : Math.max(1, cut);
-    rows.push(prefix + chars.slice(0, at).join("").trimEnd());
-    rest = chars.slice(at).join("").replace(/^ +/, "");
-    prefix = indent;
-  }
-  if (rest !== "") rows.push(prefix + rest);
-  return rows;
 }

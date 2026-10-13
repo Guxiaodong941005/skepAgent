@@ -43,7 +43,14 @@ import { CliError } from "../output.js";
 import { createTheme, detectColorLevel, detectScheme } from "../theme.js";
 import { detectGlyphs, type ProcessHooks, Screen, type ScreenIo, TICK_MS } from "../tui.js";
 import { parseFlags, quoteSlashWord } from "./flags.js";
-import { backspace, decodeShellKeys, insertText, menuQuery, type ShellKey } from "./input.js";
+import {
+  backspace,
+  ESCAPE_TIMEOUT_MS,
+  insertText,
+  menuQuery,
+  type ShellKey,
+  ShellKeyDecoder,
+} from "./input.js";
 import { JOIN_USAGE, parseJoinArgs } from "./join-args.js";
 import { ShellModel, type ShellPeer, type ShellTone } from "./model.js";
 import {
@@ -66,8 +73,8 @@ import {
 
 export { parseFlags } from "./flags.js";
 
-/** Rendered rows PgUp/PgDn move the scrollback. */
-const PAGE_LINES = 10;
+/** Rows one mouse wheel notch scrolls (SGR mouse reports; alternate-scroll sends arrows). */
+const WHEEL_ROWS = 3;
 const SUBMIT_CHOICES = ["commit", "push", "pr", "mr", "none"] as const;
 /** A master in another process is re-read every this many ticks (2 s at 250 ms). */
 const EXTERNAL_POLL_TICKS = 8;
@@ -153,8 +160,15 @@ export class Shell {
   /** Releases the `/join` dispatch waiting on a handshake that `/clean` cancelled. */
   private cancelJoin: (() => void) | null = null;
 
+  private readonly decoder = new ShellKeyDecoder();
+  /** Cancels the wait that turns a held partial escape sequence into an Esc key. */
+  private escapeWait: AbortController | null = null;
+
   private readonly onData = (chunk: Buffer | string): void => {
-    for (const key of decodeShellKeys(chunk)) this.guard(() => this.onKey(key));
+    this.escapeWait?.abort();
+    this.escapeWait = null;
+    for (const key of this.decoder.push(chunk)) this.guard(() => this.onKey(key));
+    if (this.decoder.pending) this.awaitEscape();
   };
 
   constructor(private readonly ctx: ShellCliContext) {
@@ -181,10 +195,26 @@ export class Shell {
         scheme: detectScheme(ctx.env),
       }),
     );
+    if (ctx.env.SKEP_TUI_MOUSE === "1") this.screen.setMouse(true);
     this.commands = this.buildCommands();
     this.finished = new Promise((resolve) => {
       this.finish = resolve;
     });
+  }
+
+  /** A sequence split across chunks completes with the next one; silence makes it an Esc. */
+  private awaitEscape(): void {
+    const wait = new AbortController();
+    this.escapeWait = wait;
+    this.clock.sleep(ESCAPE_TIMEOUT_MS, wait.signal).then(
+      () => {
+        if (this.escapeWait !== wait) return;
+        this.escapeWait = null;
+        for (const key of this.decoder.flush()) this.guard(() => this.onKey(key));
+      },
+      // Aborted: more bytes arrived and completed (or replaced) the sequence.
+      () => undefined,
+    );
   }
 
   run(): Promise<void> {
@@ -259,7 +289,24 @@ export class Shell {
           const step = key.name === "up" ? -1 : 1;
           const count = Math.min(model.menu.length, 6);
           model.menuIndex = (model.menuIndex + step + count) % count;
+        } else if (this.questions.length === 0) {
+          // In the alternate screen the wheel arrives as arrows (?1007h): it scrolls (§5.2).
+          model.scrollBy(key.name === "up" ? 1 : -1);
         }
+        break;
+      case "scrollUp":
+      case "scrollDown":
+        model.scrollBy(key.name === "scrollUp" ? 1 : -1);
+        break;
+      case "wheelUp":
+      case "wheelDown":
+        model.scrollBy(key.name === "wheelUp" ? WHEEL_ROWS : -WHEEL_ROWS);
+        break;
+      case "home":
+        model.scrollToTop();
+        break;
+      case "end":
+        model.scrollToBottom();
         break;
       case "tab":
         this.acceptMenu();
@@ -277,10 +324,10 @@ export class Shell {
         if (model.input === "") void this.quit();
         return;
       case "pageUp":
-        model.scrollBy(PAGE_LINES);
+        model.scrollBy(model.pageRows());
         break;
       case "pageDown":
-        model.scrollBy(-PAGE_LINES);
+        model.scrollBy(-model.pageRows());
         break;
       default:
         return;
@@ -353,7 +400,8 @@ export class Shell {
     }
     const text = selected === null ? this.model.input : `/${selected.name}`;
     this.model.input = "";
-    this.model.scroll = 0;
+    // The human just said something: show it and what follows. An empty Enter keeps the view.
+    if (text.trim() !== "") this.model.scrollToBottom();
     this.menuDismissed = false;
     // Failures are logged into the scrollback by `dispatch`; nothing is left to report here.
     this.submit(text).catch(() => undefined);
@@ -701,6 +749,12 @@ export class Shell {
         run: (_ctx, args) => this.undoCommand(args),
       },
       {
+        name: "mouse",
+        description: "wheel via mouse reporting (on) or the terminal's arrows (off)",
+        usage: "[on|off]",
+        run: (_ctx, args) => this.mouseCommand(args),
+      },
+      {
         name: "clean",
         aliases: ["clear"],
         description: "end local session(s) and clear connection state (stay in shell)",
@@ -735,6 +789,7 @@ export class Shell {
       "  (master drives work, submit none: edits stay in the folder); --manual confirms each",
       "  item first; --submit commit|push|pr|mr|none|ask overrides device.toml",
       "/agent: which agent CLI items run; else --agent, SKEP_AGENT_CLI, AGENT.md, or PATH",
+      "scroll: PgUp/PgDn, Shift+arrows, wheel or arrows (no menu open), Home/End; End follows",
       "advanced: `skep tui` opens the raw agent TUI",
     ].join("\n");
   }
@@ -1078,6 +1133,33 @@ export class Shell {
     return { type: "ok", message: `session items will run ${name}${note}; saved in ${file}` };
   }
 
+  /**
+   * Full mouse reporting scrolls with the wheel in terminals that do not turn it into arrows, but
+   * native selection then needs Shift (§5.2), so it is opt-in and off by default.
+   */
+  private mouseCommand(args: string): SlashResult {
+    const value = args.trim().toLowerCase();
+    if (value === "") {
+      const on = this.screen.mouseReporting;
+      return {
+        type: "ok",
+        message: on
+          ? "mouse reporting is on: the wheel scrolls; hold Shift to select text — /mouse off"
+          : "mouse reporting is off: the wheel scrolls as arrow keys, selection works — /mouse on",
+      };
+    }
+    if (value !== "on" && value !== "off")
+      return { type: "error", message: "usage: /mouse [on|off]" };
+    this.screen.setMouse(value === "on");
+    return {
+      type: "ok",
+      message:
+        value === "on"
+          ? "mouse reporting on: the wheel scrolls; hold Shift to select text"
+          : "mouse reporting off: native selection is back; the wheel arrives as arrow keys",
+    };
+  }
+
   private async undoCommand(args: string): Promise<SlashResult> {
     const flags = parseFlags(args, [], ["force"]);
     const [itemId, extra] = flags.positional;
@@ -1203,8 +1285,8 @@ export class Shell {
   // -------------------------------------------------------------------------------------------
   // Terminal.
 
-  log(text: string, tone: ShellTone = "info"): void {
-    this.model.append(text, tone);
+  log(text: string, tone: ShellTone = "info", gutter?: string): void {
+    this.model.append(text, tone, gutter);
     this.render();
   }
 
@@ -1262,6 +1344,7 @@ export class Shell {
     if (join !== null) await join.close().catch((error) => problems.push(errorMessage(error)));
     if (master !== null) await master.close().catch((error) => problems.push(errorMessage(error)));
     this.ticker?.abort();
+    this.escapeWait?.abort();
     this.unlisten();
     this.screen.close();
     // The terminal is the user's again; anything that went wrong while leaving is said there.
@@ -1300,7 +1383,7 @@ export class ShellJoinView implements JoinView {
     }
     const terminal = agent?.state === "done" || agent?.state === "failed";
     for (const line of this.newTailLines(key, model.tail, terminal)) {
-      this.shell.log(`${item.itemId} │ ${line}`, "muted");
+      this.shell.log(line, "muted", `${item.itemId} │ `);
     }
   }
 

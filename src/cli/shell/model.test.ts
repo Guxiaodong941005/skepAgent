@@ -117,10 +117,10 @@ describe("scrollback wrapping (SESSION-UX §3.4)", () => {
     expect(errorRows.join(" ").match(/w\d{3}/g)).toEqual(words);
     expect(errorRows[0]?.startsWith("  w000")).toBe(true);
     expect(errorRows[1]?.startsWith("      w")).toBe(true);
-    // An info line keeps one row, cut at the edge.
-    const info = rows.filter((row) => row.includes("info i"));
-    expect(info).toHaveLength(1);
-    expect(info[0]?.length).toBe(80);
+    // Every tone wraps (S1): the info line is complete, no row ends with an ellipsis.
+    const infoRows = rows.slice(rows.findIndex((row) => row.startsWith("  info")));
+    expect(infoRows.join("").match(/i/g)?.length).toBeGreaterThanOrEqual(201);
+    for (const row of rows) expect(row.endsWith("…")).toBe(false);
     expect(text(shell)).toMatchSnapshot();
   });
 
@@ -143,22 +143,27 @@ describe("scrollback wrapping (SESSION-UX §3.4)", () => {
       shell.scrollBy(-Number.MAX_SAFE_INTEGER);
       expect(at(columns)).toContain("tail info");
     }
-    // Resizing narrower while scrolled to the top keeps the view inside the scrollback.
+    // Resizing while scrolled to the top keeps the same top entry in view (§5.1).
     at(120);
     shell.scrollBy(Number.MAX_SAFE_INTEGER);
-    const before = shell.scroll;
-    at(40);
-    expect(shell.scroll).toBe(before);
-    at(200);
+    expect(at(40)).toContain("e000");
     expect(shell.scroll).toBe(shell.maxScroll());
     expect(at(200)).toContain("e000");
-    // New lines below keep a scrolled-up reader on the same rows.
+    // New lines below keep a scrolled-up reader on the same rows; the indicator counts them (S6).
     at(80);
     shell.scrollBy(-Number.MAX_SAFE_INTEGER);
     shell.scrollBy(5);
+    const body = (frame: string) => frame.split("\n").filter((row) => !row.includes("lines below"));
     const view = at(80);
+    expect(view).toMatch(/[↑^] \d+ lines above/);
+    expect(view).toMatch(/5 lines below — End to follow/);
     shell.append("x ".repeat(300).trim(), "error");
-    expect(at(80)).toBe(view);
+    const after = at(80);
+    expect(body(after)).toEqual(body(view));
+    expect(after).toMatch(/\d+ lines below — End to follow/);
+    expect(after).not.toMatch(/ 5 lines below/);
+    shell.scrollToBottom();
+    expect(at(80)).not.toContain("lines below");
   });
 
   it("wrapLine breaks inside a word only when nothing else fits", () => {

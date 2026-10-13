@@ -20,8 +20,18 @@ const ALT_SCREEN_ON = `${ESC}?1049h`;
 const ALT_SCREEN_OFF = `${ESC}?1049l`;
 const CURSOR_HIDE = `${ESC}?25l`;
 const CURSOR_SHOW = `${ESC}?25h`;
-const HOME_CLEAR = `${ESC}H${ESC}2J`;
+/** Every frame starts here; rows overwrite in place and erase their own rest (no flicker). */
+export const FRAME_START = `${ESC}H`;
+const ERASE_LINE = `${ESC}K`;
+const ERASE_BELOW = `${ESC}J`;
+const CLEAR = `${ESC}2J`;
 const RESET = `${ESC}0m`;
+/** Alternate-scroll: the wheel sends arrow keys in the alternate screen; selection still works. */
+const ALT_SCROLL_ON = `${ESC}?1007h`;
+const ALT_SCROLL_OFF = `${ESC}?1007l`;
+/** Opt-in SGR mouse reporting (wheel as `CSI < 64/65 …`); it takes over native selection. */
+const MOUSE_ON = `${ESC}?1000h${ESC}?1006h`;
+const MOUSE_OFF = `${ESC}?1006l${ESC}?1000l`;
 
 /** Below this the layout cannot show every section, so only a notice is drawn. */
 export const MIN_ROWS = 24;
@@ -268,13 +278,19 @@ export interface ScreenIo {
 export class Screen {
   private active = false;
   private closed = false;
+  private mouse = false;
+  /** The next frame clears first: the screen content is unknown (entered, resumed, resized). */
+  private dirty = true;
   private readonly onData = (chunk: Buffer | string): void => {
     for (const key of decodeKeys(chunk)) {
       if (!this.active) return;
       this.handlers.onKey(key);
     }
   };
-  private readonly onResize = (): void => this.handlers.onResize?.();
+  private readonly onResize = (): void => {
+    this.dirty = true;
+    this.handlers.onResize?.();
+  };
   private readonly onSignal = (): void => {
     this.close();
     this.handlers.onSignal?.();
@@ -317,13 +333,25 @@ export class Screen {
     this.enter();
   }
 
-  /** Full redraw. A throw (e.g. a broken stdout) restores the terminal before it propagates. */
+  /**
+   * Full redraw without clearing: each row is written over the old one and erases the rest of
+   * its line, so fast redraws (the 250 ms tick, SSH) do not flicker (§5.5). A throw (e.g. a
+   * broken stdout) restores the terminal before it propagates.
+   */
   draw(lines: Line[]): void {
     if (!this.active) return;
     try {
       const { columns, rows } = this.size();
-      const body = lines.slice(0, rows).map((line) => this.paint(line, columns));
-      this.io.stdout.write(`${HOME_CLEAR}${body.join("\r\n")}`);
+      const body = lines.slice(0, rows).map((line) => {
+        const { text, width } = this.paint(line, columns);
+        // Erasing after a full-width row would erase its last cell (pending wrap).
+        return width < columns ? `${text}${ERASE_LINE}` : text;
+      });
+      // Rows the frame does not reach are cleared from the row after its last one.
+      const rest = body.length < rows ? `${ESC}${body.length + 1};1H${ERASE_BELOW}` : "";
+      const clear = this.dirty ? CLEAR : "";
+      this.dirty = false;
+      this.io.stdout.write(`${clear}${FRAME_START}${body.join("\r\n")}${rest}`);
     } catch (error) {
       this.close();
       throw error;
@@ -331,22 +359,41 @@ export class Screen {
   }
 
   /** Every styled span ends with RESET, so a cut line never leaks its style into the next. */
-  private paint(line: Line, columns: number): string {
-    if (typeof line === "string") return truncate(line, columns);
+  private paint(line: Line, columns: number): { text: string; width: number } {
+    if (typeof line === "string") {
+      const text = truncate(line, columns);
+      return { text, width: displayWidth(text) };
+    }
     const spans = fitSpans(line.spans, columns);
     const padded = line.selected === true || line.fill === true;
-    const pad = padded ? " ".repeat(Math.max(0, columns - spansWidth(spans))) : "";
+    const used = spansWidth(spans);
+    const pad = padded ? " ".repeat(Math.max(0, columns - used)) : "";
+    const width = used + pad.length;
     if (line.selected === true) {
       // Roles are dropped under the highlight: inverse swaps fg and bg, so a colored span would
       // become a colored block, and the selection must look the same at every color level.
       const text = spans.map((span) => span.text).join("");
-      return `${this.theme.sgr({ inverse: true })}${text}${pad}${RESET}`;
+      return { text: `${this.theme.sgr({ inverse: true })}${text}${pad}${RESET}`, width };
     }
     const body = spans.map((span) => {
       const code = span.text === "" ? "" : this.theme.sgr(span);
       return code === "" ? span.text : `${code}${span.text}${RESET}`;
     });
-    return `${body.join("")}${pad}`;
+    return { text: `${body.join("")}${pad}`, width };
+  }
+
+  /**
+   * Full SGR mouse reporting (opt-in: `/mouse on`, `SKEP_TUI_MOUSE=1`). Off by default because
+   * it takes over the terminal's native text selection; the wheel works without it (?1007h).
+   */
+  setMouse(on: boolean): void {
+    if (this.mouse === on) return;
+    this.mouse = on;
+    if (this.active) this.io.stdout.write(on ? MOUSE_ON : MOUSE_OFF);
+  }
+
+  get mouseReporting(): boolean {
+    return this.mouse;
   }
 
   /** Gives the terminal back (a PTY agent runs in it) until {@link resume}. */
@@ -375,8 +422,9 @@ export class Screen {
     if (stdin.isTTY === true) stdin.setRawMode?.(true);
     stdin.on("data", this.onData);
     stdin.resume();
-    stdout.write(`${ALT_SCREEN_ON}${CURSOR_HIDE}`);
+    stdout.write(`${ALT_SCREEN_ON}${CURSOR_HIDE}${ALT_SCROLL_ON}${this.mouse ? MOUSE_ON : ""}`);
     this.active = true;
+    this.dirty = true;
   }
 
   private restore(): void {
@@ -389,7 +437,8 @@ export class Screen {
       () => {
         if (stdin.isTTY === true) stdin.setRawMode?.(false);
       },
-      () => stdout.write(`${RESET}${CURSOR_SHOW}${ALT_SCREEN_OFF}`),
+      // Every mode enter() may have turned on goes off before the alternate screen is left.
+      () => stdout.write(`${RESET}${MOUSE_OFF}${ALT_SCROLL_OFF}${CURSOR_SHOW}${ALT_SCREEN_OFF}`),
     ];
     const errors: unknown[] = [];
     for (const step of steps) {

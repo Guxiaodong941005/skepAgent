@@ -268,7 +268,7 @@ async function harness(
     running,
     /** The last full frame drawn, without escapes. */
     frame(): string {
-      const at = screen.lastIndexOf("\x1b[H\x1b[2J");
+      const at = screen.lastIndexOf("\x1b[H");
       return (at < 0 ? screen : screen.slice(at)).replace(SGR, "");
     },
     get raw(): string {
@@ -1667,6 +1667,106 @@ describe("long results in the shell (SESSION-UX R7, R8)", () => {
     expect(frame).toContain("line 11");
     for (const row of frame.split("\n")) expect(row.length).toBeLessThanOrEqual(80);
     await h.shell.quit();
+  });
+});
+
+describe("transcript scrolling (SCROLL Phase 1)", () => {
+  function frameText(h: Awaited<ReturnType<typeof harness>>): string {
+    return h.shell.model
+      .frame(80, 24)
+      .map((line) => (typeof line === "string" ? line : line.spans.map((s) => s.text).join("")))
+      .join("\n");
+  }
+
+  it("a 5 000-line history scrolls to its first line by PgUp, Home, arrows and wheel; End follows", async () => {
+    const h = await harness();
+    for (let n = 0; n < 5_000; n++) h.shell.log(`history line ${String(n).padStart(4, "0")}`);
+    frameText(h);
+    expect(frameText(h)).toContain("history line 4999");
+    // PgUp: one body less a row per press, every line seen on the way.
+    const seen = new Set<string>();
+    for (let i = 0; i < 1_000 && !seen.has("0000"); i++) {
+      h.stdin.type("\x1b[5~");
+      for (const match of frameText(h).matchAll(/history line (\d{4})/g)) seen.add(match[1] ?? "");
+    }
+    expect(seen.has("0000")).toBe(true);
+    expect(seen.size).toBeGreaterThan(4_900);
+    expect(frameText(h)).toMatch(/End to follow/);
+    // End follows the bottom again.
+    h.stdin.type("\x1b[F");
+    expect(frameText(h)).toContain("history line 4999");
+    expect(frameText(h)).not.toMatch(/End to follow/);
+    // Home jumps to the first line; arrows and the wheel move from there.
+    h.stdin.type("\x1b[H");
+    expect(frameText(h)).toContain("history line 0000");
+    h.stdin.type("\x1b[B\x1b[B");
+    expect(frameText(h)).not.toContain("history line 0001");
+    h.stdin.type("\x1b[<64;5;5M");
+    expect(frameText(h)).toContain("history line 0000");
+    h.stdin.type("\x1b[<65;5;5M\x1b[1;2B");
+    expect(frameText(h)).toContain("history line 0004");
+    expect(frameText(h)).not.toContain("history line 0003");
+    await h.shell.quit();
+  });
+
+  it("no line ends in an ellipsis because of width: a 600-character info line is all there", async () => {
+    const h = await harness();
+    const words = Array.from({ length: 120 }, (_, n) => `i${String(n).padStart(3, "0")}`);
+    h.shell.log(words.join(" "));
+    const frame = frameText(h);
+    expect(frame.match(/i\d{3}/g)).toEqual(words);
+    for (const row of frame.split("\n")) expect(row.endsWith("…")).toBe(false);
+    await h.shell.quit();
+  });
+
+  it("an empty Enter keeps a scrolled view; a sent line jumps to the bottom", async () => {
+    const h = await harness();
+    for (let n = 0; n < 200; n++) h.shell.log(`row ${n}`);
+    frameText(h);
+    h.stdin.type("\x1b[H");
+    h.stdin.type("\r");
+    expect(frameText(h)).toContain("row 0");
+    h.stdin.type("/help\r");
+    await vi.waitFor(() => expect(frameText(h)).not.toMatch(/End to follow/));
+    await h.shell.quit();
+  });
+
+  it("arrows still drive the slash menu while it is open", async () => {
+    const h = await harness();
+    for (let n = 0; n < 100; n++) h.shell.log(`row ${n}`);
+    frameText(h);
+    h.stdin.type("/");
+    const before = h.shell.model.menuIndex;
+    h.stdin.type("\x1b[B");
+    expect(h.shell.model.menuIndex).toBe(before + 1);
+    expect(h.shell.model.anchor.kind).toBe("bottom");
+    await h.shell.quit();
+  });
+
+  it("a scroll key split across two stdin chunks still scrolls and types nothing", async () => {
+    const h = await harness();
+    for (let n = 0; n < 100; n++) h.shell.log(`row ${n}`);
+    frameText(h);
+    h.stdin.type("\x1b[");
+    h.stdin.type("5~");
+    expect(h.shell.model.input).toBe("");
+    expect(h.shell.model.anchor.kind).toBe("pinned");
+    await h.shell.quit();
+  });
+
+  it("turns alternate-scroll on, mouse reporting on request, and both off on quit", async () => {
+    const h = await harness();
+    expect(h.raw).toContain("\x1b[?1007h");
+    expect(h.raw).not.toContain("\x1b[?1000h");
+    await h.shell.submit("/mouse on");
+    expect(h.raw).toContain("\x1b[?1000h\x1b[?1006h");
+    expect(h.scrollback()).toContain("mouse reporting on");
+    await h.shell.submit("/mouse");
+    expect(h.scrollback()).toContain("mouse reporting is on");
+    await h.shell.quit();
+    const tail = h.raw.slice(h.raw.lastIndexOf("\x1b[0m"));
+    expect(tail).toContain("\x1b[?1006l\x1b[?1000l\x1b[?1007l");
+    expect(h.raw.endsWith("\x1b[?1049l")).toBe(true);
   });
 });
 

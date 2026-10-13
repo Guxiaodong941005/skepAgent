@@ -40,7 +40,7 @@ function fakeTerminal() {
     hooks,
     output: () => written,
     frame(): string[] {
-      const last = written.split("\x1b[H\x1b[2J").at(-1) ?? "";
+      const last = written.split("\x1b[H").at(-1) ?? "";
       // biome-ignore lint/suspicious/noControlCharactersInRegex: matching SGR/DEC escapes
       const sgr = /\x1b\[[0-9;?]*[a-zA-Z]/g;
       return last

@@ -47,7 +47,7 @@ function fakeTerminal(columns = 80, rows = 24) {
   };
   const hooks = new EventEmitter() as EventEmitter & ProcessHooks;
   const plainFrame = (): string[] => {
-    const last = written.split("\x1b[H\x1b[2J").at(-1) ?? "";
+    const last = written.split("\x1b[H").at(-1) ?? "";
     // biome-ignore lint/suspicious/noControlCharactersInRegex: matching SGR/DEC escapes
     return last.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "").split("\r\n");
   };
@@ -63,7 +63,7 @@ function fakeTerminal(columns = 80, rows = 24) {
     plainFrame,
     /** The last frame with escapes kept, to see which line is highlighted. */
     rawFrame(): string[] {
-      return (written.split("\x1b[H\x1b[2J").at(-1) ?? "").split("\r\n");
+      return (written.split("\x1b[H").at(-1) ?? "").split("\r\n");
     },
     press(keys: string): void {
       stdin.write(keys);
@@ -1066,7 +1066,7 @@ describe("TuiJoinView keys", () => {
 
     view.resume();
     expect(term.rawModes()).toEqual([true, false, true]);
-    const reentered = term.output().lastIndexOf(`${ENTER_ALT}\x1b[?25l\x1b[H\x1b[2J`);
+    const reentered = term.output().lastIndexOf(`${ENTER_ALT}\x1b[?25l\x1b[?1007h\x1b[2J\x1b[H`);
     expect(reentered).toBeGreaterThan(term.output().lastIndexOf(LEAVE_ALT));
     expect(term.frame()[23]?.trim()).toBe("q quit");
     view.close();
