@@ -79,6 +79,8 @@ export class ShellModel {
   question: string | null = null;
   /** While set, the picker takes the keys and replaces the command menu above the input. */
   picker: ShellPicker | null = null;
+  /** Live orchestration phases, e.g. `O-1 master agent refining 12s`; null when none run. */
+  orchestration: string | null = null;
   version: string | null = SKEP_VERSION;
   /**
    * Width and body height of the last frame. A wrapped entry spans several rows, so scrolling is
@@ -181,7 +183,12 @@ export class ShellModel {
       logoLine(columns, this.glyphs, context, this.version),
       { spans: [fg("on-surface-variant", `  ${info.join(g.sep)}`)] },
     ];
-    const bee = this.beeRows(columns);
+    const bee = [
+      ...(this.orchestration === null
+        ? []
+        : [{ spans: [fg("tertiary", `  ${this.orchestration}`)] }]),
+      ...this.beeRows(columns),
+    ];
     const hint = this.hintLine();
     const prompt = this.question === null ? "> " : `${this.question} `;
     const input = this.inputLine(columns, prompt);

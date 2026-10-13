@@ -834,6 +834,25 @@ function snapshotIo(ctx: SessionCliContext): SnapshotIo {
   };
 }
 
+/** The sanitized environment an agent CLI runs with (D19): the master agent uses it too. */
+export function agentEnv(ctx: CliContext): Record<string, string> {
+  return pickEnv(ctx, AGENT_ENV_KEYS);
+}
+
+/**
+ * Snapshots `dir` and returns a check that lists the files whose content changed since: the
+ * master agent's read-only guard (docs/plans/tui-scroll-and-herdr-controller.md §3.4) reuses
+ * the item delta machinery.
+ */
+export async function treeChangeCheck(
+  ctx: SessionCliContext,
+  dir: string,
+): Promise<() => Promise<string[]>> {
+  const io = snapshotIo(ctx);
+  const before = await snapshotTree(dir, io);
+  return async () => (await computeDelta(before, io)).files.map((file) => file.path);
+}
+
 /** `2m 14s`, `12s`. */
 export function formatDuration(ms: number): string {
   const seconds = Math.max(0, Math.round(ms / 1000));

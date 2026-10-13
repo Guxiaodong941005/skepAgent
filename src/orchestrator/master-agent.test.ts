@@ -190,3 +190,47 @@ describe("CliMasterAgent", () => {
     expect(agent.conversationId).toBeNull();
   });
 });
+
+/**
+ * Opt-in: real CLIs, real model calls (AGENTS.md). Two turns in one conversation, read-only:
+ * `SKEP_REAL_CLAUDE=1`, `SKEP_REAL_CODEX=1`, `SKEP_REAL_PI=1`.
+ */
+describe.each([
+  ["claude", "SKEP_REAL_CLAUDE"],
+  ["codex", "SKEP_REAL_CODEX"],
+  ["pi", "SKEP_REAL_PI"],
+] as const)("real %s master agent", (cli, flag) => {
+  it.skipIf(process.env[flag] !== "1")(
+    "remembers across a resumed turn and edits nothing",
+    async () => {
+      const { mkdtemp, readdir } = await import("node:fs/promises");
+      const os = await import("node:os");
+      const path = await import("node:path");
+      const { execFileChecked } = await import("../util/exec.js");
+      const { cryptoRandom } = await import("../util/random.js");
+      const dir = await mkdtemp(path.join(os.tmpdir(), `skep-real-${cli}-`));
+      await execFileChecked("git", ["init", "--quiet", dir], {
+        env: { PATH: process.env.PATH ?? "" },
+      });
+      const env: Record<string, string> = {};
+      for (const key of ["PATH", "HOME", "USER", "LANG", "TERM", "TMPDIR"]) {
+        const value = process.env[key];
+        if (value !== undefined) env[key] = value;
+      }
+      const agent = new CliMasterAgent({
+        cli,
+        cwd: dir,
+        env,
+        run: execFileChecked,
+        random: cryptoRandom,
+      });
+      await agent.turn({ prompt: "Remember the codeword PLUM. Reply with just OK." });
+      const second = await agent.turn({
+        prompt: "Create a file named x.txt, then tell me the codeword. Reply with just the word.",
+      });
+      expect(second.text).toMatch(/PLUM/);
+      expect((await readdir(dir)).filter((name) => name !== ".git")).toEqual([]);
+    },
+    300_000,
+  );
+});

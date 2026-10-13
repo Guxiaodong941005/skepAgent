@@ -6,6 +6,7 @@ import path from "node:path";
 import { Duplex, PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { skepHome, skepPaths } from "../../config/paths.js";
+import type { MasterAgent } from "../../orchestrator/master-agent.js";
 import { connectSub, ListenAddressError, startMaster } from "../../session/index.js";
 import type { SessionStatus } from "../../session/messages.js";
 import type { Clock } from "../../util/clock.js";
@@ -192,6 +193,8 @@ function fakeApi(address = { host: "192.168.1.20", port: 7419 }) {
 async function harness(
   masterAddress?: { host: string; port: number },
   prepare?: (dir: string) => Promise<void> | Promise<Partial<ShellCliContext>>,
+  /** Free text is a raw intent (v0.1.13) unless a test opts into the master agent. */
+  orchestrate: "auto" | "confirm" | "off" = "off",
 ) {
   const dir = await mkdtemp(path.join(tmpdir(), "skep-shell-"));
   roots.push(dir);
@@ -219,6 +222,7 @@ async function harness(
       SKEP_HOME: dir,
       SKEP_TUI_GLYPHS: "ascii",
       SKEP_TUI_ANIMATE: "0",
+      SKEP_ORCHESTRATE: orchestrate,
       NO_COLOR: "1",
       HOME: dir,
       PATH: bin,
@@ -1816,6 +1820,204 @@ describe("transcript scrolling (SCROLL Phase 1)", () => {
     const tail = h.raw.slice(h.raw.lastIndexOf("\x1b[0m"));
     expect(tail).toContain("\x1b[?1006l\x1b[?1000l\x1b[?1007l");
     expect(h.raw.endsWith("\x1b[?1049l")).toBe(true);
+  });
+});
+
+describe("master agent orchestration in the shell (ORCH-4)", () => {
+  const BRIEF_REPLY =
+    'Plan below.\n```json\n{"title":"Add /healthz","brief":"Add GET /healthz returning 200 in the app."}\n```';
+
+  /** A scripted master agent; every prompt it got is kept. */
+  function scriptedAgent(replies: string[]) {
+    const prompts: string[] = [];
+    let started = false;
+    const agent: MasterAgent = {
+      cli: "claude",
+      get conversationId() {
+        return started ? "conv-1" : null;
+      },
+      contextChars: 0,
+      turn: async ({ prompt }) => {
+        prompts.push(prompt);
+        started = true;
+        const text = replies.shift();
+        if (text === undefined) throw new Error("no scripted reply");
+        return { text, conversationId: "conv-1" };
+      },
+      reset: () => {
+        started = false;
+      },
+    };
+    return { agent, prompts };
+  }
+
+  function settledIntent(text: string): SessionStatus["intents"][number] {
+    return {
+      intentId: "N-1",
+      text,
+      state: "planned",
+      items: [
+        {
+          itemId: "I-1",
+          repo: "app",
+          assignee: "peer-1",
+          epoch: 1,
+          title: text.slice(0, 200),
+          datalistEntries: 0,
+          state: "done",
+          result: {
+            itemId: "I-1",
+            epoch: 1,
+            repo: "app",
+            baseSha: "a".repeat(40),
+            headSha: "b".repeat(40),
+            checks: [{ name: "agent", status: "pass" }],
+            summary: "done · claude · 9s\nadded src/health.ts",
+            submit: { method: "none", state: "local", branch: "main" },
+          },
+        },
+      ],
+    } as unknown as SessionStatus["intents"][number];
+  }
+
+  it("auto (default): refine → brief sent → result → summary from the same agent", async () => {
+    const { agent, prompts } = scriptedAgent([BRIEF_REPLY, "Health check added on vps."]);
+    const h = await harness(undefined, async () => ({ createMasterAgent: () => agent }), "auto");
+    await h.shell.submit("/start --yes --repo app");
+    h.fake.peers.push(peer("peer-1", "vps", "app"));
+    await h.shell.submit("please add a health check");
+    await vi.waitFor(() => expect(h.fake.calls.intents).toHaveLength(1));
+    // The peer gets the master agent's brief, title line first; never the raw words.
+    expect(h.fake.calls.intents[0]).toBe(
+      "Add /healthz\n\nAdd GET /healthz returning 200 in the app.",
+    );
+    expect(prompts[0]).toContain("please add a health check");
+    expect(prompts[0]).toContain("- peer-1 on vps, repo app, role coding");
+    expect(h.scrollback()).toContain("O-1 brief → peers:");
+    expect(h.scrollback()).toContain("O-1 sent as intent N-1; waiting for the peers");
+    expect(h.frame()).toMatch(/O-1 waiting for peers/);
+    h.fake.intents.push(settledIntent(h.fake.calls.intents[0] ?? ""));
+    h.fake.calls.master[0]?.onEvent?.({ kind: "item-result", message: "I-1 done · vps (app)" });
+    await vi.waitFor(() => expect(h.scrollback()).toContain("O-1 summary:"));
+    expect(h.scrollback()).toContain("  │ Health check added on vps.");
+    expect(prompts[1]).toContain("<<<RESULT I-1 · done · vps (app)\ndone · claude · 9s");
+    expect(prompts[1]).toContain("please add a health check");
+    expect(h.frame()).not.toMatch(/O-1 waiting for peers/);
+    await h.shell.quit();
+  });
+
+  it("confirm: the brief waits for Enter; n cancels and nothing is sent", async () => {
+    const { agent } = scriptedAgent([BRIEF_REPLY, BRIEF_REPLY]);
+    const h = await harness(undefined, async () => ({ createMasterAgent: () => agent }), "confirm");
+    await h.shell.submit("/start --yes --repo app");
+    h.fake.peers.push(peer("peer-1", "vps", "app"));
+    await h.shell.submit("add a health check");
+    await vi.waitFor(() => expect(h.shell.model.question).toContain("send this brief?"));
+    expect(h.fake.calls.intents).toEqual([]);
+    await h.shell.submit("");
+    await vi.waitFor(() => expect(h.fake.calls.intents).toHaveLength(1));
+    await h.shell.submit("another one");
+    await vi.waitFor(() => expect(h.shell.model.question).toContain("send this brief?"));
+    await h.shell.submit("n");
+    await vi.waitFor(() => expect(h.scrollback()).toContain("O-2 cancelled; nothing was sent"));
+    expect(h.fake.calls.intents).toHaveLength(1);
+    await h.shell.quit();
+  });
+
+  it("external master: the brief goes over the control port; results come from its status", async () => {
+    const { agent, prompts } = scriptedAgent([BRIEF_REPLY, "Done on mac."]);
+    const status = {
+      sessionId: "S-9",
+      listen: "127.0.0.1:7419",
+      repo: "app",
+      joinCode: "1111-2222-3333",
+      joinCodeExpiresAtMs: null,
+      peers: [
+        {
+          peerId: "peer-1",
+          device: "mac",
+          address: "192.168.1.30",
+          family: "IPv4",
+          repo: "app",
+          head: null,
+          role: "coding",
+          progress: { phase: "idle", done: 0, total: 0, failed: 0, percent: 0, summary: "" },
+        },
+      ],
+      intents: [] as SessionStatus["intents"],
+    };
+    const sent: string[] = [];
+    const control = await controlServer((request) => {
+      if (request.op === "status") return { type: "control-result", ok: true, result: status };
+      sent.push((request as { text?: string }).text ?? "");
+      return { type: "control-result", ok: true, result: { intentId: "N-1" } };
+    });
+    const h = await harness(
+      undefined,
+      async (dir) => {
+        await writeFile(
+          path.join(dir, "session.json"),
+          `${JSON.stringify({ listen: `127.0.0.1:${control.port}`, token: "0".repeat(32) })}\n`,
+        );
+        return { createMasterAgent: () => agent };
+      },
+      "auto",
+    );
+    await waitFor(() => h.shell.model.sessionLive);
+    await h.shell.submit("add a health check");
+    await vi.waitFor(() =>
+      expect(sent).toEqual(["Add /healthz\n\nAdd GET /healthz returning 200 in the app."]),
+    );
+    status.intents.push(settledIntent(sent[0] ?? ""));
+    // The next discovery of the external master reads its status; /status triggers one now.
+    await h.shell.submit("/status");
+    await vi.waitFor(() => expect(h.scrollback()).toContain("O-1 summary:"));
+    expect(prompts[1]).toContain("<<<RESULT I-1 · done · mac (app)");
+    await h.shell.quit();
+  });
+
+  it("no session: free text is refused before any master agent turn", async () => {
+    const { agent, prompts } = scriptedAgent([BRIEF_REPLY]);
+    const h = await harness(undefined, async () => ({ createMasterAgent: () => agent }), "auto");
+    await h.shell.submit("add a health check");
+    expect(prompts).toEqual([]);
+    expect(h.shell.model.scrollback.at(-1)?.tone).toBe("error");
+    await h.shell.quit();
+  });
+
+  it("/orchestrate switches and saves the mode; off sends raw text; /history lists requests", async () => {
+    const { agent } = scriptedAgent([BRIEF_REPLY]);
+    const h = await harness(undefined, async (dir) => ({
+      createMasterAgent: () => agent,
+      env: {
+        SKEP_HOME: dir,
+        SKEP_TUI_GLYPHS: "ascii",
+        SKEP_TUI_ANIMATE: "0",
+        NO_COLOR: "1",
+        HOME: dir,
+        PATH: path.join(dir, "bin"),
+      },
+    }));
+    await h.shell.submit("/orchestrate");
+    expect(h.scrollback()).toContain("orchestration mode: auto; master agent: not started yet");
+    await h.shell.submit("/start --yes --repo app");
+    h.fake.peers.push(peer("peer-1", "vps", "app"));
+    await h.shell.submit("first request");
+    await vi.waitFor(() => expect(h.fake.calls.intents).toHaveLength(1));
+    await h.shell.submit("/orchestrate off");
+    const toml = path.join(h.dir, "device.toml");
+    expect(await readFile(toml, "utf8")).toBe('[orchestrate]\nmode = "off"\n');
+    await h.shell.submit("second request");
+    expect(h.fake.calls.intents[1]).toBe("second request");
+    await h.shell.submit("/orchestrate maybe");
+    expect(h.scrollback()).toContain("/orchestrate takes auto, confirm, off or new");
+    await vi.waitFor(async () => {
+      await h.shell.submit("/history");
+      expect(h.scrollback()).toMatch(/O-[0-9a-z]+-1 {2}awaiting → N-1 {2}first request/);
+    });
+    await h.shell.submit("/cancel O-1");
+    expect(h.scrollback()).toContain("O-1 cancelled here; intent N-1 keeps running on the peers");
+    await h.shell.quit();
   });
 });
 

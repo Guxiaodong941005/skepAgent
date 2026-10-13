@@ -9,10 +9,27 @@
  */
 
 import os from "node:os";
+import type {
+  OrchestrationItem,
+  OrchestrationMode,
+  OrchestrationState,
+} from "../../core/orchestration/reducer.js";
+import { Ledger } from "../../orchestrator/ledger.js";
+import { CliMasterAgent, type MasterAgent } from "../../orchestrator/master-agent.js";
+import { Orchestrator } from "../../orchestrator/orchestrator.js";
+import {
+  loadOrchestrationMode,
+  ORCHESTRATION_MODES,
+  saveOrchestrationMode,
+} from "../../orchestrator/settings.js";
+import { itemVerdict } from "../../session/master.js";
 import { type Clock, isoUtc, systemClock } from "../../util/clock.js";
+import { execFileChecked } from "../../util/exec.js";
+import { cryptoRandom } from "../../util/random.js";
 import { AGENT_ORDER } from "../commands/agent-tui.js";
 import {
   type AgentCli,
+  agentEnv,
   type ControlEndpoint,
   checkIntent,
   clearStaleSessionFile,
@@ -28,6 +45,7 @@ import {
   loadAgentSetting,
   type MasterFlow,
   readControlEndpoint,
+  resolveAgentCli,
   type SessionCliContext,
   type SessionStatus,
   saveAgentSetting,
@@ -35,6 +53,7 @@ import {
   startedText,
   startMasterFlow,
   submitIntentAt,
+  treeChangeCheck,
   undoItem,
   undoText,
   writeLastError,
@@ -87,7 +106,14 @@ export type ShellCliContext = SessionCliContext & {
   shellHooks?: ProcessHooks;
   clock?: Clock;
   hostname?: () => string;
+  /** The master agent for a CLI (tests pass a fake; default: the real CLI, read-only). */
+  createMasterAgent?: (cli: AgentCli, cwd: string) => MasterAgent;
 };
+
+/** A delivered intent, or the result to show instead (refused, cancelled, no match). */
+type Delivery =
+  | { ok: true; intentId: string; repos?: string[] }
+  | { ok: false; result: SlashResult };
 
 /** Opens the shell and resolves once the human left it (`/quit`, Ctrl-D, a signal). */
 export async function runShell(ctx: ShellCliContext): Promise<void> {
@@ -159,6 +185,11 @@ export class Shell {
   private cleaning: Promise<SlashResult> | null = null;
   /** Releases the `/join` dispatch waiting on a handshake that `/clean` cancelled. */
   private cancelJoin: (() => void) | null = null;
+  /** How free text is handled (`[orchestrate] mode`, default auto; plan §3.5). */
+  private mode: OrchestrationMode = "auto";
+  private readonly modeLoaded: Promise<void>;
+  /** Created on the first orchestrated request: it resolves the master agent CLI. */
+  private orchestrator: Orchestrator | null = null;
 
   private readonly decoder = new ShellKeyDecoder();
   /** Cancels the wait that turns a held partial escape sequence into an Esc key. */
@@ -201,6 +232,20 @@ export class Shell {
     this.finished = new Promise((resolve) => {
       this.finish = resolve;
     });
+    const file = ctx.paths?.deviceToml;
+    // SKEP_ORCHESTRATE=auto|confirm|off overrides device.toml for this process (scripts, tests).
+    const forced = ORCHESTRATION_MODES.find((mode) => mode === ctx.env.SKEP_ORCHESTRATE);
+    if (forced !== undefined) this.mode = forced;
+    this.modeLoaded =
+      file === undefined || forced !== undefined
+        ? Promise.resolve()
+        : loadOrchestrationMode(file, (message) => this.log(`skep: ${message}`, "warn")).then(
+            (mode) => {
+              this.mode = mode;
+            },
+            (error: unknown) =>
+              this.log(`skep: [orchestrate] setting: ${errorMessage(error)}`, "warn"),
+          );
   }
 
   /** A sequence split across chunks completes with the next one; silence makes it an Esc. */
@@ -481,9 +526,112 @@ export class Shell {
     }
   }
 
-  /** §5: free text is an intent; where it may go is the session controller's call. */
-  private freeText(text: string): Promise<SlashResult> {
-    return this.sendIntent(text);
+  /**
+   * Free text goes through the master agent (refine → peers → summary, plan §3.2) unless the
+   * mode is `off`, which is the v0.1.13 behavior: the text itself is the intent.
+   */
+  private async freeText(text: string): Promise<SlashResult> {
+    await this.modeLoaded;
+    if (this.mode === "off") return this.sendIntent(text);
+    // Nothing to send to means no reason to spend a master agent turn.
+    const route = this.session.intentRoute();
+    if (route.kind === "refused") return { type: "error", message: route.message };
+    const orchestrator = await this.ensureOrchestrator();
+    orchestrator.start(text, this.mode);
+    this.sync();
+    return { type: "ok" };
+  }
+
+  private async ensureOrchestrator(): Promise<Orchestrator> {
+    if (this.orchestrator !== null) return this.orchestrator;
+    const cwd = this.ctx.cwd ?? process.cwd();
+    const { cli } = await resolveAgentCli({
+      ...(this.ctx.paths === undefined ? {} : { deviceToml: this.ctx.paths.deviceToml }),
+      env: this.ctx.env,
+      dir: cwd,
+      warn: (message) => this.log(`skep: ${message}`, "warn"),
+    });
+    const agent =
+      this.ctx.createMasterAgent?.(cli, cwd) ??
+      new CliMasterAgent({
+        cli,
+        cwd,
+        env: agentEnv(this.ctx),
+        run: execFileChecked,
+        random: cryptoRandom,
+      });
+    const home = this.ctx.paths?.home;
+    this.orchestrator = new Orchestrator({
+      agent,
+      clock: this.clock,
+      ledger: home === undefined ? null : Ledger.at(home),
+      peers: () =>
+        this.session.snapshot().peers.map((peer) => ({
+          peerId: peer.peerId,
+          device: peer.device,
+          role: peer.role,
+          ...(peer.repo === undefined ? {} : { repo: peer.repo }),
+        })),
+      dispatch: async (brief) => {
+        const sent = await this.deliverIntent(brief);
+        if (!sent.ok) {
+          const { result } = sent;
+          throw new Error(
+            result.type === "error" || result.type === "ok"
+              ? (result.message ?? "the intent was not sent")
+              : "the intent was not sent",
+          );
+        }
+        return [sent.intentId];
+      },
+      items: (intentIds) => this.orchestrationItems(intentIds),
+      guard: () => treeChangeCheck(this.ctx, cwd),
+      ask: (question) => this.ask(question),
+      confirm: async () => {
+        const answer = await this.ask("send this brief? [enter send / e edit / n cancel]");
+        const word = answer?.trim().toLowerCase() ?? "n";
+        if (word === "" || word === "y" || word === "yes" || word === "send") {
+          return { action: "send" };
+        }
+        if (word === "e" || word === "edit") {
+          const text = await this.ask("new brief (one line; empty keeps the shown one):");
+          if (text === null) return { action: "cancel" };
+          return text.trim() === "" ? { action: "send" } : { action: "edit", text: text.trim() };
+        }
+        return { action: "cancel" };
+      },
+      show: (text, tone, gutter) => this.log(text, tone, gutter),
+      changed: () => this.sync(),
+    });
+    this.log(
+      `master agent: ${cli} (read-only, mode ${this.mode}) — /orchestrate to change`,
+      "muted",
+    );
+    return this.orchestrator;
+  }
+
+  /** The items of `intentIds` from the master this shell routes to; null when unknown. */
+  private orchestrationItems(intentIds: readonly string[]): OrchestrationItem[] | null {
+    const own = this.session.ownMaster;
+    const status = own !== null ? own.handle.status() : this.session.externalStatus;
+    if (status === null) return null;
+    const devices = new Map(status.peers.map((peer) => [peer.peerId, peer.device]));
+    const items: OrchestrationItem[] = [];
+    for (const intent of status.intents) {
+      if (!intentIds.includes(intent.intentId)) continue;
+      for (const item of intent.items) {
+        const device = devices.get(item.assignee);
+        items.push({
+          intentId: intent.intentId,
+          itemId: item.itemId,
+          verdict: itemVerdict(item),
+          repo: item.repo,
+          ...(device === undefined ? {} : { device }),
+          ...(item.result === undefined ? {} : { summary: item.result.summary }),
+        });
+      }
+    }
+    return items;
   }
 
   private intentCommand(args: string): Promise<SlashResult> | SlashResult {
@@ -503,21 +651,33 @@ export class Shell {
    * a bare intent to it (INTENT-PEER).
    */
   private async sendIntent(text: string, explicit?: string[]): Promise<SlashResult> {
+    const sent = await this.deliverIntent(text, explicit);
+    if (!sent.ok) return sent.result;
+    const to = sent.repos === undefined ? "" : ` (repo ${sent.repos.join(", ")})`;
+    return { type: "ok", message: `intent ${sent.intentId} routed: ${text}${to}` };
+  }
+
+  /**
+   * Routes one intent text (raw from `/intent`, or a master agent's brief) exactly as `/intent`
+   * always has: route check, peer picker, master-changed guard, own or control route.
+   */
+  private async deliverIntent(text: string, explicit?: string[]): Promise<Delivery> {
+    const refused = (result: SlashResult): Delivery => ({ ok: false, result });
     const route = this.session.intentRoute();
-    if (route.kind === "refused") return { type: "error", message: route.message };
+    if (route.kind === "refused") return refused({ type: "error", message: route.message });
     let repos = explicit;
     const peers = this.session.snapshot().peers;
     if (repos === undefined && peers.length > 1) {
       const picked = await this.pickPeers(peers);
-      if (picked === null) return { type: "ok", message: "intent cancelled" };
+      if (picked === null) return refused({ type: "ok", message: "intent cancelled" });
       const unknown = picked.filter((peer) => peer.repo === undefined);
       if (unknown.length > 0) {
-        return {
+        return refused({
           type: "error",
           message:
             `repo is unknown for ${unknown.map((peer) => peer.peerId).join(", ")}; intent was not sent\n` +
             "use /intent --repo <name> <text> to name the repo explicitly",
-        };
+        });
       }
       const known = [
         ...new Set(picked.flatMap((peer) => (peer.repo === undefined ? [] : [peer.repo]))),
@@ -525,7 +685,7 @@ export class Shell {
       repos = known;
       // A new discovery must not redirect a selection made for the previous master.
       const current = this.session.intentRoute();
-      if (current.kind === "refused") return { type: "error", message: current.message };
+      if (current.kind === "refused") return refused({ type: "error", message: current.message });
       const sameMaster =
         route.kind === "own"
           ? current.kind === "own" && route.master.handle === current.master.handle
@@ -533,11 +693,11 @@ export class Shell {
             route.external.status.sessionId === current.external.status.sessionId &&
             sameEndpoint(route.external.endpoint, current.external.endpoint);
       if (!sameMaster) {
-        return {
+        return refused({
           type: "error",
           message:
             "the session master changed while choosing peers; intent was not sent — check /status and resend",
-        };
+        });
       }
     }
     try {
@@ -548,19 +708,18 @@ export class Shell {
         ({ intentId } = await route.master.handle.submitIntent(text, repos));
       } else {
         const sent = await this.sendExternalIntent(route.external, text, repos);
-        if (sent.type === "error") return sent;
+        if (sent.type === "error") return refused(sent);
         intentId = sent.intentId;
       }
-      const to = repos === undefined ? "" : ` (repo ${repos.join(", ")})`;
-      return { type: "ok", message: `intent ${intentId} routed: ${text}${to}` };
+      return repos === undefined ? { ok: true, intentId } : { ok: true, intentId, repos };
     } catch (error) {
       if (isNoMatch(error)) {
         const status = await this.freshStatus(route);
         const named = repos ?? [status?.repo ?? "?"];
-        return {
+        return refused({
           type: "error",
           message: status === null ? errorMessage(error) : noMatchText(status, named),
-        };
+        });
       }
       throw error;
     } finally {
@@ -738,6 +897,33 @@ export class Shell {
         run: (_ctx, args) => this.intentCommand(args),
       },
       {
+        name: "orchestrate",
+        description: "free text via the master agent: auto, confirm, off; new = fresh context",
+        usage: `[${ORCHESTRATION_MODES.join("|")}|new]`,
+        run: (_ctx, args) => this.orchestrateCommand(args),
+      },
+      {
+        name: "summarize",
+        description: "summarize an orchestration now, with the results that exist",
+        usage: "<O-n>",
+        argsRequired: true,
+        visible: live,
+        run: (_ctx, args) => this.orchestrationCommand(args, "summarize"),
+      },
+      {
+        name: "cancel",
+        description: "stop an orchestration here (its intent keeps running on the peers)",
+        usage: "<O-n>",
+        argsRequired: true,
+        visible: live,
+        run: (_ctx, args) => this.orchestrationCommand(args, "cancel"),
+      },
+      {
+        name: "history",
+        description: "recent orchestrations in this project",
+        run: () => this.historyCommand(),
+      },
+      {
         name: "agent",
         description: "agent CLI for this device's session items",
         usage: `[${AGENT_ORDER.join("|")}]`,
@@ -800,7 +986,8 @@ export class Shell {
     const width = Math.max(...labels.map((label) => label.length));
     return [
       ...shown.map((command, i) => `${(labels[i] ?? "").padEnd(width)}  ${command.description}`),
-      "text without / is sent as an intent to this device's session master (needs a joined peer)",
+      "text without / goes to the master agent, which briefs the peers and summarizes their",
+      "  results (/orchestrate auto|confirm|off); /intent <text> sends your words as they are",
       "/start: different projects select separate homes and available ports automatically",
       "/start: --listen is the address to bind, --advertise the one peers dial (default: listen)",
       "/join: the agent edits this folder directly (no worktrees, no branches); auto by default",
@@ -917,6 +1104,8 @@ export class Shell {
       default:
         this.log(`${kind} ${message}`, "event");
     }
+    // A result or a finished intent may settle an orchestration: no need to wait for the tick.
+    if (kind.startsWith("item-") || kind.startsWith("intent-")) this.orchestrator?.poll();
     this.sync();
   }
 
@@ -1183,6 +1372,67 @@ export class Shell {
     };
   }
 
+  /** `/orchestrate [auto|confirm|off|new]`: persisted in `device.toml` `[orchestrate] mode`. */
+  private async orchestrateCommand(args: string): Promise<SlashResult> {
+    await this.modeLoaded;
+    const value = args.trim().toLowerCase();
+    if (value === "") {
+      const agent = this.orchestrator === null ? "not started yet" : this.orchestratorInfo();
+      return {
+        type: "ok",
+        message:
+          `orchestration mode: ${this.mode}; master agent: ${agent}\n` +
+          "/orchestrate auto (brief shown, sent at once) | confirm (Enter sends) | off (raw intents) | new",
+      };
+    }
+    if (value === "new") {
+      this.orchestrator?.newConversation();
+      return { type: "ok", message: "the next request starts a fresh master agent conversation" };
+    }
+    const mode = ORCHESTRATION_MODES.find((candidate) => candidate === value);
+    if (mode === undefined) {
+      return {
+        type: "error",
+        message: `/orchestrate takes ${ORCHESTRATION_MODES.join(", ")} or new`,
+      };
+    }
+    this.mode = mode;
+    const file = this.ctx.paths?.deviceToml;
+    if (file !== undefined) await saveOrchestrationMode(file, mode);
+    const saved = file === undefined ? "" : `; saved in ${file}`;
+    return { type: "ok", message: `orchestration mode: ${mode}${saved}` };
+  }
+
+  private orchestratorInfo(): string {
+    const orchestrator = this.orchestrator;
+    if (orchestrator === null) return "not started";
+    return orchestrator.describeAgent();
+  }
+
+  private orchestrationCommand(args: string, action: "summarize" | "cancel"): SlashResult {
+    const id = args.trim().toUpperCase();
+    if (!/^O-\d+$/.test(id))
+      return { type: "error", message: `usage: /${action} <O-n>, e.g. /${action} O-1` };
+    if (this.orchestrator === null)
+      return { type: "error", message: "no orchestration in this shell yet" };
+    const problem =
+      action === "summarize" ? this.orchestrator.summarize(id) : this.orchestrator.cancel(id);
+    return problem === null ? { type: "ok" } : { type: "error", message: problem };
+  }
+
+  private async historyCommand(): Promise<SlashResult> {
+    const home = this.ctx.paths?.home;
+    if (home === undefined) return { type: "error", message: "skep home is not resolved" };
+    const { records, problems } = await Ledger.at(home).recent(10);
+    for (const problem of problems) this.log(`skep: unreadable ledger entry ${problem}`, "warn");
+    if (records.length === 0)
+      return { type: "ok", message: "no orchestrations recorded in this project yet" };
+    const lines = records.map((record) =>
+      historyEntry(record.id, record.state as OrchestrationState),
+    );
+    return { type: "ok", message: ["recent orchestrations (newest first):", ...lines].join("\n") };
+  }
+
   private async undoCommand(args: string): Promise<SlashResult> {
     const flags = parseFlags(args, [], ["force"]);
     const [itemId, extra] = flags.positional;
@@ -1226,6 +1476,7 @@ export class Shell {
   /** Copies the controller's snapshot into the model: header, peers, footer, slash gating. */
   sync(): void {
     const view = this.session.snapshot();
+    this.model.orchestration = this.orchestrationLine();
     this.model.header = { ...this.model.header, session: view.live ? view.label : "no session" };
     this.model.sessionLive = view.live;
     this.model.peers = view.peers;
@@ -1234,6 +1485,15 @@ export class Shell {
     this.refreshMenu();
     this.render();
     this.maybeTick();
+  }
+
+  /** `O-1 master agent refining 12s · O-2 waiting for peers 3m 4s` for the footer. */
+  private orchestrationLine(): string | null {
+    const active = this.orchestrator?.active() ?? [];
+    if (active.length === 0) return null;
+    return active
+      .map((run) => `${run.id} ${PHASE_LABELS[run.phase] ?? run.phase} ${formatSeconds(run.forMs)}`)
+      .join(" · ");
   }
 
   /** A sub roster from the join flow with `generation`; dropped once that flow is not current. */
@@ -1273,6 +1533,8 @@ export class Shell {
     } else if (before !== null && found === null) {
       this.log(`the session master at ${before.status.listen} went away`, "event");
     }
+    // A master in another process is only seen through this status: orchestrations read it now.
+    if (found !== null) this.orchestrator?.poll();
     this.sync();
   }
 
@@ -1295,6 +1557,8 @@ export class Shell {
           if (this.session.externalStatus !== null && this.ticks % EXTERNAL_POLL_TICKS === 0) {
             await this.probeExternal();
           }
+          // Orchestrations read their items from the same status the footer shows.
+          this.orchestrator?.poll();
           // Presence and the master's own status are read live every tick.
           if (this.screen.isActive) this.sync();
         }
@@ -1368,6 +1632,7 @@ export class Shell {
     if (master !== null) await master.close().catch((error) => problems.push(errorMessage(error)));
     this.ticker?.abort();
     this.escapeWait?.abort();
+    await this.orchestrator?.flush();
     this.unlisten();
     this.screen.close();
     // The terminal is the user's again; anything that went wrong while leaving is said there.
@@ -1454,6 +1719,27 @@ export class ShellJoinView implements JoinView {
     this.tails.set(key, { seen: tail, partial });
     return lines.filter((line) => line.trim() !== "");
   }
+}
+
+const PHASE_LABELS: Record<string, string> = {
+  refining: "master agent refining",
+  asking: "master agent asks you",
+  confirming: "brief waits for you",
+  dispatching: "sending",
+  awaiting: "waiting for peers",
+  stalled: "a peer waits for a human",
+  synthesizing: "master agent summarizing",
+};
+
+function formatSeconds(ms: number): string {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+}
+
+function historyEntry(id: string, state: OrchestrationState): string {
+  const request = state.userText.replace(/\s+/g, " ").slice(0, 70);
+  const intents = state.intentIds.length === 0 ? "" : ` → ${state.intentIds.join(", ")}`;
+  return `  ${id}  ${state.phase}${intents}  ${request}`;
 }
 
 function linkText(silentMs: number, glyphs: string): string {

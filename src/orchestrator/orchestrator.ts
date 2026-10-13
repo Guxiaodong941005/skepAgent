@@ -188,6 +188,16 @@ export class Orchestrator {
     return null;
   }
 
+  /** `claude, conversation 1a2b…, 12K of 500K characters` for `/orchestrate`. */
+  describeAgent(): string {
+    const agent = this.deps.agent;
+    const id = agent.conversationId;
+    const used = `${Math.round(agent.contextChars / 1000)}K of ${MASTER_CONTEXT_MAX_CHARS / 1000}K characters`;
+    return id === null
+      ? `${agent.cli}, no conversation yet`
+      : `${agent.cli}, conversation ${id.slice(0, 8)}…, ${used}`;
+  }
+
   /** `/orchestrate new`: the next request starts a fresh master agent conversation. */
   newConversation(): void {
     this.deps.agent.reset();
