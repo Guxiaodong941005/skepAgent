@@ -401,8 +401,9 @@ export class Shell {
     }
     const text = selected === null ? this.model.input : `/${selected.name}`;
     this.model.input = "";
-    // The human just said something: show it and what follows. An empty Enter keeps the view.
-    if (text.trim() !== "") this.model.scrollToBottom();
+    // The human just said something: show it and what follows. An empty Enter keeps the view,
+    // and so does a scroll command, which would otherwise undo itself.
+    if (text.trim() !== "" && !/^\/(top|bottom)\s*$/.test(text.trim())) this.model.scrollToBottom();
     this.menuDismissed = false;
     // Failures are logged into the scrollback by `dispatch`; nothing is left to report here.
     this.submit(text).catch(() => undefined);
@@ -748,6 +749,22 @@ export class Shell {
         usage: "<item> [--force]",
         argsRequired: true,
         run: (_ctx, args) => this.undoCommand(args),
+      },
+      {
+        name: "top",
+        description: "scroll to the first line of this session's output",
+        run: () => {
+          this.model.scrollToTop();
+          return { type: "ok" };
+        },
+      },
+      {
+        name: "bottom",
+        description: "follow the newest output again",
+        run: () => {
+          this.model.scrollToBottom();
+          return { type: "ok" };
+        },
       },
       {
         name: "mouse",

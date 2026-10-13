@@ -1747,6 +1747,17 @@ describe("transcript scrolling (SCROLL Phase 1)", () => {
     await h.shell.quit();
   });
 
+  it("/top and /bottom jump without logging the jump away", async () => {
+    const h = await harness();
+    for (let n = 0; n < 200; n++) h.shell.log(`row ${String(n).padStart(3, "0")}`);
+    frameText(h);
+    h.stdin.type("/top\r");
+    await vi.waitFor(() => expect(frameText(h)).toContain("row 000"));
+    h.stdin.type("/bottom\r");
+    await vi.waitFor(() => expect(frameText(h)).not.toMatch(/End to follow/));
+    await h.shell.quit();
+  });
+
   it("arrows still drive the slash menu while it is open", async () => {
     const h = await harness();
     for (let n = 0; n < 100; n++) h.shell.log(`row ${n}`);
