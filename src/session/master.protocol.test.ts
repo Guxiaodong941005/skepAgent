@@ -1,9 +1,9 @@
 // Session protocol v2 over a real master and real subs on 127.0.0.1:0: negotiation, the mixed
 // v1/v2 matrix, targeted intents, long briefs, changed files and opt-in live output (ORCH-6).
-import { createServer, type Server } from "node:net";
+import { createConnection, createServer, type Server } from "node:net";
 import { Duplex } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { encodeFrame } from "./codec.js";
+import { encodeFrame, FrameDecoder } from "./codec.js";
 import { createEphemeral, deriveKeys } from "./handshake.js";
 import {
   type MasterEvent,
@@ -380,5 +380,39 @@ describe("live output", () => {
     // Give any further frames time to arrive; the budget holds them at 8 within 500 ms.
     await new Promise((resolve) => setImmediate(resolve));
     expect(events.filter((e) => e.kind === "peer-output")).toHaveLength(8);
+  });
+});
+
+describe("control status", () => {
+  async function controlStatus(m: MasterHandle, v: 1 | 2): Promise<Record<string, unknown>> {
+    const port = m.address?.port ?? 0;
+    return new Promise((resolve, reject) => {
+      const socket = createConnection({ host: "127.0.0.1", port }, () => {
+        socket.write(
+          encodeFrame(
+            Buffer.from(JSON.stringify({ type: "control", v, token: TOKEN, op: "status" })),
+          ),
+        );
+      });
+      const decoder = new FrameDecoder();
+      socket.on("data", (chunk: Buffer) => {
+        const [frame] = decoder.push(chunk);
+        if (frame !== undefined) resolve(JSON.parse(frame.toString("utf8")).result);
+      });
+      socket.on("error", reject);
+    });
+  }
+
+  it("answers v1 clients in the ≤0.1.13 shape and v2 clients with the new fields", async () => {
+    const m = await master();
+    await join(m, "box", "app", { work: async (item) => result(item, { changed }) });
+    await m.submitIntent("x", ["app"]);
+    await vi.waitFor(() => expect(m.status().intents[0]?.items[0]?.state).toBe("done"));
+    const v1 = JSON.stringify(await controlStatus(m, 1));
+    const v2 = JSON.stringify(await controlStatus(m, 2));
+    for (const key of ['"protocol"', '"version"', '"shareOutput"', '"changed"']) {
+      expect(v1).not.toContain(key);
+      expect(v2).toContain(key);
+    }
   });
 });

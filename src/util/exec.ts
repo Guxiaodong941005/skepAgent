@@ -23,6 +23,11 @@ export interface ExecOptions {
   /** Return a non-zero exit, signal, timeout or buffer overflow as a result instead of throwing. */
   allowFailure?: boolean;
   signal?: AbortSignal;
+  /**
+   * Called with each stdout/stderr chunk as it arrives, in addition to the buffered result (a
+   * session peer's opt-in live output, ORCH-6). It must not throw.
+   */
+  onOutput?: (chunk: string) => void;
 }
 
 export interface ExecResult {
@@ -142,6 +147,12 @@ export function execFileChecked(
         else reject(new ExecError(file, args, result, { cause: error }));
       },
     );
+    if (opts.onOutput !== undefined) {
+      const forward = opts.onOutput;
+      // execFile already decodes both streams as UTF-8; an extra listener sees the same chunks.
+      child.stdout?.on("data", (chunk: string | Buffer) => forward(chunk.toString()));
+      child.stderr?.on("data", (chunk: string | Buffer) => forward(chunk.toString()));
+    }
     child.stdin?.on("error", (error: NodeJS.ErrnoException) => {
       // A child that exits before reading stdin surfaces its real failure in the close callback.
       if (error.code !== "EPIPE") {

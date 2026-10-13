@@ -151,10 +151,16 @@ function fakeApi(address = { host: "192.168.1.20", port: 7419 }) {
       calls.sub.push(options);
       if (subGate !== null) await subGate;
       if (subError !== null) throw subError;
+      let sharing = options.shareOutput === true;
       return {
         sessionId: "S-1",
         peerId: "peer-1",
         fingerprint: "abcd-ef01-2345-6789",
+        protocol: 2,
+        sharingOutput: () => sharing,
+        shareOutput: (on) => {
+          sharing = on;
+        },
         closed: subClosed.promise,
         close: async () => {
           subCloses.push(options.code);
@@ -2209,6 +2215,54 @@ describe("split panels (ORCH-5)", () => {
     expect(own.map((entry) => entry.text)).toEqual(
       expect.arrayContaining(["I-2: agent claude (native) running", "compiling"]),
     );
+    await h.shell.quit();
+  });
+
+  it("shows a peer's opted-in live output in its panel only (ORCH-6)", async () => {
+    const h = await master();
+    await h.shell.submit("/layout split");
+    const onEvent = h.fake.calls.master[0]?.onEvent;
+    onEvent?.({
+      kind: "share-output",
+      message: "Peer peer-2 (vps) shares its live agent output",
+      peerId: "peer-2",
+    });
+    onEvent?.({
+      kind: "peer-output",
+      message: "… 3 line(s) not shown\nPASS login.test.ts",
+      peerId: "peer-2",
+      itemId: "I-4",
+    });
+    const panel = h.shell.model.transcript
+      .entries()
+      .filter((entry) => entry.peer === "peer-2")
+      .map((entry) => entry.text);
+    expect(panel).toEqual(
+      expect.arrayContaining([
+        "Peer peer-2 (vps) shares its live agent output",
+        "… 3 line(s) not shown",
+        "PASS login.test.ts",
+      ]),
+    );
+    expect(peerColumn(frameText(h))).toContain("I-4 │ PASS login.test.ts");
+    // The opt-in is news for the main view; the stream itself stays in the panel.
+    expect(h.scrollback()).toContain("shares its live agent output");
+    expect(h.scrollback()).not.toContain("PASS login.test.ts");
+    await h.shell.quit();
+  });
+
+  it("/share-output is this join's choice and lasts for this session only (ORCH-6)", async () => {
+    const h = await harness();
+    await h.shell.submit("/share-output on");
+    expect(h.scrollback()).toContain("not joined: /join a session first");
+    await h.shell.submit("/join 1234-5678-9012 --host 192.168.1.20:7419 --repo app --share-output");
+    expect(h.fake.calls.sub[0]?.shareOutput).toBe(true);
+    await h.shell.submit("/share-output");
+    expect(h.scrollback()).toContain("live agent output is shared with the master");
+    await h.shell.submit("/share-output off");
+    expect(h.scrollback()).toContain("live agent output stays on this device");
+    await h.shell.submit("/share-output maybe");
+    expect(h.scrollback()).toContain("usage: /share-output [on|off]");
     await h.shell.quit();
   });
 });

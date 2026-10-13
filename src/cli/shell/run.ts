@@ -22,6 +22,7 @@ import {
   ORCHESTRATION_MODES,
   saveOrchestrationMode,
 } from "../../orchestrator/settings.js";
+import type { MasterEvent } from "../../session/index.js";
 import { itemVerdict } from "../../session/master.js";
 import { type Clock, isoUtc, systemClock } from "../../util/clock.js";
 import { execFileChecked } from "../../util/exec.js";
@@ -964,6 +965,12 @@ export class Shell {
         },
       },
       {
+        name: "share-output",
+        description: "show this device's live agent output on the master (this session only)",
+        usage: "[on|off]",
+        run: (_ctx, args) => this.shareOutputCommand(args),
+      },
+      {
         name: "layout",
         description: "split: a panel per peer next to the main one; single: one transcript",
         usage: "[split|single]",
@@ -1032,7 +1039,8 @@ export class Shell {
       "scroll: PgUp/PgDn, Shift+arrows, wheel or arrows (no menu open), Home/End; End follows",
       "panels: /layout split shows one panel per peer (its results and progress timeline);",
       "  tab (empty input) or /focus picks the panel the scroll keys move; typed text still goes",
-      "  to the master; remote peers' live output is not shown (off by default)",
+      "  to the master; a peer's live agent output shows in its panel only after that peer",
+      "  opts in (/share-output on there, or /join … --share-output; this session only)",
       "advanced: `skep tui` opens the raw agent TUI",
     ].join("\n");
   }
@@ -1085,14 +1093,23 @@ export class Shell {
    * Master protocol events → transcript. Footer-only changes (progress) just redraw. The shell
    * scrolls, so a result is shown whole (`full`), not the plain-CLI cap (S2).
    */
-  private masterEvent(event: { kind: string; message: string; full?: string }): void {
+  private masterEvent(event: MasterEvent): void {
     const { kind } = event;
     const message = event.full ?? event.message;
     // Peer lines go to that peer's panel as well (ORCH-5); the main view is unchanged.
-    const tag = this.eventPeer(kind, message);
+    const tag = event.peerId === undefined ? this.eventPeer(kind, message) : { peer: event.peerId };
     const log = (text: string, tone: ShellTone): void => this.log(text, tone, undefined, tag);
     switch (kind) {
       case "progress":
+        break;
+      case "peer-output":
+        // A peer's opted-in live output (D35): only in its panel, like its progress timeline.
+        for (const line of message.split("\n")) {
+          this.log(line, "muted", `${event.itemId ?? "?"} │ `, { ...tag, panelOnly: true });
+        }
+        break;
+      case "share-output":
+        log(message, "event");
         break;
       case "left": {
         // `Peer peer-2 (mac) left: heartbeat_timeout` → explain the reason, say how to rejoin.
@@ -1218,6 +1235,7 @@ export class Shell {
       ...(parsed.device === undefined ? {} : { device: parsed.device }),
       ...(parsed.submit === undefined ? {} : { submit: parsed.submit }),
       ...(parsed.manual === true ? { manual: true } : {}),
+      ...(parsed.shareOutput === true ? { shareOutput: true } : {}),
       ...(parsed.agent === undefined ? {} : { agent: parsed.agent }),
       ...(parsed.view === undefined ? {} : { view: parsed.view }),
     };
@@ -1427,6 +1445,48 @@ export class Shell {
     return {
       type: "ok",
       message: `layout split · ${note}; tab or /focus moves between panels, /zoom enlarges one`,
+    };
+  }
+
+  /**
+   * Live output is the joined device's choice, never the master's, and lasts for this join only:
+   * nothing is written to device.toml (locked plan §9.9, D35).
+   */
+  private shareOutputCommand(args: string): SlashResult {
+    const word = args.trim().toLowerCase();
+    if (word !== "" && word !== "on" && word !== "off") {
+      return { type: "error", message: "usage: /share-output [on|off]" };
+    }
+    const join = this.session.ownJoin;
+    if (join === null) {
+      return {
+        type: "error",
+        message: "not joined: /join a session first (or /join … --share-output)",
+      };
+    }
+    const handle = join.handle;
+    const sharing = handle.sharingOutput?.() ?? false;
+    if (word === "") {
+      return {
+        type: "ok",
+        message: sharing
+          ? "live agent output is shared with the master for this session; /share-output off stops it"
+          : "live agent output stays on this device; /share-output on shows it on the master",
+      };
+    }
+    if (handle.protocol !== 2 || handle.shareOutput === undefined) {
+      return {
+        type: "error",
+        message: "the master runs Skep 0.1.13 or older; it cannot receive live output",
+      };
+    }
+    handle.shareOutput(word === "on");
+    return {
+      type: "ok",
+      message:
+        word === "on"
+          ? "live agent output is shared with the master until this session ends"
+          : "live agent output stays on this device",
     };
   }
 

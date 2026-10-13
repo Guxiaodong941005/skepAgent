@@ -148,7 +148,7 @@ export interface SubHandle {
 
 export { JoinRejectedError, normalizeJoinCode } from "./handshake.js";
 export { ListenAddressError, startMaster } from "./master.js";
-export { SubmitOutcomeSchema } from "./messages.js";
+export { ChangedSchema, SubmitOutcomeSchema } from "./messages.js";
 export { assertSamePath, PathMismatchError } from "./path.js";
 export { connectSub, OLDER_MASTER_NOTE, OlderMasterError } from "./sub.js";
 export type {

@@ -44,6 +44,11 @@ describe("parseJoinArgs", () => {
       "--host h:1 --code 863217270308 --repo app --manual --submit none",
       { code: "863217270308", host: "h:1", repo: "app", manual: true, submit: "none" },
     ],
+    // ORCH-6: live output is opted in per join.
+    [
+      "8632-1727-0308 h:1 --share-output",
+      { code: "8632-1727-0308", host: "h:1", shareOutput: true },
+    ],
     ["", {}],
   ])("reads %j", (args, expected) => {
     expect(parseJoinArgs(args)).toEqual(expected);

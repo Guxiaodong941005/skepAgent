@@ -189,16 +189,20 @@ function capture(dir: string, extra: Partial<SessionCliContext> = {}) {
   };
 }
 
-/** A master that answers one control request per connection with `reply`. */
-async function mockMaster(reply: unknown): Promise<{ listen: string; requests: unknown[] }> {
+/** A master that answers one control request per connection with `reply` (or its result). */
+async function mockMaster(
+  reply: unknown | ((request: { v?: number }) => unknown),
+): Promise<{ listen: string; requests: unknown[] }> {
   const requests: unknown[] = [];
   const server = net.createServer((socket) => {
     const decoder = new FrameDecoder();
     socket.on("data", (chunk) => {
       const [frame] = decoder.push(chunk);
       if (frame === undefined) return;
-      requests.push(JSON.parse(frame.toString("utf8")));
-      socket.end(encodeFrame(Buffer.from(JSON.stringify(reply))));
+      const request = JSON.parse(frame.toString("utf8")) as { v?: number };
+      requests.push(request);
+      const answer = typeof reply === "function" ? reply(request) : reply;
+      socket.end(encodeFrame(Buffer.from(JSON.stringify(answer))));
     });
   });
   servers.push(server);
@@ -1299,7 +1303,28 @@ describe("control commands", () => {
     const lines = c.stdout.trim().split("\n");
     expect(lines).toHaveLength(1);
     expect(JSON.parse(lines[0] ?? "")).toEqual({ ok: true, result: STATUS });
-    expect(mock.requests).toEqual([{ type: "control", v: 1, token: TOKEN, op: "status" }]);
+    expect(mock.requests).toEqual([{ type: "control", v: 2, token: TOKEN, op: "status" }]);
+  });
+
+  it("status asks a ≤0.1.13 master again in v1 after it refuses v2 (ORCH-6)", async () => {
+    const dir = await home();
+    const mock = await mockMaster((request: { v?: number }) =>
+      request.v === 2
+        ? {
+            type: "control-result",
+            ok: false,
+            error: { code: "bad_request", message: "Invalid first session request" },
+          }
+        : { type: "control-result", ok: true, result: STATUS },
+    );
+    await writeSessionFile(dir, mock.listen);
+    const c = capture(dir);
+    expect(await runCli(["--machine", "session", "status"], c.ctx)).toBe(0);
+    expect(JSON.parse(c.stdout.trim())).toEqual({ ok: true, result: STATUS });
+    expect(mock.requests).toEqual([
+      { type: "control", v: 2, token: TOKEN, op: "status" },
+      { type: "control", v: 1, token: TOKEN, op: "status" },
+    ]);
   });
 
   it("status renders a human table", async () => {
@@ -1615,6 +1640,42 @@ describe("session join works items in the project folder", () => {
     expect(block).toContain("trace line 39");
     expect(events.some((e) => e.kind === "item-result")).toBe(false);
     expect(events.find((e) => e.kind === "intent-failed")?.message).toContain("0 done · 1 failed");
+  });
+
+  it("reports the changed files as a structured list to a v2 master (ORCH-6)", async () => {
+    const box = await sandbox();
+    // The default stub edits notes.txt and creates health.txt.
+    const { item } = await joinAndWork(box, ["--submit", "none"]);
+    expect(item.result?.changed).toEqual({
+      files: [
+        { path: "health.txt", change: "added", added: 1, removed: 0 },
+        { path: "notes.txt", change: "modified", added: 2, removed: 1 },
+      ],
+      total: 2,
+      partial: false,
+    });
+  });
+
+  it("keeps the agent's live output on the device unless --share-output (ORCH-6)", async () => {
+    const box = await sandbox();
+    await stubAgent(box, "claude", 'echo "compiling"\necho "all green"');
+    const quiet = await joinAndWork(box, ["--submit", "none"]);
+    expect(quiet.events.some((e) => e.kind === "peer-output" || e.kind === "share-output")).toBe(
+      false,
+    );
+    expect(quiet.run.stdout).toContain('"shareOutput":false');
+
+    const shared = await joinAndWork(box, ["--submit", "none", "--share-output"]);
+    expect(shared.run.stdout).toContain('"shareOutput":true');
+    expect(shared.events.find((e) => e.kind === "share-output")?.message).toContain(
+      "shares its live agent output",
+    );
+    const output = shared.events
+      .filter((e) => e.kind === "peer-output")
+      .map((e) => e.message)
+      .join("\n");
+    expect(output).toContain("compiling");
+    expect(output).toContain("all green");
   });
 
   it("a missing agent binary at run time names the CLI and the fix", async () => {

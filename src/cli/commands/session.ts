@@ -32,10 +32,13 @@ import { Redactor } from "../../exec/redact.js";
 import { type Notification, NtfyNotifier } from "../../notify/ntfy.js";
 import type { ProcessExit } from "../../runtime/types.js";
 import {
+  type Changed,
+  ChangedSchema,
   connectSub,
   type DatalistEntry,
   type ItemContext,
   ListenAddressError,
+  type MasterEvent,
   type MasterHandle,
   type MasterOptions,
   type PeerPhase,
@@ -57,6 +60,7 @@ import { cryptoRandom } from "../../util/random.js";
 import type { CliContext } from "../context.js";
 import { CliError, EXIT } from "../output.js";
 import { quoteSlashWord } from "../shell/flags.js";
+import { SKEP_VERSION } from "../version.js";
 import {
   changedLine,
   computeDelta,
@@ -168,6 +172,8 @@ const ItemResultSchema = z.strictObject({
     .max(64),
   summary: z.string().max(4000),
   submit: SubmitOutcomeSchema.optional(),
+  // A v2 master's changed-files list (ORCH-6); validated by the session schema it came from.
+  changed: ChangedSchema.optional(),
 });
 
 const PeerProgressSchema = z
@@ -210,6 +216,9 @@ export const SessionStatusSchema = z.strictObject({
       head: z.string().nullable(),
       role: z.string().nullable(),
       progress: PeerProgressSchema.optional(),
+      protocol: z.union([z.literal(1), z.literal(2)]).optional(),
+      version: z.string().nullable().optional(),
+      shareOutput: z.boolean().optional(),
     }),
   ),
   intents: z.array(
@@ -1347,12 +1356,16 @@ async function writePrivate(file: string, data: string | Uint8Array): Promise<vo
 async function runNative(run: RunContext): Promise<AgentRun> {
   const { setup, dir, prompt, env } = run;
   run.report("running");
+  const forward = run.worker.onOutput;
   const result = await execFileChecked(setup.cli, [...NATIVE_ARGV[setup.cli]], {
     cwd: dir,
     env,
     input: prompt,
     timeoutMs: AGENT_TIMEOUT_MS,
     allowFailure: true,
+    ...(forward === undefined
+      ? {}
+      : { onOutput: (chunk: string) => forward(run.item.itemId, chunk) }),
   });
   const tail = `${result.stdout}\n${result.stderr}`;
   await writePrivate(run.transcript, tail);
@@ -1585,6 +1598,21 @@ async function executeItem(
     };
   }
   return { status: "ok", summary: `${note}agent ${agent.status}\n${tail}`, full, said };
+}
+
+/** The delta as the v2 result's changed-files list: paths and line counts, never content. */
+export function changedList(delta: ItemDelta): Changed {
+  return {
+    files: delta.files.slice(0, 200).map((file) => ({
+      path: file.path.slice(0, 512),
+      change:
+        file.before.hash === null ? "added" : file.after.hash === null ? "deleted" : "modified",
+      added: file.added,
+      removed: file.removed,
+    })),
+    total: delta.files.length,
+    partial: delta.partial,
+  };
 }
 
 /**
@@ -1971,6 +1999,11 @@ export interface ItemWorker {
   /** Aborted when the join is closing; stops a running PTY or herdr wait. */
   signal?: AbortSignal;
   onAgentState?(itemId: string, state: JoinAgentState): void;
+  /**
+   * Raw agent output while an item runs (native runs stream it). The session handle drops it
+   * unless this device's human opted in to share live output (ORCH-6, D35).
+   */
+  onOutput?(itemId: string, chunk: string): void;
   /** The joined session, recorded with each item's delta so undo/submit name the run (R2). */
   sessionId?: () => string | undefined;
   /** Measures item duration (default: the system clock). */
@@ -2090,6 +2123,8 @@ async function workItemRun(
   let focusCommand: readonly string[] | undefined;
   let tail = "";
   let transcript: string | undefined;
+  // The changed-files list always reaches a v2 master, live output or not (locked plan §9.11).
+  let changedFiles: Changed | undefined;
   const show = (submit?: SubmitOutcome): JoinViewModel => ({
     peers: worker.peers ?? [],
     item: { itemId: item.itemId, title: item.title, repo: item.repo, epoch: item.epoch },
@@ -2143,7 +2178,12 @@ async function workItemRun(
     const text = [...lines.map(clean), ...(said === "" ? [] : [`summary: ${said}`]), body]
       .filter((line) => line !== "")
       .join("\n");
-    const final: SubResult = { repo: item.repo, ...fields, summary: clipSummary(text) };
+    const final: SubResult = {
+      repo: item.repo,
+      ...fields,
+      summary: clipSummary(text),
+      ...(changedFiles === undefined ? {} : { changed: changedFiles }),
+    };
     worker.onAgentState?.(item.itemId, agentState);
     worker.view?.update(show(fields.submit));
     return final;
@@ -2268,6 +2308,7 @@ async function workItemRun(
   }
   const changed =
     deltaProblem === "" ? changedLine(delta) : `${changedLine(delta)}; ${deltaProblem}`;
+  if (deltaProblem === "") changedFiles = changedList(delta);
   const paths = delta.files.map((file) => file.path);
 
   if (executed.status === "dry") {
@@ -2476,6 +2517,11 @@ export interface JoinOptions {
   ui?: boolean;
   /** Opt out of auto control: confirm each master-driven item before it runs. */
   manual?: boolean;
+  /**
+   * Share this device's live agent output with the master for this join only (v2 masters;
+   * locked plan §9.9). Never stored on the device.
+   */
+  shareOutput?: boolean;
 }
 
 interface SubmitOptions {
@@ -2540,6 +2586,10 @@ export function register(program: Command, ctx: CliContext): void {
     )
     .option("--ui", "use the full-screen view")
     .option("--manual", "confirm each item before it runs (default: auto, no skep prompt)")
+    .option(
+      "--share-output",
+      "show this device's live agent output on the master for this session (default: off)",
+    )
     .action(async (opts: Omit<JoinOptions, "agent"> & { agent?: string; roleDir?: string }) => {
       const { agent, roleDir, ...rest } = opts;
       const choice = parseAgentFlag(agent);
@@ -2604,7 +2654,7 @@ export interface StartMasterFlowOptions extends StartOptions {
   /** A rotated join code, after the flow resolved; the first one is on the returned flow. */
   onJoinCode?(joinCode: string, expiresAtMs: number): void;
   /** Protocol events of the master (peer joined, intent planned, ...); see MasterOptions. */
-  onEvent?(event: { kind: string; message: string; full?: string }): void;
+  onEvent?(event: MasterEvent): void;
 }
 
 export interface MasterFlow {
@@ -2707,6 +2757,7 @@ export async function startMasterFlow(
       repo,
       device,
       controlToken: token,
+      version: SKEP_VERSION,
       clock: systemClock,
       random: cryptoRandom,
       onJoinCode,
@@ -3167,6 +3218,7 @@ export async function joinSessionFlow(
     serial: serialQueue(),
     signal: abort.signal,
     onAgentState: (id, state) => subHandle?.reportAgent?.(id, state),
+    onOutput: (id, chunk) => subHandle?.reportOutput?.(id, chunk),
     sessionId: () => subHandle?.sessionId,
   };
 
@@ -3242,9 +3294,16 @@ export async function joinSessionFlow(
       random: cryptoRandom,
       onFingerprint: showFingerprint,
       onProgress,
+      version: SKEP_VERSION,
+      ...(opts.shareOutput === true ? { shareOutput: true } : {}),
       // A sub that hangs up on purpose (a failed describe/datalist callback) says so here;
       // otherwise the human only sees the close reason.
       onEvent: ({ kind, message }) => {
+        if (kind === "protocol") {
+          // An older master: the join still works, on protocol v1 (plan §3.6).
+          say({ event: "session-protocol", message }, () => `session: ${message}\n`);
+          return;
+        }
         if (kind !== "error") return;
         say({ event: "session-error", message }, () => `session: ${message}\n`);
       },
@@ -3311,6 +3370,7 @@ export async function joinSessionFlow(
     updatePeers();
     const agentData =
       resolved === null ? null : { cli: resolved.cli, source: resolved.source, view };
+    const sharing = handle.sharingOutput?.() ?? false;
     say(
       {
         event: "joined",
@@ -3321,10 +3381,12 @@ export async function joinSessionFlow(
         submit: method,
         agent: agentData,
         dir,
+        protocol: handle.protocol ?? 1,
+        shareOutput: sharing,
       },
       () =>
         `joined session ${sessionId} at ${at} as ${peerId} (${controlText(control, method)})\n` +
-        `${agentLine(resolved, view, dir)}\n`,
+        `${agentLine(resolved, view, dir)}\n${shareLine(opts.shareOutput === true, sharing)}`,
     );
   } catch (error) {
     abort.abort();
@@ -3349,6 +3411,13 @@ export async function joinSessionFlow(
       await closed;
     },
   };
+}
+
+/** What the join says about live output; nothing when the human did not ask for it. */
+function shareLine(asked: boolean, sharing: boolean): string {
+  if (sharing) return "live agent output is shared with the master for this session\n";
+  if (asked) return "live agent output is not shared: the master's Skep is too old for it\n";
+  return "";
 }
 
 async function joinCommand(ctx: SessionCliContext, opts: JoinOptions): Promise<void> {
@@ -3660,13 +3729,20 @@ async function controlAt(
     throw new CliError("bad_session_file", `invalid control listen address ${endpoint.listen}`);
   }
   let reply: ControlResult;
-  try {
-    reply = await controlRequest(
+  const request = (v: 1 | 2) =>
+    controlRequest(
       target,
-      { type: "control", v: 1, token: endpoint.token, ...op },
+      { type: "control", v, token: endpoint.token, ...op },
       systemClock,
       timeoutMs ?? (op.op === "intent" ? INTENT_CONTROL_TIMEOUT_MS : CONTROL_TIMEOUT_MS),
     );
+  try {
+    // Status asks for the v2 shape; a ≤0.1.13 master refuses `v:2` as a bad request, so ask
+    // again in v1 (ORCH-6). Intents stay v1: their shape did not change.
+    reply = await request(op.op === "status" ? 2 : 1);
+    if (op.op === "status" && !reply.ok && reply.error.code === "bad_request") {
+      reply = await request(1);
+    }
   } catch (error) {
     // A lost reply to an intent is not a refusal: the master starts routing before it answers,
     // so the intent may exist. Read-only ops (status) are simply unreachable either way.
@@ -3796,6 +3872,13 @@ export interface StatusSection {
   kind: "info" | "result" | "failed";
 }
 
+/** A peer's release for `/status`: a v1 peer runs 0.1.13 or older; `+live` marks sharing. */
+function peerRelease(p: SessionStatus["peers"][number]): string {
+  if (p.protocol === undefined) return "-";
+  if (p.protocol === 1) return "≤0.1.13";
+  return `${p.version ?? "?"}${p.shareOutput === true ? " +live" : ""}`;
+}
+
 export function renderSessionStatus(status: SessionStatus): string {
   return `${sessionStatusSections(status)
     .map((section) => section.text)
@@ -3820,7 +3903,7 @@ export function sessionStatusSections(status: SessionStatus): StatusSection[] {
     lines.push("peers:");
     lines.push(
       table([
-        ["PEER", "DEVICE", "ADDRESS", "REPO", "HEAD", "ROLE", "PROGRESS"],
+        ["PEER", "DEVICE", "ADDRESS", "REPO", "HEAD", "ROLE", "PROGRESS", "SKEP"],
         ...status.peers.map((p) => [
           p.peerId,
           p.device,
@@ -3829,6 +3912,7 @@ export function sessionStatusSections(status: SessionStatus): StatusSection[] {
           p.head === null ? "-" : p.head.slice(0, 12),
           p.role ?? "-",
           p.progress === undefined ? "-" : `${p.progress.phase} ${p.progress.percent}%`,
+          peerRelease(p),
         ]),
       ]),
     );

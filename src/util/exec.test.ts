@@ -129,6 +129,20 @@ describe("execFileChecked", () => {
     expect(bytes.stdout).toBe("bytes");
   });
 
+  it("streams stdout and stderr chunks to onOutput and still buffers them", async () => {
+    const dir = await scratch();
+    const script = path.join(dir, "both.js");
+    await writeFile(script, "process.stdout.write('out\\n'); process.stderr.write('err\\n')");
+    const chunks: string[] = [];
+    const result = await execFileChecked("node", [script], {
+      env: { PATH: process.env.PATH ?? "" },
+      onOutput: (chunk) => chunks.push(chunk),
+    });
+    expect(chunks.join("").split("\n").filter(Boolean).sort()).toEqual(["err", "out"]);
+    expect(result.stdout).toBe("out\n");
+    expect(result.stderr).toBe("err\n");
+  });
+
   it("closes stdin when no input is given, so a child reading stdin exits", async () => {
     const started = Date.now();
     const result = await execFileChecked("cat", [], {

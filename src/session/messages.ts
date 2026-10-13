@@ -45,9 +45,10 @@ export const IntentInputSchema = z.strictObject({
   text: BriefSchema,
   repos: z.array(RepoRefSchema).min(1).max(16).optional(),
 });
+/** `v:1` answers in the ≤0.1.13 status shape; `v:2` adds the ORCH-6 fields. */
 const ControlStatusSchema = z.strictObject({
   type: z.literal("control"),
-  v: z.literal(1),
+  v: ProtocolSchema,
   token: TokenSchema,
   op: z.literal("status"),
 });
@@ -384,6 +385,22 @@ export const SessionStatusSchema = z.strictObject({
   ),
 });
 export type SessionStatus = z.infer<typeof SessionStatusSchema>;
+
+/** The status a ≤0.1.13 client parses strictly: no v2 peer fields, no changed-files lists. */
+export function v1Status(status: SessionStatus): SessionStatus {
+  return {
+    ...status,
+    peers: status.peers.map(({ protocol: _p, version: _v, shareOutput: _s, ...peer }) => peer),
+    intents: status.intents.map((intent) => ({
+      ...intent,
+      items: intent.items.map((item) => {
+        if (item.result === undefined) return item;
+        const { changed: _changed, ...result } = item.result;
+        return { ...item, result };
+      }),
+    })),
+  };
+}
 export const ControlResultSchema = z.discriminatedUnion("ok", [
   z.strictObject({
     type: z.literal("control-result"),

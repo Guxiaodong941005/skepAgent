@@ -29,7 +29,8 @@ export const JOIN_USAGE = [
   "          --agent claude|codex|pi (default: /agent, SKEP_AGENT_CLI, AGENT.md, else PATH),",
   "          --view native|pty|herdr|dry,",
   "          --submit commit|push|pr|mr|none|ask (default: device.toml, else none),",
-  "          --manual (confirm each item; default auto)",
+  "          --manual (confirm each item; default auto),",
+  "          --share-output (show this device's live agent output on the master, this session)",
 ].join("\n");
 
 export interface JoinArgs {
@@ -45,6 +46,8 @@ export interface JoinArgs {
   submit?: (typeof SUBMIT_METHODS)[number];
   /** Opt out of auto control. */
   manual?: boolean;
+  /** Share live agent output with the master for this join only (ORCH-6). */
+  shareOutput?: boolean;
   /** One-line notices for the human (deprecated spellings, ignored flags). */
   notes?: string[];
 }
@@ -59,7 +62,7 @@ export function parseJoinArgs(args: string): JoinArgs {
     flags = parseFlags(
       args,
       ["host", "role", "agent", "view", "code", "repo", "device", "submit", "role-dir"],
-      ["manual"],
+      ["manual", "share-output"],
     );
   } catch (error) {
     throw usage(error instanceof Error ? error.message : String(error));
@@ -115,6 +118,7 @@ export function parseJoinArgs(args: string): JoinArgs {
     ...(device === undefined ? {} : { device }),
     ...(method === undefined ? {} : { submit: method }),
     ...(flags.switches.has("manual") ? { manual: true } : {}),
+    ...(flags.switches.has("share-output") ? { shareOutput: true } : {}),
     ...(notes.length === 0 ? {} : { notes }),
   };
 }

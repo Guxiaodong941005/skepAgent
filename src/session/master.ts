@@ -33,6 +33,7 @@ import {
   sessionSchema,
   TokenSchema,
   VersionSchema,
+  v1Status,
 } from "./messages.js";
 import { outputFrame } from "./output.js";
 import type { PeerPath } from "./path.js";
@@ -502,10 +503,12 @@ class SessionMaster implements MasterHandle {
             ) {
               wire.finish("bad_token", controlError("bad_token", "Invalid session control token"));
             } else if (first.op === "status") {
+              const status = this.status();
               wire.finish("control_complete", {
                 type: "control-result",
                 ok: true,
-                result: this.status(),
+                // An older local client parses the status strictly (ORCH-6).
+                result: first.v === 1 ? v1Status(status) : status,
               });
             } else {
               void this.submitIntent(first.text, first.repos)
