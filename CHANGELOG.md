@@ -11,6 +11,16 @@ protocol rules ([`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §4.4) apply to t
 
 ## [Unreleased]
 
+## [0.1.15] - 2026-10-14
+
+License-only republish; no product feature, CLI, config or protocol changes.
+
+### Changed
+
+* The relicense from MIT to Apache-2.0 is already on `main` (`2415290`). This release
+  republishes the package so the npm `license` field reads `Apache-2.0`; the registry still
+  showed `MIT` for 0.1.14.
+
 ## [0.1.14] - 2026-10-13
 
 Master orchestrator, TUI scrolling and multi-peer panels (SCROLL, ORCH Phases 0–7,
@@ -510,7 +520,8 @@ creates the npm org `skepagent` and explicitly says go. See [`docs/RELEASE.md`](
 * Manual lease revoke; no auto-merge. The human holds plan approval, escalation decisions and
   merges.
 
-[Unreleased]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.14...HEAD
+[Unreleased]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.15...HEAD
+[0.1.15]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.14...v0.1.15
 [0.1.14]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.13...v0.1.14
 [0.1.13]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.12...v0.1.13
 [0.1.12]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.11...v0.1.12

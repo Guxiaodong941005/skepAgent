@@ -2,8 +2,27 @@
 
 This document records the package-name decision (v0.1.0), the npm registry re-check, the
 v0.1.0 checklist, the v0.1.1 session-TUI notes, the v0.1.5 peer-progress and TUI notes, the
-v0.1.8 join-UX notes, the v0.1.9 per-project isolation notes, the v0.1.10 SAME-CB notes, the v0.1.11 SESSION-UX notes, the v0.1.12 JOIN-SLIM notes, the v0.1.13 INTENT-PEER notes, the v0.1.14 ORCH/SCROLL notes, and the steps the orchestrator runs. Task agents must not `git push`,
+v0.1.8 join-UX notes, the v0.1.9 per-project isolation notes, the v0.1.10 SAME-CB notes, the v0.1.11 SESSION-UX notes, the v0.1.12 JOIN-SLIM notes, the v0.1.13 INTENT-PEER notes, the v0.1.14 ORCH/SCROLL notes, the v0.1.15 license republish notes, and the steps the orchestrator runs. Task agents must not `git push`,
 create tags, or `npm publish`.
+
+## v0.1.15 — Apache-2.0 on npm (2026-10-14)
+
+License-only npm republish. The relicense from MIT to Apache-2.0 already landed on `main` at
+`2415290`, but the published `0.1.14` still shows `MIT` on the registry. The human approved
+publishing a new patch version so the npm `license` field matches the repository
+(`Apache-2.0`). Package name stays **`@skepagent/skep`** (public). The published bin is `skep`.
+
+No product feature, CLI, config or protocol changes on top of v0.1.14: only the version
+strings (`package.json`, `SKEP_VERSION`, README, TUI header snapshots) and the release docs
+move. Session protocol negotiation is unchanged; 0.1.14 and 0.1.15 devices interoperate.
+
+Install:
+
+```bash
+npm install -g @skepagent/skep@0.1.15
+```
+
+---
 
 ## v0.1.14 — master orchestrator + TUI scroll + multi-peer panels (2026-10-13)
 
