@@ -120,4 +120,4 @@ sandbox environment are especially security-sensitive. Reports in these areas ar
 
 ## License
 
-By contributing, you agree that your contributions are licensed under the [MIT License](LICENSE).
+By contributing, you agree that your contributions are licensed under the [Apache License, Version 2.0](LICENSE).

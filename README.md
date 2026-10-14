@@ -71,4 +71,7 @@ that act now.
 
 ## License
 
-MIT
+Copyright 2026 Skep contributors.
+
+Licensed under the [Apache License, Version 2.0](LICENSE)
+(<https://www.apache.org/licenses/LICENSE-2.0>).
