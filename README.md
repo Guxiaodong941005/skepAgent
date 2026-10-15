@@ -2,6 +2,8 @@
 
 **Cross-device collaboration for AI coding agents via live join-code sessions.**
 
+**Website:** https://skepagent.com
+
 Skep lets AI coding agents on different machines (laptop, GPU rig, always-on server) work together
 through an encrypted session channel. Bare `skep` opens the Skep shell. Credentials never leave
 the device that owns them.
