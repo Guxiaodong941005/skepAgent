@@ -10,6 +10,7 @@ import { mkdir, readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 import type { OrchestrationState } from "../core/orchestration/reducer.js";
+import { SkillIdentitySchema } from "../core/skills/schemas.js";
 import { atomicWrite } from "../util/fs.js";
 
 export const LEDGER_VERSION = 1;
@@ -40,6 +41,28 @@ const LedgerRecordSchema = z.strictObject({
       phase: z.string(),
       userText: z.string(),
       synthesis: z.string().nullable(),
+      skill: SkillIdentitySchema.optional(),
+      contract: z.string().max(3000).optional(),
+      bindings: z
+        .array(
+          z.strictObject({
+            role: z.string(),
+            label: z.string(),
+            required: z.boolean(),
+            peerId: z.string().nullable(),
+            device: z.string().nullable(),
+            repo: z.string().nullable(),
+            protocolVersion: z.number().nullable(),
+            candidates: z.number().int().nonnegative(),
+            source: z.enum(["manual", "role", "repo", "unbound"]),
+          }),
+        )
+        .max(16)
+        .optional(),
+      stages: z
+        .array(z.strictObject({ id: z.string(), status: z.enum(["pending", "active", "settled"]) }))
+        .max(33)
+        .optional(),
     })
     .passthrough(),
 });

@@ -2362,3 +2362,126 @@ describe("split panels (ORCH-5)", () => {
     await h.shell.quit();
   });
 });
+
+describe("skill shell wiring (SKILL-MVP)", () => {
+  it("starts with a skill, renders its chip/table, and keeps off and /intent raw", async () => {
+    const h = await harness();
+    try {
+      await h.shell.submit("/start --yes --repo app --skill iot-ble-feature");
+      expect(h.fake.calls.master).toHaveLength(1);
+      expect(h.shell.model.header.skill).toBe("iot-ble-feature");
+      expect(h.frame()).toContain("skill: iot-ble-feature");
+      expect(h.scrollback()).toContain("skill iot-ble-feature");
+      expect(h.scrollback()).toContain("suggests /orchestrate confirm");
+      expect(JSON.parse(await readFile(path.join(h.dir, "session.json"), "utf8")).skill).toBe(
+        "iot-ble-feature",
+      );
+      h.fake.peers.push({
+        peerId: "p1",
+        device: "one",
+        address: "loopback",
+        family: "IPv4",
+        repo: "device-repo",
+        head: null,
+        role: "device",
+        protocol: 2,
+        progress: { phase: "idle", done: 0, total: 0, failed: 0, percent: 0, summary: "" },
+      });
+      h.shell.sync();
+      await h.shell.submit("/orchestrate off");
+      expect(h.scrollback()).toContain(
+        "skill iot-ble-feature is inactive while /orchestrate is off",
+      );
+      await h.shell.submit("raw feature text");
+      await h.shell.submit("/intent --repo device-repo raw escape hatch");
+      expect(h.fake.calls.intents).toEqual(["raw feature text", "raw escape hatch"]);
+      expect(
+        h.shell.commands.find((c) => c.name === "skills")?.visible?.({ sessionLive: false }),
+      ).not.toBe(false);
+      expect(h.shell.commands.find((c) => c.name === "skill")?.visible?.({ master: false })).toBe(
+        false,
+      );
+      await h.shell.submit("/skill off");
+      expect(h.shell.model.header.skill).toBe("generic");
+    } finally {
+      await h.shell.quit();
+    }
+  });
+  it("skips the multi-peer picker after resolving role targets", async () => {
+    const prompts: string[] = [];
+    const h = await harness(
+      undefined,
+      async () => ({
+        createMasterAgent: () => ({
+          cli: "codex",
+          conversationId: null,
+          contextChars: 0,
+          reset() {},
+          async turn({ prompt }) {
+            prompts.push(prompt);
+            return {
+              text: JSON.stringify({
+                title: "Feature",
+                brief: "Implement it",
+                contract: "Shared contract",
+                targets: [{ role: "device" }, { role: "server" }],
+              }),
+              conversationId: "skill-test",
+            };
+          },
+        }),
+      }),
+      "auto",
+    );
+    try {
+      await h.shell.submit("/start --yes --repo app --skill iot-ble-feature");
+      for (const [index, role] of ["device", "server"].entries())
+        h.fake.peers.push({
+          peerId: `p${index}`,
+          device: `d${index}`,
+          address: "loopback",
+          family: "IPv4",
+          repo: `${role}-repo`,
+          head: null,
+          role,
+          protocol: 2,
+          progress: { phase: "idle", done: 0, total: 0, failed: 0, percent: 0, summary: "" },
+        });
+      h.shell.sync();
+      await h.shell.submit("Implement a feature");
+      await vi.waitFor(() => expect(h.fake.calls.intents).toHaveLength(2));
+      expect(h.shell.model.picker).toBeNull();
+      expect(h.fake.calls.intentRepos).toEqual([["device-repo"], ["server-repo"]]);
+      expect(prompts[0]).toContain("ACTIVE SKILL");
+    } finally {
+      await h.shell.quit();
+    }
+  });
+  it("loads a persisted default on start and tips only on the first start without one", async () => {
+    const h = await harness();
+    try {
+      await h.shell.submit("/start --yes --repo app");
+      expect(h.shell.model.header.skill).toBe("generic");
+      expect(h.scrollback()).toContain("tip: /skills");
+      await h.shell.submit("/clean");
+      await h.shell.submit("/start --yes --repo app");
+      expect(h.scrollback().match(/tip: \/skills/g)).toHaveLength(1);
+      await h.shell.submit("/skill use iot-ble-feature --default");
+    } finally {
+      await h.shell.quit();
+    }
+    const next = await harness(undefined, async (dir) => {
+      await writeFile(
+        path.join(dir, "device.toml"),
+        await readFile(path.join(h.dir, "device.toml"), "utf8"),
+      );
+    });
+    try {
+      await next.shell.submit("/start --yes --repo app");
+      expect(next.shell.model.header.skill).toBe("iot-ble-feature");
+      expect(next.scrollback()).not.toContain("tip: /skills");
+    } finally {
+      await next.shell.quit();
+    }
+  });
+});

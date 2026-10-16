@@ -29,18 +29,35 @@ export const RefineOutputSchema = z.strictObject({
    */
   targets: z
     .array(
-      z.strictObject({
-        repo: z.string().trim().min(1).max(200),
-        title: z.string().trim().min(1).max(MAX_TITLE_CHARS).optional(),
-        brief: z.string().trim().min(1).max(MAX_BRIEF_CHARS).optional(),
-      }),
+      z
+        .strictObject({
+          repo: z.string().trim().min(1).max(200).optional(),
+          role: z
+            .string()
+            .regex(/^[a-z][a-z0-9-]{0,31}$/)
+            .optional(),
+          title: z.string().trim().min(1).max(MAX_TITLE_CHARS).optional(),
+          brief: z.string().trim().min(1).max(MAX_BRIEF_CHARS).optional(),
+        })
+        .refine((target) => (target.repo === undefined) !== (target.role === undefined), {
+          message: "each target must name exactly one of repo or role",
+        }),
     )
     .max(MAX_TARGETS)
     // Two intents for one repo would reach the same peer as two separate tasks.
-    .refine((targets) => new Set(targets.map((target) => target.repo)).size === targets.length, {
-      message: "each repo may appear in targets once",
-    })
+    .refine(
+      (targets) =>
+        new Set(
+          targets.map((target) =>
+            target.repo === undefined ? `role:${target.role}` : `repo:${target.repo}`,
+          ),
+        ).size === targets.length,
+      {
+        message: "each repo may appear in targets once",
+      },
+    )
     .optional(),
+  contract: z.string().trim().min(1).max(3_000).optional(),
   /** Asked to the human before dispatch. */
   questions: z.array(z.string().trim().min(1).max(500)).max(MAX_QUESTIONS).optional(),
   /** Master-side context; never sent to peers. */
@@ -55,7 +72,7 @@ export type RefineParse = { ok: true; output: RefineOutput } | { ok: false; reas
  * The last fenced ```json block of a reply, parsed against {@link RefineOutputSchema}. A reply
  * that is only a JSON object (no fence) is accepted too: some CLIs strip fences.
  */
-export function parseRefineOutput(reply: string): RefineParse {
+export function parseRefineOutput(reply: string, skillActive = false): RefineParse {
   const fences = [...reply.matchAll(/```(?:json)?[ \t]*\r?\n([\s\S]*?)```/g)];
   const candidate = fences.at(-1)?.[1] ?? reply.trim();
   let value: unknown;
@@ -75,6 +92,15 @@ export function parseRefineOutput(reply: string): RefineParse {
     const issue = parsed.error.issues[0];
     const where = issue === undefined || issue.path.length === 0 ? "" : `${issue.path.join(".")}: `;
     return { ok: false, reason: `the json does not match the contract: ${where}${issue?.message}` };
+  }
+  if (
+    !skillActive &&
+    (parsed.data.contract !== undefined || parsed.data.targets?.some((t) => t.role !== undefined))
+  ) {
+    return {
+      ok: false,
+      reason: "contract and role targets require an active non-generic skill; use repo targets",
+    };
   }
   return { ok: true, output: parsed.data };
 }

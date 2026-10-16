@@ -62,7 +62,12 @@ export const SHELL_MIN_ROWS = Math.min(10, MIN_ROWS);
 export type ShellTone = TranscriptTone;
 /** A footer row; `silentMs` is the time since the peer was last heard from, when known. */
 /** `repo` is known only for a master's own roster (from its status), never for a joined shell. */
-export type ShellPeer = JoinViewModel["peers"][number] & { silentMs?: number; repo?: string };
+export type ShellPeer = JoinViewModel["peers"][number] & {
+  silentMs?: number;
+  repo?: string;
+  protocolVersion?: number;
+  skillRole?: string;
+};
 
 /** The multi-peer picker shown after an intent when several peers could take it (INTENT-PEER). */
 export interface ShellPicker {
@@ -76,6 +81,7 @@ export interface ShellHeader {
   cwd: string;
   /** e.g. `no session`, `master · code 4821-0937-5520`, `joined · peer-2`. */
   session: string;
+  skill?: string;
 }
 
 /** A peer panel's view: its own layout of the transcript, anchor and size in the last frame. */
@@ -351,6 +357,9 @@ export class ShellModel {
           : `session ${sessionLabel}`;
     const info = [
       `device  ${this.header.device}`,
+      ...(this.header.skill && this.header.skill !== "generic"
+        ? [`skill: ${this.header.skill}`]
+        : []),
       `cwd  ${this.header.cwd}`,
       ...(this.sessionLive ? [`peers ${this.peers.length}`] : ["no session"]),
       ...(this.sessionLive && this.link !== null ? [this.link] : []),
@@ -457,6 +466,7 @@ export class ShellModel {
         peer === undefined
           ? [rect.id, ...scrolled]
           : [
+              ...(peer.skillRole ? [peer.skillRole] : []),
               peer.peerId,
               ...scrolled,
               peer.device,
