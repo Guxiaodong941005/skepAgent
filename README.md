@@ -5,8 +5,8 @@
 **Website:** https://skepagent.com
 
 Skep lets AI coding agents on different machines (laptop, GPU rig, always-on server) work together
-through an encrypted session channel. Bare `skep` opens the Skep shell. Credentials never leave
-the device that owns them.
+through an encrypted session channel. Bare `skep` opens the Skep shell. Skep does not actively
+detect, record, or upload provider keys or tokens.
 
 > **v0.1.15 — Apache-2.0 on npm.** License-only republish: the package is now Apache-2.0 on the
 > registry too. Features are unchanged from v0.1.14 (master orchestrator, TUI scroll, multi-peer
@@ -22,6 +22,30 @@ npm install -g @skepagent/skep@0.1.15
 ```
 
 Requires Node.js ≥ 22.12 (macOS & Linux).
+
+## Skills
+
+The default skill is `generic`, which keeps the standard refine and dispatch workflow.
+Run `/skills` to see available bundles, then `/skill use <id>` to select one. For example,
+`/start --skill iot-ble-feature` selects the packaged IoT scene skill for C++ device, HTTP
+server and app work; it is an example, not the CLI default. Join peers with `--role device`,
+`--role server`, `--role ios`, `--role android` or `--role h5` as appropriate.
+
+The master drafts a shared contract, waits for device/server results, then dispatches client
+work with those results. `/skill` shows bindings; `/skill bind <role> <peer|repo>` overrides
+matching. Required unbound roles block dispatch; optional roles are reported skipped.
+`/skill use <id> --default` saves a project default; `/skill off --default` clears it.
+`/intent` stays raw and `/orchestrate off` ignores the active skill. Mode hints never change
+the orchestration mode automatically. Scripts can use `skep session start --skill <id>`;
+a shell attaching to that local master inherits its selection.
+
+Packaged skills are built into Skep. User bundles live in `~/.skep/skills/`
+(`SKEP_SKILLS_HOME` overrides this); project bundles live in `.skep/skills/`, using
+`skill.toml` plus Markdown. Project bundles shadow user and packaged copies and need
+`/skill trust <id>` after review, once per content digest. `/skill show <id>` displays the
+manifest and text; `packaged:<id>` selects a packaged copy explicitly. Skills supply prompt
+text and roles, without changing agent tools or approvals. Peer reports and file lists inform
+the consistency summary; real-device BLE bench testing remains a human follow-up.
 
 ## Quick start
 

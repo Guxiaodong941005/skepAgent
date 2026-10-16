@@ -54,6 +54,8 @@ import {
 } from "../../session/index.js";
 import { intentRollup, itemBlock, itemVerdict } from "../../session/master.js";
 import { BRIEF_MAX } from "../../session/messages.js";
+import type { SkillRoots } from "../../skills/loader.js";
+import { loadSkillDefault, SkillSelectionSchema, skillEnvironment } from "../../skills/settings.js";
 import { type Clock, isoUtc, systemClock } from "../../util/clock.js";
 import { execFileChecked } from "../../util/exec.js";
 import { atomicWrite, safeJoin } from "../../util/fs.js";
@@ -124,6 +126,7 @@ export type { DatalistEntry, MasterHandle, MasterOptions, PlanItem };
 
 export type SessionCliContext = CliContext & {
   sessionApi?: SessionApi;
+  skillRoots?: SkillRoots;
   stdin?: Readable;
   networkInterfaces?: () => NodeJS.Dict<os.NetworkInterfaceInfo[]>;
   /** Directory inside the device's repo (default: `process.cwd()`). Tests point it at a temp repo. */
@@ -246,6 +249,7 @@ export type SessionStatus = z.infer<typeof SessionStatusSchema>;
 const IntentResultSchema = z.strictObject({ intentId: z.string().min(1) });
 
 const SessionFileSchema = z.strictObject({
+  skill: SkillSelectionSchema.optional(),
   listen: z.string().min(1),
   token: z.string().regex(TOKEN_RE),
 });
@@ -2501,6 +2505,7 @@ async function workItemRun(
 // Commands.
 
 export interface StartOptions {
+  skill?: string;
   listen?: string;
   /** `host:port` peers dial, when it differs from the bind address (NAT, relay, public IP). */
   advertise?: string;
@@ -2558,6 +2563,7 @@ export function register(program: Command, ctx: CliContext): void {
     )
     .option("--device <name>", "this device's name (default: hostname)")
     .option("--repo <name>", "the master's repo (default: basename of the git toplevel)")
+    .option("--skill <id>", "activate a skill (default: generic or the project default)")
     .option("--yes", "accept every join without prompting")
     .action(async (opts: StartOptions) => {
       await startCommand(sctx, opts);
@@ -2664,6 +2670,7 @@ export interface StartMasterFlowOptions extends StartOptions {
 }
 
 export interface MasterFlow {
+  readonly skill?: string;
   readonly handle: MasterHandle;
   /** The bind address. */
   readonly listen: string;
@@ -2741,6 +2748,20 @@ export async function startMasterFlow(
   const device = validDevice(opts.device);
   const repo = validRepo(opts.repo ?? (await defaultRepo(ctx)));
 
+  const selection =
+    opts.skill ?? (ctx.paths ? await loadSkillDefault(ctx.paths.deviceToml) : null) ?? "generic";
+  let activeSkill: string | undefined;
+  if (selection !== "generic" && selection !== "packaged:generic") {
+    const environment = await skillEnvironment({
+      cwd: ctx.cwd ?? process.cwd(),
+      env: ctx.env,
+      ...(ctx.paths ? { home: ctx.paths.home } : {}),
+      ...(ctx.skillRoots ? { roots: ctx.skillRoots } : {}),
+    });
+    const loaded = await environment.loader.get(selection);
+    activeSkill = loaded.manifest.id === "generic" ? undefined : selection;
+  }
+
   const file = sessionFilePath(ctx);
   await refuseIfRunning(file);
 
@@ -2785,9 +2806,13 @@ export async function startMasterFlow(
   try {
     listen = listenOf(handle);
     await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
-    await atomicWrite(file, `${JSON.stringify({ listen, token })}\n`, {
-      mode: 0o600,
-    });
+    await atomicWrite(
+      file,
+      `${JSON.stringify({ listen, token, ...(activeSkill ? { skill: activeSkill } : {}) })}\n`,
+      {
+        mode: 0o600,
+      },
+    );
   } catch (error) {
     await handle.close();
     await closed.catch(() => undefined);
@@ -2795,6 +2820,7 @@ export async function startMasterFlow(
   }
   started = true;
   return {
+    ...(activeSkill ? { skill: activeSkill } : {}),
     handle,
     listen,
     advertise: advertised ?? listen,
@@ -2858,8 +2884,18 @@ async function startCommand(ctx: SessionCliContext, opts: StartOptions): Promise
   try {
     const { listen, advertise, repo, device, joinCode, joinCodeExpiresAtMs } = flow;
     output.result(
-      { event: "started", listen, advertise, repo, device, joinCode, joinCodeExpiresAtMs },
-      () => startedText(flow),
+      {
+        event: "started",
+        listen,
+        advertise,
+        repo,
+        device,
+        joinCode,
+        joinCodeExpiresAtMs,
+        ...(flow.skill ? { skill: flow.skill } : {}),
+      },
+      () =>
+        startedText(flow) + (flow.skill ? `skill: ${flow.skill} (local master selection)\n` : ""),
     );
     await flow.closed;
     output.result({ event: "closed" }, () => "session closed\n");
@@ -3710,12 +3746,15 @@ export const INTENT_OUTCOME_UNKNOWN = "intent_outcome_unknown";
 export interface ControlEndpoint {
   listen: string;
   token: string;
+  skill?: string;
 }
 
 /** This device's published master endpoint, or null when no `session.json` exists. */
 export async function readControlEndpoint(ctx: CliContext): Promise<ControlEndpoint | null> {
   const local = await readSessionFile(sessionFilePath(ctx));
-  return local === null ? null : { listen: local.listen, token: local.token };
+  return local === null
+    ? null
+    : { listen: local.listen, token: local.token, ...(local.skill ? { skill: local.skill } : {}) };
 }
 
 /** Sends one control op to the master named in `session.json` and returns its `result`. */

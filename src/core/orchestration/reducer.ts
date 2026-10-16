@@ -18,6 +18,8 @@
  * that could not be sent included.
  */
 
+import type { RoleBinding } from "../skills/compose.js";
+import type { SkillIdentity } from "../skills/schemas.js";
 import type { RefineOutput } from "./schemas.js";
 
 export type OrchestrationMode = "auto" | "confirm" | "off";
@@ -51,10 +53,22 @@ export interface OrchestrationItem {
   peerId?: string;
   /** The received summary (≤4000, redacted on master and peer); absent until a result. */
   summary?: string;
+  changed?: {
+    files: { path: string; change: string; added: number | null; removed: number | null }[];
+    total: number;
+    partial: boolean;
+  };
 }
 
 /** One intent of an orchestration: a target repo with its own brief, or the single brief. */
+export interface StageProgress {
+  id: string;
+  status: "pending" | "active" | "settled";
+}
+
 export interface OrchestrationGroup {
+  stage?: string;
+  roles?: string[];
   /** The target repo; null for the single brief the route (and picker) places. */
   repo: string | null;
   /** Overrides of the top-level title and brief; null uses the top-level one. */
@@ -68,6 +82,11 @@ export interface OrchestrationGroup {
 
 export interface OrchestrationState {
   id: string;
+  skill?: SkillIdentity;
+  contract?: string;
+  bindings?: RoleBinding[];
+  stages?: StageProgress[];
+  skippedRoles?: string[];
   mode: Exclude<OrchestrationMode, "off">;
   phase: OrchestrationPhase;
   userText: string;
@@ -91,20 +110,41 @@ export interface OrchestrationState {
 }
 
 export type OrchestrationEvent =
-  | { type: "refined"; output: RefineOutput }
+  | { type: "refined"; output: RefineOutput; plan?: SkillPlan }
   | { type: "refineFailed"; cause: string }
   | { type: "answered"; text: string }
-  | { type: "confirmed"; brief?: { title: string; text: string } }
+  | {
+      type: "confirmed";
+      brief?: { title: string; text: string };
+      groups?: OrchestrationGroup[];
+      refine?: RefineOutput;
+    }
   | { type: "cancelled" }
   /** One outcome per group, in group order. */
-  | { type: "dispatched"; outcomes: DispatchOutcome[] }
+  | {
+      type: "dispatched";
+      outcomes: DispatchOutcome[];
+      bindings?: RoleBinding[];
+      skippedRoles?: string[];
+    }
   | { type: "dispatchFailed"; cause: string }
   | { type: "itemsChanged"; items: OrchestrationItem[] }
-  | { type: "summarizeNow" }
+  | { type: "summarizeNow"; items?: OrchestrationItem[] }
   | { type: "synthesized"; text: string }
   | { type: "synthFailed"; cause: string };
 
-export type DispatchOutcome = { intentId: string } | { error: string };
+export interface SkillPlan {
+  groups: OrchestrationGroup[];
+  stages: StageProgress[];
+  bindings: RoleBinding[];
+  skippedRoles: string[];
+}
+
+export type DispatchOutcome = ({ intentId: string } | { error: string }) & {
+  brief?: string;
+  title?: string;
+  roles?: string[];
+};
 
 export function startOrchestration(
   id: string,
@@ -179,9 +219,19 @@ export function reduceOrchestration(
         ...state,
         phase: "dispatching",
         brief: event.brief ?? state.brief,
+        groups: event.groups ?? state.groups,
+        refine: event.refine ?? state.refine,
       };
     case "dispatching":
-      if (event.type === "dispatched") return dispatched(state, event.outcomes);
+      if (event.type === "dispatched")
+        return dispatched(
+          {
+            ...state,
+            ...(event.bindings ? { bindings: event.bindings } : {}),
+            ...(event.skippedRoles ? { skippedRoles: event.skippedRoles } : {}),
+          },
+          event.outcomes,
+        );
       if (event.type === "dispatchFailed") {
         return { ...state, phase: "failed", failure: { stage: "dispatch", cause: event.cause } };
       }
@@ -189,7 +239,19 @@ export function reduceOrchestration(
     case "awaiting":
     case "stalled":
       if (event.type === "summarizeNow") {
-        return state.items.length === 0 ? state : { ...state, phase: "synthesizing" };
+        const items = event.items ?? state.items;
+        return items.length === 0
+          ? state
+          : {
+              ...state,
+              items: copyItems(items),
+              phase: "synthesizing",
+              groups: state.groups.map((g) =>
+                g.intentId === null && g.error === null
+                  ? { ...g, error: "not sent: summarized before this stage" }
+                  : g,
+              ),
+            };
       }
       if (event.type !== "itemsChanged") return state;
       return withItems(state, event.items);
@@ -233,27 +295,52 @@ function refining(state: OrchestrationState, event: OrchestrationEvent): Orchest
     refine: output,
     questions: [],
     brief: { title: output.title, text: output.brief },
+    ...(event.plan === undefined
+      ? {}
+      : {
+          bindings: event.plan.bindings,
+          stages: event.plan.stages,
+          skippedRoles: event.plan.skippedRoles,
+          ...(output.contract === undefined ? {} : { contract: output.contract }),
+        }),
     groups:
-      output.targets === undefined || output.targets.length === 0
+      event.plan?.groups ??
+      (output.targets === undefined || output.targets.length === 0
         ? [{ repo: null, title: null, brief: null, intentId: null, error: null }]
         : output.targets.map((target) => ({
-            repo: target.repo,
+            repo: target.repo ?? null,
             title: target.title ?? null,
             brief: target.brief ?? null,
             intentId: null,
             error: null,
-          })),
+          }))),
   };
 }
 
 function dispatched(state: OrchestrationState, outcomes: DispatchOutcome[]): OrchestrationState {
-  const groups = state.groups.map((group, index) => {
+  const sending = dispatchGroups(state);
+  const groups = state.groups.map((group) => {
+    const index = sending.indexOf(group);
+    if (index < 0) return group;
     const outcome = outcomes[index] ?? { error: "not sent" };
+    const sent = {
+      ...group,
+      ...(outcome.brief === undefined ? {} : { brief: outcome.brief }),
+      ...(outcome.title === undefined ? {} : { title: outcome.title }),
+      ...(outcome.roles === undefined ? {} : { roles: [...outcome.roles] }),
+    };
     return "intentId" in outcome
-      ? { ...group, intentId: outcome.intentId, error: null }
-      : { ...group, intentId: null, error: outcome.error };
+      ? { ...sent, intentId: outcome.intentId, error: null }
+      : { ...sent, intentId: null, error: outcome.error };
   });
   const intentIds = groups.flatMap((group) => (group.intentId === null ? [] : [group.intentId]));
+  if (
+    state.stages &&
+    state.stages.length > 0 &&
+    !sending.some((g) => groups[state.groups.indexOf(g)]?.intentId)
+  ) {
+    return advanceStage({ ...state, groups, intentIds });
+  }
   if (intentIds.length === 0) {
     // Nothing reached a peer: the request failed as a whole, with every group's cause.
     const cause = groups
@@ -331,12 +418,44 @@ export function describeOutcome(state: OrchestrationState): string {
 
 function withItems(state: OrchestrationState, items: OrchestrationItem[]): OrchestrationState {
   const next = { ...state, items: copyItems(items) };
-  const progress = itemsProgress(items);
-  if (progress === "settled") return { ...next, phase: "synthesizing" };
+  const current = dispatchGroups(state);
+  const currentIds = current.flatMap((g) => (g.intentId ? [g.intentId] : []));
+  const relevant = items.filter((item) => currentIds.includes(item.intentId));
+  const missing = currentIds.some((id) => !relevant.some((item) => item.intentId === id));
+  const progress = missing ? "running" : itemsProgress(relevant);
+  if (progress === "settled") return advanceStage(next);
   if (progress === "stalled") return { ...next, phase: "stalled" };
   return { ...next, phase: "awaiting" };
 }
 
+/** D36: only the active stage dispatches; no stages preserves the single-wave path. */
+export function dispatchGroups(state: OrchestrationState): OrchestrationGroup[] {
+  const active = state.stages?.find((s) => s.status === "active");
+  return active ? state.groups.filter((g) => g.stage === active.id) : state.groups;
+}
+
+function advanceStage(state: OrchestrationState): OrchestrationState {
+  if (!state.stages?.length) return { ...state, phase: "synthesizing" };
+  const stages = state.stages.map((s) =>
+    s.status === "active" ? { ...s, status: "settled" as const } : { ...s },
+  );
+  for (const stage of stages) {
+    if (stage.status !== "pending") continue;
+    if (!state.groups.some((g) => g.stage === stage.id)) {
+      stage.status = "settled";
+      continue;
+    }
+    stage.status = "active";
+    return { ...state, stages, phase: "dispatching" };
+  }
+  return { ...state, stages, phase: "synthesizing" };
+}
+
 function copyItems(items: readonly OrchestrationItem[]): OrchestrationItem[] {
-  return items.map((item) => ({ ...item }));
+  return items.map((item) => ({
+    ...item,
+    ...(item.changed
+      ? { changed: { ...item.changed, files: item.changed.files.map((file) => ({ ...file })) } }
+      : {}),
+  }));
 }

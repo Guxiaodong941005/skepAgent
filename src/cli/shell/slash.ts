@@ -6,6 +6,7 @@
 export interface ShellCtx {
   /** Prefer hiding session-only commands when false. */
   sessionLive?: boolean;
+  master?: boolean;
 }
 
 export interface SlashCommand {

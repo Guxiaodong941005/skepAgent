@@ -14,6 +14,7 @@ import type {
   OrchestrationMode,
   OrchestrationState,
 } from "../../core/orchestration/reducer.js";
+import { bind, type SkillPeer } from "../../core/skills/compose.js";
 import { Ledger } from "../../orchestrator/ledger.js";
 import { CliMasterAgent, type MasterAgent } from "../../orchestrator/master-agent.js";
 import { Orchestrator } from "../../orchestrator/orchestrator.js";
@@ -24,6 +25,7 @@ import {
 } from "../../orchestrator/settings.js";
 import type { MasterEvent } from "../../session/index.js";
 import { itemVerdict } from "../../session/master.js";
+import { skillEnvironment } from "../../skills/settings.js";
 import { type Clock, systemClock } from "../../util/clock.js";
 import { execFileChecked } from "../../util/exec.js";
 import { cryptoRandom } from "../../util/random.js";
@@ -84,6 +86,7 @@ import {
   QUIET_AFTER_MS,
   SessionController,
 } from "./session-controller.js";
+import { ShellSkills } from "./skills.js";
 import {
   findCommand,
   matchCommands,
@@ -198,6 +201,11 @@ export class Shell {
   private cancelJoin: (() => void) | null = null;
   /** How free text is handled (`[orchestrate] mode`, default auto; plan §3.5). */
   private mode: OrchestrationMode = "auto";
+  private skills: ShellSkills | null = null;
+  private skillsLoading: Promise<ShellSkills> | null = null;
+  private activeSkillId = "generic";
+  private activeSkillRoles: import("../../core/skills/schemas.js").SkillRole[] = [];
+  private activeManual: import("../../core/skills/compose.js").ManualBindings = {};
   private readonly modeLoaded: Promise<void>;
   /** Created on the first orchestrated request: it resolves the master agent CLI. */
   private orchestrator: Orchestrator | null = null;
@@ -282,6 +290,9 @@ export class Shell {
     this.screen.start();
     this.listen();
     this.sync();
+    void this.ensureSkills().catch((error: unknown) =>
+      this.log(`skill setting: ${errorMessage(error)}`, "error"),
+    );
     void this.probeExternal();
     return this.finished;
   }
@@ -552,14 +563,85 @@ export class Shell {
    */
   private async freeText(text: string): Promise<SlashResult> {
     await this.modeLoaded;
-    if (this.mode === "off") return this.sendIntent(text);
+    if (this.mode === "off") {
+      await this.ensureSkills();
+      if (this.activeSkillId !== "generic")
+        this.log(`skill ${this.activeSkillId} is inactive while /orchestrate is off`, "muted");
+      return this.sendIntent(text);
+    }
     // Nothing to send to means no reason to spend a master agent turn.
     const route = this.session.intentRoute();
     if (route.kind === "refused") return { type: "error", message: route.message };
     const orchestrator = await this.ensureOrchestrator();
-    orchestrator.start(text, this.mode);
+    const skills = await this.ensureSkills();
+    const skill = await skills.context();
+    orchestrator.start(text, this.mode, skill);
     this.sync();
     return { type: "ok" };
+  }
+
+  private skillPeers(): SkillPeer[] {
+    const status = this.session.ownMaster?.handle.status() ?? this.session.externalStatus;
+    return this.session.snapshot().peers.map((p) => ({
+      peerId: p.peerId,
+      device: p.device,
+      role: p.role,
+      ...(p.repo === undefined ? {} : { repo: p.repo }),
+      protocolVersion: status?.peers.find((entry) => entry.peerId === p.peerId)?.protocol ?? 1,
+    }));
+  }
+  private get skillBindings() {
+    return bind(this.activeSkillRoles, this.skillPeers(), this.activeManual);
+  }
+  private async ensureSkills(): Promise<ShellSkills> {
+    if (this.skillsLoading) return this.skillsLoading;
+    this.skillsLoading = (async () => {
+      const environment = await skillEnvironment({
+        cwd: this.ctx.cwd ?? process.cwd(),
+        env: this.ctx.env,
+        ...(this.ctx.paths ? { home: this.ctx.paths.home } : {}),
+        ...(this.ctx.skillRoots ? { roots: this.ctx.skillRoots } : {}),
+      });
+      const skills = new ShellSkills(
+        environment.loader,
+        environment.trust,
+        this.ctx.paths?.deviceToml,
+        () => this.skillPeers(),
+      );
+      await skills.initialize();
+      this.skills = skills;
+      try {
+        await this.refreshSkill();
+      } catch (error) {
+        this.log(`skill setting: ${errorMessage(error)}`, "error");
+      }
+      return skills;
+    })();
+    try {
+      return await this.skillsLoading;
+    } catch (error) {
+      this.skillsLoading = null;
+      throw error;
+    }
+  }
+  private async refreshSkill(): Promise<void> {
+    const context = await this.skills?.context(false);
+    this.activeSkillId = context?.skill.manifest.id ?? "generic";
+    this.activeSkillRoles = context?.skill.manifest.roles ?? [];
+    this.activeManual = context?.manual ?? {};
+    this.sync();
+  }
+  private async skillCommand(args: string): Promise<SlashResult> {
+    await this.modeLoaded;
+    const skills = await this.ensureSkills();
+    const view = this.session.snapshot();
+    const message = await skills.command(
+      args,
+      this.mode,
+      view.mode !== "joined" && view.mode !== "joining",
+    );
+    await this.refreshSkill();
+    return { type: "ok", message };
   }
 
   private async ensureOrchestrator(): Promise<Orchestrator> {
@@ -585,13 +667,7 @@ export class Shell {
       agent,
       clock: this.clock,
       ledger: home === undefined ? null : Ledger.at(home),
-      peers: () =>
-        this.session.snapshot().peers.map((peer) => ({
-          peerId: peer.peerId,
-          device: peer.device,
-          role: peer.role,
-          ...(peer.repo === undefined ? {} : { repo: peer.repo }),
-        })),
+      peers: () => this.skillPeers(),
       dispatch: async (brief, repos) => {
         // Target repos skip the picker, as `/intent --repo` does (ORCH-7 per-repo briefs).
         const sent = await this.deliverIntent(brief, repos);
@@ -649,7 +725,12 @@ export class Shell {
           repo: item.repo,
           ...(device === undefined ? {} : { device }),
           peerId: item.assignee,
-          ...(item.result === undefined ? {} : { summary: item.result.summary }),
+          ...(item.result === undefined
+            ? {}
+            : {
+                summary: item.result.summary,
+                ...(item.result.changed ? { changed: item.result.changed } : {}),
+              }),
         });
       }
     }
@@ -894,9 +975,21 @@ export class Shell {
     const live = (ctx: ShellCtx): boolean => ctx.sessionLive === true;
     return [
       {
+        name: "skills",
+        description: "list packaged, user and project skills",
+        run: async () => ({ type: "ok", message: await (await this.ensureSkills()).list() }),
+      },
+      {
+        name: "skill",
+        description: "select a skill, inspect roles, bind peers or trust project text",
+        usage: "[use|off|bind|unbind|show|trust]",
+        visible: (ctx) => ctx.master === true,
+        run: (_ctx, args) => this.skillCommand(args),
+      },
+      {
         name: "start",
         description: "start a local session master",
-        usage: "[--listen host:port] [--advertise host:port] [--repo name] [--yes]",
+        usage: "[--listen host:port] [--advertise host:port] [--repo name] [--yes] [--skill id]",
         run: (_ctx, args) => this.startCommand(args),
       },
       {
@@ -1077,9 +1170,15 @@ export class Shell {
         message: `a master already runs here (code ${own.joinCode ?? "none"})`,
       };
     }
-    const flags = parseFlags(args, ["listen", "advertise", "repo", "device"], ["yes"]);
+    const flags = parseFlags(args, ["listen", "advertise", "repo", "device", "skill"], ["yes"]);
+    if (flags.positional.length) return { type: "error", message: "unexpected /start arguments" };
+    const skills = await this.ensureSkills();
+    if (flags.values.skill !== undefined) await skills.use(flags.values.skill);
+    const selected = await skills.context();
+    await this.refreshSkill();
     const { listen, advertise, repo, device } = flags.values;
     const flow = await startMasterFlow(this.ctx, {
+      skill: skills.selection,
       ...(listen === undefined ? {} : { listen }),
       ...(advertise === undefined ? {} : { advertise }),
       ...(repo === undefined ? {} : { repo }),
@@ -1102,9 +1201,18 @@ export class Shell {
       (error: unknown) => this.masterEnded(flow, `session closed: ${errorMessage(error)}`),
     );
     this.sync();
+    const tip = await skills.tip();
     return {
       type: "ok",
-      message: `${startedText(flow)}${GOAL_HINT}`,
+      message:
+        `${startedText(flow)}${GOAL_HINT}` +
+        (selected
+          ? `\n${await skills.command("", this.mode, true)}` +
+            (selected.skill.manifest.mode_hint && selected.skill.manifest.mode_hint !== this.mode
+              ? `\nthis skill suggests /orchestrate ${selected.skill.manifest.mode_hint} for review before dispatch`
+              : "")
+          : "") +
+        (tip ? `\n${tip}` : ""),
     };
   }
 
@@ -1630,7 +1738,14 @@ export class Shell {
     const file = this.ctx.paths?.deviceToml;
     if (file !== undefined) await saveOrchestrationMode(file, mode);
     const saved = file === undefined ? "" : `; saved in ${file}`;
-    return { type: "ok", message: `orchestration mode: ${mode}${saved}` };
+    return {
+      type: "ok",
+      message:
+        `orchestration mode: ${mode}${saved}` +
+        (mode === "off" && this.activeSkillId !== "generic"
+          ? `\nskill ${this.activeSkillId} is inactive while /orchestrate is off`
+          : ""),
+    };
   }
 
   private orchestratorInfo(): string {
@@ -1700,16 +1815,27 @@ export class Shell {
   // Session state → header and bee footer.
 
   private shellCtx(): ShellCtx {
-    return { sessionLive: this.session.snapshot().live };
+    return {
+      sessionLive: this.session.snapshot().live,
+      master: ["master", "external"].includes(this.session.snapshot().mode),
+    };
   }
 
   /** Copies the controller's snapshot into the model: header, peers, footer, slash gating. */
   sync(): void {
     const view = this.session.snapshot();
     this.model.orchestration = this.orchestrationLine();
-    this.model.header = { ...this.model.header, session: view.live ? view.label : "no session" };
+    this.model.header = {
+      ...this.model.header,
+      session: view.live ? view.label : "no session",
+      skill: this.activeSkillId,
+    };
     this.model.sessionLive = view.live;
-    this.model.peers = view.peers;
+    const bindings = this.skills && this.activeSkillId !== "generic" ? this.skillBindings : [];
+    this.model.peers = view.peers.map((p) => {
+      const labels = bindings.filter((b) => b.peerId === p.peerId).map((b) => b.role);
+      return labels.length ? { ...p, skillRole: labels.join("+") } : p;
+    });
     this.recordTimeline(view.peers);
     this.model.link =
       view.linkSilentMs === null ? null : linkText(view.linkSilentMs, this.model.glyphs);
@@ -1782,6 +1908,15 @@ export class Shell {
     const before = this.session.externalMaster;
     if (!this.session.applyProbe(generation, found)) return;
     if (found !== null && (before === null || !sameEndpoint(before.endpoint, found.endpoint))) {
+      if (found.endpoint.skill) {
+        try {
+          const skills = await this.ensureSkills();
+          skills.selection = found.endpoint.skill;
+          await this.refreshSkill();
+        } catch (error) {
+          this.log(`session skill: ${errorMessage(error)}`, "error");
+        }
+      }
       const status = found.status;
       this.log(
         `a session master runs in another process on this device (${status.sessionId} at ` +
@@ -1884,6 +2019,7 @@ export class Shell {
     this.model.question = null;
     this.closePicker(false);
     const problems: string[] = [];
+    await this.skillsLoading?.catch((error: unknown) => problems.push(errorMessage(error)));
     const join = this.session.ownJoin;
     const master = this.session.ownMaster;
     if (join !== null) await join.close().catch((error) => problems.push(errorMessage(error)));
@@ -2006,7 +2142,7 @@ function itemFold(message: string): { fold?: string } {
 function historyEntry(id: string, state: OrchestrationState): string {
   const request = state.userText.replace(/\s+/g, " ").slice(0, 70);
   const intents = state.intentIds.length === 0 ? "" : ` → ${state.intentIds.join(", ")}`;
-  return `  ${id}  ${state.phase}${intents}  ${request}`;
+  return `  ${id}  ${state.phase}${intents}${state.skill ? `  skill: ${state.skill.skillId}` : ""}  ${request}`;
 }
 
 function linkText(silentMs: number, glyphs: string): string {

@@ -283,3 +283,65 @@ describe("RefineOutputSchema", () => {
     expect(briefText("Title", "Body")).toBe("Title\n\nBody");
   });
 });
+
+describe("skill stage reducer (D36)", () => {
+  it("replays deterministically without mutating state, including empty and failed stages", () => {
+    const initial = startOrchestration("O-staged", "feature", "auto");
+    const output = { title: "Feature", brief: "Implement", contract: "Contract" };
+    const groups = [
+      {
+        repo: "api",
+        title: "Provider",
+        brief: "Brief",
+        stage: "providers",
+        intentId: null,
+        error: null,
+      },
+      {
+        repo: "app",
+        title: "Client",
+        brief: "Brief",
+        stage: "clients",
+        intentId: null,
+        error: null,
+      },
+    ];
+    const events: OrchestrationEvent[] = [
+      {
+        type: "refined",
+        output,
+        plan: {
+          groups,
+          bindings: [],
+          skippedRoles: [],
+          stages: [
+            { id: "contract", status: "settled" },
+            { id: "providers", status: "active" },
+            { id: "empty", status: "pending" },
+            { id: "clients", status: "pending" },
+          ],
+        },
+      },
+      { type: "dispatched", outcomes: [{ error: "provider offline" }] },
+      {
+        type: "dispatched",
+        outcomes: [{ intentId: "client-intent", brief: "Contract plus untrusted earlier failure" }],
+      },
+      {
+        type: "itemsChanged",
+        items: [{ intentId: "client-intent", itemId: "I-2", verdict: "done", repo: "app" }],
+      },
+      { type: "synthesized", text: "Provider failed; client used mocks" },
+    ];
+    const before = JSON.stringify(initial);
+    const one = events.reduce(reduceOrchestration, initial);
+    const two = events.reduce(reduceOrchestration, initial);
+    expect(JSON.stringify(initial)).toBe(before);
+    expect(one).toEqual(two);
+    expect(JSON.parse(JSON.stringify(one))).toEqual(one);
+    expect(one.groups[0]?.error).toBe("provider offline");
+    expect(one.groups[1]?.brief).toContain("untrusted earlier failure");
+    expect(one.stages?.map((s) => s.status)).toEqual(["settled", "settled", "settled", "settled"]);
+    expect(one.phase).toBe("done");
+  });
+});

@@ -3440,3 +3440,39 @@ describe("SESSION-UX fix round 2 (R10-R11)", () => {
     expect(await gitIn(box.repo, ["rev-parse", "HEAD"], box.env)).toBe(head);
   });
 });
+
+describe("session start skill selection (SKILL-MVP)", () => {
+  it("accepts --skill without changing session wire options and publishes the local selection", async () => {
+    const dir = await home();
+    const fake = fakeApi();
+    const io = capture(dir, { sessionApi: fake.api, cwd: dir });
+    const running = runCli(
+      ["session", "start", "--yes", "--repo", "app", "--skill", "iot-ble-feature"],
+      io.ctx,
+    );
+    try {
+      await vi.waitFor(() => expect(fake.calls.master).toHaveLength(1));
+      await vi.waitFor(() => expect(io.stdout).toContain("skill: iot-ble-feature"));
+      expect(fake.calls.master[0]).not.toHaveProperty("skill");
+      expect(JSON.parse(await readFile(path.join(dir, "session.json"), "utf8")).skill).toBe(
+        "iot-ble-feature",
+      );
+    } finally {
+      fake.closed.resolve();
+    }
+    expect(await running).toBe(0);
+  });
+  it("refuses an unknown skill before opening a listener", async () => {
+    const dir = await home();
+    const fake = fakeApi();
+    const io = capture(dir, { sessionApi: fake.api, cwd: dir });
+    expect(
+      await runCli(
+        ["session", "start", "--yes", "--repo", "app", "--skill", "missing-skill"],
+        io.ctx,
+      ),
+    ).not.toBe(0);
+    expect(fake.calls.master).toHaveLength(0);
+    expect(io.stderr).toContain("unknown skill missing-skill");
+  });
+});
