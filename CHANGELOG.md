@@ -11,6 +11,30 @@ protocol rules ([`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §4.4) apply to t
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-16
+
+Skills: trusted bundles and staged dispatch ([`docs/plans/skep-skills-iot-workflow.md`](docs/plans/skep-skills-iot-workflow.md), D36).
+
+### Added
+
+* **Skills (SKILL-MVP).** Packaged TypeScript skill modules plus on-disk user (`~/.skep/skills/`)
+  and project (`.skep/skills/`) bundles. A skill supplies scene-fit prompts, roles, optional
+  stages and checks; it does not change agent tools, approvals or session wire fields.
+* **Selection.** `/skills`, `/skill use|off|bind|unbind|show|trust`, `/start --skill <id>`,
+  and `skep session start --skill <id>`. Project skills require `/skill trust` once per
+  SHA-256 content digest. `/skill use <id> --default` saves a project default.
+* **Staged dispatch.** When a skill defines stages, the master settles each stage before the
+  next (earlier results and changed-file lists appended as untrusted context). An empty stage
+  list keeps single-wave dispatch. Required unbound roles block dispatch; optional roles are
+  reported skipped.
+* **Example skill `iot-ble-feature`.** Roles `device` / `server` (required) and `ios` /
+  `android` / `h5` (optional); stages `contract → providers → clients`. Not the CLI default.
+
+### Changed
+
+* **CLI default skill remains `generic`**, equivalent to v0.1.15 refine and dispatch. `/intent`
+  stays raw; `/orchestrate off` ignores the active skill.
+
 ## [0.1.15] - 2026-10-14
 
 License-only republish; no product feature, CLI, config or protocol changes.
@@ -520,7 +544,8 @@ creates the npm org `skepagent` and explicitly says go. See [`docs/RELEASE.md`](
 * Manual lease revoke; no auto-merge. The human holds plan approval, escalation decisions and
   merges.
 
-[Unreleased]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.15...HEAD
+[Unreleased]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.15...v0.2.0
 [0.1.15]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.14...v0.1.15
 [0.1.14]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.13...v0.1.14
 [0.1.13]: https://github.com/Guxiaodong941005/skepAgent/compare/v0.1.12...v0.1.13

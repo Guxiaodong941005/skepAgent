@@ -2,8 +2,29 @@
 
 This document records the package-name decision (v0.1.0), the npm registry re-check, the
 v0.1.0 checklist, the v0.1.1 session-TUI notes, the v0.1.5 peer-progress and TUI notes, the
-v0.1.8 join-UX notes, the v0.1.9 per-project isolation notes, the v0.1.10 SAME-CB notes, the v0.1.11 SESSION-UX notes, the v0.1.12 JOIN-SLIM notes, the v0.1.13 INTENT-PEER notes, the v0.1.14 ORCH/SCROLL notes, the v0.1.15 license republish notes, and the steps the orchestrator runs. Task agents must not `git push`,
+v0.1.8 join-UX notes, the v0.1.9 per-project isolation notes, the v0.1.10 SAME-CB notes, the v0.1.11 SESSION-UX notes, the v0.1.12 JOIN-SLIM notes, the v0.1.13 INTENT-PEER notes, the v0.1.14 ORCH/SCROLL notes, the v0.1.15 license republish notes, the v0.2.0 Skills notes, and the steps the orchestrator runs. Task agents must not `git push`,
 create tags, or `npm publish`.
+
+## v0.2.0 — Skills (2026-10-16)
+
+Skills MVP on `main` via PR #4 (`0a14d30`). Package name stays **`@skepagent/skep`** (public).
+The published bin is `skep`.
+
+What this tag adds on top of v0.1.15 (details in [`../CHANGELOG.md`](../CHANGELOG.md)):
+
+* **Trusted skill bundles**: packaged TS modules, user and project on-disk skills, digest trust.
+* **CLI**: `/skills`, `/skill …`, `/start --skill`, `skep session start --skill`; default skill
+  remains `generic`.
+* **Staged dispatch** when a skill defines stages; example packaged skill `iot-ble-feature`.
+* Site skepagent.com updated to a skills-first narrative (IoT BLE as featured example).
+
+Install:
+
+```bash
+npm install -g @skepagent/skep@0.2.0
+```
+
+---
 
 ## v0.1.15 — Apache-2.0 on npm (2026-10-14)
 

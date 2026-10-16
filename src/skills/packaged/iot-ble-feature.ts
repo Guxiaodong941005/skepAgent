@@ -62,7 +62,7 @@ export const iotBleFeature: SkillSource = {
     version: "1.0.0",
     description: "One feature across the C++ device layer, HTTP server and selected apps.",
     tags: ["iot", "ble", "multi-stack"],
-    min_skep: "0.1.15",
+    min_skep: "0.2.0",
     mode_hint: "confirm",
     master: { guidance: "master.md", contract: "contract.md", synthesis: "synthesis.md" },
     roles: [
