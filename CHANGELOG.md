@@ -11,6 +11,46 @@ protocol rules ([`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §4.4) apply to t
 
 ## [Unreleased]
 
+## 0.3.0 — Reach & Recovery
+
+### Added
+
+* **Recovery commands.** `/retry <item|intent|O-id> [--peer peer-N]` reuses the original brief
+  on a connected peer with the same repo/role binding. `/skip <O-id>` deliberately releases a
+  held stage, naming skipped/lost roles in later briefs and synthesis. Retry attempts retain
+  earlier outcomes in the orchestration ledger.
+* **SSH reach.** `skep session start|join --via-ssh [user@]host` and `/start`, `/join`
+  equivalents. Join uses `ssh -W`; start allocates a remote loopback port with `ssh -N -R`.
+  Printed join lines include the tunnel destination; approval and peer lists label “via ssh”.
+* **Offline reports.** `skep session report [O-id|--last N] [--json]` and `/report` export the
+  existing orchestration ledger as Markdown or validated JSON: request, briefs, skill/contract,
+  stages, per-peer results, lost/skipped outcomes, changed files and synthesis.
+* **Per-peer targeting.** Optional `peerIds` on intents keeps separate role briefs for peers
+  sharing a repo. Existing protocol v1/v2 peers remain usable; older peers receive the original
+  wire shape. Master prompt version is now 5.
+
+### Changed
+
+* **Staged runs now hold at `awaiting-retry` when a required role is lost**, instead of
+  advancing to dependent work. The shell prints `/retry` and `/skip` guidance.
+* Dropped assignees show as **lost** in rollups, `/status` and synthesis, while the wire retains
+  `failed`. Peers with running items get one scrollback warning at 20 seconds of silence, before
+  the 30-second drop.
+* On link loss, the peer aborts its agent, keeps the checkout and prints its path and item state.
+  Native agent runs now receive the join's abort signal too.
+* Architecture §6 is marked historical (git event log/leases removed in v0.1.2). Issue replies
+  are local drafts only.
+
+### Known limitations
+
+* `/retry` may redo work if a peer judged **lost** had actually finished. A late result from the
+  old peerId is rejected; session resume in a later release fixes this properly.
+* Retry runs in the shell owning the live master, using already advertised repo/role bindings;
+  there is no session resume, automatic reconnect, or keep-running mode on disconnection.
+* Reports cover the ledger only: raw intents and join/leave events are not persisted. No HTML
+  report or session JSONL is added. Hosted relay, TURN/STUN, hole-punching and Windows are out.
+* Optional follow-up injection and skill authoring commands are deferred.
+
 ## [0.2.0] - 2026-10-16
 
 Skills: trusted bundles and staged dispatch ([`docs/plans/skep-skills-iot-workflow.md`](docs/plans/skep-skills-iot-workflow.md), D36).

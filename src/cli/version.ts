@@ -4,4 +4,4 @@
  * suffix so they are distinguishable from the last published release. The release task sets
  * this to the version in `package.json`; session protocol negotiation uses its own version.
  */
-export const SKEP_VERSION = "0.2.0";
+export const SKEP_VERSION = "0.3.0";
