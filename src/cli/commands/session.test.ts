@@ -7,6 +7,7 @@ import { Duplex, PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { fakeSsh } from "../../../test/helpers/fake-ssh.js";
 import { skepHome, skepPaths } from "../../config/paths.js";
 import type { Notification } from "../../notify/ntfy.js";
 import { connectSub, ListenAddressError, startMaster } from "../../session/index.js";
@@ -56,6 +57,8 @@ import {
   selectAgentView,
   serialQueue,
   setJoinViewFactory,
+  startedText,
+  startMasterFlow,
   summaryTail,
   undoItem,
   workItem,
@@ -2061,6 +2064,45 @@ describe("agent resolution at join", () => {
 });
 
 describe("items on one peer run strictly one at a time", () => {
+  it("aborts on link loss, keeps the checkout, and prints its path and item state", async () => {
+    const box = await sandbox();
+    const marker = path.join(box.repo, "agent-started");
+    await stubAgent(box, "claude", `printf started > "${marker}"\nexec ${realSleep} 30`);
+    const fake = fakeApi();
+    const open = deferred();
+    const connect = fake.api.connectSub;
+    fake.api.connectSub = async (options) => ({
+      ...(await connect(options)),
+      closed: open.promise.then(() => ({ reason: "heartbeat_timeout" })),
+      close: async () => open.resolve(),
+    });
+    const c = capture(box.home, {
+      env: box.env,
+      cwd: box.repo,
+      sessionApi: fake.api,
+      paths: skepPaths(box.env.SKEP_HOME ?? ""),
+    });
+    const shown: string[] = [];
+    const flow = await joinSessionFlow(
+      c.ctx,
+      { code: "123456789012", host: "h:1", repo: "app", role: "coding", submit: "none" },
+      {
+        say: (_data, human) => shown.push(human()),
+        ask: async () => null,
+        warn: () => {},
+        createView: () => recordingView().view,
+      },
+    );
+    const pending = fake.calls.sub[0]?.onItem(ITEM);
+    await vi.waitFor(async () => expect((await stat(marker)).isFile()).toBe(true));
+    open.resolve();
+    await flow.closed;
+    await pending;
+    expect(shown.join("\n")).toContain(`Checkout kept at ${box.repo}`);
+    expect(shown.join("\n")).toContain(`Item state at disconnect: ${ITEM.itemId}:`);
+    expect((await stat(box.repo)).isDirectory()).toBe(true);
+  });
+
   it("a second item waits for the first agent to exit", async () => {
     const box = await sandbox();
     const order = path.join(box.env.HOME ?? "", "order.log");
@@ -3475,4 +3517,133 @@ describe("session start skill selection (SKILL-MVP)", () => {
     expect(fake.calls.master).toHaveLength(0);
     expect(io.stderr).toContain("unknown skill missing-skill");
   });
+});
+
+describe("SSH session flows (no real SSH/network)", () => {
+  it("publishes the reverse end with --via-ssh, labels approval, and kills SSH on close", async () => {
+    const fake = fakeApi();
+    const ssh = fakeSsh({ reversePort: 41234 });
+    const root = await home();
+    const c = capture(root, { paths: skepPaths(root), sessionApi: fake.api, sshSpawn: ssh.spawn });
+    const acceptJoin = vi.fn(async () => true);
+    const flow = await startMasterFlow(c.ctx, { repo: "app", viaSsh: "user@gateway", acceptJoin });
+    expect(startedText(flow)).toContain("127.0.0.1:41234 --via-ssh user@gateway");
+    await fake.calls.master[0]?.acceptJoin({
+      device: "peer",
+      address: "127.0.0.1",
+      family: "IPv4",
+      fingerprint: "abc",
+    });
+    expect(acceptJoin).toHaveBeenCalledWith(expect.objectContaining({ viaSsh: "user@gateway" }));
+    await flow.close();
+    expect(ssh.process.kill).toHaveBeenCalledOnce();
+    expect(await readControlEndpoint(c.ctx)).toBeNull();
+  });
+  it("uses the tunnel stream and kills SSH when the peer flow ends", async () => {
+    const box = await sandbox();
+    const fake = fakeApi();
+    const ssh = fakeSsh();
+    const open = deferred();
+    const connect = fake.api.connectSub;
+    fake.api.connectSub = async (opts) => ({
+      ...(await connect(opts)),
+      closed: open.promise.then(() => ({ reason: "test" })),
+      close: async () => open.resolve(),
+    });
+    const c = capture(box.home, {
+      env: box.env,
+      cwd: box.repo,
+      paths: skepPaths(box.home),
+      sessionApi: fake.api,
+      sshSpawn: ssh.spawn,
+    });
+    const flow = await joinSessionFlow(
+      c.ctx,
+      {
+        host: "remote:7419",
+        code: "123456789012",
+        repo: "app",
+        role: "coding",
+        viaSsh: "gateway",
+        view: "dry",
+      },
+      {
+        say: () => {},
+        ask: async () => null,
+        warn: () => {},
+        createView: () => recordingView().view,
+      },
+    );
+    expect(fake.calls.sub[0]?.stream).toBeDefined();
+    expect(fake.calls.sub[0]?.target).toBeUndefined();
+    await flow.close();
+    expect(ssh.process.kill).toHaveBeenCalledOnce();
+  });
+  it("closes an already bound master if SSH authentication fails", async () => {
+    const fake = fakeApi();
+    const ssh = fakeSsh({ stderr: "Permission denied", exit: 255 });
+    const root = await home();
+    const c = capture(root, { paths: skepPaths(root), sessionApi: fake.api, sshSpawn: ssh.spawn });
+    await expect(
+      startMasterFlow(c.ctx, { repo: "app", viaSsh: "gateway", acceptJoin: async () => true }),
+    ).rejects.toThrow("SSH authentication failed");
+    await fake.closed.promise;
+  });
+});
+
+describe("SSH reverse lifecycle", () => {
+  it("closes the session and removes its control file if SSH exits after startup", async () => {
+    const fake = fakeApi();
+    const ssh = fakeSsh({ reversePort: 41234 });
+    const root = await home();
+    const c = capture(root, { paths: skepPaths(root), sessionApi: fake.api, sshSpawn: ssh.spawn });
+    const events: string[] = [];
+    const flow = await startMasterFlow(c.ctx, {
+      repo: "app",
+      viaSsh: "gateway",
+      acceptJoin: async () => true,
+      onEvent: (e) => events.push(e.message),
+    });
+    ssh.process.emit("close", 255, null);
+    await flow.closed;
+    expect(events.join("\n")).toContain("SSH tunnel exited 255");
+    expect(await readControlEndpoint(c.ctx)).toBeNull();
+  });
+});
+
+it("keeps SSH authentication errors when the join stream closes before the process close event", async () => {
+  const box = await sandbox();
+  const fake = fakeApi();
+  const ssh = fakeSsh();
+  fake.api.connectSub = async () => {
+    ssh.process.stderr.write("Permission denied (publickey)");
+    throw new Error("Connection closed during join");
+  };
+  const c = capture(box.home, {
+    env: box.env,
+    cwd: box.repo,
+    paths: skepPaths(box.home),
+    sessionApi: fake.api,
+    sshSpawn: ssh.spawn,
+  });
+  await expect(
+    joinSessionFlow(
+      c.ctx,
+      {
+        host: "remote:7419",
+        code: "123456789012",
+        repo: "app",
+        role: "coding",
+        viaSsh: "gateway",
+        view: "dry",
+      },
+      {
+        say: () => {},
+        ask: async () => null,
+        warn: () => {},
+        createView: () => recordingView().view,
+      },
+    ),
+  ).rejects.toThrow("SSH authentication failed");
+  expect(ssh.process.kill).toHaveBeenCalledOnce();
 });

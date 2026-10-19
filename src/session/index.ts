@@ -63,7 +63,12 @@ export interface MasterHandle {
   readonly address: { host: string; port: number } | null;
   readonly sessionId: string;
   status(): SessionStatus;
-  submitIntent(text: string, repos?: string[]): Promise<{ intentId: string }>;
+  submitIntent(text: string, repos?: string[], peerIds?: string[]): Promise<{ intentId: string }>;
+  itemIdentity?(itemId: string): { device: string; role: string } | null;
+  retryItem?(
+    itemId: string,
+    peerId?: string,
+  ): Promise<{ itemId: string; intentId: string; peerId?: string }>;
   /**
    * Milliseconds since each connected peer was last heard from (heartbeats included). Optional
    * only so hand-written test doubles still type; `startMaster` always provides it.

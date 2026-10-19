@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { controlRequest } from "../cli/commands/session.js";
 import type { Clock } from "../util/clock.js";
 import { type MasterHandle, type SubHandle, startMaster } from "./index.js";
+import { itemVerdict } from "./master.js";
 import { connectSub } from "./sub.js";
 
 const TOKEN = "b".repeat(32);
@@ -28,6 +29,12 @@ class ManualClock implements Clock {
       );
     });
   }
+  fire(): void {
+    const due = this.sleepers.filter((s) => s.at <= this.now);
+    this.sleepers = this.sleepers.filter((s) => s.at > this.now);
+    for (const s of due) s.resolve();
+  }
+
   /** Moves time without firing sleepers, so no heartbeat is sent or missed. */
   skip(ms: number): void {
     this.now += ms;
@@ -58,7 +65,7 @@ async function setup(subRepo = "app", masterRepo = "app") {
     progressIntervalMs: 0,
   });
   masters.push(master);
-  const join = async (repo = subRepo): Promise<SubHandle> => {
+  const join = async (repo = subRepo, role = "coding"): Promise<SubHandle> => {
     const count = master.status().peers.length;
     const code = master.status().joinCode;
     if (code === null || master.address === null) throw new Error("master has no join code");
@@ -66,8 +73,10 @@ async function setup(subRepo = "app", masterRepo = "app") {
       target: { host: "127.0.0.1", port: master.address.port },
       code,
       device: "vps",
+      repo,
+      role,
       clock,
-      describe: async () => ({ repo, head: "c".repeat(40), role: "coding" }),
+      describe: async () => ({ repo, head: "c".repeat(40), role }),
       collectDatalist: async (repo) => {
         datalistRepos.push(repo);
         return [];
@@ -76,7 +85,11 @@ async function setup(subRepo = "app", masterRepo = "app") {
       progressIntervalMs: 0,
     });
     subs.push(sub);
-    await until(() => master.status().peers.length === count + 1);
+    await until(
+      () =>
+        master.status().peers.length === count + 1 &&
+        master.status().peers.some((p) => p.peerId === sub.peerId && p.repo === repo),
+    );
     return sub;
   };
   return { clock, events, master, join, datalistRepos };
@@ -217,4 +230,66 @@ describe("lone peer routing (INTENT-PEER)", () => {
       expect.objectContaining({ repo: "api", assignee: "peer-1" }),
     ]);
   });
+});
+
+describe("lost work recovery", () => {
+  it("derives lost without changing wire state and retries the original brief on a new peer", async () => {
+    const { master, join } = await setup();
+    const old = await join();
+    await master.submitIntent("Original brief: implement the health check", ["app"]);
+    await until(() => master.status().intents[0]?.items[0]?.state === "claimed");
+    await old.close();
+    await until(() => master.status().peers.length === 0);
+    const lost = master.status().intents[0]?.items[0];
+    expect(lost?.state).toBe("failed");
+    if (!lost) throw new Error("missing lost item");
+    expect(itemVerdict(lost)).toBe("lost");
+    await expect(master.retryItem?.("I-1")).rejects.toThrow("No connected peer");
+    const replacement = await join();
+    expect(await master.retryItem?.("I-1")).toEqual({
+      itemId: "I-1",
+      intentId: "intent-2",
+      peerId: replacement.peerId,
+    });
+    await until(() => master.status().intents[1]?.items[0]?.state === "claimed");
+    expect(master.status().intents[1]?.text).toBe(master.status().intents[0]?.text);
+    expect(master.status().intents[1]?.items[0]?.assignee).toBe(replacement.peerId);
+    await expect(master.retryItem?.("I-1")).rejects.toThrow("already has a retry");
+    await expect(master.retryItem?.("I-2")).rejects.toThrow("not a lost or failed");
+  });
+
+  it.each([false, true])("warns once at 20 s only with running items: %s", async (running) => {
+    const { clock, master, join, events } = await setup();
+    await join();
+    if (running) {
+      await master.submitIntent("Work", ["app"]);
+      await until(() => master.status().intents[0]?.items[0]?.state === "claimed");
+    }
+    clock.skip(20_000);
+    clock.fire();
+    await until(() => (running ? events.some((e) => e.kind === "quiet") : true));
+    await new Promise<void>((r) => setImmediate(r));
+    expect(events.filter((e) => e.kind === "quiet")).toHaveLength(running ? 1 : 0);
+    expect(master.status().peers).toHaveLength(1);
+    clock.skip(20_000);
+    clock.fire();
+    await new Promise<void>((r) => setImmediate(r));
+    expect(events.filter((e) => e.kind === "quiet")).toHaveLength(running ? 1 : 0);
+  });
+});
+
+it("retry enforces the original role and an explicit replacement peer", async () => {
+  const { master, join } = await setup();
+  const original = await join("app", "device");
+  await master.submitIntent("Original role brief", ["app"]);
+  await until(() => master.status().intents[0]?.items[0]?.state === "claimed");
+  await original.close();
+  await until(() => master.status().peers.length === 0);
+  const wrong = await join("app", "server");
+  const right = await join("app", "device");
+  await expect(master.retryItem?.("I-1", wrong.peerId)).rejects.toThrow("role device");
+  await master.retryItem?.("I-1", right.peerId);
+  await until(() => master.status().intents[1]?.items[0]?.state === "claimed");
+  expect(master.status().intents[1]?.items[0]?.assignee).toBe(right.peerId);
+  expect(master.itemIdentity?.("I-1")).toEqual({ device: "vps", role: "device" });
 });

@@ -464,7 +464,7 @@ describe("peer progress relay", () => {
         { state: "failed" },
         { state: "claimed" },
       ]),
-    ).toBe("2 done · 2 failed · 1 running · 4 files changed");
+    ).toBe("2 done · 1 failed · 1 lost · 1 running · 4 files changed");
   });
 
   it("hands the sub's onItem the intent's full text, not just the 200-character title (S8)", async () => {

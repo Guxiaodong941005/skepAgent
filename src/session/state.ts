@@ -15,7 +15,7 @@ export function matchSub(repo: string, peers: readonly SubCandidate[]): SubCandi
 }
 
 export function buildPlan(
-  intent: { text: string; repos?: string[] },
+  intent: { text: string; repos?: string[]; peerIds?: string[] },
   masterRepo: string,
   peers: readonly SubCandidate[],
   options: {
@@ -25,16 +25,27 @@ export function buildPlan(
   } = {},
 ): PlanItem[] {
   const items: PlanItem[] = [];
-  for (const repo of new Set(intent.repos ?? [masterRepo])) {
-    const assignee = matchSub(repo, peers);
-    if (!assignee) continue;
+  const targets = intent.peerIds
+    ? [...new Set(intent.peerIds)].flatMap((id) => {
+        const peer = peers.find(
+          (p) => p.peerId === id && (intent.repos === undefined || intent.repos.includes(p.repo)),
+        );
+        return peer ? [peer] : [];
+      })
+    : [...new Set(intent.repos ?? [masterRepo])].flatMap((repo) => {
+        const peer = matchSub(repo, peers);
+        return peer ? [peer] : [];
+      });
+  for (const assignee of targets) {
+    const repo = assignee.repo;
     items.push({
       itemId: `I-${(options.firstItemNumber ?? 1) + items.length}`,
       repo,
       assignee: assignee.peerId,
       epoch: options.epoch ?? 1,
       title: intent.text.slice(0, 200),
-      datalistEntries: options.datalistCounts?.[repo] ?? 0,
+      datalistEntries:
+        options.datalistCounts?.[assignee.peerId] ?? options.datalistCounts?.[repo] ?? 0,
     });
   }
   return items;

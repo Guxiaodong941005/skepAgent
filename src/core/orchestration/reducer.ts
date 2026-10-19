@@ -34,19 +34,31 @@ export type OrchestrationPhase =
   | "dispatching"
   | "awaiting"
   | "stalled"
+  | "awaiting-retry"
   | "synthesizing"
   | "done"
   | "failed"
   | "cancelled";
 
 /** How an item ended, as `itemVerdict` (src/session/master.ts) reports it. */
-export type ItemVerdict = "done" | "failed" | "submit-failed" | "pending" | "declined" | "running";
+export type ItemVerdict =
+  | "done"
+  | "failed"
+  | "lost"
+  | "submit-failed"
+  | "pending"
+  | "declined"
+  | "running";
 
 export interface OrchestrationItem {
   intentId: string;
   itemId: string;
   verdict: ItemVerdict;
+  /** Earlier attempts stay in the ledger but no longer gate progress. */
+  supersededBy?: string;
+  skipped?: boolean;
   repo: string;
+  role?: string;
   /** Peer device, when the status names it. */
   device?: string;
   /** The peer the item is assigned to (its panel id), when the status names it. */
@@ -67,6 +79,7 @@ export interface StageProgress {
 }
 
 export interface OrchestrationGroup {
+  peerIds?: string[];
   stage?: string;
   roles?: string[];
   /** The target repo; null for the single brief the route (and picker) places. */
@@ -129,6 +142,8 @@ export type OrchestrationEvent =
     }
   | { type: "dispatchFailed"; cause: string }
   | { type: "itemsChanged"; items: OrchestrationItem[] }
+  | { type: "retried"; replacements: { itemId: string; intentId: string; peerId?: string }[] }
+  | { type: "skipLost" }
   | { type: "summarizeNow"; items?: OrchestrationItem[] }
   | { type: "synthesized"; text: string }
   | { type: "synthFailed"; cause: string };
@@ -144,6 +159,7 @@ export type DispatchOutcome = ({ intentId: string } | { error: string }) & {
   brief?: string;
   title?: string;
   roles?: string[];
+  peerIds?: string[];
 };
 
 export function startOrchestration(
@@ -180,6 +196,7 @@ export const TERMINAL_PHASES: ReadonlySet<OrchestrationPhase> = new Set([
 const FINAL_VERDICTS: ReadonlySet<ItemVerdict> = new Set([
   "done",
   "failed",
+  "lost",
   "submit-failed",
   "declined",
 ]);
@@ -197,6 +214,44 @@ export function reduceOrchestration(
   state: OrchestrationState,
   event: OrchestrationEvent,
 ): OrchestrationState {
+  if (event.type === "retried" && event.replacements.length > 0 && state.phase !== "cancelled") {
+    const groups = [...state.groups];
+    const items = copyItems(state.items);
+    for (const replacement of event.replacements) {
+      const item = items.find((i) => i.itemId === replacement.itemId);
+      const group = state.groups.find((g) => g.intentId === item?.intentId);
+      if (
+        !item ||
+        !group ||
+        item.supersededBy ||
+        item.skipped ||
+        !["lost", "failed"].includes(item.verdict)
+      )
+        continue;
+      item.supersededBy = replacement.intentId;
+      groups.push({
+        ...group,
+        repo: item.repo,
+        intentId: replacement.intentId,
+        ...(replacement.peerId ? { peerIds: [replacement.peerId] } : {}),
+        error: null,
+      });
+    }
+    if (groups.length === state.groups.length) return state;
+    return withItems(
+      {
+        ...state,
+        groups,
+        items,
+        phase: "awaiting",
+        synthesis: null,
+        failure: null,
+        raw: false,
+        intentIds: [...new Set(groups.flatMap((g) => (g.intentId ? [g.intentId] : [])))],
+      },
+      items,
+    );
+  }
   if (TERMINAL_PHASES.has(state.phase)) return state;
   if (event.type === "cancelled") {
     // A dispatched intent is the peers' now; cancelling only stops this side from waiting.
@@ -238,13 +293,35 @@ export function reduceOrchestration(
       return state;
     case "awaiting":
     case "stalled":
+    case "awaiting-retry":
+      if (event.type === "skipLost" && state.phase === "awaiting-retry") {
+        const activeIds = progressGroups(state).map((g) => g.intentId);
+        const lost = state.items.filter(
+          (i) =>
+            activeIds.includes(i.intentId) && i.verdict === "lost" && !i.supersededBy && !i.skipped,
+        );
+        const roles = lost.flatMap(
+          (i) => state.groups.find((g) => g.intentId === i.intentId)?.roles ?? [i.repo],
+        );
+        return withItems(
+          {
+            ...state,
+            skippedRoles: [
+              ...(state.skippedRoles ?? []),
+              ...roles.map((r) => `${r} (skipped after peer lost)`),
+            ],
+          },
+          state.items.map((i) => (lost.includes(i) ? { ...i, skipped: true } : i)),
+        );
+      }
       if (event.type === "summarizeNow") {
+        if (state.phase === "awaiting-retry") return state;
         const items = event.items ?? state.items;
         return items.length === 0
           ? state
           : {
               ...state,
-              items: copyItems(items),
+              items: mergeItems(state, items),
               phase: "synthesizing",
               groups: state.groups.map((g) =>
                 g.intentId === null && g.error === null
@@ -256,7 +333,7 @@ export function reduceOrchestration(
       if (event.type !== "itemsChanged") return state;
       return withItems(state, event.items);
     case "synthesizing":
-      if (event.type === "itemsChanged") return { ...state, items: copyItems(event.items) };
+      if (event.type === "itemsChanged") return { ...state, items: mergeItems(state, event.items) };
       if (event.type === "synthesized") return { ...state, phase: "done", synthesis: event.text };
       if (event.type === "synthFailed") {
         return {
@@ -327,6 +404,7 @@ function dispatched(state: OrchestrationState, outcomes: DispatchOutcome[]): Orc
       ...group,
       ...(outcome.brief === undefined ? {} : { brief: outcome.brief }),
       ...(outcome.title === undefined ? {} : { title: outcome.title }),
+      ...(outcome.peerIds === undefined ? {} : { peerIds: [...outcome.peerIds] }),
       ...(outcome.roles === undefined ? {} : { roles: [...outcome.roles] }),
     };
     return "intentId" in outcome
@@ -365,6 +443,7 @@ export function groupBrief(
 const VERDICT_WORDS: Record<ItemVerdict, string> = {
   done: "done",
   failed: "failed",
+  lost: "lost",
   "submit-failed": "submit failed",
   pending: "waiting for a human",
   declined: "declined",
@@ -373,6 +452,7 @@ const VERDICT_WORDS: Record<ItemVerdict, string> = {
 const VERDICT_ORDER: readonly ItemVerdict[] = [
   "done",
   "failed",
+  "lost",
   "submit-failed",
   "declined",
   "pending",
@@ -386,9 +466,11 @@ const VERDICT_ORDER: readonly ItemVerdict[] = [
  */
 export function describeOutcome(state: OrchestrationState): string {
   const parts: string[] = [];
-  const total = state.items.length;
+  const total = state.items.filter((i) => !i.supersededBy).length;
   for (const verdict of VERDICT_ORDER) {
-    const items = state.items.filter((item) => item.verdict === verdict);
+    const items = state.items.filter(
+      (item) => item.verdict === verdict && !item.supersededBy && !item.skipped,
+    );
     if (items.length === 0) continue;
     const named = items
       .map((item) => `${item.itemId} ${item.repo} on ${item.device ?? item.peerId ?? "?"}`)
@@ -398,6 +480,7 @@ export function describeOutcome(state: OrchestrationState): string {
       verdict === "done" && items.length < total ? `${items.length} of ${total}` : items.length;
     parts.push(`${count} ${VERDICT_WORDS[verdict]}: ${named}`);
   }
+  if (state.skippedRoles?.length) parts.push(`skipped: ${state.skippedRoles.join(", ")}`);
   const unsent = state.groups.filter((group) => group.error !== null);
   if (unsent.length > 0) {
     parts.push(
@@ -416,13 +499,51 @@ export function describeOutcome(state: OrchestrationState): string {
   return parts.length === 0 ? "no results" : parts.join("; ");
 }
 
+function mergeItems(state: OrchestrationState, items: OrchestrationItem[]): OrchestrationItem[] {
+  return copyItems(
+    items.map((item) => {
+      const prior = state.items.find((i) => i.itemId === item.itemId);
+      return {
+        ...item,
+        ...(item.device === undefined && prior?.device ? { device: prior.device } : {}),
+        ...(item.role === undefined && prior?.role ? { role: prior.role } : {}),
+        ...(prior?.supersededBy ? { supersededBy: prior.supersededBy } : {}),
+        ...(prior?.skipped ? { skipped: true } : {}),
+      };
+    }),
+  );
+}
+
+function progressGroups(state: OrchestrationState): OrchestrationGroup[] {
+  const active = dispatchGroups(state);
+  return state.groups.filter(
+    (g) => active.includes(g) || state.items.some((i) => i.supersededBy === g.intentId),
+  );
+}
+
 function withItems(state: OrchestrationState, items: OrchestrationItem[]): OrchestrationState {
-  const next = { ...state, items: copyItems(items) };
-  const current = dispatchGroups(state);
+  const merged = mergeItems(state, items);
+  const next = { ...state, items: copyItems(merged) };
+  const current = progressGroups(state);
   const currentIds = current.flatMap((g) => (g.intentId ? [g.intentId] : []));
-  const relevant = items.filter((item) => currentIds.includes(item.intentId));
-  const missing = currentIds.some((id) => !relevant.some((item) => item.intentId === id));
-  const progress = missing ? "running" : itemsProgress(relevant);
+  const all = merged.filter((item) => currentIds.includes(item.intentId));
+  const lostRequired = all.some(
+    (item) =>
+      item.verdict === "lost" &&
+      !item.supersededBy &&
+      !item.skipped &&
+      state.groups
+        .find((g) => g.intentId === item.intentId)
+        ?.roles?.some((role) => state.bindings?.some((b) => b.role === role && b.required)),
+  );
+  if (state.stages?.length && lostRequired) return { ...next, phase: "awaiting-retry" };
+  const relevant = all.filter((item) => !item.supersededBy && !item.skipped);
+  const missing = currentIds.some((id) => !all.some((item) => item.intentId === id));
+  const progress = missing
+    ? "running"
+    : relevant.length === 0 && all.length > 0
+      ? "settled"
+      : itemsProgress(relevant);
   if (progress === "settled") return advanceStage(next);
   if (progress === "stalled") return { ...next, phase: "stalled" };
   return { ...next, phase: "awaiting" };

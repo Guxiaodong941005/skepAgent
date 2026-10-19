@@ -18,6 +18,7 @@ import { bind, type SkillPeer } from "../../core/skills/compose.js";
 import { Ledger } from "../../orchestrator/ledger.js";
 import { CliMasterAgent, type MasterAgent } from "../../orchestrator/master-agent.js";
 import { Orchestrator } from "../../orchestrator/orchestrator.js";
+import { sessionReport } from "../../orchestrator/report.js";
 import {
   loadOrchestrationMode,
   ORCHESTRATION_MODES,
@@ -668,9 +669,9 @@ export class Shell {
       clock: this.clock,
       ledger: home === undefined ? null : Ledger.at(home),
       peers: () => this.skillPeers(),
-      dispatch: async (brief, repos) => {
+      dispatch: async (brief, repos, peerIds) => {
         // Target repos skip the picker, as `/intent --repo` does (ORCH-7 per-repo briefs).
-        const sent = await this.deliverIntent(brief, repos);
+        const sent = await this.deliverIntent(brief, repos, peerIds);
         if (!sent.ok) {
           const { result } = sent;
           throw new Error(
@@ -680,6 +681,12 @@ export class Shell {
           );
         }
         return sent.intentId;
+      },
+      retryItem: async (id, peerId) => {
+        const master = this.session.ownMaster?.handle;
+        if (!master?.retryItem)
+          throw new Error("retry requires the master shell that owns this session");
+        return master.retryItem(id, peerId);
       },
       items: (intentIds) => this.orchestrationItems(intentIds),
       guard: () => treeChangeCheck(this.ctx, cwd),
@@ -717,12 +724,14 @@ export class Shell {
     for (const intent of status.intents) {
       if (!intentIds.includes(intent.intentId)) continue;
       for (const item of intent.items) {
-        const device = devices.get(item.assignee);
+        const identity = own?.handle.itemIdentity?.(item.itemId);
+        const device = devices.get(item.assignee) ?? identity?.device;
         items.push({
           intentId: intent.intentId,
           itemId: item.itemId,
           verdict: itemVerdict(item),
           repo: item.repo,
+          ...(identity ? { role: identity.role } : {}),
           ...(device === undefined ? {} : { device }),
           peerId: item.assignee,
           ...(item.result === undefined
@@ -764,13 +773,18 @@ export class Shell {
    * Routes one intent text (raw from `/intent`, or a master agent's brief) exactly as `/intent`
    * always has: route check, peer picker, master-changed guard, own or control route.
    */
-  private async deliverIntent(text: string, explicit?: string[]): Promise<Delivery> {
+  private async deliverIntent(
+    text: string,
+    explicit?: string[],
+    targets?: string[],
+  ): Promise<Delivery> {
     const refused = (result: SlashResult): Delivery => ({ ok: false, result });
     const route = this.session.intentRoute();
     if (route.kind === "refused") return refused({ type: "error", message: route.message });
     let repos = explicit;
+    let peerIds = targets;
     const peers = this.session.snapshot().peers;
-    if (repos === undefined && peers.length > 1) {
+    if (repos === undefined && peerIds === undefined && peers.length > 1) {
       const picked = await this.pickPeers(peers);
       if (picked === null) return refused({ type: "ok", message: "intent cancelled" });
       const unknown = picked.filter((peer) => peer.repo === undefined);
@@ -786,6 +800,7 @@ export class Shell {
         ...new Set(picked.flatMap((peer) => (peer.repo === undefined ? [] : [peer.repo]))),
       ];
       repos = known;
+      peerIds = picked.map((peer) => peer.peerId);
       // A new discovery must not redirect a selection made for the previous master.
       const current = this.session.intentRoute();
       if (current.kind === "refused") return refused({ type: "error", message: current.message });
@@ -807,10 +822,10 @@ export class Shell {
       let intentId: string;
       if (route.kind === "own") {
         // The shell owns the master: no detour through session.json and the control port.
-        checkIntent(text, repos);
-        ({ intentId } = await route.master.handle.submitIntent(text, repos));
+        checkIntent(text, repos, peerIds);
+        ({ intentId } = await route.master.handle.submitIntent(text, repos, peerIds));
       } else {
-        const sent = await this.sendExternalIntent(route.external, text, repos);
+        const sent = await this.sendExternalIntent(route.external, text, repos, peerIds);
         if (sent.type === "error") return refused(sent);
         intentId = sent.intentId;
       }
@@ -841,13 +856,14 @@ export class Shell {
     shown: ExternalMaster,
     text: string,
     repos?: string[],
+    peerIds?: string[],
   ): Promise<{ type: "ok"; intentId: string } | { type: "error"; message: string }> {
     const published = await readControlEndpoint(this.ctx).catch(() => null);
     if (published === null || !sameEndpoint(published, shown.endpoint)) {
       return this.externalChanged(shown);
     }
     try {
-      const { intentId } = await submitIntentAt(shown.endpoint, text, repos);
+      const { intentId } = await submitIntentAt(shown.endpoint, text, repos, peerIds);
       return { type: "ok", intentId };
     } catch (error) {
       if (error instanceof CliError && error.code === INTENT_OUTCOME_UNKNOWN) {
@@ -920,7 +936,7 @@ export class Shell {
     const view = this.session.snapshot();
     const own = this.session.ownMaster;
     if (own !== null) {
-      this.logStatus(own.handle.status());
+      this.logStatus(own.handle.status(), own.viaSsh);
       if (view.join !== null) this.log(`this shell is also joined as ${view.join.peerId}`);
       return { type: "ok" };
     }
@@ -941,8 +957,8 @@ export class Shell {
    * `/status` promises each item's full last result (SESSION-UX §2.1): result blocks are logged
    * with a wrapping tone, failures as errors, so nothing is cut at the terminal width (R8).
    */
-  private logStatus(status: SessionStatus): void {
-    for (const section of sessionStatusSections(status)) {
+  private logStatus(status: SessionStatus, viaSsh?: string): void {
+    for (const section of sessionStatusSections(status, viaSsh)) {
       const tone =
         section.kind === "failed" ? "error" : section.kind === "result" ? "warn" : "info";
       this.log(section.text, tone);
@@ -989,13 +1005,14 @@ export class Shell {
       {
         name: "start",
         description: "start a local session master",
-        usage: "[--listen host:port] [--advertise host:port] [--repo name] [--yes] [--skill id]",
+        usage:
+          "[--listen host:port] [--advertise host:port] [--repo name] [--yes] [--skill id] [--via-ssh host]",
         run: (_ctx, args) => this.startCommand(args),
       },
       {
         name: "join",
         description: "join a session (same machine or --host)",
-        usage: "<code> <host:port> [--manual]",
+        usage: "<code> <host:port> [--manual] [--via-ssh host]",
         run: (_ctx, args) => this.joinCommand(args),
       },
       {
@@ -1018,6 +1035,62 @@ export class Shell {
         run: (_ctx, args) => this.orchestrateCommand(args),
       },
       {
+        name: "retry",
+        description: "retry lost or failed items with their original brief",
+        usage: "<item|intent|O-id> [--peer peer-N]",
+        argsRequired: true,
+        run: async (_ctx, args) => {
+          const flags = parseFlags(args, ["peer"], []);
+          const selector = flags.positional[0] ?? "";
+          const peerId = flags.values.peer;
+          if (flags.positional.length !== 1 || !/^(?:I-\d+|intent-\d+|O-\d+)$/.test(selector))
+            return { type: "error", message: "usage: /retry <item|intent|O-id>" };
+          let problem: string | null;
+          const belongs = this.orchestrator?.owns(selector);
+          if (selector.startsWith("O-") || belongs) {
+            problem = this.orchestrator
+              ? await this.orchestrator.retry(selector, peerId)
+              : "no orchestration in this shell";
+          } else {
+            const master = this.session.ownMaster?.handle;
+            if (!master?.retryItem)
+              return {
+                type: "error",
+                message: "retry requires the master shell that owns this session",
+              };
+            const ids = selector.startsWith("I-")
+              ? [selector]
+              : master
+                  .status()
+                  .intents.filter((i) => i.intentId === selector)
+                  .flatMap((i) =>
+                    i.items
+                      .filter((item) => ["lost", "failed"].includes(itemVerdict(item)))
+                      .map((item) => item.itemId),
+                  );
+            if (!ids.length) return { type: "error", message: "no lost or failed items to retry" };
+            for (const id of ids) {
+              const sent = await master.retryItem(id, peerId);
+              this.log(`retry ${id} sent as ${sent.intentId}`, "event");
+            }
+            problem = null;
+          }
+          return problem === null ? { type: "ok" } : { type: "error", message: problem };
+        },
+      },
+      {
+        name: "skip",
+        description: "deliberately continue a held stage without lost roles",
+        usage: "<O-id>",
+        argsRequired: true,
+        run: (_ctx, args) => {
+          const problem = this.orchestrator
+            ? this.orchestrator.skip(args.trim())
+            : "no orchestration in this shell";
+          return problem === null ? { type: "ok" } : { type: "error", message: problem };
+        },
+      },
+      {
         name: "summarize",
         description: "summarize an orchestration now, with the results that exist",
         usage: "<O-n>",
@@ -1032,6 +1105,27 @@ export class Shell {
         argsRequired: true,
         visible: live,
         run: (_ctx, args) => this.orchestrationCommand(args, "cancel"),
+      },
+      {
+        name: "report",
+        description: "export ledger records as Markdown or validated JSON (offline)",
+        usage: "[O-id|--last N] [--json]",
+        run: async (_ctx, args) => {
+          const flags = parseFlags(args, ["last"], ["json"]);
+          if (flags.positional.length > 1)
+            return { type: "error", message: "usage: /report [O-id|--last N] [--json]" };
+          const home = this.ctx.paths?.home;
+          if (!home) return { type: "error", message: "skep home is not resolved" };
+          await this.orchestrator?.flush();
+          const report = await sessionReport(Ledger.at(home), {
+            ...(flags.positional[0] ? { id: flags.positional[0] } : {}),
+            ...(flags.values.last !== undefined ? { last: flags.values.last } : {}),
+            ...(flags.switches.has("json") ? { json: true } : {}),
+          });
+          for (const problem of report.problems)
+            this.log(`skep: unreadable ledger entry ${problem}`, "warn");
+          return { type: "ok", message: report.text };
+        },
       },
       {
         name: "history",
@@ -1170,7 +1264,11 @@ export class Shell {
         message: `a master already runs here (code ${own.joinCode ?? "none"})`,
       };
     }
-    const flags = parseFlags(args, ["listen", "advertise", "repo", "device", "skill"], ["yes"]);
+    const flags = parseFlags(
+      args,
+      ["listen", "advertise", "repo", "device", "skill", "via-ssh"],
+      ["yes"],
+    );
     if (flags.positional.length) return { type: "error", message: "unexpected /start arguments" };
     const skills = await this.ensureSkills();
     if (flags.values.skill !== undefined) await skills.use(flags.values.skill);
@@ -1179,14 +1277,15 @@ export class Shell {
     const { listen, advertise, repo, device } = flags.values;
     const flow = await startMasterFlow(this.ctx, {
       skill: skills.selection,
+      ...(flags.values["via-ssh"] ? { viaSsh: flags.values["via-ssh"] } : {}),
       ...(listen === undefined ? {} : { listen }),
       ...(advertise === undefined ? {} : { advertise }),
       ...(repo === undefined ? {} : { repo }),
       ...(device === undefined ? {} : { device }),
       ...(flags.switches.has("yes") ? { yes: true } : {}),
-      acceptJoin: async ({ device: who, address, fingerprint }) => {
+      acceptJoin: async ({ device: who, address, fingerprint, viaSsh }) => {
         const answer = await this.ask(
-          `accept ${who} from ${address} fingerprint ${fingerprint}? [y/N]`,
+          `accept ${who} from ${address}${viaSsh ? " (via ssh)" : ""} fingerprint ${fingerprint}? [y/N]`,
         );
         return answer !== null && /^\s*y(es)?\s*$/i.test(answer);
       },
@@ -1247,7 +1346,11 @@ export class Shell {
         const rejoin =
           own === null || own.joinCode === null
             ? "/join <code>"
-            : formatJoinPaste({ host: own.advertise, code: own.joinCode });
+            : formatJoinPaste({
+                host: own.advertise,
+                code: own.joinCode,
+                ...(own.viaSsh ? { viaSsh: own.viaSsh } : {}),
+              });
         log(`${text}\nit can rejoin with the current code: ${rejoin}`, "error");
         break;
       }
@@ -1256,10 +1359,17 @@ export class Shell {
         const paste =
           own === null || own.joinCode === null
             ? null
-            : formatJoinPaste({ host: own.advertise, code: own.joinCode });
+            : formatJoinPaste({
+                host: own.advertise,
+                code: own.joinCode,
+                ...(own.viaSsh ? { viaSsh: own.viaSsh } : {}),
+              });
         log(explainJoinFailure(message, paste), "error");
         break;
       }
+      case "quiet":
+        log(message, "warn");
+        break;
       case "error":
         log(message, "error");
         break;
@@ -1367,6 +1477,7 @@ export class Shell {
     for (const note of parsed.notes ?? []) this.log(`skep: ${note}`, "warn");
     const options: JoinFlowOptions = {
       code,
+      ...(parsed.viaSsh ? { viaSsh: parsed.viaSsh } : {}),
       role: parsed.role ?? "coding",
       ...(host === undefined ? {} : { host }),
       ...(parsed.repo === undefined ? {} : { repo: parsed.repo }),
@@ -1439,7 +1550,7 @@ export class Shell {
     const rejoin =
       this.quitting === null && reason !== "sub_closed"
         ? "\nthe join code is single-use: ask the master for its current code, then\n" +
-          `/join <code> ${quoteSlashWord(flow.target)}`
+          `/join <code> ${quoteSlashWord(flow.target)}${flow.viaSsh ? ` --via-ssh ${quoteSlashWord(flow.viaSsh)}` : ""}`
         : "";
     this.log(`left the session (${explainReason(reason)})${rejoin}`, "event");
     this.sync();

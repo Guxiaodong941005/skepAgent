@@ -71,7 +71,11 @@ export interface OrchestratorDeps {
    * Sends one intent through the shell's intent route; resolves with its id. Without `repos` the
    * route (and its picker) places it; with them it goes to exactly those repos.
    */
-  dispatch(text: string, repos?: string[]): Promise<string>;
+  dispatch(text: string, repos?: string[], peerIds?: string[]): Promise<string>;
+  retryItem?(
+    itemId: string,
+    peerId?: string,
+  ): Promise<{ itemId: string; intentId: string; peerId?: string }>;
   /** The items of `intentIds` as the master reports them now; null when unknown. */
   items(intentIds: readonly string[]): OrchestrationItem[] | null;
   /**
@@ -168,6 +172,15 @@ export class Orchestrator {
       .map((run) => ({ id: run.state.id, phase: run.state.phase, forMs: now - run.phaseSinceMs }));
   }
 
+  owns(selector: string): boolean {
+    return [...this.runs.values()].some(
+      (r) =>
+        r.state.id === selector ||
+        r.state.intentIds.includes(selector) ||
+        r.state.items.some((i) => i.itemId === selector),
+    );
+  }
+
   get(id: string): OrchestrationState | null {
     return this.runs.get(id)?.state ?? null;
   }
@@ -176,7 +189,7 @@ export class Orchestrator {
   poll(): void {
     for (const run of this.runs.values()) {
       const { phase, intentIds } = run.state;
-      if (phase !== "awaiting" && phase !== "stalled") continue;
+      if (phase !== "awaiting" && phase !== "stalled" && phase !== "awaiting-retry") continue;
       const items = this.deps.items(intentIds);
       if (items === null || sameItems(items, run.state.items)) continue;
       const before = run.state.phase;
@@ -205,6 +218,63 @@ export class Orchestrator {
     this.apply(run, { type: "summarizeNow", ...(items === null ? {} : { items }) });
     this.link(run);
     if (phaseOf(run) !== "synthesizing") return `${id} has no results yet`;
+    void this.drive(run);
+    return null;
+  }
+
+  /** Reuse the exact dispatched brief; successful earlier attempts remain in the ledger. */
+  async retry(selector: string, peerId?: string): Promise<string | null> {
+    const runs = [...this.runs.values()].filter(
+      (r) =>
+        r.state.id === selector ||
+        r.state.intentIds.includes(selector) ||
+        r.state.items.some((i) => i.itemId === selector),
+    );
+    if (runs.length === 0) return `no orchestration item matching ${selector} in this shell`;
+    if (!this.deps.retryItem) return "retry requires the master shell that owns this session";
+    const problems: string[] = [];
+    let count = 0;
+    for (const run of runs) {
+      if (run.busy || run.state.phase === "cancelled") {
+        problems.push(`${run.state.id} is ${run.state.phase}`);
+        continue;
+      }
+      const candidates = run.state.items.filter(
+        (i) =>
+          !i.supersededBy &&
+          !i.skipped &&
+          (i.verdict === "lost" || i.verdict === "failed") &&
+          (selector === run.state.id || selector === i.itemId || selector === i.intentId),
+      );
+      for (const item of candidates) {
+        try {
+          const replacement = await this.deps.retryItem(item.itemId, peerId);
+          this.apply(run, { type: "retried", replacements: [replacement] });
+          this.deps.show(
+            `${run.state.id} retry ${item.itemId} sent as ${replacement.intentId}`,
+            "event",
+          );
+          count++;
+        } catch (error) {
+          problems.push(errorMessage(error));
+        }
+      }
+    }
+    return problems.length
+      ? problems.join("\n")
+      : count
+        ? null
+        : `no lost or failed items to retry for ${selector}`;
+  }
+
+  skip(id: string): string | null {
+    const run = this.runs.get(id);
+    if (run?.state.phase !== "awaiting-retry") return `${id} is not awaiting-retry`;
+    this.apply(run, { type: "skipLost" });
+    this.deps.show(
+      `${id} deliberately skipped lost roles; continuing with incomplete results`,
+      "warn",
+    );
     void this.drive(run);
     return null;
   }
@@ -246,6 +316,12 @@ export class Orchestrator {
   private apply(run: Run, event: OrchestrationEvent): void {
     const before = run.state.phase;
     run.state = reduceOrchestration(run.state, event);
+    if (run.state.phase === "awaiting-retry" && before !== "awaiting-retry") {
+      this.deps.show(
+        `${run.state.id} required role lost; stage held. /retry ${run.state.id} or /skip ${run.state.id}`,
+        "warn",
+      );
+    }
     if (run.state.phase !== before) run.phaseSinceMs = this.deps.clock.monotonicMs();
     this.persist(run);
     this.deps.changed?.();
@@ -432,7 +508,13 @@ export class Orchestrator {
     if (run.skill) {
       const bindings = bind(run.skill.skill.manifest.roles, this.deps.peers(), run.skill.manual);
       run.skill = { ...run.skill, bindings };
-      const missing = bindings.find((b) => b.required && b.repo === null);
+      const missing = bindings.find(
+        (b) =>
+          b.required &&
+          sending.some((g) => g.roles?.includes(b.role)) &&
+          b.repo === null &&
+          !state.skippedRoles?.some((r) => r.startsWith(`${b.role} (`)),
+      );
       if (missing)
         return {
           type: "dispatchFailed",
@@ -466,11 +548,28 @@ export class Orchestrator {
                 ),
               };
               current =
-                planSkill(context, output).groups.find((entry) => entry.repo === group.repo) ??
-                group;
+                planSkill(context, output).groups.find(
+                  (entry) =>
+                    entry.repo === group.repo && remaining.every((r) => entry.roles?.includes(r)),
+                ) ?? group;
             }
           }
-          return { ...current, brief: this.withPriorResults(run, current) };
+          const peerIds = [
+            ...new Set(
+              (current.roles ?? []).flatMap(
+                (role) => bindings.find((b) => b.role === role)?.peerId ?? [],
+              ),
+            ),
+          ];
+          if (peerIds.length > 1)
+            throw new SkillError(
+              "Role bindings changed to different peers; review /skill and retry the request",
+            );
+          return {
+            ...current,
+            ...(peerIds.length ? { peerIds } : {}),
+            brief: this.withPriorResults(run, current),
+          };
         });
       } catch (error) {
         return { type: "dispatchFailed", cause: errorMessage(error) };
@@ -490,15 +589,20 @@ export class Orchestrator {
         const intentId = await this.deps.dispatch(
           briefText(brief.title, brief.text),
           group.repo === null ? undefined : [group.repo],
+          group.peerIds,
         );
         outcomes.push({
           intentId,
-          ...(run.skill ? { brief: brief.text, title: brief.title, roles: group.roles } : {}),
+          ...(run.skill
+            ? { brief: brief.text, title: brief.title, roles: group.roles, peerIds: group.peerIds }
+            : {}),
         });
       } catch (error) {
         outcomes.push({
           error: errorMessage(error),
-          ...(run.skill ? { brief: brief.text, title: brief.title, roles: group.roles } : {}),
+          ...(run.skill
+            ? { brief: brief.text, title: brief.title, roles: group.roles, peerIds: group.peerIds }
+            : {}),
         });
       }
     }
@@ -538,6 +642,7 @@ export class Orchestrator {
     const ids = earlier.flatMap((g) => (g.intentId ? [g.intentId] : []));
     const data = JSON.stringify({
       results: run.state.items.filter((item) => ids.includes(item.intentId)),
+      skippedRoles: run.state.skippedRoles ?? [],
       notSent: earlier.filter((g) => g.error).map((g) => ({ repo: g.repo, error: g.error })),
     });
     const head =
@@ -690,7 +795,7 @@ export class Orchestrator {
     const outcome = describeOutcome(state);
     const partial =
       state.groups.some((group) => group.error !== null) ||
-      state.items.some((item) => item.verdict !== "done");
+      state.items.some((item) => !item.supersededBy && (item.skipped || item.verdict !== "done"));
     this.deps.show(`${state.id} outcome: ${outcome}`, partial ? "warn" : "event");
     if (state.synthesis !== null) {
       this.deps.show(`${state.id} summary:`, "event");
@@ -752,7 +857,9 @@ function phaseOf(run: Run): OrchestrationState["phase"] {
 }
 
 function sameItems(a: readonly OrchestrationItem[], b: readonly OrchestrationItem[]): boolean {
-  return JSON.stringify(a) === JSON.stringify(b);
+  const plain = (items: readonly OrchestrationItem[]) =>
+    items.map(({ supersededBy: _retry, skipped: _skip, ...item }) => item);
+  return JSON.stringify(plain(a)) === JSON.stringify(plain(b));
 }
 
 /** `web → ` for a group with a target repo; nothing for the single brief. */
