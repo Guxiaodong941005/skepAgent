@@ -11,7 +11,7 @@ protocol rules ([`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §4.4) apply to t
 
 ## [Unreleased]
 
-## 0.3.0 — Reach & Recovery
+## [0.3.0] - 2026-10-20
 
 ### Added
 
