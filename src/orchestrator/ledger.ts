@@ -10,7 +10,7 @@ import { mkdir, readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 import type { OrchestrationState } from "../core/orchestration/reducer.js";
-import { SkillIdentitySchema } from "../core/skills/schemas.js";
+import { OrchestrationStateSchema } from "../core/orchestration/state-schema.js";
 import { atomicWrite } from "../util/fs.js";
 
 export const LEDGER_VERSION = 1;
@@ -26,45 +26,16 @@ export interface LedgerRecord {
   state: OrchestrationState;
 }
 
-/** Read back loosely on `state` (it is our own JSON) but strictly on the envelope. */
-const LedgerRecordSchema = z.strictObject({
+/** Both the envelope and state are external filesystem input on read. */
+export const LedgerRecordSchema = z.strictObject({
   version: z.literal(LEDGER_VERSION),
   id: z.string().regex(/^O-[A-Za-z0-9-]+$/),
-  createdAtMs: z.number(),
-  updatedAtMs: z.number(),
+  createdAtMs: z.number().int().min(0).max(8_640_000_000_000_000),
+  updatedAtMs: z.number().int().min(0).max(8_640_000_000_000_000),
   cli: z.string(),
   conversationId: z.string().nullable(),
-  promptVersion: z.number(),
-  state: z
-    .object({
-      id: z.string(),
-      phase: z.string(),
-      userText: z.string(),
-      synthesis: z.string().nullable(),
-      skill: SkillIdentitySchema.optional(),
-      contract: z.string().max(3000).optional(),
-      bindings: z
-        .array(
-          z.strictObject({
-            role: z.string(),
-            label: z.string(),
-            required: z.boolean(),
-            peerId: z.string().nullable(),
-            device: z.string().nullable(),
-            repo: z.string().nullable(),
-            protocolVersion: z.number().nullable(),
-            candidates: z.number().int().nonnegative(),
-            source: z.enum(["manual", "role", "repo", "unbound"]),
-          }),
-        )
-        .max(16)
-        .optional(),
-      stages: z
-        .array(z.strictObject({ id: z.string(), status: z.enum(["pending", "active", "settled"]) }))
-        .max(33)
-        .optional(),
-    })
-    .passthrough(),
+  promptVersion: z.number().int().positive(),
+  state: OrchestrationStateSchema,
 });
 
 export class Ledger {
@@ -100,7 +71,7 @@ export class Ledger {
       try {
         const value: unknown = JSON.parse(await readFile(path.join(this.dir, name), "utf8"));
         const parsed = LedgerRecordSchema.parse(value);
-        records.push(parsed as unknown as LedgerRecord);
+        records.push(parsed);
       } catch (error) {
         problems.push(`${name}: ${error instanceof Error ? error.message : String(error)}`);
       }

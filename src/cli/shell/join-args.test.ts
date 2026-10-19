@@ -130,3 +130,10 @@ describe("the pasteable /join line round-trips", () => {
     expect(() => parseJoinArgs('--repo "my app')).toThrow(/unterminated quote/);
   });
 });
+
+it("preserves --via-ssh with the printed join grammar", () => {
+  expect(parseJoinArgs("1234-5678-9012 127.0.0.1:41234 --via-ssh user@gateway")).toMatchObject({
+    viaSsh: "user@gateway",
+    host: "127.0.0.1:41234",
+  });
+});

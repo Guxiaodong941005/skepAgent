@@ -21,6 +21,7 @@ export interface SessionView {
   label: string;
   /** `advertise` is the address peers dial; it is `listen` unless `/start --advertise` set it. */
   master: {
+    viaSsh?: string;
     listen: string;
     advertise: string;
     repo: string;
@@ -200,6 +201,7 @@ export class SessionController {
         live: true,
         label,
         master: {
+          ...(this.master.viaSsh ? { viaSsh: this.master.viaSsh } : {}),
           listen: this.master.listen,
           advertise: this.master.advertise,
           repo: this.master.repo,
@@ -291,7 +293,7 @@ export class SessionController {
     if (view.peers.length === 0) {
       return {
         kind: "refused",
-        message: noPeersText(master.advertise, master.joinCode),
+        message: noPeersText(master.advertise, master.joinCode, master.viaSsh),
       };
     }
     if (this.master !== null) return { kind: "own", master: this.master };
@@ -301,11 +303,11 @@ export class SessionController {
 }
 
 /** `host` is the address peers dial (the master's advertise address). */
-export function noPeersText(host: string, joinCode: string | null): string {
+export function noPeersText(host: string, joinCode: string | null, viaSsh?: string): string {
   const hint =
     joinCode === null
       ? `on another device, from a checkout of any repo: /join <code> ${quoteSlashWord(host)}`
-      : joinHint({ host, code: joinCode });
+      : joinHint({ host, code: joinCode, ...(viaSsh ? { viaSsh } : {}) });
   return `no peers joined yet — nothing can take this intent\n${hint}`;
 }
 
@@ -343,6 +345,7 @@ const LEAVE_REASONS: Record<string, string> = {
   transport_error: "network error",
   master_closed: "the master closed the session",
   sub_closed: "left on request",
+  ssh_tunnel_closed: "SSH tunnel closed (see the SSH error above)",
   callback_error: "this device failed to answer the master (see the line above)",
   protocol_error: "protocol error — are both devices on the same skep version?",
 };

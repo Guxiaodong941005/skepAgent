@@ -30,6 +30,8 @@ import { type AgentCliSchema, RepoRefSchema, ShaSchema } from "../../core/schema
 import { CHECKS_FILE_PATH, ChecksFileSchema } from "../../core/schemas/config.js";
 import { Redactor } from "../../exec/redact.js";
 import { type Notification, NtfyNotifier } from "../../notify/ntfy.js";
+import { Ledger } from "../../orchestrator/ledger.js";
+import { sessionReport } from "../../orchestrator/report.js";
 import type { ProcessExit } from "../../runtime/types.js";
 import {
   type Changed,
@@ -54,6 +56,7 @@ import {
 } from "../../session/index.js";
 import { intentRollup, itemBlock, itemVerdict } from "../../session/master.js";
 import { BRIEF_MAX } from "../../session/messages.js";
+import { openSsh, type SshSpawner, type SshTunnel, sshDestination } from "../../session/ssh.js";
 import type { SkillRoots } from "../../skills/loader.js";
 import { loadSkillDefault, SkillSelectionSchema, skillEnvironment } from "../../skills/settings.js";
 import { type Clock, isoUtc, systemClock } from "../../util/clock.js";
@@ -126,6 +129,7 @@ export type { DatalistEntry, MasterHandle, MasterOptions, PlanItem };
 
 export type SessionCliContext = CliContext & {
   sessionApi?: SessionApi;
+  sshSpawn?: SshSpawner;
   skillRoots?: SkillRoots;
   stdin?: Readable;
   networkInterfaces?: () => NodeJS.Dict<os.NetworkInterfaceInfo[]>;
@@ -512,6 +516,7 @@ export function formatJoinCode(code: string): string {
 }
 
 export interface JoinTarget {
+  viaSsh?: string;
   /** `host:port` peers dial (the master's advertise address, else its listen address). */
   host: string;
   code: string;
@@ -523,8 +528,11 @@ export interface JoinTarget {
  * not part of the paste. Each value is quoted for the slash grammar, so `parseJoinArgs` reads
  * back exactly these values.
  */
-export function formatJoinPaste({ host, code }: JoinTarget): string {
-  return `/join ${formatJoinCode(code)} ${quoteSlashWord(host)}`;
+export function formatJoinPaste({ host, code, viaSsh }: JoinTarget): string {
+  return (
+    `/join ${formatJoinCode(code)} ${quoteSlashWord(host)}` +
+    (viaSsh ? ` --via-ssh ${quoteSlashWord(viaSsh)}` : "")
+  );
 }
 
 /** A POSIX shell word: bare when safe, else single-quoted. */
@@ -534,9 +542,10 @@ export function quoteShellWord(value: string): string {
 }
 
 /** The same join for a plain shell; every argument is shell-quoted. */
-export function formatJoinCli({ host, code }: JoinTarget): string {
-  return ["skep session join --code", formatJoinCode(code), "--host", quoteShellWord(host)].join(
-    " ",
+export function formatJoinCli({ host, code, viaSsh }: JoinTarget): string {
+  return (
+    ["skep session join --code", formatJoinCode(code), "--host", quoteShellWord(host)].join(" ") +
+    (viaSsh ? ` --via-ssh ${quoteShellWord(viaSsh)}` : "")
   );
 }
 
@@ -1372,6 +1381,7 @@ async function runNative(run: RunContext): Promise<AgentRun> {
     env,
     input: prompt,
     timeoutMs: AGENT_TIMEOUT_MS,
+    ...(run.worker.signal ? { signal: run.worker.signal } : {}),
     allowFailure: true,
     ...(forward === undefined
       ? {}
@@ -2505,6 +2515,7 @@ async function workItemRun(
 // Commands.
 
 export interface StartOptions {
+  viaSsh?: string;
   skill?: string;
   listen?: string;
   /** `host:port` peers dial, when it differs from the bind address (NAT, relay, public IP). */
@@ -2515,6 +2526,7 @@ export interface StartOptions {
 }
 
 export interface JoinOptions {
+  viaSsh?: string;
   code: string;
   host?: string;
   device?: string;
@@ -2551,6 +2563,23 @@ export function register(program: Command, ctx: CliContext): void {
     .description("Run or join an in-memory session channel between devices");
 
   session
+    .command("report [id]")
+    .description("export local orchestration records as Markdown or validated JSON (offline)")
+    .option("--last <N>", "number of recent records, 1..100 (default: 1)")
+    .option("--json", "emit validated ledger records")
+    .action(async (id: string | undefined, options: { last?: string; json?: boolean }) => {
+      if (!ctx.paths) throw new Error("skep home is not resolved");
+      const report = await sessionReport(Ledger.at(ctx.paths.home), {
+        ...(id ? { id } : {}),
+        ...(options.last !== undefined ? { last: options.last } : {}),
+        ...(options.json ? { json: true } : {}),
+      });
+      for (const problem of report.problems)
+        ctx.stderr.write(`skep: unreadable ledger entry ${problem}\n`);
+      ctx.output().result(report.records, () => report.text);
+    });
+
+  session
     .command("start")
     .description("Start a session master and print the join code")
     .option(
@@ -2561,6 +2590,7 @@ export function register(program: Command, ctx: CliContext): void {
       "--advertise <host:port>",
       "address peers dial, printed in the join line (default: the --listen address)",
     )
+    .option("--via-ssh <destination>", "carry the encrypted session through [user@]host")
     .option("--device <name>", "this device's name (default: hostname)")
     .option("--repo <name>", "the master's repo (default: basename of the git toplevel)")
     .option("--skill <id>", "activate a skill (default: generic or the project default)")
@@ -2574,6 +2604,7 @@ export function register(program: Command, ctx: CliContext): void {
     .description("Join a session master with its join code")
     .requiredOption("--code <code>", "the 12-digit join code shown by the master")
     .option("--host <host:port>", "master address (default: listen from local session.json)")
+    .option("--via-ssh <destination>", "carry the encrypted session through [user@]host")
     .option("--device <name>", "this device's name (default: hostname)")
     .option("--repo <name>", "this device's repo (default: basename of the git toplevel)")
     .option("--role <role>", "role advertised to the master", "coding")
@@ -2658,7 +2689,7 @@ export function register(program: Command, ctx: CliContext): void {
 // Session flows: the command bodies without Commander, signals or blocking, so the unified shell
 // (`src/cli/shell/run.ts`) drives the same code paths as `skep session start|join|intent|status`.
 
-export type JoinRequest = Parameters<MasterOptions["acceptJoin"]>[0];
+export type JoinRequest = Parameters<MasterOptions["acceptJoin"]>[0] & { viaSsh?: string };
 
 export interface StartMasterFlowOptions extends StartOptions {
   /** Asked for every join unless `yes` is set. */
@@ -2670,6 +2701,7 @@ export interface StartMasterFlowOptions extends StartOptions {
 }
 
 export interface MasterFlow {
+  readonly viaSsh?: string;
   readonly skill?: string;
   readonly handle: MasterHandle;
   /** The bind address. */
@@ -2733,12 +2765,18 @@ export async function startMasterFlow(
   ctx: SessionCliContext,
   opts: StartMasterFlowOptions,
 ): Promise<MasterFlow> {
+  if (opts.viaSsh) sshDestination(opts.viaSsh);
+  if (opts.viaSsh && opts.advertise)
+    throw new CliError(
+      "bad_options",
+      "--via-ssh allocates a remote loopback address; omit --advertise",
+    );
   let target: HostPort;
   if (opts.listen !== undefined) {
     target = concreteHostPort("--listen", opts.listen);
   } else {
     const ifaces = (ctx.networkInterfaces ?? os.networkInterfaces)();
-    target = { host: pickListenHost(ifaces), port: DEFAULT_PORT };
+    target = { host: opts.viaSsh ? "127.0.0.1" : pickListenHost(ifaces), port: DEFAULT_PORT };
   }
   // A wildcard is no address a peer can dial, so it is refused here exactly as for a bind.
   const advertised =
@@ -2789,22 +2827,51 @@ export async function startMasterFlow(
       random: cryptoRandom,
       onJoinCode,
       acceptJoin: (request) =>
-        opts.yes === true ? Promise.resolve(true) : opts.acceptJoin(request),
+        opts.yes === true
+          ? Promise.resolve(true)
+          : opts.acceptJoin({ ...request, ...(opts.viaSsh ? { viaSsh: opts.viaSsh } : {}) }),
       ...(opts.onEvent === undefined ? {} : { onEvent: opts.onEvent }),
     },
     target,
     opts.listen === undefined,
   );
+  let tunnel: SshTunnel | undefined;
+  let ended = false;
   const closed = handle.closed.then(
-    () => removeOwnSessionFile(file, token),
+    () => {
+      ended = true;
+      tunnel?.close();
+      return removeOwnSessionFile(file, token);
+    },
     async (error: unknown) => {
+      tunnel?.close();
       await removeOwnSessionFile(file, token);
       throw error;
     },
   );
   let listen: string;
+  let remote: string | null = null;
   try {
     listen = listenOf(handle);
+    if (opts.viaSsh) {
+      const bound = parseHostPort(listen);
+      if (!bound) throw new CliError("bad_listen", "invalid bound session address");
+      tunnel = openSsh({
+        destination: opts.viaSsh,
+        target: bound,
+        reverse: true,
+        env: pickEnv(ctx, ["PATH", "HOME", "USER", "SSH_AUTH_SOCK"]),
+        clock: systemClock,
+        ...(ctx.sshSpawn ? { spawn: ctx.sshSpawn } : {}),
+      });
+      const port = await tunnel.ready;
+      remote = `127.0.0.1:${port}`;
+      void tunnel.closed.then((error) => {
+        if (!error) return;
+        opts.onEvent?.({ kind: "error", message: error.message });
+        void handle.close();
+      });
+    }
     await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
     await atomicWrite(
       file,
@@ -2813,9 +2880,12 @@ export async function startMasterFlow(
         mode: 0o600,
       },
     );
+    if (ended) throw new CliError("ssh_closed", "Session ended while opening the SSH tunnel");
   } catch (error) {
+    tunnel?.close();
     await handle.close();
     await closed.catch(() => undefined);
+    await removeOwnSessionFile(file, token);
     throw error;
   }
   started = true;
@@ -2823,7 +2893,8 @@ export async function startMasterFlow(
     ...(activeSkill ? { skill: activeSkill } : {}),
     handle,
     listen,
-    advertise: advertised ?? listen,
+    advertise: remote ?? advertised ?? listen,
+    ...(opts.viaSsh ? { viaSsh: opts.viaSsh } : {}),
     repo,
     device,
     get joinCode() {
@@ -2848,8 +2919,10 @@ async function startCommand(ctx: SessionCliContext, opts: StartOptions): Promise
     // One prompt at a time: concurrent joins must not interleave questions and answers.
     const answer = prompts.then(async () => {
       reader ??= new LineReader(ctx.stdin ?? process.stdin);
-      const { device: who, address, fingerprint } = request;
-      ctx.stderr.write(`Accept ${who} from ${address} fingerprint ${fingerprint}? [y/N] `);
+      const { device: who, address, fingerprint, viaSsh } = request;
+      ctx.stderr.write(
+        `Accept ${who} from ${address}${viaSsh ? " (via ssh)" : ""} fingerprint ${fingerprint}? [y/N] `,
+      );
       const line = await reader.next();
       return line !== null && /^\s*y(es)?\s*$/i.test(line);
     });
@@ -2867,7 +2940,7 @@ async function startCommand(ctx: SessionCliContext, opts: StartOptions): Promise
           { event: "join-code", joinCode, joinCodeExpiresAtMs: expiresAtMs },
           () =>
             `join code: ${joinCode}${expiryText(expiresAtMs)}\n` +
-            `${formatJoinPaste({ host: flow.advertise, code: joinCode })}\n`,
+            `${formatJoinPaste({ host: flow.advertise, code: joinCode, ...(flow.viaSsh ? { viaSsh: flow.viaSsh } : {}) })}\n`,
         ),
     });
   } catch (error) {
@@ -2910,7 +2983,10 @@ async function startCommand(ctx: SessionCliContext, opts: StartOptions): Promise
 export function startedText(flow: MasterFlow): string {
   const { listen, advertise, repo, joinCode, joinCodeExpiresAtMs } = flow;
   const dial = advertise === listen ? "" : `peers dial ${advertise}\n`;
-  const hint = joinCode === null ? "" : `${joinHint({ host: advertise, code: joinCode })}\n`;
+  const hint =
+    joinCode === null
+      ? ""
+      : `${joinHint({ host: advertise, code: joinCode, ...(flow.viaSsh ? { viaSsh: flow.viaSsh } : {}) })}\n`;
   return (
     `session master listening on ${listen} (repo ${repo})\n${dial}` +
     `join code: ${joinCode ?? "none"}${expiryText(joinCodeExpiresAtMs)}\n${hint}`
@@ -3153,6 +3229,7 @@ export interface JoinFlowIo {
 }
 
 export interface JoinFlow {
+  readonly viaSsh?: string;
   readonly handle: SubHandle;
   /** `host:port` of the master. */
   readonly target: string;
@@ -3182,6 +3259,7 @@ export async function joinSessionFlow(
   opts: JoinFlowOptions,
   io: JoinFlowIo,
 ): Promise<JoinFlow> {
+  if (opts.viaSsh) sshDestination(opts.viaSsh);
   const code = normalizeJoinCode(opts.code);
   if (code === null) {
     throw new CliError("bad_code", "--code must be 12 digits (NNNN-NNNN-NNNN)", EXIT.usage);
@@ -3244,6 +3322,7 @@ export async function joinSessionFlow(
   const joinView = io.createView();
   const abort = new AbortController();
   let subHandle: SubHandle | undefined;
+  const recoveryStates = new Map<string, string>();
   const worker: ItemWorker = {
     ctx,
     dir,
@@ -3259,7 +3338,10 @@ export async function joinSessionFlow(
     terminal: serialQueue(),
     serial: serialQueue(),
     signal: abort.signal,
-    onAgentState: (id, state) => subHandle?.reportAgent?.(id, state),
+    onAgentState: (id, state) => {
+      recoveryStates.set(id, state);
+      subHandle?.reportAgent?.(id, state);
+    },
     onOutput: (id, chunk) => subHandle?.reportOutput?.(id, chunk),
     sessionId: () => subHandle?.sessionId,
   };
@@ -3328,9 +3410,21 @@ export async function joinSessionFlow(
   };
 
   let handle: SubHandle;
+  let tunnel: SshTunnel | undefined;
+  let sshLost = false;
   try {
-    handle = await api.connectSub({
-      target,
+    if (opts.viaSsh) {
+      tunnel = openSsh({
+        destination: opts.viaSsh,
+        target,
+        env: pickEnv(ctx, ["PATH", "HOME", "USER", "SSH_AUTH_SOCK"]),
+        clock: systemClock,
+        ...(ctx.sshSpawn ? { spawn: ctx.sshSpawn } : {}),
+      });
+      await tunnel.ready;
+    }
+    const connecting = api.connectSub({
+      ...(tunnel ? { stream: tunnel.stream } : { target }),
       code,
       device,
       clock: systemClock,
@@ -3389,7 +3483,9 @@ export async function joinSessionFlow(
           { event: "item", item },
           () => `item ${item.itemId} (epoch ${item.epoch}, ${item.repo}): ${item.title}\n`,
         );
+        recoveryStates.set(item.itemId, "queued");
         const result = await workItem(worker, item, context);
+        recoveryStates.set(item.itemId, "result ready");
         say(
           { event: "item-result", itemId: item.itemId, epoch: item.epoch, ...result },
           () => `${itemHeadline(item.itemId, result)}\n`,
@@ -3397,16 +3493,46 @@ export async function joinSessionFlow(
         return result;
       },
     });
+    handle = tunnel
+      ? await Promise.race([
+          connecting,
+          tunnel.closed.then((error) => {
+            throw error ?? new CliError("ssh_closed", "SSH tunnel closed during join");
+          }),
+        ])
+      : await connecting;
     subHandle = handle;
+    if (tunnel)
+      void tunnel.closed.then((error) => {
+        if (!error) return;
+        sshLost = true;
+        say({ event: "session-error", message: error.message }, () => `${error.message}\n`);
+        void handle.close();
+      });
   } catch (error) {
+    const cause = tunnel?.failure() ?? error;
+    tunnel?.close();
     joinView.close();
-    throw error;
+    throw cause;
   }
 
-  const closed = handle.closed.finally(() => {
-    abort.abort();
-    joinView.close();
-  });
+  const closed = handle.closed
+    .then((outcome) => {
+      tunnel?.close();
+      abort.abort();
+      if ((outcome.reason !== "sub_closed" || sshLost) && recoveryStates.size > 0) {
+        const items = [...recoveryStates].map(([id, state]) => `${id}: ${state}`).join("; ");
+        say(
+          { event: "work-recovery", dir, items, reason: outcome.reason },
+          () =>
+            `Link lost; agent aborted. Checkout kept at ${dir}\nItem state at disconnect: ${items}\nReview this folder to recover local work before retrying.\n`,
+        );
+      }
+      return sshLost ? { reason: "ssh_tunnel_closed" } : outcome;
+    })
+    .finally(() => {
+      joinView.close();
+    });
   const at = formatHostPort(target);
   try {
     showFingerprint(handle.fingerprint);
@@ -3443,6 +3569,7 @@ export async function joinSessionFlow(
   return {
     handle,
     target: at,
+    ...(opts.viaSsh ? { viaSsh: opts.viaSsh } : {}),
     device,
     repo,
     role,
@@ -3788,7 +3915,7 @@ async function controlAt(
   try {
     // Status asks for the v2 shape; a ≤0.1.13 master refuses `v:2` as a bad request, so ask
     // again in v1 (ORCH-6). Intents stay v1: their shape did not change.
-    reply = await request(op.op === "status" ? 2 : 1);
+    reply = await request(op.op === "status" || op.peerIds !== undefined ? 2 : 1);
     if (op.op === "status" && !reply.ok && reply.error.code === "bad_request") {
       reply = await request(1);
     }
@@ -3808,6 +3935,12 @@ async function controlAt(
     throw error;
   }
   if (!reply.ok) {
+    if (reply.error.code === "bad_request" && op.peerIds !== undefined)
+      throw new CliError(
+        "bad_request",
+        "The master does not support per-peer targeting; upgrade it to 0.3.0 or later",
+        EXIT.rejected,
+      );
     // A ≤0.1.13 master only parses intents up to 4000 characters; say so rather than echo its
     // generic parse error (locked plan §9.13).
     const chars = op.op === "intent" && typeof op.text === "string" ? op.text.length : 0;
@@ -3841,7 +3974,18 @@ async function intentCommand(
 }
 
 /** Validates the intent's input; shared by the control path and an in-process master. */
-export function checkIntent(text: string, repos: string[] | undefined): void {
+export function checkIntent(text: string, repos: string[] | undefined, peerIds?: string[]): void {
+  if (
+    peerIds !== undefined &&
+    (peerIds.length === 0 ||
+      peerIds.length > 16 ||
+      peerIds.some((id) => !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(id)))
+  )
+    throw new CliError(
+      "bad_peer",
+      "--peer must name 1..16 connected peer IDs (peer-N)",
+      EXIT.usage,
+    );
   if (text.length < 1 || text.length > MAX_INTENT_TEXT) {
     const message = `intent text must be 1..${MAX_INTENT_TEXT} chars`;
     throw new CliError("bad_intent", message, EXIT.usage);
@@ -3859,10 +4003,16 @@ export async function submitIntent(
   ctx: SessionCliContext,
   text: string,
   repos?: string[],
+  peerIds?: string[],
 ): Promise<{ intentId: string }> {
-  checkIntent(text, repos);
+  checkIntent(text, repos, peerIds);
   return parseIntentResult(
-    await control(ctx, { op: "intent", text, ...(repos === undefined ? {} : { repos }) }),
+    await control(ctx, {
+      op: "intent",
+      text,
+      ...(repos === undefined ? {} : { repos }),
+      ...(peerIds ? { peerIds } : {}),
+    }),
   );
 }
 
@@ -3871,10 +4021,16 @@ export async function submitIntentAt(
   endpoint: ControlEndpoint,
   text: string,
   repos?: string[],
+  peerIds?: string[],
 ): Promise<{ intentId: string }> {
-  checkIntent(text, repos);
+  checkIntent(text, repos, peerIds);
   return parseIntentResult(
-    await controlAt(endpoint, { op: "intent", text, ...(repos === undefined ? {} : { repos }) }),
+    await controlAt(endpoint, {
+      op: "intent",
+      text,
+      ...(repos === undefined ? {} : { repos }),
+      ...(peerIds ? { peerIds } : {}),
+    }),
   );
 }
 
@@ -3947,7 +4103,7 @@ export function renderSessionStatus(status: SessionStatus): string {
     .join("\n")}\n`;
 }
 
-export function sessionStatusSections(status: SessionStatus): StatusSection[] {
+export function sessionStatusSections(status: SessionStatus, viaSsh?: string): StatusSection[] {
   const sections: StatusSection[] = [];
   const code = status.joinCode === null ? "none" : formatJoinCode(status.joinCode);
   let lines = [
@@ -3969,7 +4125,7 @@ export function sessionStatusSections(status: SessionStatus): StatusSection[] {
         ...status.peers.map((p) => [
           p.peerId,
           p.device,
-          p.address,
+          `${p.address}${viaSsh ? " (via ssh)" : ""}`,
           p.repo ?? "-",
           p.head === null ? "-" : p.head.slice(0, 12),
           p.role ?? "-",

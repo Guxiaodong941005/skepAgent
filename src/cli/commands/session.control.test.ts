@@ -285,3 +285,24 @@ describe("clearStaleSessionFile", () => {
     expect(await readFile(file, "utf8")).toContain(listen);
   });
 });
+
+it("never widens a targeted intent when an older master refuses the additive field", async () => {
+  let requests = 0;
+  const port = await server((socket) => {
+    requests++;
+    reply(socket, {
+      type: "control-result",
+      ok: false,
+      error: { code: "bad_request", message: "Invalid first session request" },
+    });
+  });
+  await expect(
+    submitIntentAt(
+      { listen: `127.0.0.1:${port}`, token: TOKEN },
+      "exact target",
+      ["app"],
+      ["peer-2"],
+    ),
+  ).rejects.toThrow("upgrade it to 0.3.0");
+  expect(requests).toBe(1);
+});

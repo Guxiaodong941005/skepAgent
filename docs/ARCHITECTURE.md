@@ -527,7 +527,12 @@ agent)`, `leasesHeldBy(s, agent)`, `isOwner(s, task, agent)`, `pendingReviews(s,
 
 ---
 
-## 6. Lease protocol
+## 6. Lease protocol — HISTORICAL (removed in v0.1.2)
+
+This signed git event log and epoch-fenced lease design was removed in v0.1.2; the section is
+retained for historical reference. Current sessions use an in-memory master and subs over
+AES-256-GCM TCP after a join-code handshake (`src/session/`). Only the orchestration ledger at
+`~/.skep/projects/<id>/orchestrations/O-*.json` is persisted (`src/orchestrator/ledger.ts`).
 
 ### 6.1 Claiming
 

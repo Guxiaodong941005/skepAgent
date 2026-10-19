@@ -154,7 +154,7 @@ export function refineSkillSections(context: SkillContext): string {
   return text;
 }
 
-/** D36: merge roles before repo routing; cross-stage merges wait for their latest stage. */
+/** V030-4: merge roles only on the same peer; cross-stage merges wait for their latest stage. */
 export function planSkill(context: SkillContext, output: RefineOutput): SkillPlan {
   const { manifest: m, files } = context.skill;
   for (const binding of context.bindings) {
@@ -191,7 +191,10 @@ export function planSkill(context: SkillContext, output: RefineOutput): SkillPla
     const section = role
       ? `YOUR ROLE: ${role.label} — repo ${repo}\n${target.brief ?? output.brief}\n\nDONE WHEN / ROLE GUIDANCE:\n${files[role.guidance]}\nREPORT: implemented contract fields, deviations, changed files and tests run.`
       : (target.brief ?? output.brief);
-    const existing = groups.find((g) => g.repo === repo);
+    const peerId = binding?.peerId;
+    const existing = groups.find(
+      (g) => g.repo === repo && g.peerIds?.[0] === (peerId ?? undefined),
+    );
     if (existing) {
       if (roleId) existing.roles?.push(roleId);
       existing.title = `[${m.id} · ${existing.roles?.join("+") || repo}] ${output.title}`;
@@ -206,6 +209,7 @@ export function planSkill(context: SkillContext, output: RefineOutput): SkillPla
     } else {
       groups.push({
         repo,
+        ...(peerId ? { peerIds: [peerId] } : {}),
         title,
         brief: section,
         intentId: null,

@@ -33,6 +33,7 @@ import {
   type SessionStatus,
   SessionStatusSchema,
   sessionSchema,
+  supportsPeerIds,
   TokenSchema,
   VersionSchema,
   v1Status,
@@ -100,9 +101,17 @@ const PEER_STATUS_RE = /^(done|FAILED|blocked|declined|skipped|DRY RUN) · (.+)$
  * agent succeeded, the agent may still be waiting for a human in its pane (submit `pending`), or
  * nothing ran because the peer declined or skipped it.
  */
-export type ItemVerdict = "done" | "failed" | "submit-failed" | "pending" | "declined" | "running";
+export type ItemVerdict =
+  | "done"
+  | "failed"
+  | "lost"
+  | "submit-failed"
+  | "pending"
+  | "declined"
+  | "running";
 
 export function itemVerdict(item: ItemOutcome): ItemVerdict {
+  if (item.state === "failed" && item.result === undefined) return "lost";
   if (itemFailed(item)) return "failed";
   if (item.state !== "done" || item.result === undefined) return "running";
   const submit = item.result.submit?.state;
@@ -165,6 +174,7 @@ export function intentRollup(items: readonly ItemOutcome[]): string {
   const count: Record<ItemVerdict, number> = {
     done: 0,
     failed: 0,
+    lost: 0,
     "submit-failed": 0,
     pending: 0,
     declined: 0,
@@ -181,6 +191,7 @@ export function intentRollup(items: readonly ItemOutcome[]): string {
   return [
     `${count.done} done`,
     `${count.failed} failed`,
+    ...optional(count.lost, "lost"),
     ...optional(count["submit-failed"], "submit failed"),
     ...optional(count.pending, "waiting for you"),
     ...optional(count.declined, "declined"),
@@ -251,6 +262,7 @@ interface Request {
   cancel: () => void;
 }
 interface Intent {
+  peerIds?: string[];
   intentId: string;
   text: string;
   repos: string[];
@@ -315,6 +327,11 @@ class SessionMaster implements MasterHandle {
   private readonly unauthenticated = new Set<SessionWire>();
   private readonly peers = new Map<string, Peer>();
   private readonly intents: Intent[] = [];
+  private readonly itemIdentities = new Map<string, { device: string; role: string }>();
+  private readonly identities = new Map<string, { device: string; role: string; repo: string }>();
+  private readonly retried = new Set<string>();
+  private readonly retrying = new Set<string>();
+  private readonly quietWarned = new Set<string>();
   private readonly timers = new Set<AbortController>();
   private peerSeq = 0;
   private intentSeq = 0;
@@ -420,18 +437,79 @@ class SessionMaster implements MasterHandle {
     }));
   }
 
-  submitIntent(text: string, repos?: string[]): Promise<{ intentId: string }> {
+  itemIdentity(itemId: string): { device: string; role: string } | null {
+    const item = this.allItems().find((i) => i.itemId === itemId);
+    return item
+      ? (this.itemIdentities.get(itemId) ?? this.identities.get(item.assignee) ?? null)
+      : null;
+  }
+
+  async retryItem(
+    itemId: string,
+    peerId?: string,
+  ): Promise<{ itemId: string; intentId: string; peerId?: string }> {
+    const intent = this.intents.find((i) => i.items.some((item) => item.itemId === itemId));
+    const item = intent?.items.find((i) => i.itemId === itemId);
+    if (!intent || !item || !["lost", "failed"].includes(itemVerdict(item)))
+      throw new ChannelError(`${itemId} is not a lost or failed item`);
+    if (this.retried.has(itemId) || this.retrying.has(itemId))
+      throw new ChannelError(`${itemId} already has a retry`);
+    const identity = this.itemIdentities.get(itemId) ?? this.identities.get(item.assignee);
+    const peer = [...this.peers.values()].find(
+      (p) =>
+        p.repo === item.repo &&
+        p.role === identity?.role &&
+        (peerId === undefined || p.peerId === peerId),
+    );
+    if (!peer)
+      throw new ChannelError(
+        `No connected peer has repo ${item.repo} and role ${identity?.role ?? "unknown"}; join a replacement and /retry ${itemId}`,
+      );
+    this.retrying.add(itemId);
+    try {
+      const result = await this.submitTo(intent.text, [item.repo], [peer.peerId]);
+      this.retried.add(itemId);
+      return { itemId, intentId: result.intentId, peerId: peer.peerId };
+    } finally {
+      this.retrying.delete(itemId);
+    }
+  }
+
+  submitIntent(text: string, repos?: string[], peerIds?: string[]): Promise<{ intentId: string }> {
+    return this.submitTo(text, repos, peerIds);
+  }
+
+  private submitTo(
+    text: string,
+    repos?: string[],
+    peerIds?: string[],
+  ): Promise<{ intentId: string }> {
     if (this.stopped) return Promise.reject(new ChannelError("Master session is closed"));
-    const input = IntentInputSchema.parse({ text, ...(repos ? { repos } : {}) });
+    const input = IntentInputSchema.parse({
+      text,
+      ...(repos ? { repos } : {}),
+      ...(peerIds ? { peerIds } : {}),
+    });
+    if (input.peerIds?.some((id) => !this.peers.has(id)))
+      return Promise.reject(
+        new ChannelError(
+          "Target peer is no longer connected; check /status and select a connected peer",
+        ),
+      );
     return new Promise((resolve, reject) => {
       const intent: Intent = {
+        ...(input.peerIds ? { peerIds: [...new Set(input.peerIds)] } : {}),
         intentId: `intent-${++this.intentSeq}`,
         text: new Redactor().redact(input.text),
         repos: [...new Set(input.repos ?? [this.options.repo])],
         explicitRepos: input.repos !== undefined,
         state: "open",
         items: [],
-        waiting: new Set(this.recipients(input.repos)),
+        waiting: new Set(
+          this.recipients(input.repos).filter(
+            (id) => peerIds === undefined || peerIds.includes(id),
+          ),
+        ),
         candidates: [],
         requests: [],
         routing: false,
@@ -449,6 +527,9 @@ class SessionMaster implements MasterHandle {
           type: "intent",
           intentId: intent.intentId,
           text: wireText(intent.text, peer.protocol),
+          ...(peer.protocol === 2 && input.peerIds && supportsPeerIds(peer.version)
+            ? { peerIds: input.peerIds }
+            : {}),
         });
       }
       if (intent.waiting.size === 0) this.route(intent);
@@ -523,7 +604,11 @@ class SessionMaster implements MasterHandle {
                 result: first.v === 1 ? v1Status(status) : status,
               });
             } else {
-              void this.submitIntent(first.text, first.repos)
+              void this.submitIntent(
+                first.text,
+                first.repos,
+                "peerIds" in first ? first.peerIds : undefined,
+              )
                 .then((result) => {
                   if (wire.active)
                     wire.finish("control_complete", { type: "control-result", ok: true, result });
@@ -682,6 +767,23 @@ class SessionMaster implements MasterHandle {
           this.event("join-failed", `Join from ${who} ended: ${reason}`);
         }
       },
+      () => {
+        if (
+          !peer ||
+          this.quietWarned.has(peer.peerId) ||
+          !this.allItems().some(
+            (i) => i.assignee === peer?.peerId && (i.state === "planned" || i.state === "claimed"),
+          )
+        )
+          return;
+        this.quietWarned.add(peer.peerId);
+        this.event(
+          "quiet",
+          `Peer ${peer.peerId} (${peer.device}) quiet for 20 s with running items; it will be lost at 30 s without a heartbeat`,
+          undefined,
+          { peerId: peer.peerId },
+        );
+      },
     );
     const rejectJoin = (reason: JoinRejectReason) =>
       wire.finish(reason, { type: "join-reject", reason });
@@ -709,6 +811,7 @@ class SessionMaster implements MasterHandle {
       peer.repo = message.repo;
       peer.head = message.head;
       peer.role = message.role;
+      this.identities.set(peer.peerId, { device: peer.device, repo: peer.repo, role: peer.role });
       this.progressChanged(peer);
       intent.candidates.push({
         peerId: peer.peerId,
@@ -839,21 +942,35 @@ class SessionMaster implements MasterHandle {
     intent.routing = true;
     intent.cancel();
     const candidates = intent.candidates.filter((candidate) => this.peers.has(candidate.peerId));
-    for (const repo of intent.repos) {
-      const candidate = matchSub(repo, candidates);
-      if (candidate)
-        intent.requests.push({
-          requestId: `request-${++this.requestSeq}`,
-          candidate,
-          done: false,
-          entries: 0,
-          cancel: () => {},
+    const selected = intent.peerIds
+      ? intent.peerIds.flatMap((id) => {
+          const candidate = candidates.find(
+            (c) => c.peerId === id && (!intent.explicitRepos || intent.repos.includes(c.repo)),
+          );
+          return candidate ? [candidate] : [];
+        })
+      : intent.repos.flatMap((repo) => {
+          const candidate = matchSub(repo, candidates);
+          return candidate ? [candidate] : [];
         });
-    }
+    for (const candidate of selected)
+      intent.requests.push({
+        requestId: `request-${++this.requestSeq}`,
+        candidate,
+        done: false,
+        entries: 0,
+        cancel: () => {},
+      });
     // A bare intent defaults to the master's repo, but a lone peer working on another repo is
     // still the only possible assignee, so route the work to that peer's repo (INTENT-PEER).
     const sole = candidates[0];
-    if (!intent.requests.length && !intent.explicitRepos && candidates.length === 1 && sole) {
+    if (
+      !intent.requests.length &&
+      !intent.peerIds &&
+      !intent.explicitRepos &&
+      candidates.length === 1 &&
+      sole
+    ) {
       intent.requests.push({
         requestId: `request-${++this.requestSeq}`,
         candidate: sole,
@@ -892,17 +1009,26 @@ class SessionMaster implements MasterHandle {
     // Plan the repos that were actually routed, which may differ from the requested ones after
     // the lone-peer fallback.
     const items = buildPlan(
-      { text: intent.text, repos: intent.requests.map((request) => request.candidate.repo) },
+      {
+        text: intent.text,
+        repos: intent.requests.map((request) => request.candidate.repo),
+        ...(intent.peerIds ? { peerIds: intent.peerIds } : {}),
+      },
       this.options.repo,
       intent.requests.map((request) => request.candidate),
       {
         firstItemNumber: this.itemSeq,
         datalistCounts: Object.fromEntries(
-          intent.requests.map((request) => [request.candidate.repo, request.entries]),
+          intent.requests.map((request) => [request.candidate.peerId, request.entries]),
         ),
       },
     );
     this.itemSeq += items.length;
+    for (const item of items) {
+      const identity = this.identities.get(item.assignee);
+      if (identity)
+        this.itemIdentities.set(item.itemId, { device: identity.device, role: identity.role });
+    }
     intent.items = items.map((item) => ({
       ...item,
       state: this.peers.has(item.assignee) ? "planned" : "failed",
@@ -1092,7 +1218,7 @@ class SessionMaster implements MasterHandle {
     if (verdicts.includes("running")) return;
     intent.finished = true;
     const rollup = intentRollup(intent.items);
-    if (verdicts.some((v) => v === "failed" || v === "submit-failed")) {
+    if (verdicts.some((v) => v === "failed" || v === "lost" || v === "submit-failed")) {
       this.event("intent-failed", `${intent.intentId} failed: ${intent.text}\n  ${rollup}`);
     } else if (verdicts.includes("pending")) {
       this.event(

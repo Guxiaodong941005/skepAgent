@@ -44,6 +44,7 @@ export const IntentInputSchema = z.strictObject({
   // v1 peers receive at most the first 4000 characters (master.ts `wireText`).
   text: BriefSchema,
   repos: z.array(RepoRefSchema).min(1).max(16).optional(),
+  peerIds: z.array(IdSchema).min(1).max(16).optional(),
 });
 /** `v:1` answers in the ≤0.1.13 status shape; `v:2` adds the ORCH-6 fields. */
 const ControlStatusSchema = z.strictObject({
@@ -57,7 +58,7 @@ const ControlIntentSchema = z.strictObject({
   v: z.literal(1),
   token: TokenSchema,
   op: z.literal("intent"),
-  ...IntentInputSchema.shape,
+  ...IntentInputSchema.omit({ peerIds: true }).shape,
 });
 export const JoinSchema = z.strictObject({
   type: z.literal("join"),
@@ -66,7 +67,19 @@ export const JoinSchema = z.strictObject({
   pub: base64(32),
   nonce: base64(16),
 });
-export const FirstFrameSchema = z.union([ControlStatusSchema, ControlIntentSchema, JoinSchema]);
+const ControlIntentV2Schema = z.strictObject({
+  type: z.literal("control"),
+  v: z.literal(2),
+  token: TokenSchema,
+  op: z.literal("intent"),
+  ...IntentInputSchema.shape,
+});
+export const FirstFrameSchema = z.union([
+  ControlStatusSchema,
+  ControlIntentSchema,
+  ControlIntentV2Schema,
+  JoinSchema,
+]);
 export type FirstFrame = z.infer<typeof FirstFrameSchema>;
 
 export const JoinRejectReasonSchema = z.enum([
@@ -330,7 +343,12 @@ export const SessionMsgV2Schema = z.discriminatedUnion("type", [
     peerId: IdSchema,
     version: VersionSchema,
   }),
-  z.strictObject({ type: z.literal("intent"), intentId: IdSchema, text: BriefSchema }),
+  z.strictObject({
+    type: z.literal("intent"),
+    intentId: IdSchema,
+    text: BriefSchema,
+    peerIds: z.array(IdSchema).min(1).max(16).optional(),
+  }),
   ...sessionMembers,
   ProgressMsgV2Schema,
   ResultMsgV2Schema,
@@ -429,3 +447,9 @@ export const ControlResultSchema = z.discriminatedUnion("ok", [
   }),
 ]);
 export type ControlResult = z.infer<typeof ControlResultSchema>;
+
+/** Earlier v2 peers parse intent frames strictly, so omit the additive field for them. */
+export function supportsPeerIds(version: string | null): boolean {
+  const match = /^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(version ?? "");
+  return match !== null && (Number(match[1]) > 0 || Number(match[2]) >= 3);
+}

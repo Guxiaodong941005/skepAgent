@@ -41,10 +41,10 @@ function setup(
     confirm?: "send" | "edit";
   } = {},
 ) {
-  const roster = options.peers ?? peers;
+  const roster = [...(options.peers ?? peers)];
   const context = options.context ?? { skill, bindings: bind(skill.manifest.roles, roster) };
   const prompts: string[] = [];
-  const sent: { text: string; repos?: string[]; id: string }[] = [];
+  const sent: { text: string; repos?: string[]; peerIds?: string[]; id: string }[] = [];
   const shown: string[] = [];
   let current: OrchestrationItem[] = [];
   const agent: MasterAgent = {
@@ -69,10 +69,18 @@ function setup(
     clock: { nowMs: () => 1000, monotonicMs: () => 0, sleep: () => new Promise(() => {}) },
     peers: () => roster,
     items: () => current,
-    dispatch: async (text, repos) => {
+    retryItem: async (itemId) => {
+      const old = current.find((i) => i.itemId === itemId);
+      const prior = sent.find((s) => s.id === old?.intentId);
+      if (!prior) throw new Error("unknown item");
+      const id = `intent-${sent.length + 1}`;
+      sent.push({ ...prior, id });
+      return { itemId, intentId: id };
+    },
+    dispatch: async (text, repos, peerIds) => {
       if (options.failRepos?.includes(repos?.[0] ?? "")) throw new Error("offline");
       const id = `intent-${sent.length + 1}`;
-      sent.push({ text, repos, id });
+      sent.push({ text, repos, peerIds, id });
       return id;
     },
     guard: async () => async () => [],
@@ -114,7 +122,7 @@ describe("skills in orchestration (D36)", () => {
   it("keeps generic prompts byte-identical to the pre-skill path", () => {
     const g = loadSkillSource(generic, "packaged");
     const input = { userText: "test", peers: [], answers: [] };
-    expect(PROMPT_VERSION).toBe(3);
+    expect(PROMPT_VERSION).toBe(5);
     expect(refinePrompt({ ...input, skill: { skill: g, bindings: [] } })).toBe(refinePrompt(input));
     const synth = { userText: "x", groups: [], items: [], outcome: "none" };
     expect(synthesisPrompt({ ...synth, skill: { skill: g, bindings: [] } })).toBe(
@@ -175,7 +183,45 @@ describe("skills in orchestration (D36)", () => {
     });
     expect(records[0]?.state.contract).toBe(output.contract);
     expect(records[0]?.state.bindings).toHaveLength(5);
-    expect(records[0]?.promptVersion).toBe(3);
+    expect(records[0]?.promptVersion).toBe(5);
+  });
+  it("holds a lost required provider, retries the original brief, and then starts clients", async () => {
+    const h = setup();
+    const run = h.orchestrator.start("feature", "auto", h.context);
+    await vi.waitFor(() => expect(h.sent).toHaveLength(2));
+    h.update([item("intent-1", "lost"), item("intent-2")]);
+    expect(h.orchestrator.get(run.id)?.phase).toBe("awaiting-retry");
+    expect(h.sent).toHaveLength(2);
+    expect(h.shown.join("\n")).toContain(`/retry ${run.id} or /skip ${run.id}`);
+    expect(await h.orchestrator.retry(run.id)).toBeNull();
+    expect(h.sent[2]?.text).toBe(h.sent[0]?.text);
+    h.update([item("intent-1", "lost"), item("intent-2"), item("intent-3", "running")]);
+    expect(h.sent).toHaveLength(3);
+    h.update([item("intent-1", "lost"), item("intent-2"), item("intent-3")]);
+    await vi.waitFor(() => expect(h.sent).toHaveLength(5));
+    h.update([
+      item("intent-1", "lost"),
+      item("intent-2"),
+      item("intent-3"),
+      item("intent-4"),
+      item("intent-5"),
+    ]);
+    expect((await run.done).items[0]?.supersededBy).toBe("intent-3");
+  });
+  it("only /skip deliberately releases lost providers and tells clients and synthesis", async () => {
+    const h = setup();
+    const run = h.orchestrator.start("feature", "auto", h.context);
+    await vi.waitFor(() => expect(h.sent).toHaveLength(2));
+    h.roster.splice(0, 1);
+    h.update([item("intent-1", "lost"), item("intent-2")]);
+    expect(h.sent).toHaveLength(2);
+    expect(h.orchestrator.skip(run.id)).toBeNull();
+    await vi.waitFor(() => expect(h.sent).toHaveLength(4));
+    expect(h.sent[2]?.text).toContain("device (skipped after peer lost)");
+    h.update([item("intent-1", "lost"), item("intent-2"), item("intent-3"), item("intent-4")]);
+    expect((await run.done).items[0]?.skipped).toBe(true);
+    expect(h.prompts[1]).toContain("device (skipped after peer lost)");
+    expect(h.prompts[1]).toContain("lost");
   });
   it("refuses unbound required roles before sending anything", async () => {
     const h = setup({ peers: peers.filter((p) => p.role !== "server") });
@@ -194,16 +240,22 @@ describe("skills in orchestration (D36)", () => {
       expect(h.sent).toHaveLength(0);
     }
   });
-  it("merges roles sharing one repo into sections in one intent", async () => {
+  it("keeps separate role briefs when different peers share one repo", async () => {
     const roster = peers.map((p) => ({ ...p, repo: "monorepo" }));
     const h = setup({ peers: roster });
     const run = h.orchestrator.start("request", "auto", h.context);
-    await vi.waitFor(() => expect(h.sent).toHaveLength(1));
-    expect(h.sent[0]?.repos).toEqual(["monorepo"]);
+    await vi.waitFor(() => expect(h.sent).toHaveLength(2));
+    expect(h.sent[0]?.peerIds).toEqual(["p0"]);
+    expect(h.sent[1]?.peerIds).toEqual(["p1"]);
     expect(h.sent[0]?.text).toContain("YOUR ROLE: C++ device / SDK layer");
-    expect(h.sent[0]?.text).toContain("YOUR ROLE: iOS app");
-    expect(h.sent[0]?.text.match(/FEATURE CONTRACT/g)).toHaveLength(1);
-    h.update([item("intent-1")]);
+    expect(h.sent[0]?.text).not.toContain("YOUR ROLE: iOS app");
+    h.update([item("intent-1"), item("intent-2")]);
+    await vi.waitFor(() => expect(h.sent).toHaveLength(4));
+    expect(h.sent[2]?.peerIds).toEqual(["p2"]);
+    expect(h.sent[3]?.peerIds).toEqual(["p3"]);
+    expect(h.sent[2]?.text).toContain("YOUR ROLE: iOS app");
+    expect(h.sent[2]?.text).not.toContain("YOUR ROLE: Android app");
+    h.update(h.sent.map((s) => item(s.id)));
     expect((await run.done).phase).toBe("done");
   });
   it("keeps skills without stages in a single wave", async () => {
@@ -281,6 +333,6 @@ describe("role changes before a later stage", () => {
     expect(h.sent[2]?.text).not.toContain("YOUR ROLE: iOS app");
     h.update([item("intent-1"), item("intent-2"), item("intent-3")]);
     const state = await run.done;
-    expect(state.groups.find((g) => g.repo === "mobile")?.title).toMatch(/· android\]/);
+    expect(state.groups.find((g) => g.roles?.includes("android"))?.title).toMatch(/· android\]/);
   });
 });

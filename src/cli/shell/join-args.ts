@@ -25,7 +25,7 @@ export const JOIN_USAGE = [
   "       /join <host:port> <NNNN-NNNN-NNNN>",
   "       /join            (this device's own master)",
   "repo and device default to this checkout's directory name and this hostname",
-  "optional: --repo <name>, --device <name>, --role <role>,",
+  "optional: --repo <name>, --device <name>, --role <role>, --via-ssh [user@]host,",
   "          --agent claude|codex|pi (default: /agent, SKEP_AGENT_CLI, AGENT.md, else PATH),",
   "          --view native|pty|herdr|dry,",
   "          --submit commit|push|pr|mr|none|ask (default: device.toml, else none),",
@@ -34,6 +34,7 @@ export const JOIN_USAGE = [
 ].join("\n");
 
 export interface JoinArgs {
+  viaSsh?: string;
   code?: string;
   host?: string;
   role?: string;
@@ -61,7 +62,7 @@ export function parseJoinArgs(args: string): JoinArgs {
   try {
     flags = parseFlags(
       args,
-      ["host", "role", "agent", "view", "code", "repo", "device", "submit", "role-dir"],
+      ["host", "role", "agent", "view", "code", "repo", "device", "submit", "role-dir", "via-ssh"],
       ["manual", "share-output"],
     );
   } catch (error) {
@@ -109,6 +110,7 @@ export function parseJoinArgs(args: string): JoinArgs {
     }
   }
   return {
+    ...(flags.values["via-ssh"] ? { viaSsh: flags.values["via-ssh"] } : {}),
     ...(code === undefined ? {} : { code }),
     ...(host === undefined ? {} : { host }),
     ...(role === undefined ? {} : { role }),

@@ -13,8 +13,8 @@ import {
 } from "../core/orchestration/schemas.js";
 import { refineSkillSections, type SkillContext } from "../core/skills/compose.js";
 
-/** 3: optional skill context and staged dispatch (D36). 2: per-repo `targets` in the refine contract, per-group synthesis (ORCH-7). */
-export const PROMPT_VERSION = 3;
+/** 5: per-peer role briefs. 4: lost/skipped recovery context in staged briefs. 3: optional skill context and staged dispatch (D36). 2: per-repo `targets` in the refine contract, per-group synthesis (ORCH-7). */
+export const PROMPT_VERSION = 5;
 /** Result text one synthesis prompt carries at most (plan §3.7); cuts are announced. */
 export const SYNTH_RESULTS_BUDGET = 24_000;
 
@@ -65,7 +65,7 @@ export function refinePrompt(input: RefineInput): string {
           "",
           "For this skill, targets may name exactly one of role or repo; prefer declared roles.",
           "Return a contract string (at most 3000 chars) filled from the shared skeleton when provided.",
-          "Skep resolves roles, merges shared repos and honors the stage dependency order.",
+          "Skep resolves roles to peers, keeps separate briefs for different peers sharing a repo, and honors the stage dependency order.",
         ]
       : []),
     "",
@@ -203,7 +203,11 @@ export function resultBlocks(
   const share = Math.max(400, Math.floor(budget / Math.max(1, items.length)));
   let cut = false;
   const blocks = items.map((item) => {
-    const where = `${item.itemId} · ${item.verdict} · ${item.device ?? "?"} (${item.repo})`;
+    const status =
+      item.verdict +
+      (item.skipped ? " (skipped deliberately)" : "") +
+      (item.supersededBy ? ` (retried as ${item.supersededBy})` : "");
+    const where = `${item.itemId} · ${status} · ${item.device ?? "?"} (${item.repo})`;
     const summary =
       (item.summary ?? "(no result received)") +
       (includeChanged && item.changed ? `\nChanged files: ${JSON.stringify(item.changed)}` : "");

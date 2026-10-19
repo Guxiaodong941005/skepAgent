@@ -100,11 +100,13 @@ function fakeApi(address = { host: "192.168.1.20", port: 7419 }) {
     sub: SubOptions[];
     intents: string[];
     intentRepos: (string[] | undefined)[];
+    intentPeers: (string[] | undefined)[];
   } = {
     master: [],
     sub: [],
     intents: [],
     intentRepos: [],
+    intentPeers: [],
   };
   /** Peers the fake master reports in `status()`; tests push into it. */
   const peers: MasterPeer[] = [];
@@ -134,9 +136,10 @@ function fakeApi(address = { host: "192.168.1.20", port: 7419 }) {
           peers: peers.map((peer) => ({ ...peer })),
           intents: intents.map((intent) => ({ ...intent })),
         }),
-        submitIntent: async (text, repos) => {
+        submitIntent: async (text, repos, peerIds) => {
           calls.intents.push(text);
           calls.intentRepos.push(repos);
+          calls.intentPeers.push(peerIds);
           if (intentError !== null) throw intentError;
           return { intentId: "N-1" };
         },
@@ -2482,6 +2485,36 @@ describe("skill shell wiring (SKILL-MVP)", () => {
       expect(next.scrollback()).not.toContain("tip: /skills");
     } finally {
       await next.shell.quit();
+    }
+  });
+});
+
+describe("release recovery/report commands", () => {
+  it("/report works without a live session", async () => {
+    const h = await harness();
+    try {
+      await h.shell.submit("/report --json");
+      expect(h.scrollback()).toContain("[]");
+      await h.shell.submit("/report O-1 --last 2");
+      expect(h.scrollback()).toContain("choose an O-id or --last N");
+    } finally {
+      await h.shell.quit();
+    }
+  });
+  it("preserves the selected peer when two peers share a repo", async () => {
+    const h = await harness();
+    try {
+      await h.shell.submit("/start --yes --repo app");
+      h.fake.peers.push(peer("peer-1", "ios", "mobile"), peer("peer-2", "android", "mobile"));
+      const sending = h.shell.submit("/intent work on Android only");
+      await vi.waitFor(() => expect(h.shell.model.picker).not.toBeNull());
+      h.stdin.type("\x1b[B");
+      h.stdin.type(" ");
+      h.stdin.type("\r");
+      await sending;
+      expect(h.fake.calls.intentPeers).toEqual([["peer-2"]]);
+    } finally {
+      await h.shell.quit();
     }
   });
 });

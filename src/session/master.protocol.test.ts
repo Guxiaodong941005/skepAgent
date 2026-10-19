@@ -3,6 +3,7 @@
 import { createConnection, createServer, type Server } from "node:net";
 import { Duplex } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { SessionWire } from "./channel.js";
 import { encodeFrame, FrameDecoder } from "./codec.js";
 import { confirmation, createEphemeral, deriveKeys, JoinRejectedError } from "./handshake.js";
 import {
@@ -564,5 +565,64 @@ describe("control status", () => {
       expect(v1).not.toContain(key);
       expect(v2).toContain(key);
     }
+  });
+});
+
+describe("per-peer intent targeting (additive protocol v2)", () => {
+  it.each(["0.2.0", "0.3.0"])(
+    "targets exactly the selected peer sharing a repo, peer release %s",
+    async (version) => {
+      const sent = vi.spyOn(SessionWire.prototype, "send");
+      try {
+        const m = await master();
+        const first = await join(m, "first", "app", { version });
+        const second = await join(m, "second", "app", { version });
+        await vi.waitFor(() =>
+          expect(m.status().peers.find((p) => p.peerId === second.handle.peerId)?.version).toBe(
+            version,
+          ),
+        );
+        await m.submitIntent("Only the second peer's brief", ["app"], [second.handle.peerId]);
+        await vi.waitFor(() => expect(second.items).toHaveLength(1));
+        expect(first.items).toHaveLength(0);
+        expect(second.texts).toEqual(["Only the second peer's brief"]);
+        const intent = sent.mock.calls
+          .map(([message]) => message)
+          .find((m) => (m as { type?: string }).type === "intent");
+        expect(intent).toEqual({
+          type: "intent",
+          intentId: "intent-1",
+          text: "Only the second peer's brief",
+          ...(version === "0.3.0" ? { peerIds: [second.handle.peerId] } : {}),
+        });
+        // A strict 0.2.0 peer never receives the new key, yet routing remains exact.
+        await expect(m.submitIntent("No widening", ["app"], ["peer-999"])).rejects.toThrow(
+          "no longer connected",
+        );
+      } finally {
+        sent.mockRestore();
+      }
+    },
+  );
+  it("creates distinct items when explicitly targeting two peers on the same repo", async () => {
+    const m = await master();
+    const first = await join(m, "first", "app", {
+      collectDatalist: async () => [{ kind: "path", path: "first.ts" }],
+    });
+    const second = await join(m, "second", "app", { collectDatalist: async () => [] });
+    await m.submitIntent("Both peers", ["app"], [first.handle.peerId, second.handle.peerId]);
+    await vi.waitFor(() => expect(first.items.length + second.items.length).toBe(2));
+    expect(first.items[0]?.assignee).toBe(first.handle.peerId);
+    expect(first.items[0]?.datalistEntries).toBe(1);
+    expect(second.items[0]?.datalistEntries).toBe(0);
+    expect(second.items[0]?.assignee).toBe(second.handle.peerId);
+  });
+  it("keeps targeted routing compatible with a v1 peer", async () => {
+    const m = await master();
+    const first = await join(m, "first", "app", { protocol: 1 });
+    const second = await join(m, "second", "app", { protocol: 1 });
+    await m.submitIntent("v1 target", ["app"], [second.handle.peerId]);
+    await vi.waitFor(() => expect(second.items).toHaveLength(1));
+    expect(first.items).toHaveLength(0);
   });
 });

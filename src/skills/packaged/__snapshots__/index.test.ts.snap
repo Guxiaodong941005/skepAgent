@@ -58,7 +58,7 @@ Stages: contract [] after []; providers [device, server] after [contract]; clien
 
 For this skill, targets may name exactly one of role or repo; prefer declared roles.
 Return a contract string (at most 3000 chars) filled from the shared skeleton when provided.
-Skep resolves roles, merges shared repos and honors the stage dependency order.
+Skep resolves roles to peers, keeps separate briefs for different peers sharing a repo, and honors the stage dependency order.
 
 TASK: turn the human's request below into a clear, self-contained brief for the peer agents.
 A peer agent cannot see this conversation or this project; give it everything it needs:
